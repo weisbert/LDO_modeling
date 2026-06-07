@@ -2,8 +2,19 @@
 
 ## UPDATE (2026-06-07c) — TARGET B PHASES 0–3 EXECUTED (ultracode session): pipeline VALIDATED in Spectre
 Ran the Phase 0–3 plan from 2026-06-07b on the Linux/Cadence box. **CLI phases 0–2 + skillbridge phase 3
-done and validated.** New tooling in `cadence/` (see `cadence/README.md`). Uncommitted (commits user-gated).
-Only Phase 4 (real PMU LDO in-situ) remains — it needs the 5 open inputs + the real PMU netlist.
+done and validated**, + a SpectreRF PSS RF acceptance, + a company-side Phase-4 runbook. New tooling in
+`cadence/` (see `cadence/README.md`).
+
+**PUSHED to GitHub** — branch **`target-b-cadence-bringup`** (off `main`), 4 commits:
+`83641eb` Phases 0–3 · `3933fc7` RF PSS acceptance · `fe7dd71` company runbook · (+ this HANDOFF update).
+Pull it on the company machine; merge to `main`/open a PR when ready.
+
+**Phase 4 (real PMU LDO in-situ) is the only thing left, and it runs ON THE COMPANY MACHINE** — the real
+PMU can't leave that environment, so the user does the *extraction* there following
+**`cadence/COMPANY_RUNBOOK.md`** (setup/env-adapt → in-situ pin-level extraction recipe → `import_cadence`
+→ `fit_model` → `score`/PSS-HB drop-in). The npz contract is the firewall; fitting is pure Python.
+**One open question:** does the 0.8 V LDO also take the 1.8 V supply (PSRR-relevant)? If yes, `fit_model`
+needs a 2nd PSRR path (decision 4) — a no-input change I can make now on request.
 
 **Phase 0 — env (DONE).** `cadence/env.sh` mirrors the live Virtuoso IC618 env. **`spectre -64` is
 MANDATORY** — default 32-bit mode compiles the Verilog-A CMI with `gcc -m32` and dies on missing
