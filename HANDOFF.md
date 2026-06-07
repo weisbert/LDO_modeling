@@ -1,5 +1,146 @@
 # HANDOFF — LDO behavioral-model builder (as of 2026-06-07)
 
+## UPDATE (2026-06-07c) — TARGET B PHASES 0–3 EXECUTED (ultracode session): pipeline VALIDATED in Spectre
+Ran the Phase 0–3 plan from 2026-06-07b on the Linux/Cadence box. **CLI phases 0–2 + skillbridge phase 3
+done and validated.** New tooling in `cadence/` (see `cadence/README.md`). Uncommitted (commits user-gated).
+Only Phase 4 (real PMU LDO in-situ) remains — it needs the 5 open inputs + the real PMU netlist.
+
+**Phase 0 — env (DONE).** `cadence/env.sh` mirrors the live Virtuoso IC618 env. **`spectre -64` is
+MANDATORY** — default 32-bit mode compiles the Verilog-A CMI with `gcc -m32` and dies on missing
+`gnu/stubs-32.h`; 64-bit compiles clean. Spectre 18.1.0.077 confirmed; **"VA compiles in Spectre" CLOSED.**
+
+**Phase 1 — VA round-trip (DONE, composite 0.2 = numerical floor).** Built the Spectre pipeline:
+`psf.py` (psfascii reader) → `spectre_run.py` (`spectre -64`) → `spectre_bench.py` (NET/PIN-parameterized
+measurement bench, mirrors `harness/bench.py`) → `extract_ref.py` (→ `results/ref/<name>.npz` per
+`CADENCE_EXTRACTION.md`) → `bench_spectre.py`+`score_spectre.py` (reuse `harness/score.py` metrics with a
+Spectre backend; ngspice isn't on this box so `score.py` can't grade directly). noise `out` is already
+V/√Hz (no V²/Hz convert); per-instance noise contribution is captured (Phase-4 bonus).
+- **BUG CAUGHT + FIXED — inverted `.va` PSRR sign.** Verilog-A `I(vout)<+ X` removes current FROM vout,
+  but the validated SPICE `.lib` mirror (`Gd 0 vout ...`) injects INTO it → emitted PSRR was 180° flipped
+  (would invert 304 MHz sideband asymmetry). `emit_va` already negated the *spur* tones for this reason but
+  missed the PSRR lines. Fixed in `harness/fit_model.py:emit_va` (negate the 2 PSRR `I(vout)<+`
+  contributions) + the committed `model/ldo_model.va` (hand-applied, coefficients untouched → `.lib` pristine).
+  Round-trip Pdeg 180→0, composite 5.6→0.2. **The `.va` was never simulated before — Target A only ran the `.lib`.**
+
+**Phase 2 — transistor GT cross-sim (DONE; full 12-architecture matrix).** Bringing ngspice BSIM3 GT into
+Spectre needed three fixes in `cadence/spectre_bench.py:spice_dut` (all caught during bring-up):
+(1) **BSIM3 level map** ngspice `level=8` → Spectre `level=49` (8 → generic `mos8`, rejects BSIM3 params);
+(2) **strip `{param}`** subckt braces (Spectre spice resolves bare names, not `{}`);
+(3) instance the subckt in **spice-lang**, stimuli in spectre-lang, nets bridge.
+- **Cross-sim is near-perfect:** base composite **3.8 (Spectre) vs 3.9 (ngspice)**; Zout ΔRMS ≤0.006 dB,
+  **1/f noise band Δ 0.000 dB** (the flicker-`kf` worry is moot), 304 MHz Zout 0.724 vs 0.724.
+- **12-architecture matrix** (Workflow, parallel + adversarial verify vs committed `matrix.md`):
+  **10/12 match, 1 minor, 1 deviation.** match: base 3.8/3.9, cout10n 2.4/2.7, cout4n7 2.6/2.7, esr_hi
+  4.0/4.1, iq_lo 4.95/5.0, iq_hi 4.06/4.1, wp_big 7.66/7.8, cg_hi 6.33/6.3, v2_capless 6.51/6.8,
+  **v4_ffpsrr 3.9/4.0** (non-min-phase PSRR — validates the sign fix). minor: v1_nmos 9.23/8.9 (+0.33,
+  benign — underdetermined Cout on a flat NMOS-follower Zout). **deviation: v3_miller 20.6/6.3.**
+  - **v3_miller deviation = a pre-existing FITTER bifurcation, NOT a Cadence-pipeline defect.** Diagnosed:
+    GT physics is cross-sim identical (Zout/PSRR agree to ~0.005 dB); fitting the *ngspice* npz reproduces
+    the good committed fit, but fitting the *Spectre* npz (identical to 0.005 dB) lands in a different
+    least-squares basin (`G1` const +0.029 → −154; huge per-corner G1/w1) that fits 121 µ but whose
+    quadratic-in-ln(iload) interpolation blows the off-corner PSRR band error to 15.94 dB at 20 µ
+    (Pband weight 2 → composite). Same "low analytic residual but bad realized band" trap documented for
+    v4 250 µ in 2026-06-06c. v3 PSRR fit is ill-conditioned (migrating multipole + non-min-phase + the only
+    non-passive GT). The fit is deterministic; the sub-0.01 dB cross-sim noise just tips the bifurcation.
+  - **v5_spur / v6_spur2 NOT in the matrix** — they have intrinsic on-chip tones; a Spectre intrinsic-spur
+    characterizer (PSS or free-run transient-FFT) isn't built yet (the empty-spur extraction is correct for
+    the other 12). This is where SpectreRF PSS should be wired (Phase 3+).
+
+**Phase 3 — skillbridge productionization (DONE).** Live Virtuoso IC618 over skillbridge.
+- Created lib **`LDO_model_lab`** (`ddCreateLib`, self-contained at `cadence/cds/`) and imported
+  `model/ldo_model.va` as a **veriloga cellview** `LDO_model_lab/ldo_model/veriloga` (recipe = the box's
+  own dreg_gen: write `veriloga.va` + `master.tag`, `ddUpdateLibList`). Verified it's a valid simulatable
+  Cadence cell (characterizing it reproduces the Phase-1 round-trip; PSRR sign correct).
+- Reusable drivers: `cadence/skill_lib.py` (`ensure_lib` / `import_va_cellview` / `list_cells`) + its
+  CIW twin `cadence/skill/ldo_cellview.il` (`ldoEnsureLib` / `ldoImportVA`, validated: loads + runs).
+- **`cadence/import_cadence.py`** — the contract converter: ADE/OCEAN PSF tree OR manual CSV →
+  `results/ref/<name>.npz` (`assemble()` = single schema writer). **CSV manual-TB fallback verified
+  end-to-end** (array-equality vs source npz + fit-compatible) → the user's manual-TB question answered: yes.
+- **OCEAN caveat:** the standalone `ocean` binary is OS-broken here (`sysname` → "unknown" on RHEL8/4.18,
+  fatal; live Virtuoso tolerates it). So characterization runs via the validated spectre path (same
+  SPECTRE181 engine ADE uses); for Phase 4 in-situ, run the contract analyses in the user's ADE session
+  and feed the PSF/CSV through `import_cadence.py`. In-session OCEAN-via-skillbridge was avoided (would
+  hijack the user's live ADE/OCEAN globals).
+
+**OPEN ITEMS (recommended follow-ups, none blocking the validated pipeline):**
+- Regenerate ALL `model/*.va` from the fixed `emit_va` (esp. v4_ffpsrr — non-min-phase PSRR, RF-relevant).
+  Only `model/ldo_model.va` was hand-fixed; the others still carry the old PSRR sign. (Churns committed files
+  with cosmetic re-fit noise on the `.lib`s — user's call.)
+- Harden the v3-class PSRR fit (regularize / prefer-smaller-|G|-and-w-spread tie-break that generalizes
+  across corners, or pin the band realization) — a CORE `fit_model.py` change → re-validate the matrix.
+- Build the Spectre intrinsic-spur characterizer (PSS/transient-FFT) → enables v5/v6 + the real 304 MHz use case.
+- Phase 3 (skillbridge/ADE/OCEAN) and Phase 4 (in-situ PMU LDO) still need the 5 open inputs below.
+
+**Uncommitted tracked changes:** `harness/fit_model.py` (emit_va PSRR sign), `model/ldo_model.va` (sign),
+`.gitignore` (+Spectre scratch), `HANDOFF.md`. New: `cadence/` (tooling+README). Spectre validation
+artifacts (`model/*_spectre.*`, `results/ref/*_spectre.npz`, `cadence/work*`) are .gitignored.
+
+## UPDATE (2026-06-07b) — LINUX/CADENCE BRING-UP: Target B decisions + execution plan (NOT yet executed)
+Planning session on the Linux/Cadence box. **Nothing executed yet** — the user will run Phase 0+ in the
+NEXT conversation under **ultracode (Workflow multi-agent orchestration)**. This section IS the handoff.
+On-disk state: pulled to `fc8fadc`, working tree clean.
+
+**Environment VERIFIED on this box (facts, not assumptions):**
+- **Virtuoso IC618** running; **skillbridge 1.8.0** live and drivable from `python3` (`Workspace.open()`
+  connects, `hiGetCurrentWindow()` works). Server: `workarea/skill_tools/skillbridge/python_server.py`.
+- **Spectre 18.1** (`SPECTRE181`) on disk at `/home/yusheng/Program/eda/cadence/SPECTRE181` → we have
+  REAL `pac/pxf/pnoise/pss` LOCALLY. ⇒ the prior handoff's **Xyce / VACASK / OpenVAF workarounds are
+  NOT needed** — validate 304 MHz sidebands with **SpectreRF directly**.
+- `model/ldo_model.va` is clean `module ldo_model(vin,vout)`, standard VAMS, **no `laplace_nd`** → should
+  compile in Spectre (the one untested item; Phase 1 closes it via `ahdl`/VA compiler).
+- Reusable SKILL idioms: `workarea/skill_tools/` (`skill_tools.il`, `dreg_gen`, `mytool`, `PLAN.md`).
+
+**DECISIONS made this session:**
+1. **Test DUTs (no real LDO on this box) = reuse existing assets as self-validating DUTs, do BOTH, in order:**
+   - **Stage A — VA round-trip:** instantiate emitted `model/ldo_model.va` as the DUT in Spectre. Proves
+     VA compiles + builds the characterize→import→fit pipeline against a KNOWN answer (≈ identity refit).
+   - **Stage B — transistor GT cross-sim:** bring `ground_truth/ldo_gt.lib` (BSIM3 on `models/*.mod`) into
+     Spectre via `simulator lang=spice`; characterize; cross-check vs the trusted ngspice `gt_ref.npz`.
+     **Watch:** BSIM3 level mapping (ngspice level 8 ↔ Spectre `bsim3v3`) + flicker `kf`.
+   - Do NOT design a new LDO (no extra coverage, pure risk).
+2. **Integration style = HYBRID:** validate VA-compile + characterization via **spectre CLI on netlists** first
+   (fast de-risk), THEN wrap into the **skillbridge → ADE/OCEAN** production "SKILL side".
+3. **Real PMU LDO = IN-SITU, reconciled with `CADENCE_EXTRACTION.md`:**
+   - User will NOT pull the LDO out standalone (bias/VREF/IBP hard to recreate; normal sim IS the full PMU top).
+   - But the contract demands ideal-vin DECOUPLED extraction. **RECONCILIATION = "in-situ OP + pin-level
+     decoupled extraction":** LDO stays fully wired in the PMU top (bias/VREF/IBP/enables all real). Apply the
+     contract stimuli at the LDO's OWN pins — 1 A AC into `vout` pin (Zout), 1 V AC on supply pin (PSRR),
+     `pnoise` at `vout` pin. **Idealize ONLY the supply pin's AC:** read the real rail level from the in-situ
+     OP, place an ideal DC source (= AC ground) at the supply pin during the Zout/noise AC runs. **Noise
+     attribution** = Spectre **per-instance noise contribution** summed over the LDO instance only (=
+     contract "intrinsic LDO noise"); external IBP/bias noise rides the optional `ibp_xfer_*` port.
+   - **Drop-in acceptance:** swap the LDO instance for the model in the full top; aggressors (other blocks'
+     switching, supply ripple) are already there ⇒ spurs arrive via Zout/PSRR by construction. Intrinsic
+     `spur_F` likely EMPTY for a plain LDO.
+4. **Multi-supply:** this LDO has **1.05 V + 1.8 V** supplies → extend the single-vin contract with a 2nd
+   PSRR path: extract `p_*` from each supply pin → two PSRR blocks in the model (additive extension).
+5. **Extraction mechanism is DECOUPLED from fitting** (the contract is the firewall). **Manual-TB fallback is
+   first-class:** a hand-built ADE TB emitting the contract arrays feeds `fit_model.py` identically. Build
+   `import_cadence.py` to accept **ADE manual CSV exports**. Recommended real-chip path: hand-build & verify
+   the in-situ recipe ONCE → OCEAN-sweep the 3 corners → skillbridge orchestrates (ADE state → OCEAN → bridge).
+
+**EXECUTION PLAN (phases):**
+- **Phase 0:** source SPECTRE181 env; confirm `spectre` + VA compiler; reusable env script.
+- **Phase 1 (VA round-trip, CLI):** TB netlist instantiates `ldo_model.va`; run `ac` (1A→vout) / `ac`|`pxf`
+  (vin) / `noise` per contract; write **`import_cadence.py`** (Spectre psfascii/CSV → `results/ref/<name>.npz`
+  per `CADENCE_EXTRACTION.md`); `fit_model` + `score` → expect tiny composite. CLOSES "VA compiles in Spectre".
+- **Phase 2 (transistor GT cross-sim, CLI):** same TB, DUT = `ldo_gt` via `simulator lang=spice`; 3 corners;
+  compare Spectre arrays vs ngspice `gt_ref.npz`; fit→emit→score; tabulate deltas.
+- **Phase 3 (skillbridge productionization):** `ddCreateLib` (lib name TBD, default `LDO_model_lab`); DUTs as
+  cellviews (veriloga + spice text); OCEAN `ac/noise/dc/pss` via skillbridge; `import_cadence` reads ADE PSF;
+  package as reusable `.il` + py driver in `skill_tools` style ("point at a cellview → get the npz").
+- **Phase 4 (later):** real PMU LDO — in-situ pin-level extraction (decision 3), multi-supply (decision 4),
+  drop-in PSS/HB acceptance + speedup measurement.
+- **Build the characterization NET/PIN-parameterized from the start** (generalize `bench.py`'s 2-port measure
+  to "which net is vout / which is supply / where to inject") so Phase 1/2 bench work transfers to Phase 4 in-situ.
+
+**OPEN INPUTS still needed from the user** (the 3 the contract names + 2 extras):
+- **Nominal vin** (model hardcodes 1.05 V as PSRR ref `Vrf`) — confirm PMU LDO supply = 1.05 V; + role of the 1.8 V supply.
+- **The 3 load corners** (low/nom/high) bracketing the real operating load, + which is nominal (Target A used 121 µA).
+- **Design Cout / ESR** of the 0.8 V output.
+- **What else sits on the 0.8 V output net** (external decap? other loads?) — sets the Zout/noise boundary (defect-6).
+- **Cadence lib name / location** for Phase 3.
+
 ## UPDATE (2026-06-07) — published to GitHub + made Linux-portable; phase-plan Tasks 1–3 closed
 **Repo:** https://github.com/weisbert/LDO_modeling (PUBLIC, branch `main`). The user now also works
 the project on a **Linux** box via `git clone`/`git pull`. Added `README.md` (Linux setup +

@@ -858,8 +858,12 @@ module ldo_model(vin, vout);
     I(np2, vrf) <+ Cps*ddt(V(np2, vrf));
     I(vin, np3) <+ (V(vin) - V(np3))*(w3*Cps);
     I(np3, vrf) <+ Cps*ddt(V(np3, vrf));
-    I(vout)     <+ G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
-                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf));
+    // NEGATIVE sign: I(vout)<+ removes current FROM vout, but the SPICE mirror
+    // 'Gd 0 vout ...' injects INTO vout. Negate so the .va PSRR sign matches the
+    // ngspice-validated .lib/GT (same convention as the spur tones below). The .va
+    // was never simulated until the Phase-1 Spectre VA round-trip, which caught this.
+    I(vout)     <+ -(G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
+                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf)));
 
     // ---- PSRR complex-conjugate 2nd-order section (non-min-phase / notch phase) ----
     // series R-L-C lowpass state x=V(ncs2,vrf); b0 reads V_C=x, b1 reads V_R=a1*dx/dt.
@@ -867,7 +871,7 @@ module ldo_model(vin, vout);
     I(vin, ncs1)  <+ V(vin, ncs1)/Rpc;
     I(ncs1, ncs2) <+ idt(V(ncs1, ncs2))/Lpc;
     I(ncs2, vrf)  <+ Cpc*ddt(V(ncs2, vrf));
-    I(vout)       <+ pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1);
+    I(vout)       <+ -(pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1));   // INTO vout (see above)
 
     // ---- intrinsic discrete spurs: deterministic current tones @vout ----
     {spur_va}
