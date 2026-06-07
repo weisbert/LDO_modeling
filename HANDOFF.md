@@ -62,6 +62,15 @@ Spectre needed three fixes in `cadence/spectre_bench.py:spice_dut` (all caught d
   and feed the PSF/CSV through `import_cadence.py`. In-session OCEAN-via-skillbridge was avoided (would
   hijack the user's live ADE/OCEAN globals).
 
+**RF acceptance (SpectreRF PSS @ 304 MHz, `cadence/rf_accept.py`, model vs GT — bonus).**
+PSS runs locally (no license gap). (1) **Linear carrier PSRR matches GT to ~0.5 dB** (57.7 vs 57.2 dB),
+amplitude-independent → the model is accurate for the linear supply-spur transfer (PSRR-sign fix matters).
+(2) **LTI model does NOT capture nonlinear upconversion** — GT 2f scales square-law (−49→−14 dBc over
+2→100 mV), model stays at floor; by design (spurs ride the linear PSRR path). (3) **Speedup is
+system/convergence-scale, not standalone** — the model's ~18 nodes + VA overhead make toy-GT PSS slower
+(0.61 vs 0.17 s); the win is a complex real LDO in a large system (Phase 4 measures it). See
+memory `rf-pss-acceptance-findings`.
+
 **OPEN ITEMS (recommended follow-ups, none blocking the validated pipeline):**
 - Regenerate ALL `model/*.va` from the fixed `emit_va` (esp. v4_ffpsrr — non-min-phase PSRR, RF-relevant).
   Only `model/ldo_model.va` was hand-fixed; the others still carry the old PSRR sign. (Churns committed files
