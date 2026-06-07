@@ -1,0 +1,710 @@
+{
+  "summary": "Survey OPEN-SOURCE implementations for LDO/supply behavioral modeling, rational fitting, Verilog-A/HB toolchains — find reusable repos",
+  "agentCount": 7,
+  "logs": [],
+  "result": {
+    "scans": [
+      {
+        "ecosystem": "Open-source LDO / analog-IC generators, designs, and frequency-domain fitting/macromodeling tooling for building a controlled-source-only behavioral LDO model for Cadence PSS/HB",
+        "repos": [
+          {
+            "name": "scikit-rf (skrf.vectorFitting.VectorFitting)",
+            "url": "https://github.com/scikit-rf/scikit-rf",
+            "license": "BSD-3-Clause",
+            "language": "Python (numpy/scipy) — drops straight into your 3.11 venv",
+            "activity": "Actively maintained, large community, frequent releases; vector-fitting module added in PR #416 and continuously extended (auto_fit, passivity).",
+            "what_it_does": "RF/microwave toolbox. Its VectorFitting class fits tabulated frequency responses (S/Y/Z) to rational pole-residue models, evaluates/enforces passivity, and exports an equivalent SPICE subcircuit netlist.",
+            "modeling_approach": "Fast Relaxed Vector Fitting with vector_fit(n_poles_real, n_poles_cmplx) AND auto_fit() (automatic pole adding/skimming = auto-order). Passivity: is_passive(), passivity_test() (documented as a HALF-SIZE test matrix / Hamiltonian-style eigenvalue band detection), passivity_enforce() (SVD perturbation iterations). write_spice_subcircuit_s() emits an N-port subckt using 'linear dependent current sources on all ports controlled by currents through equivalent admittances' i.e. R/L/C + controlled current sources realizing the state-space model — explicitly NO Laplace/s-domain blocks, and explicitly targeted at ngspice/Xyce/LTspice. Complex-conjugate pole pairs are stored singly and realized as RLC sections. No Verilog-A export. No noise/spur handling (S-param/impedance only).",
+            "reusable_for_us": "HIGHEST-value reuse and a near-perfect fit to NEXT TASK 1 and 2. Lift (a) the vector_fit/auto_fit fitter to replace/augment your SK PSRR and Zout fitters with auto-order; (b) passivity_test()+passivity_enforce() as your passivity-verification GATE on synthesized Zout (task 2) — it already implements the half-size/Hamiltonian test you named; (c) write_spice_subcircuit_s as a reference (or direct generator) for the controlled-current-source + admittance synthesis you require, since it is BSD and already controlled-source-only and ngspice/Xyce-validated. You would still add: signed/complex-conjugate PSRR realization for non-min-phase, explicit e^-sTau all-pass delay extraction, and your Verilog-A mirror (skrf has none).",
+            "caveats": "Fitter is geared to S-parameters/passive multiports; PSRR is a transfer ratio (can be >1, non-passive) so passivity_enforce must NOT be applied to the PSRR path — only to Zout. SPICE export realizes state-space generically; you must verify the emitted topology survives Spectre PSS/HB (it was validated for transient/AC in ngspice/Xyce, not PSS). No delay/all-pass extraction and no noise/spur modeling — those remain your work."
+          },
+          {
+            "name": "AnalogGym (Low Dropout Regulator category)",
+            "url": "https://github.com/CODA-Team/AnalogGym",
+            "license": "BSD-3-Clause",
+            "language": "Python (98%) + ngspice netlists",
+            "activity": "Moderately active research suite (~127 commits, ICCAD'24 paper); maintainers post ngspice-version compatibility notes. No formal releases.",
+            "what_it_does": "Open analog-synthesis benchmark with 30 topologies incl. LDOs. Ships transistor-level sky130 ngspice netlists + testbenches + a performance-extraction script (perf_extraction_LDO.py) for light (5mA) and heavy (55mA) load.",
+            "modeling_approach": "NOT a behavioral/macromodel generator — transistor netlist + characterization harness. perf_extraction_LDO.py parses ngspice raw output to extract ~15 metrics: load/line regulation (DC sweep), PSRR (AC sweep), DC gain, GBW, phase margin (AC loop gain), transient undershoot/overshoot (transient step), power, Vos. Does NOT extract output impedance Zout or noise, and does NOT itself invoke the simulator (post-processing only).",
+            "reusable_for_us": "Reusable as (1) an additional independent ground-truth LDO + load-dependent (5mA/55mA) testbench to broaden your multi-DUT registry beyond your ngspice GT, and (2) a reference for PSRR/transient/phase-margin extraction parsing. Its PSRR-AC and load-step measurement recipes can validate your characterization flow. Good cross-check for Target-A generalization.",
+            "caveats": "Post-processor only (no testbench generation, no simulator invocation, minimal error handling). No Zout/noise/spur extraction — the hardest parts of your model are exactly what it omits. sky130 1.8V parts, not RF/304MHz-carrier oriented."
+          },
+          {
+            "name": "OpenFASOC — LDO generator (openfasoc/generators/ldo-gen)",
+            "url": "https://github.com/idea-fasoc/OpenFASOC",
+            "license": "Apache-2.0",
+            "language": "Python + Tcl + Verilog + Makefiles",
+            "activity": "Actively developed (>2000 commits, open issues/PRs).",
+            "what_it_does": "Spec-to-GDS generator for a DIGITAL LDO (comparator + digital controller toggling power switches) on sky130hvl. Produces RTL/Verilog + transistor netlist + GDS via OpenROAD; verifies with ngspice/Xyce transient sims.",
+            "modeling_approach": "Generates an implementation, NOT a behavioral macromodel of an analog LDO. Characterization is transient-only: sweeps VREG vs clock freq (0.1/1/10 MHz) and output cap; tools/simulations.py + processing.py post-process ngspice/Xyce raw data; ldo_tran_ngspice.sp is the templated testbench. No Zout/PSRR/noise extraction; being a digital LDO it has no continuous-time error-amp PSRR to model.",
+            "reusable_for_us": "Mostly REFERENCE. Reusable bits: the Python ngspice/Xyce raw-file parsing in simulations.py/processing.py and the .sp testbench-templating pattern (Makefile-driven sweep harness) — a tidy example for your characterization automation. The DIGITAL-LDO architecture itself is a poor analog for your continuous-time RF LDO (no analog Zout(s)/PSRR(s) loop to fit).",
+            "caveats": "Digital LDO != analog LDO; its metrics (settling vs clock) don't map to your Zout/PSRR/noise/spur model. Heavy flow (OpenROAD/Magic/Netgen) you don't need. No macromodeling at all."
+          },
+          {
+            "name": "polyrat (rational approximation library)",
+            "url": "https://github.com/jeffrey-hokanson/polyrat",
+            "license": "GPL-3.0",
+            "language": "Pure Python (numpy/scipy)",
+            "activity": "Research library (~188 commits, CI present); maintenance sporadic.",
+            "what_it_does": "General rational/polynomial approximation library implementing AAA (Adaptive Anderson-Antoulas), Sanathanan-Koerner iteration, STABILIZED Sanathanan-Koerner, and Vector Fitting under one API, with numerically robust bases (Arnoldi/Vandermonde, barycentric).",
+            "modeling_approach": "Multiple fitters incl. exactly the Stabilized-SK and VF algorithms; supports complex-valued, multi-output data. Produces a rational approximant (rat(x)); pole/residue extraction is not the headline API and there is no built-in circuit synthesis, passivity, or Verilog-A export.",
+            "reusable_for_us": "Directly relevant to NEXT TASK 1: it has a STABILIZED Sanathanan-Koerner implementation (more numerically robust than a naive SK loop) and AAA/VF in one place — you can swap your hand-rolled SK PSRR fitter for its stabilized SK to improve non-min-phase phase fits, then extract poles/residues yourself for your signed real-pole / complex-conjugate section synthesis.",
+            "caveats": "GPL-3.0 — if you ever distribute, copyleft applies (using it as a local fitting tool to produce your own netlists is generally fine, but be aware). Function-approximation focus: no passivity gate, no SPICE/VA emission, pole/residue plumbing is on you."
+          },
+          {
+            "name": "baryrat (AAA + BRASIL barycentric rational approximation)",
+            "url": "https://github.com/c-f-h/baryrat",
+            "license": "BSD-2-Clause",
+            "language": "Pure Python",
+            "activity": "Maintained (~114 commits, CI workflows, optional extended-precision via gmpy2/flamp).",
+            "what_it_does": "Barycentric rational approximation: AAA algorithm and BRASIL (best rational approximation), plus polynomial/Floater-Hormann interpolation.",
+            "modeling_approach": "AAA with automatic order via mmax (max terms) or tol (error tolerance). Exposes poles(), residues()/polres(), zeros() — i.e. it DOES give you pole-residue-zero data suitable for circuit synthesis. No passivity, no SPICE/VA export.",
+            "reusable_for_us": "Strong candidate for the 'AAA with auto-order' Zout fitter in NEXT TASK 1. BSD-2 (permissive), tiny dependency, and crucially exposes poles()/residues() you can feed into your RLC + controlled-source synthesis. Use AAA(tol=...) to auto-pick Zout order, then realize complex-conjugate pairs as RLC sections. Good complement to scikit-rf (AAA often nails sharp Zout resonances VF struggles with).",
+            "caveats": "Pure approximation — no passivity enforcement, no delay/all-pass extraction, no netlist emission; you build the synthesis + passivity gate around it. AAA can produce poles in the RHP / spurious poles that need filtering before realization as passive RLC."
+          },
+          {
+            "name": "OpenVAF (+ ngspice OSDI / Xyce VA)",
+            "url": "https://github.com/pascalkuthe/OpenVAF",
+            "license": "GPL-3.0 (compiler binary; compiled .osdi models are your own)",
+            "language": "Rust (compiler); consumes Verilog-A",
+            "activity": "Active; ngspice has shipped the OSDI interface since v39, so OpenVAF-compiled Verilog-A loads in ngspice; Xyce also supports VA (VAPP).",
+            "what_it_does": "Standards-track Verilog-A compiler that emits simulator-independent OSDI shared objects loadable at runtime.",
+            "modeling_approach": "Compiles your .va mirror to a binary device model. Not a modeling/fitting tool itself — it is the compile/validate path for the Verilog-A you emit.",
+            "reusable_for_us": "Reusable as the COMPILE-AND-CHECK gate for your emitted .va mirror, independent of Spectre/OpenVAF inside Cadence. KEY finding for your stack note: ngspice (>=v39) can load OSDI/Verilog-A — so although ngspice still lacks PSS/HB, you CAN compile and run your .va mirror in ngspice for transient/AC parity, and use Xyce (which DOES have multi-tone HB, GPLv3) for the open HB sideband validation you wanted.",
+            "caveats": "OpenVAF historically rejects some behavioral/analog-function constructs and has VA-language coverage gaps; your VA must stay within supported subset. GPLv3 compiler (your compiled models/netlists are unaffected for internal use). Still no PSS in ngspice."
+          },
+          {
+            "name": "Xyce (Sandia parallel simulator — HB engine)",
+            "url": "https://github.com/Xyce/Xyce",
+            "license": "GPLv3",
+            "language": "C++ (MPI)",
+            "activity": "Actively maintained by Sandia.",
+            "what_it_does": "SPICE-compatible parallel simulator with single- and MULTI-TONE Harmonic Balance (HB), plus AC, transient, MOR, sensitivity, UQ; supports Verilog-A models via VAPP.",
+            "modeling_approach": "Not a model; it is the open HB/PSS-like engine. Accepts standard R/L/C + controlled sources (your exact subset) and Verilog-A devices.",
+            "reusable_for_us": "Directly serves NEXT TASK 3 / your stack gap: it is the open-source HB engine to validate spur/sideband asymmetry of your controlled-source-only subckt (and your .va mirror) since ngspice has no PSS/HB. Run your ldo_model.subckt under Xyce multi-tone HB near the 304 MHz carrier to cross-check Spectre PSS/HB before/independent of Cadence.",
+            "caveats": "Xyce HB conventions and convergence differ from Spectre PSS/HB; results corroborate but won't be bit-identical. Build/setup heavier than ngspice. GPLv3."
+          },
+          {
+            "name": "efabless sky130_cw_ip (Christoph Weiser sky130 analog IP)",
+            "url": "https://github.com/efabless/sky130_cw_ip",
+            "license": "Apache-2.0",
+            "language": "SPICE/xschem schematics, Verilog, Tcl/Make",
+            "activity": "Derived from christoph-weiser/mpw7; documented improvements, moderate activity.",
+            "what_it_does": "Tapeout-grade sky130 analog IP collection: bandgap, two linear regulators (1.2V & 1.5V), bias gen, SAR-ADC, clock gen. Transistor-level (schematics + hierarchical GDS).",
+            "modeling_approach": "Transistor designs, NOT behavioral models. Testbenches: block-level + top extracted sims in ngspice/Xyce across PVT corners (TT/SS/SF/FF/FS), +/-10% supply, temp sweep. No explicit PSRR/Zout/noise testbenches documented.",
+            "reusable_for_us": "Reference + optional extra ground-truth: a real-ish analog LDO (continuous-time, with bandgap/bias) you could adopt as another DUT in your variants registry to test generalization, and its PVT-corner testbench structure is a usable template. Closer to a 'real LDO' than OpenFASOC's digital one.",
+            "caveats": "No behavioral model, no PSRR/Zout/noise characterization to lift — you'd build the characterization yourself. sky130 1.8V analog, not RF/304MHz."
+          },
+          {
+            "name": "ALIGN (analog layout from netlist)",
+            "url": "https://github.com/ALIGN-analoglayout/ALIGN-public",
+            "license": "BSD-3-Clause",
+            "language": "Python + C++",
+            "activity": "Active (UMN/TAMU/Intel Labs).",
+            "what_it_does": "Automated analog LAYOUT generator: unannotated SPICE netlist -> GDSII, incl. power-delivery circuits.",
+            "modeling_approach": "Pure layout synthesis. No behavioral/macromodeling, no Zout/PSRR/noise characterization.",
+            "reusable_for_us": "REFERENCE ONLY for your project — it operates downstream (layout), not on behavioral modeling or frequency-domain characterization. No fitter/macromodel/characterization code to reuse.",
+            "caveats": "Out of scope for behavioral LDO modeling; included for completeness since it was named in the survey set."
+          },
+          {
+            "name": "IIC-OSIC-TOOLS (JKU all-in-one OSIC Docker)",
+            "url": "https://github.com/iic-jku/IIC-OSIC-TOOLS",
+            "license": "Apache-2.0 (curation; bundles many separately-licensed tools)",
+            "language": "Docker/shell packaging (Ubuntu 24.04, amd64+arm64)",
+            "activity": "Very active; regular dated releases.",
+            "what_it_does": "All-in-one container for sky130/gf180/ihp130 analog+digital design: ngspice, Xyce, xschem, Magic, KLayout, OpenVAF, PDKs, plus JKU spec-extraction helper scripts (osic-multitool).",
+            "modeling_approach": "Environment/distribution, not a model. Bundles the simulators and Verilog-A compiler you'd use; JKU helper scripts include analog spec extraction (gain/PSRR/etc.) flows.",
+            "reusable_for_us": "Reusable as a reproducible Linux environment that already pairs ngspice(+OSDI), Xyce(HB), and OpenVAF — convenient for the cross-engine HB/Verilog-A validation in your NEXT TASKS without hand-installing each. Its companion osic-multitool spec-extraction scripts are a reference for AC characterization parsing.",
+            "caveats": "You're on Windows/native ngspice subprocess (not a git repo); adopting this is a workflow change (Docker) you may not want. It's a bundle, so check individual tool licenses. No LDO macromodel inside."
+          }
+        ],
+        "takeaways": "The single biggest win is scikit-rf's VectorFitting (BSD-3): it already does auto-order rational fitting (vector_fit/auto_fit), a half-size/Hamiltonian passivity test + enforcement, AND a controlled-current-source-plus-admittance SPICE export that is Laplace-free and ngspice/Xyce/LTspice-validated — i.e. it nearly turnkey-solves your NEXT TASKS 1 (better Zout fitter) and 2 (passivity gate), provided you apply passivity only to Zout (PSRR is a non-passive transfer ratio) and add the non-min-phase complex-conjugate PSRR sections, explicit e^-sTau all-pass delay, and noise/spur blocks yourself. For fitting, pair scikit-rf with baryrat (AAA, auto-order, exposes poles/residues, BSD-2) for sharp Zout resonances and polyrat's stabilized Sanathanan-Koerner (GPL-3) to harden your PSRR phase fit. The generator/IP ecosystem (OpenFASOC's digital LDO, sky130_cw_ip, AnalogGym, ALIGN) yields transistor netlists and characterization-parsing patterns but NO ready-made behavioral LDO macromodel and crucially no Zout/noise/spur extraction — those remain your differentiator; AnalogGym/sky130_cw_ip are still useful as extra ground-truth DUTs and PSRR/transient extraction references. Finally, for Target B and HB validation, note ngspice (>=v39) can now load OpenVAF/OSDI Verilog-A (so you can compile/parity-check your .va mirror locally), while Xyce (GPLv3) provides the open multi-tone Harmonic Balance engine to validate 304 MHz sideband asymmetry that ngspice lacks."
+      },
+      {
+        "ecosystem": "Open-source rational / passive macromodeling (fitting) libraries — vector fitting, AAA barycentric rational, Sanathanan-Koerner, and S-parameter SPICE-synthesis tools — assessed for reuse in fitting LDO Zout(s)/PSRR(s) and synthesizing them to lumped RLC + controlled sources for Cadence PSS/HB.",
+        "repos": [
+          {
+            "name": "scikit-rf (skrf.vectorFitting.VectorFitting)",
+            "url": "https://github.com/scikit-rf/scikit-rf",
+            "license": "BSD-3-Clause",
+            "language": "Python (numpy/scipy)",
+            "activity": "actively maintained (large, popular project; VectorFitting actively developed since PR #416, ongoing API additions like auto_fit/state-space SPICE export)",
+            "what_it_does": "Full-featured pole-residue rational macromodeling: fits frequency responses (S/Z/Y) to sum-of-rational-basis, evaluates the fit, tests/enforces passivity, and exports an equivalent SPICE subcircuit. The single most complete open-source macromodeling stack in Python.",
+            "modeling_approach": "Fast-relaxed vector fitting (vector_fit with n_poles_real/n_poles_cmplx, init_pole_spacing lin/log/custom, fit_constant=D, fit_proportional=E·s, enforce_dc) PLUS auto_fit() automatic model-order selection via pole adding/skimming. Handles complex-conjugate pole pairs (stored as positive-imag, conjugate reconstructed) and DC/proportional terms. Passivity: passivity_test() uses a half-size test matrix; passivity_enforce() uses SVD/singular-value perturbation of residues (DC-preserving). SPICE export (write_spice_subcircuit_s) is a DIRECT STATE-SPACE realization using linear dependent current sources controlled by currents through equivalent admittances — NOT physical Foster RLC branches — and it is documented as SCATTERING-PARAMETER ONLY (assumes a common reference node / reference impedance). No explicit transport-delay (e^-sτ) extraction; no Zout/PSRR/noise/spur concept.",
+            "reusable_for_us": "HIGH as a fitter + passivity gate; MEDIUM-LOW as a netlist emitter. Lift directly: (1) vector_fit/auto_fit as the better auto-order Zout fitter we want in NEXT-task 1 (gives poles/residues/D/E including complex-conjugate pairs); (2) passivity_test (half-size matrix) + is_passive + passivity_enforce as the passivity-verification GATE for NEXT-task 2 — this is exactly the Hamiltonian/half-size check requested and is ready to call. Do NOT reuse write_spice_subcircuit_s for our emit step: it violates our hard constraint indirectly (it is S-param-only and emits a state-space G-source realization with a reference impedance, not the physical per-block RLC Zout branches / signed real-pole PSRR sections we emit). Instead take its poles/residues and feed our own Foster-RLC + signed-section synthesizer. Worth mining _get_ABCDE() and the SPICE template as a reference for our own G/E-source state-space fallback.",
+            "caveats": "SPICE export is S-parameter-only and state-space (controlled-source) based — not portable to our 'physical RLC Zout branch' realization and untested for one-port driving-point Z(s) of an LDO output. Passivity tooling currently documented for S-parameters; mapping our Zout(s)/Yout(s) to that test needs care (passivity of a one-port immittance = positive-real, which the half-size/Hamiltonian machinery supports but you must feed Z/Y correctly). No delay extraction. Heavyweight dependency if you only need the fitter."
+          },
+          {
+            "name": "scipy.interpolate.AAA",
+            "url": "https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.AAA.html",
+            "license": "BSD-3-Clause (SciPy)",
+            "language": "Python (numpy/scipy)",
+            "activity": "actively maintained (in SciPy core since v1.15; we already depend on scipy in the 3.11 venv)",
+            "what_it_does": "AAA (adaptive Antoulas-Anderson) greedy barycentric rational approximation of real/complex sampled data; exposes support_points, weights, errors and provides poles() and residues() (and roots/zeros).",
+            "modeling_approach": "Barycentric AAA with automatic order selection (tol or mmax), greedy support-point picking for numerical stability. Native complex-data support (ideal for complex frequency responses). poles()/residues() convert the barycentric form to pole-residue form (real + complex-conjugate poles). clean_up() removes Froissart doublet spurious pole/zero pairs.",
+            "reusable_for_us": "VERY HIGH and ZERO new dependency. This is the auto-order Zout/PSRR fitter requested in NEXT-task 1 — feed it complex Zout(jw)/PSRR(jw) on our AC grid, get auto-order poles+residues with NO manual pole-count tuning, then run our existing partial-fraction -> RLC-branch / signed-real-pole-section synthesizer. Complements our Sanathanan-Koerner PSRR fit (AAA tends to nail non-minimum-phase shapes and sharp resonances better; use clean_up() then enforce stability by flipping RHP poles). Best first thing to try for the 'better Zout fitter' boundary.",
+            "caveats": "AAA does not enforce stability/passivity or minimum-phase — you must post-process (reject/flip RHP poles, clamp residues) and pass through a passivity gate. Tight tol -> Froissart doublets (mitigated by clean_up). No SPICE synthesis, no delay extraction. Confirm the SciPy version in our venv has it (>=1.15)."
+          },
+          {
+            "name": "baryrat (c-f-h/baryrat)",
+            "url": "https://github.com/c-f-h/baryrat",
+            "license": "BSD-2-Clause",
+            "language": "Python (numpy/scipy; optional gmpy2/flamp for extended precision)",
+            "activity": "actively maintained (114 commits, CI via GitHub Actions; on PyPI)",
+            "what_it_does": "Barycentric rational/polynomial interpolation+approximation toolkit: AAA algorithm, the BRASIL best-uniform (minimax) rational approximation algorithm, and barycentric interpolation, with pole/residue and zero extraction.",
+            "modeling_approach": "AAA (auto-order) plus BRASIL for best L-infinity (Chebyshev/minimax) rational fits — minimax can give tighter worst-case error than AAA's near-best. polres() returns poles+residues, zeros() returns zeros; supports real and complex functions/poles. Optional extended-precision arithmetic for ill-conditioned high-order fits.",
+            "reusable_for_us": "HIGH and permissively licensed. A superset of scipy.AAA with BRASIL minimax on top — useful when we want to MINIMIZE the WORST-CASE Zout/PSRR magnitude/phase error (relevant to spur-fidelity near 304 MHz where a single bad band matters). polres() gives exactly the pole/residue list our RLC + signed-section synthesizer consumes. Extended precision helps if a non-min-phase PSRR pushes order high and the fit gets ill-conditioned. Pure-Python, drops into the venv cleanly.",
+            "caveats": "No passivity/stability enforcement and no SPICE synthesis — same post-processing burden as scipy.AAA (flip RHP poles, gate passivity). BRASIL is for scalar real-interval minimax primarily; for complex frequency-response phase you'll mostly use its AAA path. No delay extraction. Two forks exist (c-f-h original is the maintained one; DerXu is a fork)."
+          },
+          {
+            "name": "c-f-h/aaa",
+            "url": "https://github.com/c-f-h/aaa",
+            "license": "BSD-2-Clause (same author as baryrat)",
+            "language": "Python (numpy/scipy)",
+            "activity": "low/stable — small single-purpose port; superseded for most users by scipy.interpolate.AAA and baryrat",
+            "what_it_does": "A compact, faithful Python port of the original MATLAB AAA (Nakatsukasa/Sete/Trefethen) — rational approximation in barycentric form.",
+            "modeling_approach": "Pure AAA greedy barycentric, returns barycentric form; poles/residues obtainable as in the reference algorithm. Handles complex data.",
+            "reusable_for_us": "REFERENCE / LOW (prefer scipy.AAA or baryrat). Useful only as a minimal, easy-to-read implementation to copy-paste/modify if we want a self-contained AAA we fully control (e.g., to bolt on our own RHP-pole reflection inside the loop). Otherwise redundant.",
+            "caveats": "No passivity, no SPICE, no delay; minimal maintenance. Use the maintained scipy/baryrat versions in production."
+          },
+          {
+            "name": "polyrat (jeffrey-hokanson/polyrat)",
+            "url": "https://github.com/jeffrey-hokanson/polyrat",
+            "license": "GPL-3.0",
+            "language": "Python (numpy/scipy)",
+            "activity": "maintained but small (188 commits, ~18 stars; CI active; research-grade)",
+            "what_it_does": "Polynomial and rational function library implementing the STABILIZED Sanathanan-Koerner iteration (its headline contribution), plus vector fitting, standard SK, AAA, and multiple polynomial bases (Arnoldi-orthogonalized Vandermonde, Legendre, barycentric Lagrange).",
+            "modeling_approach": "Stabilized SK iteration with Arnoldi-orthogonal basis for far better conditioning/accuracy than naive SK — directly relevant because our PSRR block already uses a Sanathanan-Koerner rational fit. Returns poles/residues; supports complex-valued and MULTIVARIATE (parametric) rational approximation (StabilizedSKRationalApproximation(num_degree, denom_degree), sklearn-style .fit/__call__).",
+            "reusable_for_us": "HIGH for the PSRR path specifically, license permitting. This is the direct, better-conditioned upgrade to OUR existing SK PSRR fit (memory: SK-fit signed sections). The Arnoldi-stabilized SK should improve the non-minimum-phase PSRR PHASE fidelity called out in NEXT-task 1 and reduce the ill-conditioning we hit at higher order. Its MULTIVARIATE rational approximation is interesting for OP-parameterization by load current (one parametric fit across Iload instead of per-OP refits). Take poles/residues into our signed-real-pole-section synthesizer.",
+            "caveats": "GPL-3.0 — viral copyleft. Since our project is local/internal and NOT distributed, GPL is usable now, but it would block us from ever shipping the model code, and even vendoring the algorithm taints our emitter if distributed. Safer path: use it locally to validate that stabilized-SK helps, then reimplement the (published, non-secret) stabilized-SK+Arnoldi algorithm ourselves to keep our codebase license-clean. No passivity enforcement, no SPICE synthesis, no delay extraction."
+          },
+          {
+            "name": "PhilReinhold/vectfit_python",
+            "url": "https://github.com/PhilReinhold/vectfit_python",
+            "license": "GPL-2.0",
+            "language": "Python (100%)",
+            "activity": "dormant (~9 commits, no recent activity, no releases)",
+            "what_it_does": "A widely-cited minimal Python duplication of Gustavsen's fast-relaxed vector fitting; exposes vectfit_auto (auto pole count) and vectfit_auto_rescale (for ill-conditioned data).",
+            "modeling_approach": "Fast-relaxed VF, pole-residue output, handles complex-conjugate poles. vectfit_auto provides a simple automatic-order convenience. No passivity, no SPICE.",
+            "reusable_for_us": "LOW-MEDIUM / REFERENCE. Historically the go-to standalone VF, but superseded for our needs by scikit-rf (more complete) and scipy.AAA (no-dep). Its vectfit_auto rescaling trick is a useful reference if our Zout fit is numerically touchy. GPL-2.0 + dormant argue against vendoring.",
+            "caveats": "GPL-2.0 (copyleft), unmaintained, no passivity/SPICE/delay. Prefer scikit-rf or scipy.AAA."
+          },
+          {
+            "name": "SebastianL18/Vector_Fitting_for_python (vectfit3.py)",
+            "url": "https://github.com/SebastianL18/Vector_Fitting_for_python",
+            "license": "custom/non-OSI — 'embedding in commercial software strictly prohibited', citation required (NOT a standard open-source license)",
+            "language": "Python (100%)",
+            "activity": "active-ish (~30 commits)",
+            "what_it_does": "Faithful Python port of Gustavsen's vectfit3.m (Fast Relaxed VF), with the original MATLAB option semantics; output as state-space (SER) or pole-residue.",
+            "modeling_approach": "Fast-relaxed VF; vectfit() main entry plus buildRES()/flat2full() helpers; supports asymptotic terms D and E (all four D/E on/off combos), complex-conjugate poles, symmetric/asymmetric matrices, stability enforcement. No passivity ENFORCEMENT, no SPICE export.",
+            "reusable_for_us": "LOW for us. Closest 1:1 to the canonical vectfit3 if we specifically wanted MATLAB-identical behavior, but it adds nothing scikit-rf/scipy.AAA don't, and the license is the problem.",
+            "caveats": "License is NON-OSI and restrictive (no commercial embedding, mandatory citation) — do not vendor; reference-only. No passivity enforcement, no SPICE synthesis, no delay."
+          },
+          {
+            "name": "milanofthe/Vectorfitting",
+            "url": "https://github.com/milanofthe/Vectorfitting",
+            "license": "MIT",
+            "language": "Python (100%)",
+            "activity": "minimal (~2 commits, few stars) but permissively licensed",
+            "what_it_does": "From-scratch pure-Python fast-relaxed VF for MIMO frequency-domain data; parses Touchstone .snp; models as D + s·E + Σ Rk/(s-pk).",
+            "modeling_approach": "Standard / relaxed / fast-relaxed VF modes; MIMO common-pole fitting; autonomous order selection (smart mode, autoreduce); pole-residue extraction (VecFit/RelaxedVecFit/FastRelaxedVecFit classes, TransferFunction.evaluate/.Poles). No passivity, no SPICE.",
+            "reusable_for_us": "MEDIUM (MIT is the appeal). A clean, dependency-light, MIT-licensed VF we could safely vendor and extend with our own RHP-pole reflection + Foster-RLC synthesis if we want VF (not AAA) and need license cleanliness for a shippable emitter. Autoreduce/smart-mode gives the auto-order we want. Small/young, so audit before relying on it.",
+            "caveats": "Very low maturity (2 commits), no passivity/SPICE/delay, limited test coverage — audit/own it if adopted. MIMO common-pole assumption may be irrelevant for our 2-port LDO (we fit Zout and PSRR separately)."
+          },
+          {
+            "name": "artemiy-dmitriev/vectfit",
+            "url": "https://github.com/artemiy-dmitriev/vectfit",
+            "license": "unknown (verify before use)",
+            "language": "Python",
+            "activity": "small/uncertain maintenance",
+            "what_it_does": "Python VF port whose distinguishing feature is fitting transfer functions for COMPLEX-VALUED signals (not just real-symmetric frequency responses).",
+            "modeling_approach": "Vector fitting extended to complex-valued data/poles. No passivity or SPICE noted.",
+            "reusable_for_us": "LOW / NICHE. Its complex-signal handling is already covered by scipy.AAA and baryrat (both natively complex). Only of interest if a VF (rather than AAA) formulation on complex data is specifically needed.",
+            "caveats": "License unverified, low maturity, no passivity/SPICE/delay. Reference-only."
+          },
+          {
+            "name": "mit-crpg/vectfit",
+            "url": "https://github.com/mit-crpg/vectfit",
+            "license": "MIT (typical for MIT-CRPG; verify)",
+            "language": "C++ (xtensor / xtensor-blas)",
+            "activity": "maintained within the OpenMC ecosystem context; niche",
+            "what_it_does": "Fast-relaxed vector fitting in C++ using xtensor for arrays and xtensor-blas for linear algebra — a performance-oriented VF core (originated for nuclear cross-section windowed multipole fitting).",
+            "modeling_approach": "Fast-relaxed VF, pole-residue output, complex poles. No passivity/SPICE/delay.",
+            "reusable_for_us": "LOW. We are a Python/ngspice stack; pulling in a C++/xtensor build is not worth it given pure-Python options (scipy.AAA, baryrat) cover our fitting needs at our problem sizes. Reference only.",
+            "caveats": "C++ build/toolchain burden on Windows; no passivity/SPICE/delay; wrong language for our pipeline."
+          },
+          {
+            "name": "TeledyneLeCroy/SignalIntegrity (Nubis-Communications fork)",
+            "url": "https://github.com/TeledyneLeCroy/SignalIntegrity",
+            "license": "GPL-3.0 (GPLv3+)",
+            "language": "Python (with TeX docs, Jupyter)",
+            "activity": "actively maintained (releases through 2025; on PyPI; author P. Pupalaikis)",
+            "what_it_does": "Signal/power-integrity toolkit: S-parameter viewing/manipulation, linear circuit-and-S-parameter system simulation, de-embedding, virtual probing, network-analyzer calibration, PRBS generation. Strong on connecting/solving interconnected linear+S-parameter blocks.",
+            "modeling_approach": "Linear system solve over interconnected circuit/S-parameter blocks (frequency domain); not primarily a pole-residue macromodel fitter. Its niche overlap with us is S-parameter-to-circuit / equivalent-circuit and de-embedding tooling, but it is not a vector-fitting/AAA Zout/PSRR fitter and does not emit our RLC+controlled-source LDO subckt.",
+            "reusable_for_us": "LOW / REFERENCE. Useful as a cross-check or for S-parameter bookkeeping if we ever export the LDO as a 2-port .sNp, but it does not provide the rational fit + RLC synthesis we need, and GPL-3.0 would taint a distributed emitter. Mostly tangential to the LDO-behavioral-model task.",
+            "caveats": "GPL-3.0 (copyleft); not a macromodeling/VF fitter; no passivity-enforcement-to-RLC synthesis for our use case; heavier than needed."
+          },
+          {
+            "name": "DEPACT (delay-extraction passive macromodeling) — algorithm, NOT an open repo",
+            "url": "https://ieeexplore.ieee.org/document/1391063",
+            "license": "n/a (published algorithm; no canonical open-source implementation found)",
+            "language": "n/a (described for HSPICE controlled-source realization)",
+            "activity": "n/a (academic; no maintained GitHub repo located)",
+            "what_it_does": "Delay-Extraction-based Passive Compact Transmission-line macromodeling: extracts transport delay, fits the residual with low-order rational functions (VF), and realizes a passive, causal macromodel using controlled sources in HSPICE.",
+            "modeling_approach": "Takes log of multiport H, splits into a propagation/DELAY part (e^-sτ realized as cascaded delay sections / controlled sources) + a low-order rational part fit by VF, guaranteeing passivity/causality. Directly addresses delay + rational-fit + controlled-source SPICE realization.",
+            "reusable_for_us": "REFERENCE ONLY but conceptually IMPORTANT for NEXT-task 1's explicit delay extraction. No usable open-source code was found, but the DEPACT recipe (extract e^-sτ first, fit the rest rationally, realize delay as a lumped all-pass / cascaded controlled-source delay) is exactly the pattern we want for the PSRR/Zout PHASE all-pass term. We would implement a lumped Pade/Bessel all-pass approximation of e^-sτ from R/L/C + controlled sources ourselves, using DEPACT as the design reference.",
+            "caveats": "No maintained open-source implementation located (only papers and HSPICE descriptions). Aimed at multiconductor T-lines, not LDO immittances — adopt the delay-extraction idea, not the (nonexistent) code."
+          },
+          {
+            "name": "cpoussot/mLF (Multivariate Loewner Framework)",
+            "url": "https://github.com/cpoussot/mLF",
+            "license": "unknown (verify; research code)",
+            "language": "likely MATLAB/Python research code (verify)",
+            "activity": "research-grade, low maintenance",
+            "what_it_does": "Implements the (multivariate) Loewner framework: data-driven construction of a rational descriptor LTI model that interpolates given frequency-domain samples, via Loewner/shifted-Loewner matrices and rank truncation.",
+            "modeling_approach": "Loewner interpolation (data-driven, non-iterative rational realization with automatic McMillan-degree detection via SVD rank). Produces a state-space/descriptor realization; complex data supported. No built-in passivity enforcement to RLC or SPICE export.",
+            "reusable_for_us": "LOW-MEDIUM / REFERENCE. The Loewner framework is an attractive alternative auto-order fitter for Zout/PSRR (no nonlinear pole-relocation iteration, automatic order from SVD), but this particular repo is research-grade with unclear license/language. If we want Loewner, easier to implement the scalar 1-D Loewner ourselves and feed poles to our synthesizer than to depend on this repo.",
+            "caveats": "License/language unverified, low maturity; outputs a descriptor realization (needs conversion to pole-residue then RLC); no passivity/SPICE/delay. Reference for the method, not a drop-in dependency."
+          }
+        ],
+        "takeaways": "For our hard constraint (physical RLC + controlled sources, no laplace), the open-source value here is overwhelmingly in the FITTERS and the PASSIVITY GATE, not in the SPICE emitters — every emitter we found (scikit-rf's write_spice_subcircuit_s, SignalIntegrity) produces an S-parameter, state-space controlled-source realization that does not match our per-block physical Zout-branch / signed-real-pole-PSRR-section emit, so we keep our own synthesizer and just feed it better poles/residues. Best immediate, license-clean, zero-new-dependency wins: scipy.interpolate.AAA (and baryrat for minimax/BRASIL) for the auto-order Zout/PSRR fit we want in NEXT-task 1 — both give complex poles+residues with automatic order and no manual pole-count tuning. For NEXT-task 2 (passivity gate), scikit-rf's passivity_test (half-size matrix) + passivity_enforce (SVD perturbation) is BSD-licensed and directly usable as the verification gate, provided we feed it our immittance correctly. For the non-minimum-phase PSRR phase, polyrat's stabilized Sanathanan-Koerner is the principled upgrade to our current SK fit (but GPL-3.0 — use locally / reimplement before shipping), and the DEPACT delay-extraction recipe (no open code, but a clear pattern) tells us how to factor out e^-sτ and realize it as a lumped all-pass."
+      },
+      {
+        "ecosystem": "Open-source Verilog-A / behavioral-model toolchain (compilers, simulators with HB, rational-fit + SPICE-synthesis libraries, and behavioral macromodel examples) for building/validating a fast lumped-RLC + controlled-source LDO model for Cadence PSS/HB",
+        "repos": [
+          {
+            "name": "OpenVAF (original, pascalkuthe)",
+            "url": "https://github.com/pascalkuthe/OpenVAF",
+            "license": "GPL-3.0 (with some MIT-derived code attributed)",
+            "language": "Rust (~86%), some C++/C",
+            "activity": "dormant - last release 23.5.0 (May 2023); author confirmed no support since end of 2023. Use the reloaded fork instead.",
+            "what_it_does": "Standalone Verilog-A compiler that emits OSDI shared objects (.osdi) loadable by simulators (ngspice, Melange, VACASK). Fast compile, simulation-independent output.",
+            "modeling_approach": "Compiles standard analog Verilog-A (ddt/idt, contributions, controlled sources, white_noise/flicker_noise). No documented Laplace operator support (laplace_nd/zp/zd) - it targets compact device models. This is FINE for us: our emitted .va is explicitly lumped RLC + VCVS/VCCS + ddt only, no s-domain blocks, so we never need Laplace.",
+            "reusable_for_us": "This is exactly the tool that compiles our emitted .va mirror. Workflow: openvaf ldo_model.va -> ldo_model.osdi, then `pre_osdi` load into ngspice (v39+). Confirms our 'no laplace_nd' constraint is well-aligned with the open compiler. But prefer the reloaded fork below.",
+            "caveats": "GPL-3.0 affects only the compiler binary, not our generated models. Unmaintained. Original OSDI 0.3 only. Behavioral VA works but the project's testing/focus is compact device models; some VA language features unsupported."
+          },
+          {
+            "name": "OpenVAF-reloaded (arpadbuermen fork)",
+            "url": "https://github.com/arpadbuermen/OpenVAF",
+            "license": "GPL-3.0 (MIT-derived code attributed)",
+            "language": "Rust (~80%), C++/Pascal/C",
+            "activity": "actively maintained (active through at least Dec 2024); prebuilt Linux + Windows binaries; LLVM 18-21 auto-detect.",
+            "what_it_does": "Maintained continuation of OpenVAF. Fixes loop-compile crashes, $bound_step(), param-init bugs; extends OSDI 0.3 -> 0.4 (resistive/reactive Jacobian contributions, parameter 'given' flags, model input lists, and HARMONIC-BALANCE functions).",
+            "modeling_approach": "Same Verilog-A->OSDI compile path as upstream, plus OSDI-0.4 HB hooks. Targets ngspice 44+ (uses 0.3 features) and VACASK 0.2+ (full 0.4).",
+            "reusable_for_us": "TOP PICK to compile our .va mirror on Windows (prebuilt Win binary - matches our Win/Py3.11 stack). The added OSDI-0.4 HB functions are what make VACASK able to HB-validate our model. Use this, not the dormant upstream.",
+            "caveats": "GPL-3.0 (binary only). No Laplace (not needed for us). HB benefit only materializes through a simulator that consumes OSDI-0.4 HB (VACASK), since ngspice has no HB engine."
+          },
+          {
+            "name": "VACASK (Verilog-A Circuit Analysis Kernel)",
+            "url": "https://codeberg.org/arpadbuermen/VACASK",
+            "license": "AGPL-3.0",
+            "language": "C++20 (deps: KLU + libstdc++ only)",
+            "activity": "actively maintained (commits through 2026; ~600+ commits, multiple releases); same author as OpenVAF-reloaded.",
+            "what_it_does": "Lightweight analog simulator whose device library is built entirely from Verilog-A modules compiled by OpenVAF-reloaded and loaded at runtime via OSDI 0.4. Supports op, dc, ac, tran, noise, S-parameter, AND harmonic balance (hb).",
+            "modeling_approach": "Pure OSDI device model host; HB solver consumes the OSDI-0.4 HB functions emitted by OpenVAF-reloaded. Spectre-like netlist intent. Because it runs whatever VA OpenVAF compiles, it handles our behavioral RLC+controlled-source+ddt model directly.",
+            "reusable_for_us": "HIGH for Task 3 / validation: this is the ONLY fully open path that runs Verilog-A behavioral models AND has a working HB engine (ngspice has none; Xyce needs C++ plugin compile). Build flow: emit .va -> OpenVAF-reloaded -> .osdi -> VACASK hb. Lets us sanity-check sideband/spur fidelity in an open engine before/instead of relying solely on Cadence PSS/HB. Validate our LDO subckt's HB behavior here.",
+            "caveats": "AGPL-3.0 (only matters if we distribute a modified simulator - not for using it). Newer/less battle-tested than Spectre; HB is recent. No native Spectre SPICE-netlist parity guarantee - we'd port the test netlist. Codeberg-hosted (not GitHub). Linux-first; check Windows build/WSL."
+          },
+          {
+            "name": "Xyce (Sandia) + Xyce/ADMS",
+            "url": "https://github.com/Xyce/Xyce",
+            "license": "GPLv3 (Sandia open-source)",
+            "language": "C++ (parallel/Trilinos); ADMS back-end is XML templates",
+            "activity": "actively maintained by Sandia; ADMS itself unmaintained upstream (continued under Qucs).",
+            "what_it_does": "Production-grade parallel SPICE-compatible simulator with single/multi-tone Harmonic Balance, MPDE, MOR, sensitivity, UQ. Verilog-A support is via ADMS: .va -> admsXml (Xyce back-end) -> C++ -> buildxyceplugin -> load with -plugin.",
+            "modeling_approach": "Xyce/ADMS implements only ANALOG Verilog-A: contributions, controlled (flow/potential) sources, ddt() in contributions, white_noise/flicker_noise, analog functions. Explicitly NO Laplace/Z-transform filters, NO idt() (differentiate charge instead), and I(<port>) accessors generate buggy code. No hierarchical module instantiation.",
+            "reusable_for_us": "MEDIUM for HB validation of our .va (alternative to VACASK) - mature HB. Our model fits ADMS's supported subset (no Laplace, ddt-only, controlled sources) - so it should compile. Also useful as a HB cross-check engine for sideband asymmetry (Task 3).",
+            "caveats": "No netlist .va import - must run admsXml + compile a C++ plugin (heavier than ngspice/VACASK OSDI). ADMS is unmaintained. ADMS HB+Verilog-A combination not documented together - VERIFY HB works with a custom ADMS device before relying on it. idt unsupported - keep model in ddt form (we already do)."
+          },
+          {
+            "name": "ngspice (OSDI/OpenVAF + B/E/G behavioral + XSPICE)",
+            "url": "https://github.com/imr/ngspice",
+            "license": "BSD-style / GPL mix (mostly BSD-3 + some GPL components)",
+            "language": "C",
+            "activity": "actively maintained (v46+).",
+            "what_it_does": "Our current ground-truth engine. Loads OpenVAF-compiled .osdi Verilog-A models (since v39, via `osdi`/`pre_osdi`). Native behavioral B/E/G sources; XSPICE code models incl. s_xfer for Laplace transfer functions. Transient noise supported.",
+            "modeling_approach": "OSDI hosts our compiled .va; B/E/G evaluate math expressions of node V/branch I/params. Laplace only via XSPICE s_xfer (AC+tran), not via E-source LAPLACE. CRITICAL: ngspice has NO harmonic balance; PSS is experimental and NOT publicly released.",
+            "reusable_for_us": "HIGH for characterization + AC/tran/noise validation (already our stack). Confirms our emitted .va compiles+runs via OSDI. Confirms our design choice to AVOID Laplace blocks: ngspice's only Laplace is XSPICE s_xfer, which is exactly the kind of s-domain block we exclude for PSS/HB portability. NOT usable for HB/spur validation - that's why VACASK/Xyce/Cadence are needed.",
+            "caveats": "No HB; PSS not shipping. So ngspice cannot validate the spur/sideband fidelity that is our whole point - only the linear blocks (Zout/PSRR/noise) in AC/tran."
+          },
+          {
+            "name": "scikit-rf VectorFitting",
+            "url": "https://github.com/scikit-rf/scikit-rf/blob/master/skrf/vectorFitting.py",
+            "license": "BSD-3-Clause",
+            "language": "Python (numpy + scipy only)",
+            "activity": "actively maintained (core scikit-rf module; ongoing releases).",
+            "what_it_does": "Gustavsen-style vector fitting of frequency responses to pole-residue rational form, with automatic model-order selection (auto_fit: add poles to high-error bands, prune spurious via energy norm), passivity_test/is_passive and passivity_enforce, and write_spice_subcircuit_s SPICE export.",
+            "modeling_approach": "Fits to poles[] (cc pairs stored once, +imag), residues[MxK], constant_coeff, proportional_coeff - directly accessible. SPICE export = direct state-space realization using VCCS (G) primarily + VCVS (E) + R/L/C; real poles = 1 state var, complex-conjugate pairs = 2 state vars; emits negative-resistance via G-in-parallel-with-R. Output targets ngspice/Xyce/LTspice.",
+            "reusable_for_us": "VERY HIGH for Task 1 + Task 2. (a) auto_fit gives us the auto-order Zout/PSRR fitter we want, with complex-conjugate (2nd-order) sections - matches 'signed 2nd-order PSRR sections.' (b) passivity_test/passivity_enforce is literally the Task-2 passivity gate (Gustavsen half-size/Hamiltonian-style). (c) .poles/.residues let us drive our OWN RLC + controlled-source synthesizer (keeps our hard lumped-only constraint). Pure numpy/scipy = drops into our Py3.11 venv.",
+            "caveats": "write_spice_subcircuit_s currently exports S-parameter networks only (Z/Y export 'not implemented') - so for a 1-port Zout/PSRR we EITHER wrap as 1-port S then convert, OR (better) just take .poles/.residues and run our own RLC synthesis to honor the no-blackbox constraint. Its native synthesis uses negative-R tricks we may not want in PSS/HB - prefer our signed-real-pole/2nd-order sections. Passivity API is per the realization; verify on our hand-built RLC, not just on skrf's."
+          },
+          {
+            "name": "baryrat (AAA + BRASIL rational approximation)",
+            "url": "https://github.com/c-f-h/baryrat",
+            "license": "BSD-2-Clause",
+            "language": "Python (numpy + scipy; optional gmpy2/flamp for extended precision)",
+            "activity": "actively maintained (CI active; recent commits).",
+            "what_it_does": "Barycentric rational approximation: AAA algorithm (Nakatsukasa-Sete-Trefethen) plus BRASIL best-rational, polynomial/rational interpolation. Returns the approximant AND poles/residues (polres()) and zeros (zeros()).",
+            "modeling_approach": "AAA does adaptive, near-optimal complex rational fits with automatic order selection (tol or mmax). polres() converts the barycentric form to pole-residue form -> directly mappable to real-pole / complex-conjugate sections we synthesize as RLC + signed controlled sources.",
+            "reusable_for_us": "HIGH for Task 1 (the 'AAA with auto-order' alternative we explicitly want for the Zout/PSRR fitter). AAA is excellent on sharp/non-min-phase responses and the polres()/zeros() output feeds our RLC+controlled-source synthesizer and explicit delay (all-pass) extraction. BSD-2 + pure numpy/scipy = clean drop-in next to scikit-rf. Use AAA when VF struggles with order/sharp phase; cross-check the two fitters.",
+            "caveats": "AAA fits complex data generally; for a guaranteed-stable causal model you must mirror/enforce conjugate symmetry and flip RHP poles yourself (no built-in passivity/stability enforcement - pair it with scikit-rf's passivity gate). No SPICE synthesis - fit only; we supply the RLC realization."
+          },
+          {
+            "name": "EstebanEnriquez/vectorFitting (Fast-Relaxed VF)",
+            "url": "https://github.com/EstebanEnriquez/vectorFitting",
+            "license": "MIT",
+            "language": "MATLAB (NOT Python)",
+            "activity": "actively maintained (release Apr 2025).",
+            "what_it_does": "Clean, optimized MATLAB reimplementation of Gustavsen Fast-Relaxed VF (vectfit3 lineage). Returns real/complex state-space or residue-pole representation (poles A, residues C, D, E).",
+            "modeling_approach": "Pole-relocation least-squares VF; residue-pole output suitable for Zout/PSRR transfer-function fitting. Fit only, no SPICE synthesis.",
+            "reusable_for_us": "Reference only / algorithm cross-check. It's MATLAB so it doesn't drop into our Python venv, but it's a cleaner, MIT-licensed VF reference than the original vectfit3 if we want to (re)implement relaxed-VF semantics in Python alongside scikit-rf. Prefer scikit-rf/baryrat for actual use.",
+            "caveats": "MATLAB-only (no MATLAB in our stack). No passivity enforcement, no synthesis. Treat as a clean reference implementation, not a dependency."
+          },
+          {
+            "name": "dwarning/VA-Models",
+            "url": "https://github.com/dwarning/VA-Models",
+            "license": "Educational Community License 2.0 (per-model copyright)",
+            "language": "Verilog-A models (+ Pascal/C++ tooling/scripts)",
+            "activity": "actively maintained (v2.2, Oct 2024); prebuilt OSDI binaries for Linux/Windows.",
+            "what_it_does": "Curated collection of COMPACT semiconductor device models (BSIM, HICUM, MEXTRAM, VBIC, FinFET/SOI, HEMT/HBT, IGBT, diodes, varactors) packaged to build with OpenVAF and run in ngspice/Xyce via OSDI.",
+            "modeling_approach": "Transistor/diode physics-based compact models in Verilog-A; no behavioral macromodels, no opamp/regulator/PSRR examples.",
+            "reusable_for_us": "Reference only - as a working reference for the OpenVAF->OSDI->ngspice build/run flow and Windows OSDI packaging (mirror its compile scripts for our .va). Not a source of LDO/PSRR modeling patterns.",
+            "caveats": "Contains NO behavioral/opamp/regulator macromodels - purely compact device models. ECL-2.0 per model. Value is the build pipeline, not the content."
+          },
+          {
+            "name": "Qucs / Qucs-S / Qucs-ADMS (+ Mike Brinson modular VA opamp macromodels)",
+            "url": "https://github.com/Qucs/qucs",
+            "license": "GPLv2/GPLv3 (Qucs/qucsator/ADMS); macromodel reports are academic",
+            "language": "C++ (qucsator), Verilog-A (models), Qt6 GUI (Qucs-S)",
+            "activity": "Qucs-S actively maintained (Qt6, drives ngspice/Xyce/qucsator). qucsator + Qucs-ADMS less active. ADMS upstream unmaintained, continued under Qucs.",
+            "what_it_does": "qucsator has a harmonic-balance engine; Qucs-S is a unified GUI over ngspice/Xyce/qucsator and can dynamically compile/load Verilog-A via ADMS 2.3.4 (VA subset). Mike Brinson published Verilog-A 'modular macromodel' opamp work modeling PSRR, output impedance, and noise via equation-defined/controlled-source building blocks for HB.",
+            "modeling_approach": "Brinson macromodels build opamp behavior (incl. PSRR auxiliary networks, Zout, noise) from controlled sources + lumped elements / equation-defined devices - same philosophy as our per-block LDO model, designed to survive HB. ADMS path = .va -> C subset for qucsator.",
+            "reusable_for_us": "MEDIUM as PATTERN reference for Task 1/3: the Brinson modular opamp macromodels are the closest open published example of PSRR/Zout/noise built from controlled sources for HB - mirror their topology choices (PSRR auxiliary network, controlled-source noise injection) in our blocks. qucsator HB is a third open HB engine option to cross-check spurs.",
+            "caveats": "ADMS supports only a Verilog-A subset and is unmaintained. Brinson examples are mostly in papers/reports (Qucs report PDFs), not a clean GitHub repo - extract patterns by hand. qucsator HB is older/less robust than Xyce/VACASK. Use for ideas + a secondary HB cross-check, not as a dependency."
+          }
+        ],
+        "takeaways": "For our exact next tasks the highest-value, directly-droppable open source is in Python: scikit-rf VectorFitting (BSD-3, numpy/scipy) gives us auto-order vector fitting WITH complex-conjugate (2nd-order) sections AND a built-in passivity_test/passivity_enforce that is essentially our Task-2 passivity gate; and baryrat (BSD-2, numpy/scipy) gives the AAA auto-order fitter with polres()/zeros() for non-min-phase phase + delay extraction (Task 1). We should consume their poles/residues and run our OWN RLC + signed-controlled-source synthesis to keep the hard lumped-only constraint (skrf's native SPICE export is S-param-only and uses negative-R tricks we want to avoid). On the toolchain side, our 'no laplace_nd, ddt-only, controlled-source' design is well-matched to the open Verilog-A path: compile our .va with OpenVAF-reloaded (active, Windows binaries, OSDI 0.4 w/ HB hooks) and HB-validate in VACASK (open, has a working HB engine) since ngspice has NO HB/PSS - this is the cleanest open route to check sideband/spur fidelity before Cadence; Xyce HB is a mature fallback but needs an ADMS C++ plugin compile (verify HB+VA actually works). For behavioral-pattern inspiration (PSRR/Zout/noise from controlled sources for HB), mirror Mike Brinson's Qucs modular opamp macromodels; dwarning/VA-Models is reference-only (compact devices) but a good template for the Windows OpenVAF->OSDI build flow."
+      },
+      {
+        "ecosystem": "Open-source harmonic-balance / PSS / RF steady-state simulation engines (and the rational-fit + passivity tooling that feeds an HB-portable behavioral LDO model)",
+        "repos": [
+          {
+            "name": "Xyce (Sandia National Laboratories)",
+            "url": "https://github.com/Xyce/Xyce",
+            "license": "GPL-3.0",
+            "language": "C / C++ (Trilinos/KLU solvers, MPI parallel)",
+            "activity": "actively maintained (release 7.10, July 2025; Sandia-backed, active Google Group)",
+            "what_it_does": "SPICE-compatible parallel circuit simulator. The ONLY mature open-source engine with real harmonic balance: single-tone AND multi-tone .HB, plus .AC, .NOISE, .TRAN, MPDE, MOR, sensitivity/UQ. Has a Verilog-A model compiler (ADMS-style).",
+            "modeling_approach": "Frequency-domain harmonic balance (Newton in HB domain). Supports controlled sources (E/G/VCVS/VCCS/CCVS/CCCS) and B-source / EDD behavioral expressions, so a pure RLC+controlled-source subckt runs natively. No s-domain block needed — matches our hard constraint. Multi-tone HB is exactly the carrier+supply-tone setup needed to validate spur folding/sideband asymmetry.",
+            "reusable_for_us": "HIGH — primary out-of-Cadence HB validator. Run our ldo_model subckt with a ~304MHz carrier on vin plus supply tones and read sideband/spur amplitudes via .HB; cross-check sideband asymmetry from Task 3 against Spectre PSS/HB. Also compiles our emitted Verilog-A mirror. Closes the gap that ngspice has no PSS/HB. Best path: drive via Qucs-S or direct netlist on Windows (prebuilt Windows binaries exist).",
+            "caveats": "GPL-3.0 (fine for an internal validation tool, not for linking into shipped IP). HB convergence degrades under strong nonlinearity / high RF power (documented), but our block is near-linear (memory: spur band is linear), so HB should converge well. Multi-tone HB cost grows with tone count × harmonics. Windows build/setup is heavier than ngspice; multi-tone netlist syntax (.HB freq list) differs from Spectre."
+          },
+          {
+            "name": "scikit-rf (skrf.vectorFitting)",
+            "url": "https://github.com/scikit-rf/scikit-rf",
+            "license": "BSD-3-Clause",
+            "language": "Python (numpy/scipy)",
+            "activity": "very active (v1.12.0, May 2026; ~900 stars, 5700+ commits)",
+            "what_it_does": "RF/microwave Python library whose vectorFitting module implements Gustavsen Fast Relaxed Vector Fitting, fit-quality analysis, passivity evaluation + enforcement, and automatic SPICE equivalent-circuit export. Accepts S, Z, OR Y frequency responses (not just S-params).",
+            "modeling_approach": "Vector fitting to rational pole-residue form, then write_spice_subcircuit_s() synthesizes a state-space realization into an equivalent SPICE subckt of 'passive or active impedances/admittances' (R/L/C + controlled G/E sources) — explicitly netlist syntax compatible with ngspice/Xyce/LTspice, NO Laplace block. passivity_test() uses the half-size singularity test matrix (Gustavsen-Semlyen 2008, confirmed in source: builds P=(A-B·inv(D-I)·C)(A-B·inv(D+I)·C) and checks imaginary eigenvalues); passivity_enforce() perturbs residues to remove violations.",
+            "reusable_for_us": "HIGHEST single match. Directly serves all three of our next tasks: (1) replace our SK-fit PSRR/Zout fitter with skrf vector_fit on Z (Zout) and a transfer ratio (PSRR) with auto-order, getting complex-conjugate pole pairs natively; (2) its half-size passivity gate IS Task 2 — drop-in passivity-verification on synthesized Zout; reuse write_spice_subcircuit_s as a reference RLC+G/E synthesizer for Task 1's 'synthesize to RLC + controlled sources'. We can lift the fitter, the passivity test/enforce routines, and the SPICE-synthesis pattern almost verbatim. BSD-3 license is clean for direct reuse.",
+            "caveats": "S/Z/Y-matrix oriented; PSRR (a dimensionless ratio) needs wrapping as a 1-port/2-port transfer to fit cleanly. No native Verilog-A export (only SPICE) — we still emit our own .va. SPICE export realizes complex poles via the state-space form (controlled sources), so check the emitted topology survives Spectre PSS/HB and matches our 'signed real-pole sections' style; may prefer their realization. No explicit minimum-phase/delay (e^-sτ all-pass) extraction — Task 1's delay-extraction is still on us. Issue #1056 notes a bug in one export overload — verify on current version."
+          },
+          {
+            "name": "Qucs-S (ra3xdh/qucs_s) + qucsator_rf",
+            "url": "https://github.com/ra3xdh/qucs_s",
+            "license": "GPL-2.0 (GUI) / GPL (qucsator_rf kernel)",
+            "language": "C++ / Qt6 (GUI), C++ (kernel)",
+            "activity": "actively maintained (Qt6 port, regular releases)",
+            "what_it_does": "Free schematic/netlist GUI that drives multiple free kernels (ngspice, qucsator_rf, Xyce, SPICE OPUS). For HB it delegates to Xyce single/multi-tone HB ('full range of SPICE components, faster and much more stable' than the old built-in Qucs HB). qucsator_rf is its native RF/AC kernel.",
+            "modeling_approach": "Front-end orchestration: synthesizes SPICE-style netlists and calls Xyce for .HB; can also call ngspice for transient/AC and SPICE OPUS for shooting-method PSS (sssetol convergence knob). Handles controlled sources and behavioral blocks since it passes a full SPICE netlist through.",
+            "reusable_for_us": "MEDIUM — convenient harness/wrapper to set up the multi-tone HB experiment without hand-writing Xyce .HB cards, and to flip between ngspice (our existing characterization) and Xyce (HB validation) on the same schematic. Reference-only for the model itself. Useful if we want a GUI sanity-check of spur folding before scripting Xyce directly.",
+            "caveats": "Its own built-in HB is rudimentary/deprecated — the real engine is still Xyce (so Xyce caveats apply). GPL. Adds a GUI/tooling layer we may not need for a scripted Python+ngspice flow; value is mostly the prewired Xyce-HB netlist generation."
+          },
+          {
+            "name": "ngspice .PSS (periodic steady state)",
+            "url": "https://ngspice.sourceforge.io/docs/ngspice-html-manual/manual.xhtml",
+            "license": "BSD / GPL mix (ngspice)",
+            "language": "C",
+            "activity": "ngspice itself active; the PSS code is dormant/experimental (refined ~2011-2012, unmaintained since)",
+            "what_it_does": "Confirms the gap: ngspice has NO harmonic balance. It has an experimental .PSS shooting-method analysis enabled via --enable-pss (already on in Windows builds), intended to find an oscillator's fundamental + harmonics, plus PAC/PNoise built on it.",
+            "modeling_approach": "Time-domain shooting (transient-based) searching for the period via RHS-vector error minimization + FFT. Documented as AUTONOMOUS-only (oscillators/VCOs) and only to retrieve frequency — not a driven/non-autonomous engine. Marked 'Experimental code' in the manual; 'works for some circuits, maybe not all' per devs.",
+            "reusable_for_us": "LOW for validation — it is essentially the negative result that justifies needing Xyce/Cadence: ngspice cannot do the driven carrier+supply-tone PSS/HB we need. Keep ngspice strictly for what it is already good at in our flow: transient-FFT + AC characterization of the ground-truth LDO. Do not rely on .PSS for spur-folding validation.",
+            "caveats": "Autonomous-only, experimental, buggy, dormant; cannot inject a 304MHz carrier + supply tones on a driven LDO and read sidebands. No multi-tone. Confirms cross-engine HB validation must go to Xyce (open) or Spectre."
+          },
+          {
+            "name": "baryrat (c-f-h/baryrat) — AAA + BRASIL",
+            "url": "https://github.com/c-f-h/baryrat",
+            "license": "BSD-2-Clause",
+            "language": "Python (numpy/scipy; optional gmpy2/flamp extended precision)",
+            "activity": "actively maintained (successor that absorbed the author's standalone aaa repo)",
+            "what_it_does": "Barycentric rational approximation toolkit: AAA algorithm (auto-order via tol/mmax), BRASIL best-uniform rational approximation, plus pole/residue (polres()) and zero (zeros()) extraction.",
+            "modeling_approach": "Barycentric AAA fit of tabulated complex frequency response with automatic degree selection, then converts to pole-residue-zero form for synthesis. More numerically robust on spiky/resonant responses than naive least-squares; complements vector fitting.",
+            "reusable_for_us": "HIGH for Task 1's 'AAA with auto-order' Zout/PSRR fitter. Use baryrat.aaa() to get an auto-order rational fit of Zout(jw) and PSRR(jw), extract poles/residues with polres(), then hand the pole-residue set to our RLC+controlled-source synthesizer (or to scikit-rf's realizer). Clean BSD-2 license, pure Python — drops straight into our 3.11 venv.",
+            "caveats": "AAA gives a barycentric/rational fit but does NOT enforce stability/passivity or minimum-phase — must pass results through stable-pole flipping + a passivity gate (use scikit-rf's). No SPICE synthesis of its own. Delay (e^-sτ) extraction still manual. Order can be higher than vector fitting for the same accuracy; prune small residues before synthesis."
+          },
+          {
+            "name": "Vector_Fitting_for_python (SebastianL18) — vectfit3 port",
+            "url": "https://github.com/SebastianL18/Vector_Fitting_for_python",
+            "license": "unknown / none declared (NO LICENSE file found)",
+            "language": "Python (numpy/scipy/matplotlib)",
+            "activity": "actively developed (last commit Oct 2025, v1.3.1)",
+            "what_it_does": "Faithful Python port of Gustavsen-Semlyen Fast Relaxed Vector Fitting (vectfit3.m / SINTEF), returning a state-space SER {A,B,C,D,E} and pole-residue form, with optional stable-pole enforcement.",
+            "modeling_approach": "Classic relaxed VF with pole relocation; outputs state-space or pole-residue, directly usable for RLC/controlled-source synthesis of Zout and PSRR.",
+            "reusable_for_us": "MEDIUM — a clean standalone vectfit3 if we want the canonical Gustavsen algorithm without pulling all of scikit-rf. Good cross-check against skrf's fitter on the same Zout data. But scikit-rf is preferable because it ALSO bundles the half-size passivity test + SPICE export under a clear BSD license.",
+            "caveats": "No declared license — legally unsafe to copy code into our project without contacting the author; treat as reference/algorithm-validation only until licensing clarified. No passivity enforcement, no SPICE synthesis (poles/residues only). Other ports (PhilReinhold/vectfit_python, AlMrvn, EstebanEnriquez) exist but are older/less maintained; PhilReinhold's is MIT but stale."
+          },
+          {
+            "name": "ahkab (ahkab/ahkab)",
+            "url": "https://github.com/ahkab/ahkab",
+            "license": "GPL-2.0",
+            "language": "Python",
+            "activity": "dormant/effectively abandoned (last release v0.18, July 2015; original author deceased; no activity 2024-2026)",
+            "what_it_does": "Pure-Python SPICE-like simulator with OP/DC/TRAN/AC/PZ, symbolic small-signal transfer-function extraction, AND periodic-steady-state of NON-autonomous (driven) circuits via time-domain shooting + brute-force (Brambilla-D'Amore method).",
+            "modeling_approach": "Time-domain shooting / brute-force PSS for driven circuits — notable because, unlike ngspice .PSS, it explicitly targets non-autonomous circuits. Symbolic PZ/transfer-function extraction could in principle characterize Zout/PSRR poles directly.",
+            "reusable_for_us": "LOW-to-MEDIUM, reference only. The shooting-PSS-for-driven-circuits implementation is a readable Python reference if we ever want an in-house steady-state check, and the symbolic transfer-function code is interesting for pole extraction. But it is unmaintained, GPL-2.0, limited device/behavioral-source support, and not credible for production 304MHz spur-fidelity validation.",
+            "caveats": "Abandoned since 2015; small/limited device and controlled-source support (behavioral B-sources not clearly supported); pure-Python so slow for many-harmonic RF; GPL-2.0. Use for algorithm study, not as a validation engine — Xyce is the real answer."
+          }
+        ],
+        "takeaways": "Two repos are direct, lift-and-reuse wins. scikit-rf (BSD-3, very active) is the single best match: its vectorFitting module gives an auto-order rational fitter for Zout/PSRR (Task 1), a half-size singularity-matrix passivity test + enforcement that IS Task 2, and a SPICE export that synthesizes pole-residue terms into RLC + controlled sources (G/E) with no Laplace block — matching our hard constraint and feeding our .va emit. baryrat (BSD-2) supplies the AAA-with-auto-order fitter for Task 1, with pole/residue/zero extraction. For out-of-Cadence HB validation, Xyce is the only mature open engine with real single- and multi-tone harmonic balance, runs our pure RLC+controlled-source subckt and our Verilog-A mirror natively, and lets us inject a 304MHz carrier + supply tones to verify spur folding/sideband asymmetry (Task 3); Qucs-S is a convenient front-end that just delegates HB to Xyce. ngspice and ahkab confirm the gap rather than fill it — ngspice has no HB and only an experimental autonomous-only PSS, so keep ngspice for transient-FFT/AC characterization and push all PSS/HB validation to Xyce (open) and Spectre. Caveats to respect: scikit-rf/Xyce are S-param/GPL-flavored respectively (Xyce GPL-3 is fine for an internal validator, not for shipped IP), the SebastianL18 vectfit port has no license (reference only), and none of these auto-extract the e^-sτ all-pass delay we still need to add by hand."
+      },
+      {
+        "ecosystem": "Open-source power-integrity / PDN / EMI modeling & impedance-extraction tooling (vector fitting → passivity → RLC/controlled-source SPICE synthesis; Z/Y/S handling; shunt-through impedance; rational approximation).",
+        "repos": [
+          {
+            "name": "scikit-rf (skrf.vectorFitting.VectorFitting + write_spice_subcircuit_s)",
+            "url": "https://github.com/scikit-rf/scikit-rf",
+            "license": "BSD-3-Clause (OSI approved)",
+            "language": "Python (numpy/scipy/matplotlib)",
+            "activity": "actively maintained / production-stable — v1.12.0 released May 2026, maintained by J. Hillairet (CEA), frequent releases",
+            "what_it_does": "Full N-port RF/microwave network toolkit. The VectorFitting class fits tabulated frequency responses (S, and also Z/Y) to a pole-residue rational model with vector fitting; auto_fit() does automatic pole add/skim order selection; passivity_test()/is_passive()/passivity_enforce() assess and fix passivity; write_spice_subcircuit_s() emits a SPICE .SUBCKT realizing the fitted model. Also provides Z/Y parameter access (Network.z/.y), Touchstone I/O, IEEEP370 2x-thru de-embedding, and Circuit cascading.",
+            "modeling_approach": "Vector fitting (real + complex-conjugate poles, constant d + proportional e terms) -> real state-space (A,B,C,D,E) -> SPICE netlist. I VERIFIED THE EXPORTER SOURCE (skrf/vectorFitting.py, write_spice_subcircuit_s ~line 2463): it emits ONLY R, L, C, zero-volt sense V sources, and controlled sources G (VCCS) and F (CCCS) — grep confirms ZERO 'laplace' and ZERO B-source statements. Each real pole -> a state node = 1F cap + VCCS(Gx) + CCCS(Fx) + R(=-1/pole_re); each complex pole pair -> two coupled state nodes (re/im) cross-coupled by VCCS with gain=pole_im; proportional term -> 1H inductor (Le) + VCCS/CCCS. Passivity via residue-eigenvalue/singular-value perturbation (passivity_enforce). It is S-parameter-based, so the synthesized subckt carries port reference resistors (z0). It does NOT directly model Zout/PSRR asymmetry, noise PSD, or spurs.",
+            "reusable_for_us": "HIGHEST-VALUE FIND. Directly addresses NEXT TASK 1 and 2. (a) Replace our hand-rolled SK PSRR fit and Zout fitter with VectorFitting.vector_fit/auto_fit on our ngspice-extracted Zout(s) and PSRR(s) curves — gives non-min-phase poles incl. complex-conjugate pairs automatically with auto-order. (b) passivity_test/is_passive/passivity_enforce is a ready-made passivity gate for synthesized Zout (TASK 2) — uses exactly the half-size/Hamiltonian-class assessment we wanted. (c) write_spice_subcircuit_s is a proven RLC+VCCS/CCCS state-space synthesizer that obeys our HARD CONSTRAINT (no laplace, no B-domain) and targets ngspice/Xyce/LTspice — we can lift its pole->RLC-branch synthesis pattern (or adapt it to emit 1-port Zout/2-port PSRR networks referenced to vout instead of S-param ports). Pip-installable into our 3.11 venv. BSD license is permissive for reuse.",
+            "caveats": "Exporter is S-parameter-oriented (synthesizes a scattering subckt with port reference resistors), not a bare Zout admittance ladder — to drop into our subckt ldo_model we either feed Z/Y and adapt, or reuse the per-pole synthesis recipe rather than the whole writer. State-space realization uses 1F/1H normalizing elements and VCCS/CCCS rather than physically-meaningful RLC values (fine for HB/PSS, but not human-readable RLC). No Verilog-A emitter (we already have ours). Does not handle our noise-PSD/spur blocks. Passivity enforcement is for the rational model generally; verify it converges on our specific Zout fits."
+          },
+          {
+            "name": "baryrat (AAA + BRASIL rational approximation)",
+            "url": "https://github.com/c-f-h/baryrat",
+            "license": "BSD-2-Clause",
+            "language": "Python (pure; numpy/scipy; optional gmpy2/flamp for extended precision)",
+            "activity": "maintained, moderate cadence — 51 stars, 114 commits, 6 releases, on PyPI",
+            "what_it_does": "Barycentric rational and polynomial interpolation/approximation. Implements the AAA algorithm (Nakatsukasa/Sete/Trefethen 2018) for near-optimal rational approximation of tabulated data, plus the BRASIL best-uniform rational approximation algorithm, Floater-Hormann, and fixed-pole/fixed-node rational interpolation.",
+            "modeling_approach": "AAA greedy barycentric rational fit with automatic support-point/order selection; BarycentricRational.polres() returns POLES and RESIDUES, .zeros() returns zeros. This is the AAA-with-auto-order our TASK 1 explicitly named, and the pole/residue output plugs straight into a residue->RLC-branch synthesis (same target form scikit-rf uses).",
+            "reusable_for_us": "Strong for TASK 1 as the auto-order fitter for Zout(s) and PSRR(s). AAA handles complex frequency-domain data and resonant/non-min-phase responses well and gives an automatic minimal pole set; .polres() output feeds directly into either scikit-rf's synthesizer or our own signed real-pole / complex-conjugate-section -> RLC + controlled-source emitter. Lightweight, permissive, easy venv install. Use AAA to pick order, then convert poles/residues to our lumped sections.",
+            "caveats": "Pure approximation library — NO passivity enforcement, NO SPICE/RLC export, NO stability/causality guarantees (AAA can return RHP poles or non-passive residues that you must filter/flip). For an LDO Zout you must enforce stable poles and post-check passivity (use scikit-rf for that). Real-data symmetry (conjugate pole pairs) must be enforced by you for a real-valued netlist. No explicit delay (e^-sTau) extraction — the all-pass/delay part of TASK 1 still has to be done separately."
+          },
+          {
+            "name": "Vector_Fitting_for_python (SebastianL18 — vectfit3 port)",
+            "url": "https://github.com/SebastianL18/Vector_Fitting_for_python",
+            "license": "not clearly stated in repo (license unclear — likely follows Gustavsen vectfit3 terms; treat as unverified)",
+            "language": "Python (numpy/scipy/matplotlib)",
+            "activity": "small / likely dormant — 19 stars, ~30 commits, single-author port; no release cadence visible",
+            "what_it_does": "Direct Python port of Gustavsen's vectfit3.m Fast Relaxed Vector Fitting. Computes a rational (pole-residue or state-space) approximation of scalar or vector frequency-domain data; buildRES() builds residue matrices.",
+            "modeling_approach": "Classic relaxed vector fitting (pole relocation by least squares), output in pole-residue or state-space form. Same algorithm family as scikit-rf's VectorFitting but standalone and closer to the canonical MATLAB reference.",
+            "reusable_for_us": "Reference / fallback only. If you want the exact, well-documented Gustavsen relaxed-VF behavior outside scikit-rf (e.g., to cross-check scikit-rf's fits, or fit a single Zout vector without pulling the full skrf stack), this is a usable drop-in. Mostly redundant given scikit-rf is better maintained and adds passivity + SPICE export.",
+            "caveats": "License NOT confirmed — must verify before adopting (Gustavsen's code historically had non-commercial/attribution terms). No passivity enforcement, no SPICE export. Low activity, single maintainer. Prefer scikit-rf unless you specifically need the bare canonical VF."
+          },
+          {
+            "name": "SINTEF Vector Fitting (vectfit3 / Matrix Fitting Toolbox, Gustavsen)",
+            "url": "https://www.sintef.no/en/software/vector-fitting/",
+            "license": "Gustavsen terms — historically 'public domain'/free for use with citation, but NOT a clean OSI license; commercial terms unclear (treat as restricted)",
+            "language": "MATLAB",
+            "activity": "stable / canonical reference, infrequent updates — the authoritative VF source since 1998",
+            "what_it_does": "The original/reference vector fitting (vectfit3.m) and Matrix Fitting Toolbox: rational pole-residue macromodeling of multiport frequency responses, with a passivity-enforcement routine (residue-matrix perturbation) and netlist generation for ATP-EMTP.",
+            "modeling_approach": "Fast Relaxed Vector Fitting + passivity assessment/enforcement by residue perturbation. This is the algorithmic ancestor of both scikit-rf's VectorFitting and the Python ports. Netlist export targets ATP-EMTP (power-systems), not SPICE.",
+            "reusable_for_us": "Reference only for us (MATLAB stack mismatch; we are Python/ngspice). Valuable as the authoritative spec/citation for the VF + passivity-enforcement math behind scikit-rf and baryrat. Read it to understand passivity_enforce internals (TASK 2) and FRP/RP perturbation, then use the Python tools.",
+            "caveats": "MATLAB-only (does not fit our venv stack). Licensing is the classic Gustavsen academic/with-citation arrangement, not a permissive OSI license — not safe to vendor into our toolchain. SPICE export is ATP-EMTP, not ngspice/Spectre."
+          },
+          {
+            "name": "Xyce (Sandia parallel SPICE with .HB harmonic balance)",
+            "url": "https://github.com/Xyce/Xyce",
+            "license": "GPLv3",
+            "language": "C++ (Verilog-A device support via ADMS/OpenVAF-generated models)",
+            "activity": "actively maintained by Sandia National Labs",
+            "what_it_does": "Open-source, SPICE-compatible analog simulator with native Harmonic Balance (.HB, single- and multi-tone), .AC, .TRAN, sensitivity, sampling. Supports our exact element set (R/L/C + E/G/F/H controlled sources + B-sources) and can ingest Verilog-A device models.",
+            "modeling_approach": "Not a fitter — it is the open-source HB/PSS-class ENGINE. Solves periodic steady state in the frequency domain (HB) the way Spectre PSS does, which is what our spur/sideband-fidelity model targets.",
+            "reusable_for_us": "Directly enables NEXT TASK 3 / the Verilog-A mirror validation goal. Since ngspice has NO PSS/HB, Xyce is the open engine to HB-validate our emitted subckt AND our .va mirror: run multi-tone HB around the ~304 MHz carrier and check sideband asymmetry without Cadence in the loop. Our RLC+VCCS/CCCS subckt (and scikit-rf's exporter output) are Xyce-compatible. Pairs naturally with the scikit-rf-synthesized netlists.",
+            "caveats": "GPLv3 (engine, run as external subprocess like ngspice — no linking concern; do not vendor GPL code into our model). HB convergence on strongly nonlinear circuits can be finicky (our model is mostly linear, so favorable). Verilog-A support needs OpenVAF/ADMS-built models; confirm our .va constructs compile for Xyce. Adds a second simulator subprocess to the harness."
+          },
+          {
+            "name": "GT-CHIPS/PDN-Impedance-Analysis",
+            "url": "https://github.com/GT-CHIPS/PDN-Impedance-Analysis",
+            "license": "no license file (all-rights-reserved by default — not reusable as-is)",
+            "language": "MATLAB",
+            "activity": "dormant — ~9 commits, 8 stars, no releases",
+            "what_it_does": "Computes PDN impedance for 2.5D/3D heterogeneous integration by building RLGC/T-matrices for P/G planes, C4/u-bumps, TSV/via arrays and cascading them (with reductions for parallel array excitation) into a port impedance.",
+            "modeling_approach": "Analytic/numerical T-matrix (ABCD) cascade of physical PDN structures -> impedance curves. It GENERATES impedance from geometry; it does NOT do rational fitting or RLC-equivalent extraction.",
+            "reusable_for_us": "Reference only. It is upstream of our pipeline (produces Z(f) curves), not part of it. The T-matrix cascade idea is a tidy way to assemble a multi-section Zout if we ever model package/board around the LDO, but it does not extract a behavioral macromodel and won't feed a vector-fit step beyond providing a Z curve to fit.",
+            "caveats": "MATLAB, no license (cannot legally reuse code), dormant. Geometry/PDN-physics focused, not regulator-behavioral. Wrong stack for us."
+          },
+          {
+            "name": "scikit-rf de-embedding + Z/Y/Touchstone (IEEEP370, ImpedanceCancel)",
+            "url": "https://github.com/scikit-rf/scikit-rf/blob/master/doc/source/tutorials/Deembedding.ipynb",
+            "license": "BSD-3-Clause",
+            "language": "Python",
+            "activity": "actively maintained (part of scikit-rf)",
+            "what_it_does": "skrf.calibration.deembedding provides IEEEP370 2x-thru (NZC/ZC), SplitTee, ImpedanceCancel and related fixture-removal methods; Network gives Z/Y access and Touchstone read/write. Together they implement the data-conditioning front-end for impedance extraction (shunt-through-style 2-port Z, fixture de-embedding).",
+            "modeling_approach": "S<->Z<->Y conversions, fixture/lead de-embedding, port-impedance renormalization. This is the 'clean the measured/simulated 2-port before fitting' layer.",
+            "reusable_for_us": "Useful for TASK 3 (Target B / real Cadence LDO import). If Target-B Zout/PSRR come from a 2-port (shunt-through-style) extraction or Touchstone export, use skrf to convert to Z, de-embed probe/fixture parasitics, and hand clean Z(f) to VectorFitting/AAA. For our local ngspice ground truth (already de-embedded by construction) it is optional, but it standardizes the import path for real measured data.",
+            "caveats": "De-embedding methods target PCB/interconnect (up to mmW) fixtures; for an on-chip/simulated LDO most aren't needed. It is a data front-end, not a model synthesizer — value is conditional on Target-B data coming in as 2-port/Touchstone. Bundled with scikit-rf (no extra dependency)."
+          }
+        ],
+        "takeaways": "scikit-rf is the standout: its VectorFitting class is a near-drop-in for both of our hardest next tasks. Its auto_fit() gives automatic-order, complex-conjugate (non-min-phase) pole fitting of Zout/PSRR; its passivity_test/is_passive/passivity_enforce is a ready-made passivity gate (TASK 2); and I verified in source that write_spice_subcircuit_s emits ONLY R/L/C + VCCS(G)/CCCS(F) state-space branches with zero laplace and zero B-sources — i.e., it already obeys our hard constraint and targets ngspice/Xyce. baryrat adds the exact AAA-with-auto-order fitter we named (returns poles/residues via polres()), though we must enforce stability/passivity ourselves. For the missing PSS/HB engine, Xyce (GPLv3) gives open multi-tone .HB to validate sideband asymmetry of both our subckt and the Verilog-A mirror, since ngspice has none. The PI/EMI-specific tools (GT-CHIPS PDN, EMI Norton/Thevenin terminal modeling literature, ripple/spur extraction) are mostly reference-only or wrong-stack/wrong-license — our noise-Norton, spur-tone, and delay-extraction blocks have no off-the-shelf open implementation and stay in-house, but they should be fed by the scikit-rf/baryrat fitting + scikit-rf passivity gate + scikit-rf-style synthesis pipeline."
+      },
+      {
+        "ecosystem": "Open-source ML circuit macromodeling + other open behavioral-modeling / rational-fitting repos for analog/RF blocks (assessed for a fast LTI 2-port LDO model for Cadence PSS/HB)",
+        "repos": [
+          {
+            "name": "scikit-rf (skrf.vectorFitting.VectorFitting)",
+            "url": "https://github.com/scikit-rf/scikit-rf",
+            "license": "BSD-3-Clause (permissive; commercial-OK)",
+            "language": "Python (numpy/scipy/matplotlib)",
+            "activity": "Actively maintained — v1.12.0 released May 2026, 44 releases, ~5,800 commits, ~900 stars",
+            "what_it_does": "RF/microwave toolbox. Its VectorFitting module fits frequency-domain responses (S/Y/Z, Touchstone) to a sum of rational basis functions (real poles + complex-conjugate pole pairs), then has passivity_test()/is_passive()/passivity_enforce() and exports an equivalent N-port SPICE subcircuit via write_spice_subcircuit_s().",
+            "modeling_approach": "Gustavsen-style pole-relocation vector fitting -> state-space (A,B,C,D). SPICE export is a DIRECT state-space realization using ONLY lumped R/L/C plus B-type controlled sources (parallel-RLC + series-R for impedances, series-RLC + voltage-controlled current source for admittances); real poles -> RL/RC branches, complex-conjugate pairs -> two states / RLC resonators. Docs explicitly state NO Laplace blocks and ngspice/LTspice/Xyce compatibility. Passivity check + enforcement on residues is built in. It is generic frequency-domain fitting — it does NOT itself model PSRR-vs-Vin, noise PSD, or discrete spurs; you feed it Zout (and could feed PSRR as a transfer function).",
+            "reusable_for_us": "HIGHEST-value find and a near drop-in for two of our NEXT tasks. (1) Replace our hand-rolled Zout/PSRR fitter: feed it ngspice-characterized Zout (Touchstone/array), get auto-order rational fit with complex-conjugate pairs (exactly the signed 2nd-order sections we want for non-min-phase phase). (2) Its write_spice_subcircuit_s emits PURE R/L/C + controlled sources with no laplace_nd — satisfies our HARD constraint and is already ngspice/Xyce-targeted (Xyce gives us an open HB path). (3) passivity_test/passivity_enforce is a ready-made passivity-verification GATE for synthesized Zout. We can lift the realization routine for our SK-section synthesizer and the passivity gate wholesale; license is compatible.",
+            "caveats": "Fits S/Y/Z magnitude+phase but has no notion of OP-parameterization by load current (we wrap that ourselves), no noise/spur modeling, and no explicit delay (e^-sTau all-pass) extraction — we'd add the all-pass on top. State-space->B-source realization is one valid topology but may need massaging to keep PSS/HB-friendly (avoid huge fan-out B-sources); verify the emitted netlist converges in Spectre PSS specifically. Passivity enforcement perturbs residues, slightly raising fit error."
+          },
+          {
+            "name": "polyrat",
+            "url": "https://github.com/jeffrey-hokanson/polyrat",
+            "license": "GPL-3.0 (copyleft — contaminates derived code; treat as algorithm reference, do not vendor into our tool)",
+            "language": "Python (numpy/scipy, scikit-learn-style API)",
+            "activity": "Research code, ~188 commits; sporadic maintenance, RTD docs present",
+            "what_it_does": "Polynomial and rational function approximation library: fits y~f(x) by minimizing least squares with a unified API across several rational fitters.",
+            "modeling_approach": "Implements Adaptive Anderson-Antoulas (AAA), Sanathanan-Koerner iteration, STABILIZED Sanathanan-Koerner iteration, and Vector Fitting, plus stable polynomial bases (Vandermonde-with-Arnoldi, barycentric Lagrange). No state-space realization, no passivity enforcement, no SPICE/VA emit.",
+            "reusable_for_us": "Reference/algorithm source for our NEXT task 1. We already use a Sanathanan-Koerner PSRR fit; polyrat's STABILIZED-SK and its numerically-robust barycentric/Arnoldi conditioning are directly relevant to tightening non-min-phase phase and getting auto-order. Read it to improve our fitter's conditioning and SK stabilization. Do NOT copy code (GPL) — reimplement the idea or use scipy/baryrat instead.",
+            "caveats": "GPL-3.0 is the big one given our (currently non-OSS, vendor-facing) tool. Stops at the rational function — no circuit realization, no passivity, no Verilog-A. Maintenance is research-grade."
+          },
+          {
+            "name": "scipy.interpolate.AAA",
+            "url": "https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.AAA.html",
+            "license": "BSD-3-Clause",
+            "language": "Python (in scipy >= 1.15, already in our 3.11 venv if scipy is current)",
+            "activity": "Actively maintained as part of SciPy core",
+            "what_it_does": "Built-in barycentric AAA rational approximation of tabulated complex data, with .poles() and .residues() accessors and Froissart-doublet handling notes.",
+            "modeling_approach": "Adaptive Antoulas-Anderson (greedy barycentric) rational fit with automatic order selection; returns barycentric form convertible to pole-residue. No realization/passivity.",
+            "reusable_for_us": "Zero-dependency, license-clean way to get an AUTO-ORDER rational fit of Zout/PSRR (directly serves NEXT task 1's auto-order goal). Use .poles()/.residues() then hand poles to our existing signed-real-pole / 2nd-order-section synthesizer (or to scikit-rf's realizer). Cleanest baseline AAA we can adopt with no licensing friction since it's already in scipy.",
+            "caveats": "AAA can produce spurious Froissart doublets and does not guarantee stable/passive poles — must post-filter (drop poles with tiny residues, reflect RHP poles) before realization. No native complex-conjugate-pair structuring, magnitude weighting, or vector (shared-pole) fit across multiple responses (vector fitting is better when fitting Zout and PSRR with a common pole set)."
+          },
+          {
+            "name": "baryrat",
+            "url": "https://github.com/c-f-h/baryrat",
+            "license": "BSD-2-Clause (permissive)",
+            "language": "Pure Python (numpy/scipy; optional gmpy2/flamp for extended precision)",
+            "activity": "Maintained, CI configured, ~114 commits",
+            "what_it_does": "Barycentric rational/polynomial approximation: AAA, plus BRASIL (best minimax rational approximation), rational interpolation with fixed poles/nodes, Floater-Hormann.",
+            "modeling_approach": "AAA + BRASIL minimax. Exposes polres() (pole-residue extraction) and zeros(). No state-space realization, no passivity, no circuit emit.",
+            "reusable_for_us": "Permissive-license alternative/complement to scipy.AAA for NEXT task 1. Its polres() gives us poles/residues to feed our RLC+controlled-source synthesizer, and BRASIL (best minimax) is attractive when we want a guaranteed-low-error LOW-ORDER fit of PSRR phase rather than least-squares — fewer sections = simpler synthesized netlist = friendlier PSS/HB. BSD-2 means we can vendor it.",
+            "caveats": "No passivity guarantee or enforcement, no complex-conjugate-pair structuring for signed 2nd-order sections (we structure ourselves), and no vector/shared-pole fit. Smaller/niche project than scikit-rf."
+          },
+          {
+            "name": "Vector_Fitting_for_python (SebastianL18) / vectfit_python (PhilReinhold)",
+            "url": "https://github.com/SebastianL18/Vector_Fitting_for_python",
+            "license": "RESTRICTIVE / non-OSS — SebastianL18 README forbids embedding in commercial software and lacks an OSI license; PhilReinhold's vectfit_python is an older MIT-ish port with no recent activity",
+            "language": "Python (numpy/scipy/matplotlib)",
+            "activity": "Low — ~30 commits, no release cadence (Sebastian); PhilReinhold port effectively dormant",
+            "what_it_does": "Direct Python ports of Gustavsen-Semlyen Fast Relaxed Vector Fitting (vectfit3.m). Outputs both state-space (real block-diagonal for conjugate pairs) and pole-residue form.",
+            "modeling_approach": "Classic relaxed vector fitting; real block-diagonal state-space realization of complex-conjugate pairs is a useful pattern. No passivity enforcement, no SPICE/VA export.",
+            "reusable_for_us": "Reference-only. scikit-rf's vector fitting supersedes these (it adds passivity + SPICE export under a clean BSD-3 license). The block-diagonal real-state realization of conjugate pairs is a helpful illustration for our signed 2nd-order sections, but copying SebastianL18's code is blocked by its no-commercial-embedding clause.",
+            "caveats": "Licensing is the dealbreaker for Sebastian's (no-commercial-embedding). No passivity, no circuit emit. Prefer scikit-rf or scipy.AAA instead."
+          },
+          {
+            "name": "ML circuit macromodel -> Verilog-A (Rosenbaum/UIUC/CAEML RNN; neural-ODE circuit transient lineage)",
+            "url": "https://experts.illinois.edu/en/publications/verilog-a-compatible-recurrent-neural-network-model-for-transient",
+            "license": "N/A — no public code release found",
+            "language": "N/A (papers describe PyTorch/LSTM training + hand-written Verilog-A export)",
+            "activity": "Paper-only; repeated searches (CAEML, GitHub topics) found NO maintained open repo for the RNN/neural-ODE-to-Verilog-A flow",
+            "what_it_does": "Body of work (Chen/Raginsky/Rosenbaum EPEPS 2017 'Verilog-A compatible RNN model'; later input-to-state-stable neural-ODE transient models; high-speed-channel RNN) that trains discrete-time RNN/LSTM or neural ODEs on transient data, converts to continuous time, and emits Verilog-A black-box models for SPICE — ~5x speedups claimed.",
+            "modeling_approach": "Black-box NONLINEAR data-driven state-space (RNN/LSTM/neural-ODE) -> Verilog-A. Aimed at nonlinear transient behavior (I/O buffers, ESD, channels). No explicit Zout/PSRR/noise/spur decomposition; PSRR/noise/spurs are not addressed.",
+            "reusable_for_us": "Reference-only / largely a MISMATCH for us. Our spur band is linear (memory: harmonics <-62 dBc) so an LTI multiport (Zout+PSRR) is the right model and a nonlinear NN macromodel is overkill, harder to make PSS/HB-convergent, and risks spurious tones. Worth knowing as the citation lineage if Target B ever shows genuine nonlinearity, but there's no code to lift and the approach doesn't fit our LTI-supply, frequency-domain, passivity-gated pipeline.",
+            "caveats": "No public, maintained code repository despite the prominent papers — cannot be adopted. NN-to-Verilog-A models are notoriously fragile for PSS/HB convergence and don't naturally give noise/spur fidelity; orthogonal to our hard R/L/C-only constraint."
+          },
+          {
+            "name": "chaospy",
+            "url": "https://github.com/jonathf/chaospy",
+            "license": "MIT (permissive)",
+            "language": "Python (numpy/scipy; integrates scikit-learn/openturns)",
+            "activity": "Maintained, widely used UQ toolbox",
+            "what_it_does": "Polynomial chaos expansion + advanced Monte Carlo for uncertainty quantification: low-discrepancy sampling, quadrature, orthogonal-polynomial surrogates.",
+            "modeling_approach": "Polynomial-chaos/quadrature surrogates of scalar/vector outputs vs random parameters. Not a dynamic/frequency-domain or circuit-realization tool.",
+            "reusable_for_us": "Reference-only / tangential for the core model, but a plausible enabler for PVT/Monte-Carlo parameterization: if we later want our OP-parameterized model coefficients (pole/residue values vs load current, temperature, process) as cheap surrogates, chaospy can build the response surface. Not relevant to Zout/PSRR/noise/spur fidelity itself.",
+            "caveats": "Solves a different problem (parametric UQ, not LTI fitting/realization). No circuit/Verilog-A emit. Only pull in if/when we add a PVT corner surrogate layer."
+          },
+          {
+            "name": "GPflow / GPy (Gaussian-process surrogate enablers)",
+            "url": "https://github.com/GPflow/GPflow",
+            "license": "GPflow Apache-2.0; GPy BSD-3-Clause (both permissive)",
+            "language": "Python (GPflow on TensorFlow>=2.4 + TF-Probability; GPy on numpy/scipy)",
+            "activity": "GPflow actively maintained (v2.11.0, Jun 2026); GPy mature/maintenance-mode",
+            "what_it_does": "General Gaussian-process regression frameworks (composable kernels/likelihoods, sparse/variational GPs).",
+            "modeling_approach": "GP regression surrogates of smooth functions. Not frequency-domain rational fitting, no circuit realization.",
+            "reusable_for_us": "Reference-only for the LTI model; possible enabler for smooth interpolation of model coefficients across load current / PVT (alternative to chaospy) if simple table+spline proves insufficient. Adds a heavy TensorFlow dependency (GPflow) — GPy is lighter if we ever need it.",
+            "caveats": "Heavyweight for what is essentially 1-D coefficient interpolation over load current; scipy splines likely suffice. No bearing on Zout/PSRR/noise/spur synthesis or the R/L/C-only constraint."
+          },
+          {
+            "name": "dwarning/VA-Models (Verilog-A compact-model collection)",
+            "url": "https://github.com/dwarning/VA-Models",
+            "license": "Mixed (per-model; many CMC/public compact models, generally redistributable)",
+            "language": "Verilog-A (with ngspice/Xyce/OpenVAF test harnesses)",
+            "activity": "Maintained collection, used as OpenVAF/ngspice test suite",
+            "what_it_does": "Curated set of Verilog-A compact/behavioral models with build/run scripts validated against ngspice, Xyce, and OpenVAF.",
+            "modeling_approach": "Hand-written Verilog-A device/behavioral models; demonstrates idioms that compile cleanly in OpenVAF/Spectre.",
+            "reusable_for_us": "Reference for our Verilog-A MIRROR (.va) emit: concrete, OpenVAF/ngspice/Xyce-validated Verilog-A coding patterns and a ready test-harness structure to confirm our emitted .va compiles. Directly helps the 'must compile (OpenVAF/Spectre)' requirement and the Xyce/Qucs-S HB-validation path. Reference-only (we're not lifting model math).",
+            "caveats": "Device-model focused, not LDO/regulator behavioral models; no Zout/PSRR/noise/spur examples. Value is in VA idioms + cross-simulator test scaffolding, not reusable model code."
+          }
+        ],
+        "takeaways": "For our LTI-supply PSS/HB use case the clear winner is scikit-rf's VectorFitting (BSD-3, actively maintained): it does auto-order rational fitting with complex-conjugate pole pairs, has a built-in passivity test+enforcement (our NEXT task 2 gate), and exports a SPICE subcircuit using ONLY R/L/C + B-type controlled sources with no Laplace blocks, already targeting ngspice/Xyce — i.e. it nearly matches our hard constraint and pipeline out of the box. Round it out with scipy.interpolate.AAA / baryrat (clean licenses) and polyrat (GPL, reference-only) for auto-order and stabilized-SK fitting ideas to tighten non-min-phase PSRR/Zout phase; we still add OP-parameterization, explicit e^-sTau all-pass delay, and noise/spur blocks ourselves since none of these tools model those. The ML circuit-macromodel lineage (Rosenbaum/UIUC RNN-to-Verilog-A, neural-ODE transient) is paper-only with no maintained public code and is a conceptual mismatch — it targets nonlinear transient, whereas our spur band is linear, so it's reference-only at best. GP/PCE surrogates (GPflow Apache-2.0, GPy/chaospy BSD/MIT) and dwarning/VA-Models are useful enablers (PVT coefficient surrogates; OpenVAF/Xyce-validated Verilog-A idioms for our .va mirror) but not core to the model."
+      }
+    ],
+    "ranking": {
+      "ecosystem_summary": "The open-source landscape splits cleanly into three layers, and only two of them contain anything we should actually adopt. Layer 1 = rational FITTERS (vector fitting, AAA, Sanathanan-Koerner). This is mature, permissively licensed, pure-numpy/scipy, and directly serves our hardest open boundary (Task 1 PSRR/Zout phase). Layer 2 = a PASSIVITY GATE: scikit-rf packages the canonical Gustavsen-Semlyen half-size singularity-matrix test + SVD residue-perturbation enforcement under BSD-3, which is essentially our Task-2 gate ready to call. Layer 3 = open HB/PSS ENGINES + the Verilog-A toolchain (Xyce, VACASK, OpenVAF-reloaded), which give us a Cadence-independent way to HB-validate sideband asymmetry and to compile our .va mirror, closing the gap that ngspice has no PSS/HB.\n\nThe single most important practical finding from inspecting our own repo: scipy 1.17.1 is already in the venv and ALREADY ships scipy.interpolate.AAA with .poles()/.residues(). That is a zero-dependency, zero-license-risk, auto-order rational fitter available to us today — it is the cheapest possible first move on Task 1. scikit-rf and baryrat are NOT currently installed; adopting either is a deliberate pip-install decision, not a free lunch.\n\nA hard, repeated lesson across all six scans: every open-source SPICE EMITTER we found (scikit-rf's write_spice_subcircuit_s, SignalIntegrity, the SINTEF ATP-EMTP exporter) realizes a generic S-parameter state-space network with port reference resistors and 1F/1H normalizing elements + VCCS/CCCS — verified Laplace-free, but NOT our per-block physical realization (Zout as physical RLC branches; PSRR as signed real-pole coupling-current sections injected at vout; decoupled Norton noise; deterministic SIN spurs; OP-parameterization by load current; plus a hand-written Verilog-A mirror). None of them model PSRR-vs-Vin, noise PSD, spurs, or load-current parameterization. So the correct architecture is unambiguous: adopt OSS for FITTING and the PASSIVITY CHECK, feed the resulting poles/residues into OUR existing synthesizer (harness/fit_model.py psrr_model / zmodel / emit / emit_va), and keep our emitter and all four behavioral blocks bespoke.\n\nLicensing materially constrains choices because we emit vendor-facing deliverables. The fitters we want are clean (scipy BSD-3 already vendored; scikit-rf BSD-3; baryrat BSD-2). The GPL-3 options (polyrat's stabilized-SK; the vectfit3 ports that are GPL or no-license/non-commercial) are usable only as local, non-distributed tools or as algorithm references to reimplement — never vendored into a shippable emitter. The HB engines (Xyce GPLv3, VACASK AGPL, OpenVAF GPL) are fine because we run them as external subprocesses exactly like ngspice; their licenses do not touch the netlists/models we generate.",
+      "top_reusable": [
+        {
+          "name": "scipy.interpolate.AAA (already in our venv, scipy 1.17.1)",
+          "url": "https://docs.scipy.org/doc/scipy/reference/generated/scipy.interpolate.AAA.html",
+          "license": "BSD-3-Clause",
+          "why": "I verified scipy.interpolate.AAA imports cleanly in our .venv (scipy 1.17.1). It is an auto-order barycentric rational fitter with .poles()/.residues(), native complex-data support, and clean_up() for Froissart doublets. ZERO new dependency, ZERO license risk, callable in fit_model.py today. This is the cheapest possible upgrade path for the auto-order Zout/PSRR fit we want.",
+          "use_for": "Zout fit (auto-order, sharp resonances) + PSRR fit (non-min-phase poles -> feed our signed-section synthesizer); poles/residues plug straight into psrr_model G-bank and zmodel branches.",
+          "risk": "AAA does not enforce stability/passivity/min-phase: must reflect RHP poles, drop tiny residues, and enforce conjugate symmetry before realization. No SPICE/VA emit and no delay extraction (both stay ours). Already mitigated in part by our existing pole-validation logic in _sk_fit."
+        },
+        {
+          "name": "scikit-rf VectorFitting (passivity_test / passivity_enforce + auto_fit)",
+          "url": "https://github.com/scikit-rf/scikit-rf",
+          "license": "BSD-3-Clause",
+          "why": "The single best match for Task 2. Its passivity_test() is the exact Gustavsen-Semlyen half-size singularity matrix you named (source builds P=(A-B inv(D-I) C)(A-B inv(D+I) C) and checks imaginary eigenvalues); passivity_enforce() does SVD residue perturbation. BSD-3, pure numpy/scipy, drops into our 3.11 venv. auto_fit() also gives vector fitting with native complex-conjugate (2nd-order) pole pairs as a cross-check to AAA. NOT currently installed (pip install scikit-rf).",
+          "use_for": "Passivity gate on synthesized Zout (Task 2) + alternative auto-order Zout/PSRR fitter (Task 1, cross-check AAA). Apply passivity ONLY to Zout immittance, never PSRR.",
+          "risk": "PSRR is a non-passive transfer ratio (>1) -> NEVER run passivity_enforce on it. Passivity API is S-param-documented: must feed our 1-port Zout as Z/Y correctly (positive-real test), and verify the gate on our HAND-BUILT RLC, not just on skrf's internal realization. Do NOT reuse write_spice_subcircuit_s (S-param state-space, wrong topology for us). New dependency to install/audit."
+        },
+        {
+          "name": "Xyce (multi-tone Harmonic Balance)",
+          "url": "https://github.com/Xyce/Xyce",
+          "license": "GPL-3.0",
+          "why": "The only mature open engine with real single- AND multi-tone .HB. Runs our exact element set (R/L/C + E/G/F/H + B-sources) natively and ingests Verilog-A. Lets us inject a ~304 MHz carrier + supply tones and read sideband/spur amplitudes WITHOUT Cadence in the loop. Our spur band is linear (memory: harmonics <-62 dBc) so HB converges well. Prebuilt Windows binaries exist; run as a subprocess like ngspice (GPL never touches our netlists).",
+          "use_for": "HB validation of sideband asymmetry for both the SPICE subckt and the .va mirror (Task 3); cross-check Spectre PSS/HB before Cadence.",
+          "risk": "GPLv3 (fine as external validator, do not vendor/link). HB conventions differ from Spectre -> corroborates, not bit-identical. Heavier Windows setup than ngspice; multi-tone .HB card syntax differs from Spectre. Verilog-A path needs an ADMS C++ plugin build (verify HB+VA works together) -> for the .va specifically, VACASK/OpenVAF-reloaded is the lighter route."
+        },
+        {
+          "name": "baryrat (AAA + BRASIL minimax)",
+          "url": "https://github.com/c-f-h/baryrat",
+          "license": "BSD-2-Clause",
+          "why": "Permissive superset of scipy.AAA: adds BRASIL best-uniform (minimax) rational approximation on top of AAA, with polres()/zeros(). Minimax matters specifically for our spur-fidelity goal because it minimizes WORST-CASE error in a band (e.g. near 304 MHz) and tends to give a LOWER-ORDER fit -> fewer sections -> simpler, friendlier PSS/HB netlist. BSD-2 means we can even vendor it.",
+          "use_for": "PSRR/Zout fit when we want guaranteed-low-order or worst-case-bounded sections (Task 1); polres() feeds our synthesizer.",
+          "risk": "Marginal value OVER scipy.AAA since AAA is already in-venv; justified only if minimax/low-order specifically helps. No passivity/stability enforcement (pair with skrf gate). BRASIL is primarily scalar-real-interval; for complex phase you mostly use its AAA path. New (small) dependency."
+        },
+        {
+          "name": "OpenVAF-reloaded + VACASK",
+          "url": "https://github.com/arpadbuermen/OpenVAF",
+          "license": "GPL-3.0 (compiler) / AGPL-3.0 (VACASK)",
+          "why": "OpenVAF-reloaded has PREBUILT WINDOWS binaries (matches our Win/3.11 stack) and compiles our ddt-only, no-Laplace, controlled-source .va to OSDI. VACASK (same author) is the only fully-open path that BOTH runs Verilog-A behavioral models AND has a working HB engine. Together: emit .va -> OpenVAF-reloaded -> .osdi -> VACASK hb gives a Cadence-independent HB check of our .va mirror, and ngspice (v39+) can load the same .osdi for AC/tran parity. Compiler/sim GPL/AGPL never touch our generated models.",
+          "use_for": "Compile-and-check gate for the emitted .va mirror (Task 3) + open HB validation of the .va specifically; closes the 'VA is untested locally' open item from HANDOFF.",
+          "risk": "VACASK is Codeberg-hosted, Linux-first (check Windows build / WSL), newer/less battle-tested than Spectre; no Spectre-netlist parity (port the TB). OpenVAF rejects some behavioral constructs -> keep .va in the supported ddt/controlled-source subset (we already do). HB benefit needs OSDI-0.4-consuming sim (VACASK), not ngspice."
+        }
+      ],
+      "how_others_model_ldo": "There is a sharp divide, and it validates our approach by absence. The OSS LDO-GENERATOR ecosystem (OpenFASOC ldo-gen, AnalogGym, sky130_cw_ip, ALIGN) does NOT build behavioral macromodels at all. They emit transistor-level netlists/GDS and CHARACTERIZE them via testbenches. Their characterization is also narrow relative to ours: AnalogGym's perf_extraction_LDO.py parses ngspice raw output for ~15 DC/AC/transient metrics (load/line reg, PSRR-AC sweep, DC gain, GBW, phase margin, transient under/overshoot) but explicitly does NOT extract output impedance Zout or noise. OpenFASOC's LDO is a DIGITAL LDO characterized transient-only (VREG vs clock freq vs Cout) with no continuous-time PSRR/Zout/noise concept at all. So the exact quantities our model is built on -- Zout(s), noise PSD shape, and discrete spurs -- are precisely what every OSS LDO project omits. That is our differentiator, confirmed across all six scans: nobody open-source extracts Zout/noise/spurs from an LDO and fits a behavioral supply model.\n\nWhere OSS DOES have a coherent modeling philosophy is in the macromodeling/SI world, and it matches ours conceptually. The Mike Brinson Qucs modular opamp macromodels are the closest published example: they build opamp PSRR (via auxiliary networks), output impedance, and noise from controlled sources + lumped elements, explicitly designed to survive HB -- the same per-block, controlled-source, HB-robust philosophy as our Zout/PSRR/noise/spur decomposition. The difference is they hand-design the blocks; we DATA-FIT them from a ground-truth and gate them. The rational-macromodeling community (scikit-rf, baryrat, polyrat, the DEPACT delay-extraction recipe) handles the LINEAR part the way we do -- pole/residue fit then lumped realization -- but they target generic passive multiports/interconnect, so they fit immittance/S-params and synthesize a single generic state-space network. They have no notion of a regulator's two distinct paths (driving-point Zout that should be passivity-gated vs. a PSRR transfer ratio that should NOT), no noise/spur decomposition, and no OP-parameterization by load current. The ML-macromodel lineage (UIUC/Rosenbaum RNN-to-Verilog-A, neural-ODE) is a true mismatch: it targets nonlinear transient black-boxes, has no public code, and would be fragile in PSS/HB -- exactly wrong for our verified-linear spur band.",
+      "mapping_to_our_tasks": "TASK 1 (non-min-phase PSRR/Zout phase + 2nd-order sections + delay). Today our _sk_fit (harness/fit_model.py:147) explicitly REJECTS complex poles (returns None when |pole.imag| is non-negligible -> falls back to the min-phase shelf). That is the precise gap. Plan: (a) Adopt scipy.interpolate.AAA NOW (already in-venv) to fit i_c = H/Zout for PSRR and Zout directly, keeping its complex-conjugate poles instead of discarding them. (b) Extend our psrr_model G-bank: currently it is G0 + sum Gi/(1+s/wi) (signed REAL poles only); add signed 2nd-order (complex-conjugate) sections realized as inductor-free RLC + VCCS so non-min-phase notch phase is exact. AAA/baryrat polres() supplies the conjugate pairs; OUR synthesizer realizes them. (c) Cross-check with scikit-rf auto_fit (native conjugate pairs) on the same Zout/PSRR arrays. (d) DELAY: we already have a Hilbert min-phase/linear-delay DIAGNOSTIC (bringup.py:_minphase_score, line 34 removes the best-fit linear/delay term) but no e^-sTau SYNTHESIS. No OSS implements this (DEPACT is paper-only, no code). Implement DEPACT's recipe ourselves: extract the linear-phase slope = tau, then realize e^-sTau as a lumped Bessel/Pade all-pass (RLC + controlled sources). DEPACT is the design reference, not a dependency.\n\nTASK 2 (passivity gate on synthesized Zout). Greenfield -- no passivity code exists in our harness. Adopt scikit-rf passivity_test() (half-size Hamiltonian/singularity matrix) + is_passive() + passivity_enforce() (SVD residue perturbation). Feed it our Zout poles/residues as a 1-port immittance (positive-real test). CRITICAL: gate/enforce ONLY Zout; never the PSRR transfer ratio. Add it to score.py as a hard gate after Zout synthesis and verify it on OUR hand-built RLC values, not just on skrf's internal realization.\n\nTASK 3 (Target B + HB validation). For IMPORT: if Cadence Zout/PSRR come out as 2-port/Touchstone, use scikit-rf Network Z/Y conversion + IEEEP370 de-embedding to clean to Z(f) before fitting; for our DC-extracted ground truth this is optional. The extraction/fit/emit pipeline itself (import_cadence.py CSV->gt_ref.npz, then existing fit+emit) stays ours -- no OSS does Zout/PSRR/noise/spur extraction. For HB VALIDATION of sideband asymmetry: run the emitted subckt under Xyce multi-tone .HB (304 MHz carrier + supply tones). For the .va mirror specifically (closing the 'VA untested locally' open item): OpenVAF-reloaded (Windows binary) -> .osdi -> ngspice v39+ for AC/tran parity, and -> VACASK hb for an open HB check. Qucs-S is an optional GUI to prewire the Xyce .HB cards.",
+      "gaps_no_oss": "Five pieces have NO usable OSS and stay bespoke. (1) Zout/PSRR/noise/spur EXTRACTION from an LDO: every OSS LDO project (AnalogGym, OpenFASOC, sky130_cw_ip) omits Zout and noise extraction entirely; our bench.py + gen_reference.py is the differentiator. (2) Our per-block PHYSICAL realization + emitter: all OSS emitters (scikit-rf write_spice_subcircuit_s, SignalIntegrity, SINTEF) produce a generic S-parameter state-space network with port reference resistors -- not our physical Zout RLC branches, signed-section PSRR coupling current at vout, decoupled Norton noise, or deterministic SIN spurs. Keep harness/fit_model.py emit/psrr_model/zmodel. (3) The explicit e^-sTau ALL-PASS delay extraction+synthesis: DEPACT describes the recipe but has no maintained open code; we implement the lumped Bessel/Pade all-pass ourselves. (4) NOISE Norton block (white + Lorentzians, In=Sv/|Zout|) and the SPUR block (deterministic vout tones): no OSS models LDO output-noise PSD shape or discrete spurs -- both are entirely ours. (5) OP-PARAMETERIZATION by load current (poles/residues interpolated quad-in-ln(iload)): no rational-fit library has any notion of a parametric sweep coupled to circuit realization (polyrat has multivariate SK and chaospy/GP could surface-fit coefficients later, but that is overkill vs. our existing spline/quadratic interpolation). The Verilog-A MIRROR content is also ours (dwarning/VA-Models gives only device-model idioms and a build harness, no regulator behavioral patterns).",
+      "recommendation": "Adopt three things, in this order, and keep everything else in-house.\n\n1. IMMEDIATELY (zero cost, zero license risk): use scipy.interpolate.AAA -- already importable in our venv (scipy 1.17.1) -- as the auto-order Zout/PSRR fitter for Task 1. Keep its complex-conjugate poles (our _sk_fit currently discards them, which is the documented Task-1 gap) and feed them to an EXTENDED psrr_model that gains signed 2nd-order (complex-conjugate) RLC+VCCS sections. This is the highest-leverage, lowest-risk move.\n\n2. INSTALL scikit-rf (BSD-3) for two jobs: (a) Task-2 passivity gate -- passivity_test (half-size Hamiltonian) + passivity_enforce, applied ONLY to synthesized Zout, never PSRR; (b) auto_fit as a vector-fitting cross-check against AAA. Do NOT use its SPICE exporter -- wrong topology for us.\n\n3. INSTALL Xyce (GPLv3, run as external subprocess) for Task-3 HB validation of sideband asymmetry near 304 MHz, plus OpenVAF-reloaded (Windows binary) + VACASK to compile and HB-check the .va mirror (closes the 'VA untested locally' open item) -- since ngspice has no PSS/HB.\n\nTreat as REFERENCE-ONLY (do not vendor): baryrat (only if minimax/low-order specifically helps -- AAA already covers the base case), polyrat's stabilized-SK (GPL-3; reimplement the published algorithm if our SK conditioning needs it), the vectfit3 ports (GPL/no-license), DEPACT (paper recipe for our own all-pass), AnalogGym/sky130_cw_ip (extra ground-truth DUTs), and Brinson's Qucs macromodels (topology inspiration). Explicitly do not pursue: the ML/RNN-to-Verilog-A lineage (no code, nonlinear, PSS/HB-fragile, mismatched to our verified-linear spur band) and any OSS SPICE emitter. Net: OSS gives us a better fitter and a real passivity gate cheaply, plus an open HB cross-check; the extraction, the four behavioral blocks, the physical synthesizer, the delay all-pass, and the OP-parameterization remain our defensible core."
+    }
+  }
+}

@@ -1,0 +1,1060 @@
+{
+  "summary": "Survey mainstream LDO/supply modeling methods and compare to our per-block behavioral model",
+  "agentCount": 8,
+  "logs": [],
+  "result": {
+    "findings": [
+      {
+        "category": "Analytical / Classical Small-Signal LDO Models (hand-derived symbolic transfer functions, pole-zero placement, loop-gain/PM, closed-form PSRR and Zout, output-noise derivations)",
+        "methods": [
+          {
+            "name": "Rincon-Mora / Gupta voltage-divider (impedance-ratio) PSRR model",
+            "what": "The canonical hand-model for LDO power-supply rejection. The supply ripple vin reaches vout through a voltage divider: the series impedance from VIN to VOUT is the pass-device output resistance roP (PMOS rds, or for an NMOS source-follower roughly 1/gm), and the shunt impedance to ground is the parallel combination of the open-loop output filter ZO (RL || 1/(sCO) including RESR, plus RFB1+RFB2) and the closed-loop shunt impedance ZO-REG = (ZO||roP)/LGV that the feedback loop creates. Supply gain AIN = vout/vin = (ZO||ZO-REG)/(roP + ZO||ZO-REG), and PSR = 1/AIN. In closed form the PSRR Bode plot has PSRdc = (Aol*beta)^-1 (set by DC loop gain), a dominant ZERO at z1 = BWA (error-amp/dominant-pole bandwidth, where loop gain starts dropping), a pole p1 = UGF (loop unity-gain frequency, where PSR is worst, typically 0.1-10 MHz), a pole p2 = pout (the output pole when CO shunts roP), and an ESR zero z2 = 1/(2*pi*RESR*CO) that degrades high-frequency rejection. The whole approach reuses op-amp PSRR theory (Steyaert-Sansen, Sackinger).",
+            "where_used": "Georgia Tech (Gabriel Rincon-Mora, Vishal Gupta, Amit Patel) JSSC/TCAS-II/ISCAS/SOC papers and Rincon-Mora's book 'Analog IC Design with Low-Dropout Regulators' (McGraw-Hill, 2009). It is the standard mental model taught in industry/academia for LDO PSRR and is the basis of most app-note PSRR explanations (TI, ADI, Maxim AN-883/898).",
+            "strengths": [
+              "Gives direct physical insight: PSR = ratio of supply-to-output impedance over output-to-ground impedance; you immediately see what raises PSR (raise roP / supply impedance, lower ZO-REG / raise loop gain, add Cout).",
+              "Closed-form PSRR(f) with explicit DC value and pole/zero list (PSRdc, BWA, UGF, pout, ESR zero) maps one-to-one onto the measured PSRR curve and the 'worst-case PSR near UGF' notch that matters for RF supplies.",
+              "Correctly predicts the high-frequency floor set by CO and RESR (PSR -> roP/RESR), and the distinction between PMOS, NMOS-cascode, NMOS source-follower supply paths.",
+              "Calculated vs simulated pole/zero agreement is good (their Table I: fZD/fCO/fPD/fO/fEA within ~10-15%), so it is genuinely predictive, not just qualitative."
+            ],
+            "weaknesses": [
+              "Single-input model: classically derived for the VIN->VOUT path only. To use it for spur fidelity you must separately and self-consistently fit Zout(f) and the loop gain; the same roP/loop-gain quantities appear in both, and hand algebra rarely keeps them phase-consistent.",
+              "Pole-zero counting is approximate (widely-separated-pole assumption). Near a Zout/loop resonance (complex pole pair, peaking/inductive bump) the real-pole cascade misrepresents both magnitude AND phase, which is exactly where transient ringing and spur phase live.",
+              "Captures only deterministic small-signal ripple transfer. It says nothing about discrete spurs originating inside the LDO (charge-pump ripple, reference/clock tones, bias spurs) - those are added by hand as separate sources, not predicted.",
+              "Assumes LTI, single bias point; gm-compression, slewing, and the load-dependence of roP/pout (PSR shifts with IL) require re-deriving per operating point.",
+              "Bipolar/PNP and current-mode variants (Patel-Rincon-Mora) add a second series-feedback loop and several more poles/zeros, so the 'simple divider' becomes a multi-loop algebra exercise that is easy to get wrong."
+            ],
+            "supply_handling": "This is THE classical method for Zout(f) and PSRR(f) as closed forms: ZO-REG = (ZO||roP)/LGV makes the loop-gain-shaped output impedance explicit, and PSR = 1/AIN with poles at BWA/UGF/pout and the ESR zero. It does NOT natively produce noise PSD (added as separate output-referred sources) and does NOT produce discrete spurs (must be injected by hand). For PSS/HB it is not a runnable model by itself - it is a recipe whose extracted poles/zeros you then realize as a laplace_nd/Foster network; if you keep magnitude AND phase of Zout and the VIN->VOUT path consistent it feeds spur fidelity well, but the real-pole approximations near resonances are the weak point for spur amplitude/phase accuracy.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Loop-gain / phase-margin closed-loop Zout reduction (feedback theory: Zout = Zo,ol/(1+T(s)))",
+            "what": "The classical feedback view (Razavi 'The Low Dropout Regulator: A Circuit for All Seasons', IEEE SSC-M 2019; ADI 'Ask The Applications Engineer-37'). Open-loop output impedance Zo,ol (set by pass-device output resistance in parallel with RL, gds3, R1+R2 and CO) is reduced by the return ratio: Zout(s) = Zo,ol(s)/(1+T(s)), where T(s) is the loop gain (error-amp gain * pass-device gm * output network). At DC, Zout is tiny (Zo,ol/T0). As frequency rises, T(s) rolls off at -20 dB/dec past the dominant pole, so Zout RISES with frequency at +20 dB/dec - i.e. the LDO looks INDUCTIVE - until CO takes over and Zout falls again. This inductive region, interacting with load capacitance, forms a series-RLC and is the source of the transient ringing and the Zout 'bump'. Loop gain T(s), phase margin, dominant pole (CO*RL or Miller), gain-bandwidth and the ESR zero (placed to recover phase margin) are the design knobs.",
+            "where_used": "Razavi (UCLA) tutorial paper; ADI Analog Dialogue (Ask The Applications Engineer-37, Understand LDO Concepts); standard in every analog-IC textbook (Razavi 'Design of Analog CMOS ICs', Sansen). Universally used by designers to reason about stability and transient response before any simulation.",
+            "strengths": [
+              "Directly connects stability (phase margin of T(s)) to output-impedance shape and to transient overshoot/ringing - one transfer function explains AC, transient and PSRR behavior.",
+              "The Zout = Zo,ol/(1+T) form is exact in the LTI sense and exposes the inductive-rise mechanism, which is precisely the resonant Zout feature your project found governs the load-step ring.",
+              "Clear pass-device contrast: PMOS common-source vs NMOS source-follower change Zo,ol, the location of the output pole, and the supply path, so the same framework explains why NMOS LDOs have ~20-30 dB better PSRR.",
+              "Easy to convert into a behavioral model: realize T(s) and Zo,ol as rational functions, then Zout follows; this is the cleanest path to a phase-correct Zout for PSS/HB."
+            ],
+            "weaknesses": [
+              "Requires an accurate symbolic T(s); for multi-stage / nested-Miller / DFCFC capless loops the hand-derived T(s) gets high-order and error-prone, and the '1+T' division can hide where complex poles actually land.",
+              "The inductive-Zout / complex-pole region is exactly where the dominant-pole approximation is least valid, so hand numbers for the resonant peak Q and frequency are often off - and that peak sets ring amplitude/spur sidebands.",
+              "Says nothing about noise or spurs directly - those are bolted on.",
+              "Load-, ESR- and Cout-dependence means a single T(s) is only valid at one operating corner; capless vs large-Cout designs need different dominant-pole stories."
+            ],
+            "supply_handling": "Best classical handle on Zout(f) WITH correct phase (the +20 dB/dec inductive rise and the CO-induced fall), because Zout = Zo,ol/(1+T) preserves phase if T(s) is rational. PSRR can be derived in the same framework (forward supply path / (1+T)). Noise PSD and discrete spurs are out of scope. For PSS/HB: this is the most convergence-friendly basis - realize T(s) and Zo,ol as low-order rational laplace_nd blocks and the LDO becomes a passive, smooth LTI two-port (Zout + PSRR), which HB/shooting handle with no Newton-convergence trouble; the only fidelity risk is under-modeling the resonant pole pair.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Closed-form output-noise PSD decomposition (input-referred noise * noise gain)",
+            "what": "Analytical LDO output-noise model: refer every internal noise source to the error-amp input, then multiply by the closed-loop noise gain (1 + R1/R2) up to the loop bandwidth. En_out = sqrt(En_div^2 + En_ref^2 + En_erramp^2): contributions from the feedback divider, the voltage reference (bandgap), and the error amplifier. The reference and error-amp dominate; the pass FET is negligible because its noise is divided by the large open-loop gain between it and the EA input (TI SLAA412 'LDO Noise Demystified'; ADI AN-1120). Each source carries a 1/f (flicker) part rising at low f and a flat thermal floor; the loop low-pass-shapes them and the bandgap is RC-filtered (large internal R + external Cnr) so the noise rolls off above the loop/filter bandwidth. Output noise is specified either as spectral density (uV/rtHz) - needed for RF/sideband work - or integrated RMS (uVrms) - for sampled systems.",
+            "where_used": "TI app notes (SLAA412), ADI AN-1120 'Noise Sources in Low Dropout Regulators', ultra-low-noise LDO datasheets (ADM717x, TPS717xx, LT306x), and academic low-1/f-noise LDO papers (MDPI Electronics 2025). Standard for noise budgeting.",
+            "strengths": [
+              "Identifies the right dominant sources (reference + EA) and the noise-gain (1+R1/R2) multiplier, giving a quick uVrms/uV-rtHz estimate from a few parameters.",
+              "Explains the two real reduction levers (lower EA bandwidth; RC-filter the bandgap with a noise-reduction cap) that designers actually use.",
+              "Naturally separates flicker (1/f) and thermal (white) regions, matching measured spectral-density curves; gives the spectral shape RF sideband analysis needs."
+            ],
+            "weaknesses": [
+              "Classical version is white+1/f only and assumes noise rides 'through' a flat gain; it ignores that the output noise is LOOP-SHAPED by Zout (your finding: Sout = Sv*|Yout|^2 + PSRR path), so a naive white-through-flat-gain model mis-shapes the spectrum near the Zout resonance.",
+              "Predicts a smooth PSD - it does NOT predict the DISCRETE spurs that real LDOs emit (reference/clock/charge-pump tones); those must be added as deterministic sources.",
+              "Source values (kf flicker coeff, reference noise) are process-specific fit parameters, not derivable by hand; the model is a template you must calibrate.",
+              "Integrated-RMS number loses frequency info and is useless for placing a sideband relative to an RF carrier."
+            ],
+            "supply_handling": "Gives the output NOISE PSD as a closed form (sum of referred sources * noise gain, with 1/f + thermal shape and a loop/filter low-pass). Properly extended it becomes an output-referred shaped Norton source (In = Sv/|Zout|) plus the PSRR path - the generalization your project adopted. It does NOT model discrete spurs (a known gap that must be filled by an explicit tone source) and is silent on Zout/PSRR phase. For PSS/HB: noise is handled in the separate Pnoise/Hbnoise step, where Spectre folds noise sidebands via periodic transfer functions (PXF) to the carrier; a behavioral shaped-Norton + PSRR noise model plugs straight into that and converges trivially since it is linear, but its spur-fidelity value is zero unless deterministic tones are added on top.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Capless / multi-stage symbolic compensation models (DFCFC, nested-Miller, pole-splitting)",
+            "what": "For internally-compensated (capacitor-less) LDOs the output pole is no longer dominant, so designers hand-derive a 3-stage-amplifier transfer function and apply pole-splitting / nested-Miller / damping-factor-control frequency compensation (Leung & Mok, JSSC 2003) to place a complex-conjugate non-dominant pole pair with a controlled damping factor and to track the pole that moves with load current. The closed-form loop gain becomes a 3rd/4th-order rational with deliberately positioned zeros (Miller, feedforward CFF) cancelling parasitic poles, and Zout/PSRR are derived from that higher-order T(s).",
+            "where_used": "Leung-Mok (HKUST) and successors; capless LDOs for SoC point-of-load; MIT/GIST low-noise three-stage LDO theses; modern fast-transient capless designs. Used wherever no off-chip Cout is allowed.",
+            "strengths": [
+              "Handles the regime your generalization work hit (capless, multi-pole) where the simple single-output-pole divider model breaks.",
+              "Explicitly models the complex-pole pair and its damping factor - i.e. the resonant Zout peak - rather than approximating it with real poles, so it can predict ring Q and the spur-relevant peaking.",
+              "Provides principled zero placement (feedforward/Miller) that you can replicate in a behavioral Zout/PSRR fit."
+            ],
+            "weaknesses": [
+              "High-order symbolic algebra (3-4 poles, multiple zeros, load-dependent) is tedious and error-prone by hand; most designers fall back to simulation to confirm.",
+              "Strongly load- and process-dependent; the pole pair migrates with IL and gm, so a single closed form is only locally valid.",
+              "Still LTI/small-signal: no spurs, no large-signal slew, no native noise.",
+              "Damping-factor expressions are sensitive to parasitic estimates that are hard to know without extraction."
+            ],
+            "supply_handling": "Produces a higher-order, complex-pole Zout(f) and PSRR(f) that more faithfully captures resonant peaking/inductive behavior than the real-pole divider model - good for phase-correct Zout. Noise and spurs still external. For PSS/HB: realizing the 3rd/4th-order T(s) and the resulting Zout as a rational laplace_nd block is still smooth and convergence-friendly; the higher order slightly raises HB harmonic/sideband bookkeeping but remains far cheaper and more robust than the transistor-level multistage loop, which itself can struggle with PSS shooting convergence.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "NMOS source-follower vs PMOS common-source pass-device supply-path analysis",
+            "what": "Classical comparison of how the pass device sets the VIN->VOUT supply path and thus PSRR. A PMOS common-source pass device couples supply ripple through its gate-referenced gain (and its rds), giving moderate PSRR that the loop must fight. An NMOS source-follower pass device intrinsically attenuates supply ripple (source follows gate, and the gate is regulated/clean), so VIN->VOUT is ~1/gm-divided rather than rds-divided, yielding ~20-30 dB better PSRR below and above the dominant pole - at the cost of a gate drive above VIN (charge pump) and headroom. Hand analysis expresses the supply path roP (PMOS) vs ~1/gm and the follower's ripple-replica behavior at the source.",
+            "where_used": "Razavi tutorial; multiple JSSC/patent NMOS-LDO and super-source-follower works; supply-noise-cancellation NMOS LDO patents (US9577508); RF/PLL/VCO point-of-load LDOs where PSRR is paramount.",
+            "strengths": [
+              "Explains the single biggest architectural PSRR lever (NMOS-SF >> PMOS) in closed form, directly relevant to choosing/representing the supply element near an RF carrier.",
+              "Maps cleanly to the divider model's roP term (just swap roP for the follower's ~1/gm supply impedance).",
+              "Captures the 'follower passes a replica of gate ripple' subtlety that determines residual PSRR."
+            ],
+            "weaknesses": [
+              "Qualitative-to-semi-quantitative; exact numbers need the EA PSRR and charge-pump ripple folded in.",
+              "NMOS-SF introduces charge-pump switching spurs onto the rail - a DISCRETE-spur source the small-signal analysis ignores.",
+              "Headroom/charge-pump complexity means the 'clean gate' assumption can fail and re-inject supply ripple."
+            ],
+            "supply_handling": "Sets the DC/HF asymptotes of the VIN->VOUT (PSRR) path and the supply-side term of Zout. Directly informs the behavioral PSRR block's high-frequency floor. It actually FLAGS a discrete-spur source (charge-pump ripple in NMOS-SF designs) that pure small-signal models miss - useful as a reminder to add a deterministic tone at the pump frequency. For PSS/HB the choice only changes the fitted PSRR(f) asymptotes, not the convergence behavior of a behavioral two-port.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Realization of hand-derived transfer functions as Verilog-A/Laplace behavioral two-ports (the bridge to PSS/HB)",
+            "what": "Not a derivation method but the standard way classical results are USED in EDA: take the hand-derived Zout(s), PSRR(s)=VIN->VOUT(s), and noise PSD, and realize them as a behavioral two-port - either pole-zero Laplace primitives (Verilog-A laplace_zp/laplace_np/laplace_nd, Spectre ahdlLib) or an equivalent Foster/Cauer RLC ladder - presenting the supply node as an LTI element (regulated source + series Zout + ripple-injection via PSRR), with deterministic spur tones added as ideal sources and noise as a shaped Norton source.",
+            "where_used": "Cadence Spectre/SpectreRF behavioral flows (ahdlLib, Verilog-A), the EDABoard/Cadence-forum recommended LDO behavioral-modeling practice (model the op-amp/loop via laplace_zp), Qucs/HB behavioral-macromodel literature (Brinson). This is exactly the family your project's emitted SPICE/Verilog-A model lives in.",
+            "strengths": [
+              "Turns paper transfer functions into a runnable model that is orders of magnitude faster than transistor-level in PSS/HB and avoids the regulator loop's Newton-convergence pitfalls.",
+              "If Zout and PSRR are kept rational with correct magnitude AND phase, the model reproduces transient ringing, PSRR notch, and carrier-sideband ripple faithfully.",
+              "Linear LTI blocks partition cleanly in HB (Brinson: keep nonlinear parts in Verilog-A, linear parts as components, one linear element per macromodel node) - excellent convergence.",
+              "Deterministic spur tones and shaped-Norton noise can be superposed without disturbing the LTI core, giving full spur fidelity in one model."
+            ],
+            "weaknesses": [
+              "Pure-Laplace blocks can have convergence/causality issues in shooting/transient if poles are near-imaginary or if a non-minimum-phase response is forced through a minimum-phase realization (your V4 PSRR non-min-phase fix is exactly this trap).",
+              "Trapezoidal-rule ringing in PSS shooting can stall on high-Q rational blocks; needs gear2/trap method and adequate tstab.",
+              "Fidelity is only as good as the hand-extracted poles/zeros - garbage Q/phase in gives garbage spur sidebands out.",
+              "High-order Laplace blocks increase HB harmonic/sideband count and memory; must keep order minimal."
+            ],
+            "supply_handling": "This is where Zout(f), PSRR(f), noise PSD, AND discrete spurs are finally COMBINED into one supply element: series Zout (rational), VIN->VOUT PSRR path (rational), shaped-Norton noise (for Pnoise/Hbnoise PXF folding to the carrier), and explicit tone sources for deterministic spurs. Done right it is the fastest, most convergent route to PSS/HB spur fidelity; the failure modes are non-minimum-phase mis-realization, too-high-Q rational poles stalling shooting, and forgetting that spurs must be explicit (the LTI core never creates them).",
+            "maturity": "mainstream-production"
+          }
+        ],
+        "relevance_to_spur_pss": "Highly relevant as the FOUNDATION, with sharp limits. The analytical/classical family is exactly what lets you replace a transistor-level LDO with a fast, convergent supply element for PSS/HB near an RF carrier: (1) The loop-gain / closed-loop-output-impedance result Zout(s)=Zo,ol/(1+T(s)) and the Rincon-Mora voltage-divider PSRR (PSRdc=(Aol*beta)^-1, dominant zero at BWA, pole at UGF, output pole pout, ESR zero at 1/2*pi*RESR*CO) give you closed-form Zout(f) and PSRR(f) that, when realized as low-order rational laplace_nd/Foster two-ports with correct MAGNITUDE AND PHASE, reproduce both the transient ring and the carrier-sideband ripple while converging far better in shooting/HB than the real regulator loop (no Newton-stall on the multistage loop, smooth LTI partitioning per Brinson). This matches your project's findings that the spur band is linear and that transient is governed by a phase-correct Zout. (2) The classical noise decomposition gives the output noise PSD shape (1/f + thermal, noise-gain (1+R1/R2)) that, once loop/Zout-shaped into a Norton source, folds correctly to carrier sidebands via Spectre Pnoise/Hbnoise PXF. BUT three things the classical small-signal family fundamentally CANNOT do and that dominate spur fidelity: (a) it never predicts DISCRETE SPURS - reference/clock/charge-pump/bias tones must be added as explicit deterministic sources at vout (your spur block); the LTI core creates no new tones. (b) Its widely-separated-real-pole approximations misrepresent the resonant/complex-pole Zout peak and the non-minimum-phase PSRR - exactly the magnitude/phase region that sets spur amplitude and phase (your V4 non-min-phase fix and the need for signed Foster sections). (c) It is single-bias-point LTI, so gm-compression/slew and load-dependent pole migration are out of scope (fine here since your spur band is linear, but a caveat). Net: use the classical results to STRUCTURE and seed the behavioral Zout/PSRR/noise blocks (right poles/zeros, right asymptotes, right physical knobs), then fit magnitude+phase to ground-truth and bolt on explicit spur tones - which is precisely the per-block swappable model your memory describes.",
+        "sources": [
+          "Amit P. Patel and Gabriel A. Rincon-Mora, 'High Power-Supply-Rejection (PSR) Current-Mode Low-Dropout (LDO) Regulator', IEEE TCAS-II (full text consulted): https://rincon-mora.gatech.edu/publicat/jrnls/tcasii09_ldo_psr.pdf",
+          "Vishal Gupta and Gabriel A. Rincon-Mora, 'A Low Dropout, CMOS Regulator with High PSR over Wideband Frequencies', IEEE ISCAS 2005 (full text consulted; defines PSRdc=(Aol*beta)^-1, zero=BWA, poles=UGF & pout, ESR zero=1/2*pi*RESR*Cout): https://rincon-mora.gatech.edu/publicat/cnfs/iscas05_ldo_psr.pdf",
+          "Gabriel A. Rincon-Mora, 'Analog IC Design with Low-Dropout Regulators', McGraw-Hill, 2009 (referenced as primary textbook for the divider model)",
+          "Gabriel A. Rincon-Mora, 'Study and Design of Low Drop-Out Regulators' (Rincon-Mora & Allen): https://rincon-mora.gatech.edu/publicat/unpub_pprs/ldo_des.pdf",
+          "Gabriel A. Rincon-Mora, 'Integrated Linear Regulators: Design Recipes for High PSRR Performance' (GTAC): https://www.rincon-mora.gatech.edu/research/gtac/gtac_s3f.pdf",
+          "V. Gupta and G. A. Rincon-Mora, 'High-PSR LDOs: Variations, Improvements, and Best Compromise', IEEE TCAS-II 2021: https://rincon-mora.gatech.edu/publicat/jrnls/tcasii21psr.pdf",
+          "Behzad Razavi, 'The Low Dropout Regulator [A Circuit for All Seasons]', IEEE Solid-State Circuits Magazine, 2019: https://ieeexplore.ieee.org/document/8741287/ (Zout = parallel combination of Y_L, gds3, R1+R2 and closed-loop pass-device Zout)",
+          "Sanjay Pithadia and Ankur Verma, 'LDO Noise Demystified', TI Application Report SLAA412B (full text consulted; ties LDO noise to RF sidebands/transmit mask and to VCO noise-floor / aliasing): https://www.ti.com/lit/pdf/slaa412",
+          "Analog Devices, AN-1120 'Noise Sources in Low Dropout (LDO) Regulators': https://www.analog.com/en/resources/app-notes/an-1120.html",
+          "Analog Devices, 'Ask The Applications Engineer-37: Low-Dropout Regulators' (inductive Zout from loop-gain rolloff; Zout=Zo,ol/(1+T)): https://www.analog.com/en/resources/analog-dialogue/articles/low-dropout-regulators.html",
+          "K. N. Leung and P. K. T. Mok, 'A Capacitor-Free CMOS Low-Dropout Regulator With Damping-Factor-Control Frequency Compensation', IEEE JSSC vol.38 no.10, Oct 2003: https://www.semanticscholar.org/paper/1d51798fc7ae6b28e24c619afd827693235d1e8a",
+          "M. S. J. Steyaert and W. M. C. Sansen, 'Power supply rejection ratio in operational transconductance amplifiers', IEEE TCAS vol.37, 1990 (op-amp PSRR theory underlying the LDO divider model)",
+          "Springer Nature, 'Analog LDO' (Chapter 3) small-signal loop-gain/Zout/PSRR derivations: https://link.springer.com/content/pdf/10.1007/978-3-031-84916-9_3.pdf",
+          "M. Brinson et al., 'Qucs Equation-Defined and Verilog-A Higher Order Behavioral Device Models for Harmonic Balance Circuit Simulation' (HB convergence via linear macromodel partitioning): https://core.ac.uk/download/pdf/161866839.pdf",
+          "V. Saxena, 'Behavioral Modeling using Verilog-A' (laplace_zp/np/nd for op-amp/loop transfer functions in Spectre PSS/HB): https://www.eecis.udel.edu/~vsaxena/courses/ece504/Handouts/VerilogA%20Modeling.pdf",
+          "Cadence, 'Noise Simulation in Spectre RF Using Improved Pnoise/Hbnoise' (PXF sideband-to-output noise folding around a carrier): https://community.cadence.com/cadence_blogs_8/b/rf/posts/virtuoso-video-diary-noise-simulation-in-spectre-rf-using-improved-pnoise-hbnoise-and-direct-plot-form-options"
+        ]
+      },
+      {
+        "category": "Behavioral macromodeling in Verilog-A / Verilog-AMS / VHDL-AMS and controlled-source equivalent-circuit macromodels for LDOs/regulators/op-amps",
+        "methods": [
+          {
+            "name": "Controlled-source equivalent-circuit op-amp/regulator macromodel (Boyle-style and modern G/E-element)",
+            "what": "The classic SPICE-netlist macromodel: replace the transistor-level circuit with a small fixed topology of controlled sources (E=VCVS, F=CCCS, G=VCCS, H=CCVS), R, C, L, and diodes that reproduces the terminal behavior. Boyle/Cohn/Pederson/Solomon (1974) and Alexander/Bowers established the canonical three-stage form: a (gain-normalized) input differential stage, an intermediate gain+pole-shaping stage, and an output stage with current/voltage limiters and a slew-rate clamp. Modern versions (e.g., Renesas SLG88103V whitepaper, 2017/2025) keep the cascaded-section idea but drop the input transistor pair entirely, building the input stage from diodes + dependent sources so that CMRR, PSRR+, PSRR-, Vos, bias/offset current, voltage/current noise and their temperature dependence are each modeled by a dedicated G-R-L-E sub-ladder. Pole/zero shaping is done with explicit RC stages (R23/C4 second pole, R24/C5 dominant pole, extra stages added as needed); slew rate via reverse-breakdown diodes (BV=SR*C); output impedance via G14/R33 + L6 networks.",
+            "where_used": "The dominant industry approach for vendor SPICE models distributed with parts (ADI/LTspice, TI, Renesas/Dialog, Microchip, ON Semi). Runs in any SPICE-class engine: Spectre, HSPICE, Eldo/Questa-ADMS, PSpice, LTspice, ngspice, AFS/Spectre APS. Used for board/PMIC/SoC system simulation where the designer needs a part-accurate but cheap supply/amplifier model.",
+            "strengths": [
+              "Engine-agnostic and ubiquitous — runs everywhere SPICE runs; no Verilog-A compiler needed",
+              "Each electrical parameter (PSRR, CMRR, noise, Zout, slew, Iq) is an independently tunable sub-network, so datasheet fitting is direct and modular",
+              "Built from real R/C/L/diode/controlled-source primitives, so it is inherently charge/current-based and natural state lives in caps/inductors — generally PSS/HB friendly (no hidden state)",
+              "Renesas reports good speedup vs transistor-level with measured-vs-simulated agreement on gain/phase, CMRR, PSRR, noise PSD, step response",
+              "Mature: 50 years of accumulated practice, well-understood failure modes"
+            ],
+            "weaknesses": [
+              "Hand-built topology is laborious and brittle; adding poles/zeros or a second Zout resonance means editing the netlist by hand",
+              "Boyle-style gain-normalized input stage does NOT represent the true input/supply path, so PSRR, CMRR, Zout are often crude or DC-only in legacy models — the well-known weak spot",
+              "Diode-based slew/limit blocks introduce hard nonlinearities (clamps) that hurt HB/PSS convergence if they are active at the period boundary",
+              "Discrete-spur generation is not native: a controlled-source linear macromodel only passes a supply tone to the output through its PSRR/Zout path — it will reproduce a spur if the supply stimulus contains it, but it does not itself synthesize deterministic tones",
+              "Noise is modeled as PSD sources (white R + 1/f diode) for .noise analysis; these do not become time-domain spurs and are excluded from PSS large-signal solution"
+            ],
+            "supply_handling": "Zout(f): modeled explicitly with G/R/L output ladders (Renesas G14/R33/L6) — can give a resonant Zout if an L and C are included; only as accurate as the hand-placed poles. PSRR(f): modeled with dedicated supply-sensing sub-ladders (G4-R15-L2-R16-E6 for PSRR+, G5-R17-L3-R18-E8 for PSRR-) where the L sets the +20dB/dec rolloff — gives a real frequency-dependent PSRR injected into the signal path, working in both AC and transient. Noise PSD: white via a resistor, 1/f via series diode+source; valid only in .noise/.AC. Discrete spurs: only reproduced if the supply node is driven with the tone; the model multiplies it by PSRR(f) — fidelity of the sideband equals fidelity of the fitted PSRR/Zout. PSS/HB: because state is in real caps/inductors (ddt-equivalent), these models are usually accepted by shooting and HB; the risk is the diode clamps (slew/output limiters) being active at a shooting boundary, causing non-convergence — mitigated by setting tstab so clamps are inactive at the boundary.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Verilog-A behavioral macromodel using Laplace operators (laplace_nd / laplace_zp / laplace_zd / laplace_np)",
+            "what": "Write the regulator/op-amp as a Verilog-A module whose transfer characteristics (open-loop gain, Zout, PSRR, line/load reg) are expressed as rational transfer functions via the built-in Laplace filter operators. The error amp is an ideal high-gain block with a laplace_nd loop-gain shape; the pass device and feedback set DC line/load regulation; PSRR is a second laplace_nd whose input is the sensed supply node V(vdd) and whose output is summed (via a contribution) into V(vout); Zout is realized either as an explicit Norton current contribution through a laplace_nd admittance or as the closed-loop result of the modeled loop gain. This is the form taught in Kundert's Designer's Guide to Verilog-AMS and in university Verilog-A courses (Saxena ECE504), and the form the LDO chapters (Springer/MDPI) use.",
+            "where_used": "Cadence Spectre/AMS Designer, Synopsys (CustomSim/HSPICE Verilog-A), Siemens Eldo/Questa, Keysight ADS (Verilog-A for HB). Used by IP/PMIC teams for SoC-level co-simulation and by the automotive LDO PSRR-modeling work (MDPI Mathematics 2022). It is the family the user's own project uses (laplace-based PSRR/Zout blocks).",
+            "strengths": [
+              "Compact and parametric: a full PSRR(f) or Zout(f) is one laplace_nd numerator/denominator coefficient list — trivial to refit from extracted poles/zeros",
+              "laplace_nd state is a SpectreRF-SUPPORTED differential-operator state (Kundert: ddt, idt, idtmod and Laplace filter functions are the only state SpectreRF handles natively) — so it is legal and convergent in PSS shooting and HB, unlike delay/z-domain forms",
+              "Exact small-signal frequency response in AC and correct linear propagation in PSS/HB small-signal phases, so a supply tone is passed to the output as a true sideband with correct magnitude AND phase",
+              "Separable per-effect blocks (loop gain, PSRR+, PSRR-, Zout, noise) map cleanly onto the physics",
+              "Can add white_noise()/flicker_noise() contributions that feed .noise and pnoise analyses"
+            ],
+            "weaknesses": [
+              "High-order laplace_nd can be numerically stiff; Cadence's Andrew Beckett notes that naively replacing laplace_nd with an explicit ddt-based ODE (tracking 3rd derivatives) causes 'no convergence at minimum time step' — the Laplace operator is better-conditioned, but very high order or widely-spaced poles still stress the solver",
+              "Laplace operators are linear/time-invariant: a single laplace_nd cannot create new tones; nonlinear spur generation (e.g., supply-dependent gm modulation, mixing) must be added explicitly with smooth analog expressions, and those must be C-infinity to stay HB-convergent",
+              "Transient accuracy of Laplace operators depends on simulator's internal convolution/recursive-filter implementation and timestep; impulse-response truncation can smear fast Zout ringing",
+              "Getting both magnitude AND phase of PSRR/Zout right requires a true (possibly non-minimum-phase) fit — minimum-phase-only fits give wrong transient/sideband phase (a boundary the user's project already hit)",
+              "Authoring still requires Verilog-A toolchain and per-effect fitting; not as plug-and-play as a vendor .lib"
+            ],
+            "supply_handling": "Zout(f): a laplace_nd admittance/impedance driven by the load gives an exact, phase-correct Zout including resonances — strong. PSRR(f): a dedicated laplace_nd from V(vdd) to a vout contribution gives exact frequency-dependent supply rejection in AC, transient, PSS and HB; this is the cleanest way to inject a supply ripple as an output sideband. Noise PSD: white_noise()/flicker_noise() contributions give correct output noise PSD for .noise/pnoise; for loop-shaped noise the Norton-at-vout (Sin=Sv*|Yout|^2) formulation is needed (matches the user's finding). Discrete spurs: a pure-Laplace model is linear so it only RELAYS supply spurs through PSRR(f) — fidelity of the sideband = fidelity of the laplace fit; deterministic self-generated tones require an explicit smooth nonlinear contribution. PSS/HB: best-in-class among behavioral options because Laplace state is exactly the state SpectreRF/HB knows how to set/read/sensitize; no hidden state, co-periodic with sources, robust under shooting and harmonic balance.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Behavioral macromodel using lumped-RC / ddt-idt ODE realizations (no Laplace operator)",
+            "what": "Instead of laplace_nd, realize the same poles/zeros with explicit reactive contributions: I(n) <+ C*ddt(V(n)), V(n) <+ L*ddt(I(n)), or integral forms with idt/idtmod, optionally building the transfer function as a state-space/ODE in Verilog-A. PSRR and Zout become small explicit RLC sub-networks (the Verilog-A analogue of the controlled-source macromodel). This is the bridge between the netlist macromodel and the Laplace-operator model.",
+            "where_used": "Used when designers want explicit, physically-interpretable state (e.g., to expose an output cap, ESR, bondwire L), when the simulator's Laplace implementation is suspected, or in engines with weak Laplace support. Common in Verilog-AMS power-converter models (Spiazzi/Buso) and in compact-model practice generally.",
+            "strengths": [
+              "State lives in ddt/idt/idtmod operators, which Kundert confirms are SpectreRF-supported — so these models are PSS/HB-legal when written carefully",
+              "Physically interpretable: each pole is a real C or L you can tie to a layout parasitic (Cout, ESR, bondwire) — good for what-if and for matching transient ringing exactly",
+              "Can be made fully charge-based (q=C*V), which is the most convergence-robust formulation for Newton/shooting",
+              "No dependence on the simulator's Laplace convolution engine"
+            ],
+            "weaknesses": [
+              "Andrew Beckett (Cadence forum) documents the central pitfall: an explicit ddt-ODE that is the algebraic equivalent of a laplace_nd can FAIL transient convergence ('No convergence with minimum time step') where the Laplace operator converged — high derivatives are numerically sensitive and need rescaling and custom natures/disciplines with their own abstol/blowup",
+              "More verbose and error-prone than one laplace_nd line for high-order responses",
+              "Easy to accidentally create hidden state (a variable used before set, or set only inside @cross/@timer) which SpectreRF outlaws and aborts on — must keep every variable assigned every iteration (Kundert)",
+              "Same linearity limitation: no native spur synthesis"
+            ],
+            "supply_handling": "Zout(f): exact and phase-correct if the RLC ladder matches the extracted impedance; naturally captures resonant ringing in transient. PSRR(f): an explicit RLC supply-to-output network injects the ripple with correct frequency shaping (same idea as the controlled-source macromodel, but in Verilog-A). Noise PSD: add white_noise/flicker_noise contributions. Discrete spurs: linear — relays supply tones only. PSS/HB: supported because state is in ddt/idt/idtmod, BUT more fragile than laplace_nd — high-order ddt forms can blow up minimum timestep (Beckett), and careless coding introduces hidden state that SpectreRF rejects. Net: use laplace_nd unless you specifically need exposed physical state.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Event/threshold-rich behavioral models (transition/slew/cross/last_crossing, @timer, local-state) for regulator digital wrappers (soft-start, current-limit, UVLO, PWM/PFM)",
+            "what": "Many regulator behaviors are inherently event-driven: soft-start ramps, current-limit foldback, UVLO comparators, enable sequencing, mode switching (PWM/PFM), and switching-converter control loops. The natural Verilog-A/AMS coding uses cross()/above() event detection, transition()/slew() for clean edges, @timer for periodic sampling, and integer/real local variables that remember state between events. Kundert's track-and-hold, divider and DFF examples are the canonical patterns.",
+            "where_used": "PMIC system models, switching-regulator/DC-DC behavioral models, supervisory/sequencing logic, and the digital-control portions of mixed-signal LDOs (digital LDOs). Heavily used in Verilog-AMS and VHDL-AMS PMIC simulation and in real-number-model (RNM) flows.",
+            "strengths": [
+              "Naturally expresses sequencing/protection behavior that is awkward in pure controlled-source form",
+              "transition()/slew() give clean, timestep-controlled edges for transient and digital co-sim",
+              "Fast for system-level transient and functional verification of start-up/fault behavior"
+            ],
+            "weaknesses": [
+              "This is the family that BREAKS PSS/HB. Kundert: delay and z-domain transfer functions create hidden state and are OUTLAWED — Spectre aborts before RF analysis. transition/slew/cross/last_crossing also create hidden state (briefly), and random/dist_* both create hidden state and a non-periodic process unusable in PSS/QPSS",
+              "Local state variables (value used before set, or set only inside an event block) are detected and cause SpectreRF to terminate",
+              "Even when made hidden-state-free (idt-based DFF), an abstract sample/transition model can BLOCK small-signal propagation — the transition output is fixed by the large-signal solution, so a supply sideband does NOT propagate (Kundert's small-signal-propagation caveat). Fatal for spur/sideband fidelity",
+              "Workarounds (ignore_state / instrument_module attributes) only suppress the error message; they do NOT fix the underlying convergence/propagation problem and are only safe for measurement/stimulus blocks"
+            ],
+            "supply_handling": "Zout(f)/PSRR(f): generally NOT modeled in this family (it is for digital/sequencing behavior); if a regulator core is wrapped this way, the small-signal supply path is often broken. Noise PSD: random/dist_* are unusable in PSS/QPSS. Discrete spurs: a switching-converter event model CAN generate deterministic tones in transient (switching ripple), but if it relies on hidden state it cannot be carried into PSS/HB, and if it uses transition() the sideband won't propagate in the small-signal phase. PSS/HB: WORST family for RF — must keep co-periodic with sources, avoid all hidden-state functions, and ensure a continuous signal path each period; otherwise non-convergent or silently wrong sidebands. For spur fidelity near a carrier, keep the supply path purely Laplace/ddt and quarantine event logic outside the RF small-signal path.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Dedicated frequency-dependent PSRR injection technique for LDO behavioral models (auxiliary-network / supply-sensing transfer-function approach)",
+            "what": "A focused refinement (e.g., the MDPI Mathematics 2022 automotive-LDO PSRR work; op-amp PSRR macromodeling literature) that treats PSRR(f) as a first-class, accurately-fitted transfer function rather than a single DC number. The supply node is sensed, passed through a fitted multi-pole/zero network (Laplace operator or auxiliary RLC schematic with G/R/L/E ladders), and summed into the output. PSRR+ and PSRR- are handled separately. The 2022 automotive paper reports an optimized PSRR model accurate below ~500 kHz, motivated by the fact that legacy vendor LDO models had only crude/DC PSRR.",
+            "where_used": "Automotive/industrial LDO behavioral models where supply-ripple rejection across the converter switching band is safety/EMC-relevant; op-amp vendor macromodels (CMRR/PSRR sub-ladders). Implemented in both SPICE controlled-source form and Verilog-A laplace form.",
+            "strengths": [
+              "Directly targets the hardest-to-model and most spur-relevant quantity — frequency-dependent supply rejection",
+              "Separate PSRR+/PSRR- and proper pole/zero fit give correct sideband magnitude across the supply-ripple band",
+              "Drop-in for AC, transient and (if Laplace/ddt-based) PSS/HB; relays a supply tone to the output as a phase-correct sideband",
+              "Matches the user's project architecture (signed-section SK-fit PSRR block, non-minimum-phase fix)"
+            ],
+            "weaknesses": [
+              "Stated validity is band-limited (the automotive model: below ~500 kHz) — near an RF carrier the PSRR fit may need to extend much higher in frequency and capture non-minimum-phase behavior",
+              "Still linear: it relays supply spurs but does not synthesize new ones from regulator nonlinearity",
+              "Quality is entirely fit-dependent: wrong phase or a missing non-minimum-phase zero gives wrong sideband phase/magnitude even if |PSRR| looks right",
+              "Requires careful extraction of PSRR from the real LDO (AC + possibly large-signal) to fit"
+            ],
+            "supply_handling": "This technique IS the supply-handling method: PSRR(f) is the deliverable. Zout(f) is typically modeled by a companion network. Noise: add PSD sources. Discrete spurs: best-in-class for RELAYING a deterministic supply tone into a correct output sideband (magnitude+phase), which is exactly the LDO-as-supply-element-near-carrier use case; it does not itself create tones. PSS/HB: convergent and correct provided it is realized with laplace_nd or ddt/idt (supported state) and not with event/hidden-state constructs.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Verilog-A/EDD models engineered specifically for Harmonic Balance (Brinson/Qucs RF device modeling discipline)",
+            "what": "A modeling discipline (Brinson & Kuznetsov, Qucs equation-defined-device + Verilog-A RF models for HB) for writing behavioral models that converge well in harmonic balance specifically. Core rules: keep as much of the model LINEAR as possible and confine nonlinearity to small, well-behaved equation-defined/Verilog-A blocks; ensure all branch constitutive relations are continuous and infinitely differentiable; reserve nonlinear sections so HB partitioning does not fail; avoid constructs that HB cannot Fourier-transform (hidden state, hard clamps, lookup discontinuities).",
+            "where_used": "Qucs/QucsStudio, Keysight ADS, and general HB-based RF flows; the methodology generalizes to any HB engine (Spectre HB, ADS HB). Directly relevant to modeling an LDO as a supply element inside an HB RF sim.",
+            "strengths": [
+              "Explicit recipe for HB-convergent behavioral models: linear-dominant + small smooth nonlinear cores + C-infinity constitutive relations",
+              "Reduces HB 'partition failure' by keeping nonlinear partitions small",
+              "Compatible with the Laplace/ddt linear-supply-path approach the user needs",
+              "Aligns with Coram et al. 'Best Practices for Compact Modeling in Verilog-A': continuity and differentiability are MANDATORY for Newton/HB convergence; avoid hidden state; use $limexp instead of exp; smooth all transitions"
+            ],
+            "weaknesses": [
+              "A discipline/guideline rather than a turnkey LDO model — you still write the model",
+              "Strict smoothness can force approximation of genuinely sharp behavior (current limit, dropout knee) with smooth functions, trading a little accuracy for convergence",
+              "Not all behavioral authors follow it, so many existing vendor/IP models are NOT HB-clean"
+            ],
+            "supply_handling": "Zout(f)/PSRR(f): unchanged in form (Laplace/ddt) but the discipline ensures they remain HB-convergent. Noise PSD: keep noise as small-signal PSD (white_noise/flicker_noise), excluded from the HB large-signal balance; use pnoise/HBnoise for sideband noise. Discrete spurs: if a deterministic tone must be self-generated, implement it as a small, smooth, co-periodic nonlinear contribution so HB can Fourier-resolve it; never via random/event/hidden-state. PSS/HB: this is the family whose entire purpose is robust PSS/HB convergence — the right lens for fast spur-fidelity LDO modeling.",
+            "maturity": "emerging"
+          }
+        ],
+        "relevance_to_spur_pss": "Highly relevant — this family is the correct foundation for the user's goal, and the survey resolves the core design questions. (1) For an LDO acting as a SUPPLY element whose only job is to relay/shape a supply tone into a sideband near an RF carrier, the spur band is linear (consistent with the user's own MEMORY finding that harmonics are <-62 dBc), so a LINEAR multiport behavioral model defined by Zout(f) and PSRR(f) is sufficient and is exactly what the controlled-source and Laplace families provide. (2) The single most important convergence fact, from Kundert's 'Hidden State in SpectreRF': SpectreRF/PSS supports ONLY the state held by ddt, idt, idtmod, and the Laplace filter functions (laplace_nd etc.). Therefore the supply path MUST be realized with laplace_nd or ddt/idt — NOT with delay, z-transform, transition, slew, cross, last_crossing, or random/dist_* (all create hidden state; some are outlawed outright and abort the run, others break or block small-signal propagation so the sideband silently vanishes). This directly tells the user how to keep the model PSS/HB-convergent and fast. (3) laplace_nd is the recommended realization for phase-correct PSRR(f)/Zout(f): it is the best-conditioned (Beckett: the equivalent hand-rolled high-order ddt ODE can fail at minimum timestep) and it is HB/PSS-legal. Non-minimum-phase fits matter (matches the user's V4 PSRR finding) because sideband PHASE depends on it. (4) For deterministic self-generated spurs (the user's spur block), pure linear models only RELAY supply tones; any self-generated tone must be a small, smooth, co-periodic nonlinear contribution per the Brinson/Coram HB discipline (continuous, C-infinity, no hidden state), or injected as a deterministic source — never via random()/event logic which is non-periodic and unusable in PSS/QPSS. (5) Noise should stay as PSD (white_noise/flicker_noise, or the Norton-at-vout loop-shaped form the user adopted) feeding pnoise/HBnoise, kept OUT of the large-signal HB balance. Net: build the LDO as a linear Laplace (laplace_nd) two-port in Zout(f)+PSRR(f), add smooth co-periodic deterministic spur sources, keep noise as PSD — this maximizes spur fidelity AND PSS/HB convergence/speed.",
+        "sources": [
+          "Kenneth S. Kundert, 'Hidden State in SpectreRF', The Designer's Guide Community, v2 (2019/2024) — https://designers-guide.org/analysis/hidden-state.pdf (full text read: ddt/idt/idtmod/Laplace are the only SpectreRF-supported state; delay/z-transform outlawed; transition/slew/cross/last_crossing and random/dist_* cause hidden state; small-signal propagation caveat)",
+          "Geoffrey J. Coram et al., 'Best Practices for Compact Modeling in Verilog-A', IEEE — https://www.researchgate.net/publication/281227678_Best_Practices_for_Compact_Modeling_in_Verilog-A (continuity/differentiability mandatory; avoid hidden state; $limexp; convergence written into the model)",
+          "Cadence Community forum, 'Convergence difficulties in Verilog A while using equivalent differential equation instead of laplace_nd function' (Andrew Beckett, Cadence) — https://community.cadence.com/cadence_technology_forums/f/custom-ic-design/37413/ (laplace_nd converges where equivalent 3rd-order ddt ODE fails at min timestep; scale derivatives, custom natures/disciplines)",
+          "Cadence Community forum, 'How to avoid Hidden State in VerilogA model for SpectreRF' (Andrew Beckett) — https://community.cadence.com/cadence_technology_forums/f/rf-design/26712/ (keep every variable assigned every iteration; cross() + assignment pattern; idt-based state)",
+          "Nazar Shtybel (Renesas), 'Designing an Accurate SPICE Macromodel for Ultra-Low Power, Rail-to-Rail CMOS Op Amps', White Paper R19WP0020EE0101 (2017/2025) — https://www.renesas.com/en/document/whp/designing-accurate-spice-macromodel-ultra-low-power-rail-rail-cmos-op-amps (full text read: modern controlled-source macromodel; PSRR+/PSRR- as G-R-L-E ladders; noise = white R + 1/f diode; output-Z = G/R/L; references Boyle 1974 and Alexander/Bowers)",
+          "Boyle, Cohn, Pederson, Solomon, 'Macromodeling of Integrated Circuit Operational Amplifiers', IEEE JSSC vol. SC-9 no. 6, Dec 1974 (foundational controlled-source op-amp macromodel)",
+          "M. Brinson & V. Kuznetsov, 'Qucs equation-defined and Verilog-A RF device models for harmonic balance circuit simulation' — https://core.ac.uk/download/pdf/161866839.pdf and https://repository.londonmet.ac.uk/3928/ (keep model linear-dominant, confine smooth nonlinearity, reduce HB partition failure)",
+          "'Optimized Power Supply Rejection Ratio Modeling Technique for Simulation of Automotive Low-Dropout Linear Voltage Regulators', MDPI Mathematics 10(7):1150, 2022 — https://www.mdpi.com/2227-7390/10/7/1150 (frequency-dependent PSRR behavioral model accurate below ~500 kHz; legacy LDO models had crude/DC PSRR)",
+          "'SPICE It Up: Understanding and Using Op-Amp Macromodels', Electronic Design — https://www.electronicdesign.com/technologies/analog/article/21806271/ (Boyle three-stage VCVS/VCCS structure and limitations)",
+          "'Macromodeling of Operational Amplifier's Power Supply Rejection Ratio Effects', ResearchGate 229005936 (PSRR+/PSRR- frequency-dependent macromodel injection)",
+          "Vishal Saxena, ECE504 'Behavioral Modeling using Verilog-A' course handout, Univ. of Delaware — https://www.eecis.udel.edu/~vsaxena/courses/ece504/Handouts/VerilogA%20Modeling.pdf (laplace_nd, gain/pole/zero, slew, white_noise/flicker_noise patterns)",
+          "Kenneth S. Kundert & Olaf Zinke, 'The Designer's Guide to Verilog-AMS', Springer/Kluwer 2004 (behavioral op-amp/regulator modeling, Laplace operators, AMS methodology)",
+          "Verilog-AMS Language Reference Manual v2.x, Accellera (laplace_nd/laplace_zp definition; analog operator restrictions)",
+          "'Behavioral Modeling of LDO', Springer chapter 10.1007/978-81-322-1524-0_10 (LDO block-level behavioral model: error amp via Laplace, PSRR, line/load regulation)"
+        ]
+      },
+      {
+        "category": "Black-box system identification &amp; rational/passive macromodeling (signal-/power-integrity world): fitting measured/simulated Zout(f), PSRR(f), Y/Z/S data into pole-residue state-space models and synthesizing passive SPICE/Verilog-A equivalent circuits",
+        "methods": [
+          {
+            "name": "Vector Fitting (VF) — Gustavsen-Semlyen, incl. Relaxed VF (RVF) and Orthonormal VF",
+            "what": "The workhorse of the family. VF fits tabulated complex frequency-response data H(jw) (a scalar, or each entry of a Y/Z/S matrix, or PSRR(jw)) to a rational pole-residue model H(s) = d + s*e + sum_k c_k/(s - p_k). It is an iterative reformulation of the Sanathanan-Koerner (SK) iteration cast in a partial-fraction (barycentric-like) basis: starting from an initial pole set, it solves a linear least-squares problem for residues plus the residues of a 'scaling' sigma(s); the zeros of sigma become the relocated poles for the next iteration. Real poles give first-order sections, complex-conjugate pairs give second-order sections, and the model is forced to have stable (LHP) poles by flipping any RHP poles. Relaxed VF (Gustavsen 2006) removes the rigid high-frequency asymptotic =1 constraint on sigma, dramatically improving pole relocation and convergence especially on noisy data; Orthonormal VF (Deschrijver/Dhaene) replaces partial fractions with orthonormal rational basis functions for better conditioning at high order. Matrix/fast VF shares a common pole set across all matrix entries for a compact MIMO macromodel.",
+            "where_used": "Reference implementation vectfit3.m (SINTEF, Gustavsen). Python: scikit-rf skrf.vectorFitting (vector_fit, auto_fit, passivity_test, passivity_enforce, write_spice_subcircuit_s). Commercial: IdEM / IdemWorks (Grivet-Talocia, now part of Dassault SIMULIA SI/PI flow), Keysight ADS broadband SPICE / 'Fit' models, Cadence Sigrity/PowerSI, Simberian Simbeor. Dominant in power-systems EMTP, high-speed interconnect/package SI, and PDN/PI impedance modeling.",
+            "strengths": [
+              "Robust, mature, well-documented; de-facto industry standard for turning measured/simulated Z(f)/Y(f)/S(f) into a state-space + SPICE model.",
+              "Directly applicable to an LDO's measured/simulated Zout(f) (as a 1-port Z or Y) and PSRR(f) (as a 2-port transfer / controlled-source path).",
+              "Guarantees stable poles; pairs naturally with passivity enforcement to give SPICE-convergent, energy-bounded models.",
+              "Output is exactly a sum of RLC sections + controlled sources, which simulators (incl. PSS/HB) handle as ideal linear elements — fast and analytically Jacobian-friendly."
+            ],
+            "weaknesses": [
+              "Pure LS fit weights by |data| and frequency sampling; small-but-important features (a sharp PSRR notch, a high-Q Zout resonance) need adequate sample density and sometimes inverse-magnitude weighting or they get under-fit.",
+              "Passivity enforcement and the minimum-phase assumption are in tension with genuinely non-minimum-phase LDO PSRR (RHP zeros / sign reversals / loop delay) — see supply_handling.",
+              "Order selection is manual-ish (n_poles_real/n_poles_cmplx); too few poles miss resonances, too many create spurious near-cancelling pole/zero pairs that hurt HB/PSS Jacobian conditioning.",
+              "Noisy data degrades the fit (relaxed VF helps but VF still interpolates noise to some degree)."
+            ],
+            "supply_handling": "Zout(f): excellent — a 1-port Z(s) or Y(s) pole-residue model captures the LDO output resonance (the load-step ring) with correct magnitude AND phase, which is exactly what governs transient and what a passive RLC realization reproduces. PSRR(f): good for magnitude/phase but the catch is non-minimum-phase content (the model memory notes a non-min-phase V4 PSRR with sign reversals): standard passive VF assumes a minimum-phase/passive response; a true RHP zero or net loop delay must be modeled explicitly (signed sections / cascaded delay+rational), otherwise VF either mis-fits the phase or the passivity step distorts it. Noise PSD: VF is for transfer/immittance functions, not stochastic sources — but it is the right tool to fit the SHAPING filter |Zout(jw)| or the loop-shape so a Norton noise source Sin = Sv*|Yout|^2 can be injected at vout (matches the project's shaped-Norton approach). Discrete spurs: VF cannot represent deterministic tones — spurs are not part of a rational immittance and must be added as separate periodic sources; VF only provides the linear transfer that the spur propagates through. PSS/HB: ideal citizen — once realized as RLC + linear controlled sources the macromodel is exactly linear, so it contributes a constant (frequency-evaluated) admittance stamp into HB and a linear block into shooting/PSS with no convergence penalty and analytic derivatives; this is the single biggest argument for VF in this application.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Sanathanan-Koerner (SK) iteration / Levy linearized rational LS",
+            "what": "The classical ancestor (Levy 1959 linearized; Sanathanan-Koerner 1963 iteratively reweighted). Writes H(jw) ~ N(jw)/D(jw), multiplies through by D to linearize (Levy), then iteratively reweights each LS solve by 1/|D_prev| so the solution converges to the true weighted nonlinear LS fit rather than the magnitude-biased Levy fit. VF is essentially SK in a partial-fraction basis with explicit pole flipping for stability; modern 'stabilized SK' variants (e.g. Hochman) add orthogonal polynomial bases to fix the notorious ill-conditioning of the monomial Vandermonde system at wide bandwidth/high order.",
+            "where_used": "Foundational in control/system-ID textbooks and MATLAB-style transfer-function fitting; underlies invfreqs/invfreqz-type routines and the theory behind VF. Used directly when a numerator/denominator polynomial form (rather than pole-residue) is wanted — e.g. fitting a compact PSRR(s) for a Verilog-A Laplace block.",
+            "strengths": [
+              "Conceptually simple; gives a closed-form rational TF (num/den) directly usable in Verilog-A laplace_nd / s-domain blocks.",
+              "Natural for low-order LDO loop transfer functions where you actually want zeros (incl. RHP zeros) explicit.",
+              "Stabilized (orthogonal-basis) versions are competitive with VF in accuracy."
+            ],
+            "weaknesses": [
+              "Naive monomial implementation is severely ill-conditioned over wide frequency spans (exactly the LDO mHz-to-100MHz span), causing garbage high-order fits — this is precisely why VF replaced it for SI work.",
+              "No built-in stability guarantee (poles can land in RHP); must post-process.",
+              "Iteration can stall or oscillate on noisy/resonant data."
+            ],
+            "supply_handling": "Zout/PSRR: can fit both as N(s)/D(s); the advantage over VF is that RHP zeros in a non-minimum-phase PSRR are represented naturally in the numerator, so it is arguably the cleaner route for the project's signed/non-min-phase PSRR block. Noise PSD / spurs: same as VF — SK fits transfer functions only, not sources or tones. PSS/HB: if realized as a linear laplace block or RLC it is as convergence-friendly as VF; but if left as a high-order ill-conditioned polynomial, HB Jacobian stamps can be poorly scaled. Practical recommendation: use SK/stabilized-SK when you want explicit RHP zeros in PSRR(s), use VF when you want a guaranteed-passive RLC Zout.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Loewner framework (LF) — Mayo-Antoulas, tangential interpolation",
+            "what": "A direct, essentially non-iterative data-driven realization method. From frequency samples it partitions the data into 'left' and 'right' sets and builds the Loewner matrix L and shifted-Loewner matrix Ls; for MIMO it uses tangential (left/right direction-vector) interpolation. An SVD of [L, Ls] (and the pencil) reveals the true minimal McMillan degree: the numerical rank tells you the model order, and truncating the SVD gives a reduced descriptor/state-space realization (E,A,B,C) that interpolates the data. No initial pole guess, no SK-style iteration.",
+            "where_used": "Strong in the model-order-reduction / systems-and-control community (Antoulas, Beattie, Gugercin) and increasingly in SI/microwave macromodeling and EM data reduction. Appears in research macromodeling flows and some MOR toolboxes; used for very-high-port-count S-parameter reduction.",
+            "strengths": [
+              "Non-iterative and pole-guess-free — avoids VF's convergence sensitivity entirely.",
+              "Automatically exposes the minimal order via the singular-value drop, giving a principled order-selection (useful to find the smallest LDO Zout/PSRR model that still rings correctly).",
+              "Naturally MIMO/multiport via tangential interpolation (good if Zout, PSRR, and a load-port are modeled as one multiport)."
+            ],
+            "weaknesses": [
+              "Raw LF interpolates noise (it forces exact interpolation), so on measured/noisy LDO data it overfits unless regularized (least-squares Loewner) — a documented weakness.",
+              "Produces a descriptor (E,A,B,C) realization that is not inherently passive or even guaranteed stable; needs the same passivity/stability post-processing as VF, and SPICE synthesis from a descriptor form is less standardized than from VF pole-residue.",
+              "Less turnkey tooling than VF for the SPICE-export step; more of a research/MOR tool."
+            ],
+            "supply_handling": "Zout/PSRR: fits both accurately and gives the minimal order, attractive when you want the smallest convergent macromodel. Non-minimum-phase: LF makes no minimum-phase assumption, so RHP zeros are captured as naturally as any other data — a genuine advantage over passive VF for the V4-style PSRR. Noise PSD: again a transfer-function tool, used for the shaping filter, not the stochastic source. Discrete spurs: not representable. PSS/HB: once converted to state-space/RLC it is linear and HB/PSS-friendly like VF; but the lack of built-in passivity means an un-enforced descriptor model can inject negative-resistance behavior that breaks HB/shooting convergence — passivity must be enforced before trusting it in PSS.",
+            "maturity": "emerging"
+          },
+          {
+            "name": "AAA algorithm (adaptive Antoulas-Anderson) — barycentric rational approximation",
+            "what": "Modern (Nakatsukasa-Sete-Trefethen, SIAM 2018) rational approximation in barycentric form with greedy adaptive selection of support/interpolation points plus a linearized LS solve for barycentric weights. Yields poles/residues (via a generalized eigenvalue problem on the barycentric form) with near-best accuracy, no user-supplied pole count, and strong numerical stability. A natural competitor/complement to VF and LF for the fitting step.",
+            "where_used": "Originated in numerical-analysis (Chebfun/Oxford) but rapidly adopted for frequency-response and nonlinear-eigenvalue/rational fitting; used in research SI/EM contexts and as a robust front-end that can seed VF or feed a realization. set-valued/MIMO and weighted variants exist.",
+            "strengths": [
+              "Extremely robust and parameter-free (no initial poles, automatic order via greedy stopping) — avoids both SK ill-conditioning and VF pole-init sensitivity.",
+              "Barycentric form is well-conditioned even over the wide LDO frequency span; gives clean poles/residues for subsequent RLC synthesis.",
+              "Handles sharp features (PSRR notches, Zout resonances) gracefully because support points cluster adaptively where the response varies fast."
+            ],
+            "weaknesses": [
+              "Does not enforce stability or passivity natively — extracted poles can be RHP and must be filtered/flipped, and passivity enforced separately.",
+              "Less established than VF in production SI EDA SPICE-export flows; you typically use AAA to FIT then hand off to a VF/state-space realization+passivity step.",
+              "Weighting for relative (dB) accuracy on PSRR needs care."
+            ],
+            "supply_handling": "Zout/PSRR: high-accuracy magnitude+phase fit with automatic order; arguably best-in-class for capturing a high-Q Zout resonance with few poles. Non-minimum-phase: no min-phase assumption, RHP zeros captured directly. Noise PSD: shaping-filter fitting only, like the others. Spurs: not representable. PSS/HB: only as convergence-friendly as the realization you build from its poles/residues — after stability filtering and RLC/state-space synthesis it is a linear block identical in HB behavior to a VF model. Practical role here: a robust fitter to seed/replace VF, especially for tricky PSRR shapes.",
+            "maturity": "emerging"
+          },
+          {
+            "name": "State-space realization + passivity enforcement (Hamiltonian / residue-perturbation)",
+            "what": "The 'make it physical and convergent' stage applied after any fitter (VF/LF/AAA/SK). The pole-residue model is realized as a state-space (A,B,C,D[,E]) system. Passivity is then (1) verified — the standard fast test forms a Hamiltonian (or half-size singularity-test) matrix whose purely-imaginary eigenvalues mark frequency bands where the model violates passivity (Re{Y}<0 or |S|>1); and (2) enforced — by perturbing residues / Hamiltonian eigenvalues (Grivet-Talocia 2004 Hamiltonian perturbation; Gustavsen fast residue-perturbation; Semlyen-Gustavsen half-size test) to push all eigenvalues off the imaginary axis with minimal change to the fit. DC-preserving and accuracy-constrained variants exist.",
+            "where_used": "Built into IdEM/IdemWorks, scikit-rf (passivity_test/passivity_enforce), Keysight/Cadence broadband-model generators, EMTP. The canonical reference is Grivet-Talocia & Gustavsen, 'Passive Macromodeling: Theory and Applications' (Wiley 2016).",
+            "strengths": [
+              "Guarantees the macromodel cannot generate energy — the key to STABLE time-domain AND PSS/HB/shooting simulation; a non-passive Zout model is the classic cause of HB/transient divergence.",
+              "Fast modern tests (half-size, Hamiltonian) make verification cheap even at high order/port count.",
+              "Enforcement preserves accuracy within a user tolerance and can preserve DC exactly (important for an LDO's regulated DC operating point)."
+            ],
+            "weaknesses": [
+              "Passivity is the WRONG constraint for an active element: an LDO with PSRR < 0 dB (gain from supply) or with regions where it appears to deliver energy is legitimately non-passive, so blindly enforcing passivity on the PSRR path can corrupt the model. Passivity should be applied to the genuinely passive Zout port, NOT to active gain/PSRR paths.",
+              "Enforcement is iterative and can fail to converge or over-perturb when violations are large.",
+              "Non-minimum-phase responses are not made causal/physical by passivity enforcement — that needs delay extraction (next method)."
+            ],
+            "supply_handling": "Zout: enforce passivity here — a passive Norton/RLC Zout is exactly right and is what keeps load-step transients and HB stable. PSRR: do NOT force passivity (it is an active transfer path); use stability-only constraints and explicit RHP-zero/sign handling. Noise PSD: passive realization of the shaping immittance ensures the injected Norton noise sees a physical, stable filter. Spurs: orthogonal to this step. PSS/HB convergence: THIS is the lever — passivity + stability of the linear macromodel is the dominant factor in whether SpectreRF PSS/HB and Spectre HB converge near the carrier; a passive, low-order, well-scaled state-space/RLC block stamps cleanly and keeps the Newton/shooting Jacobian well-conditioned.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "SPICE/Verilog-A equivalent-circuit synthesis from pole-residue (RLC + controlled-source realization)",
+            "what": "Turns the rational model into a netlist the simulator treats as ideal linear elements. Each real pole c/(s-p) becomes a first-order section (parallel RC for impedance form, series RL for admittance form: R, C=1/c, etc.); each complex-conjugate pole pair becomes a second-order RLC section, often with a voltage/current-controlled source (gyrator or VCCS) to realize the required (possibly negative) residue sign and to map a residue/pole pair to physical R,L,C values; the constant d and proportional s*e terms become a resistor and an inductor (impedance) or resistor and capacitor (admittance). Gustavsen 'SPICE equivalent circuits of frequency-domain responses' (IEEE TEMC 2002) and the Wiley book give the canonical branch formulas; scikit-rf write_spice_subcircuit_s emits a controlled-source state-space netlist directly. For Verilog-A, the same model is emitted as a laplace_nd / pole-residue analog block or as the shaped-Norton + PSRR-path structure used in the project.",
+            "where_used": "IdEM SPICE-link, scikit-rf, Keysight ADS, Cadence Sigrity/Spectre broadband models; the project itself emits SPICE subckt + Verilog-A from fitted Zout/PSRR.",
+            "strengths": [
+              "Produces a portable, simulator-agnostic block (works in ngspice, Spectre, HSPICE, ADS) — matches the project's ngspice-subprocess + Verilog-A emission.",
+              "RLC + linear controlled sources are exactly the elements PSS/HB/shooting handle most efficiently (constant stamps, analytic Jacobians) — best possible convergence behavior.",
+              "Human-inspectable: poles/resonances map to recognizable LC sections (the Zout resonance is literally an LC tank)."
+            ],
+            "weaknesses": [
+              "Negative R/L/C from sign-indefinite residues require controlled sources; some simulators dislike negative elements and convergence/initialization can suffer if not realized via VCCS/gyrator.",
+              "Constant + proportional (d, s*e) terms and any net delay are awkward to realize purely with R/L/C (the s*e term is a pure inductor/capacitor that can dominate at band edges and add stiffness).",
+              "Verilog-A laplace blocks are convenient but some are evaluated differently (or with hidden interpolation) in HB vs transient, occasionally hurting spur fidelity — a hand-built RLC/controlled-source netlist is safer for PSS/HB."
+            ],
+            "supply_handling": "Zout: realize as a passive Norton (current source in parallel with synthesized Y(s) RLC) — directly supports injecting the shaped noise current and the deterministic spur currents at vout. PSRR: realize as a VCCS/E-source path from the supply node to vout with the fitted transfer (allowing the active, non-passive gain and RHP-zero sign). Noise PSD: the synthesized passive Zout doubles as the noise-shaping network; white+Lorentzian Norton sources injected across it reproduce the loop-shaped output noise. Discrete spurs: implemented as independent periodic current/voltage sources at vout at the measured tone frequencies/phases — this is THE place spurs live, and PSS/HB then folds them to f_RF +/- m*f_spur sidebands. PSS/HB: a clean RLC+controlled-source subckt is the most convergence-robust representation; avoids the per-iteration cost and possible HB-mode artifacts of a behavioral laplace block.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Delay-extraction / non-minimum-phase macromodeling (DEPACT, delayed VF)",
+            "what": "Handles responses whose phase is NOT minimum-phase — i.e. they contain pure transport delay or RHP zeros that a finite stable pole-residue model cannot represent without huge order. The method factors H(s) = e^{-s*tau} * H_rational(s) (delay extracted by Brent-method optimization or causal Fourier continuation / Hilbert-transform causality check), or builds a cascade of delay + rational sections (DEPACT). Delayed/iterative VF optimizes tau jointly with poles/residues. RHP zeros are then either left in the numerator (non-passive but stable) or approximated by an all-pass/delay factor.",
+            "where_used": "High-speed interconnect / long-transmission-line macromodeling (Achar, Nakhla, Grivet-Talocia, Charest); relevant whenever measured phase shows net group delay beyond what poles explain.",
+            "strengths": [
+              "Correctly represents net loop delay / RHP-zero phase lag with low rational order — directly relevant to a fast LDO loop whose PSRR phase rolls past minimum-phase expectation.",
+              "Keeps the rational part low-order and well-conditioned, which is good for HB/PSS Jacobian quality.",
+              "Causality-checked (Hilbert/Kramers-Kronig) so the model does not respond before excitation."
+            ],
+            "weaknesses": [
+              "A pure delay e^{-s*tau} is itself hard for HB/PSS: in HB it is an exact per-harmonic phase rotation (fine), but in shooting/transient it needs a delay line / Pade approximation that can re-introduce poles and hurt convergence.",
+              "Joint delay+pole optimization is more fragile than plain VF.",
+              "Overkill for an LDO if the non-min-phase content is just one RHP zero — a signed second-order section (as the project already does) is simpler."
+            ],
+            "supply_handling": "Zout: usually minimum-phase, so delay extraction rarely needed. PSRR: THE relevant tool when the project's non-min-phase V4 PSRR has net group delay rather than a single RHP zero — extract tau, fit the rest rationally, and in HB the delay is an exact phase term per harmonic (good for spur-phase fidelity around the carrier). Noise PSD: not applicable (sources, not transfer). Discrete spurs: spur PHASE relative to carrier depends on the PSRR/Zout phase the spur sees; getting the non-min-phase phase right (via delay extraction) is what makes the predicted sideband phase/asymmetry correct. PSS/HB: HB tolerates pure delay well (exact in frequency domain), which actually favors HB over shooting/transient for non-min-phase LDO supply modeling near an RF carrier; in shooting-PSS use a low-order Pade of the delay to stay convergent.",
+            "maturity": "mainstream-production"
+          }
+        ],
+        "relevance_to_spur_pss": "Very high relevance for the LINEAR transfer/immittance part of the problem, low relevance for the stochastic-source and tone parts. This family is exactly the right way to convert simulated/measured LDO Zout(f) and PSRR(f) into compact, stable, passive (for Zout) pole-residue state-space models and then into RLC + controlled-source SPICE/Verilog-A blocks. That representation is the single most convergence-friendly thing you can hand to Cadence SpectreRF PSS/Spectre HB/shooting: linear RLC + linear controlled sources produce constant frequency-evaluated stamps with analytic Jacobians, no per-iteration nonlinear re-evaluation, and (if passivity is enforced on the genuinely passive Zout port) a guaranteed energy-bounded block that will not cause HB/PSS divergence. The project's own findings line up with this: the spur band is linear (harmonics <-62 dBc), the transient is governed by Zout(s), and noise is a loop-shaped Norton across Zout — all of which are precisely what rational macromodeling captures. Critical caveats specific to spur/PSS fidelity: (1) Passivity enforcement must NOT be applied to the active PSRR/gain path (PSRR<0 dB is legitimately non-passive); enforce passivity only on Zout, and use stability-only + explicit RHP-zero/delay handling for PSRR. (2) Non-minimum-phase PSRR (RHP zeros / net loop delay, the project's V4 problem) is the main failure mode of vanilla passive VF — use signed second-order sections, stabilized-SK with explicit numerator zeros, the delay-extraction variant, or AAA/Loewner (which make no min-phase assumption). (3) This family CANNOT model the two things spur fidelity ultimately needs as sources: the discrete spur TONES and the noise PSD. Those must be added as deterministic periodic current/voltage sources and as shaped Norton noise sources injected at vout; rational macromodeling supplies only the linear network through which they propagate. In PSS/HB the linear macromodel then correctly folds an injected f_spur and the noise PSD into f_RF +/- m*f_spur sidebands (cyclostationary noise folding), so getting Zout/PSRR magnitude AND phase right via VF/AAA/Loewner is what makes the sideband amplitudes and phase/asymmetry correct. Net: adopt this family for the Zout/PSRR blocks (VF or AAA fit -> stability filter -> passivity enforce on Zout only -> RLC/controlled-source synthesis), and keep spurs/noise as separate injected sources.",
+        "sources": [
+          "B. Gustavsen and A. Semlyen, 'Rational approximation of frequency domain responses by vector fitting,' IEEE Trans. Power Delivery, 14(3):1052-1061, 1999 — https://www.sintef.no/en/software/vector-fitting/",
+          "B. Gustavsen, 'Improving the pole relocating properties of vector fitting' (Relaxed Vector Fitting), IEEE Trans. Power Delivery, 21(3):1587-1592, 2006 — https://www.sintef.no/globalassets/project/vectfit/references/relaxed_vf.pdf",
+          "vectfit3.m Fast Relaxed Vector Fitting user's guide (SINTEF/Gustavsen) — https://labcit.ligo.caltech.edu/~rana/mat/vectfit/vectfit3_userguide.pdf",
+          "scikit-rf VectorFitting API (vector_fit, auto_fit, passivity_test, passivity_enforce, write_spice_subcircuit_s) — https://scikit-rf.readthedocs.io/en/latest/api/generated/skrf.vectorFitting.VectorFitting.html and tutorial https://scikit-rf.readthedocs.io/en/latest/tutorials/VectorFitting.html",
+          "B. Gustavsen, 'Computer code for rational approximation of frequency dependent admittance matrices' / 'SPICE equivalent circuits of frequency-domain responses,' IEEE Trans. EMC, 2002 — IEEE Xplore doc 1223619 https://ieeexplore.ieee.org/document/1223619/",
+          "S. Grivet-Talocia and B. Gustavsen, 'Passive Macromodeling: Theory and Applications,' Wiley, 2016 — https://www.wiley.com/en-us/Passive+Macromodeling:+Theory+and+Applications-p-9781118094914",
+          "S. Grivet-Talocia, 'Passivity enforcement via perturbation of Hamiltonian matrices,' IEEE Trans. Circuits Syst. I, 51(9):1755-1769, 2004; and Semlyen-Gustavsen half-size singularity test for fast passivity assessment — https://www.semanticscholar.org/paper/4fd6e9a51b1dcffe596d930aa4cf3f5a371011b1",
+          "IdEM & MpiLOG macromodeling tools (Grivet-Talocia / IdemWorks, Politecnico di Torino) — https://www.rd-access.eu/edatools/content/idem-mpilog-macromodeling-tools-system-level-signal-integrity-and-emc-assessment",
+          "Y. Nakatsukasa, O. Sete, L. N. Trefethen, 'The AAA algorithm for rational approximation,' SIAM J. Sci. Comput., 2018 — https://arxiv.org/abs/1612.00337",
+          "A. J. Mayo and A. C. Antoulas, Loewner framework / tangential interpolation; 'Constructive interpolation point selection in the Loewner framework' — https://arxiv.org/pdf/2108.13042 ; 'Loewner Matrix interpolation for noisy S-parameter data' (Kabir & Xiao) — https://ieeexplore.ieee.org/document/7835426/",
+          "Stabilized multivariate Sanathanan-Koerner iteration (Hochman et al.) — https://www.researchgate.net/publication/344360226_Multivariate_Rational_Approximation_Using_a_Stabilized_Sanathanan-Koerner_Iteration",
+          "Delay-extraction macromodeling: DEPACT and delayed Vector Fitting for non-minimum-phase / long-delay networks; 'Time-Domain Delay Extraction-Based Macromodeling' and 'Time Delay Extraction from Frequency Domain Data Using Causal Fourier Continuations' — https://arxiv.org/pdf/1508.05429",
+          "Cyclostationary noise primer (noise folding / sidebands around carrier; PSS+Pnoise, HB noise) — designers-guide.org 'An Introduction to Cyclostationary Noise' — https://designers-guide.org/theory/cyclo-preso.pdf",
+          "SpectreRF PSS / harmonic balance vs shooting Newton background — https://scholarworks.calstate.edu/downloads/c821gn30b"
+        ]
+      },
+      {
+        "category": "Nonlinear frequency-domain behavioral models for harmonic balance / PSS (X-parameters / PHD, hot S-parameters, large-signal scattering functions, envelope/memory extensions, and supply representation in HB/PSS/shooting RF flows)",
+        "methods": [
+          {
+            "name": "Poly-Harmonic Distortion (PHD) model / X-parameters (spectral linearization around a large-signal operating point)",
+            "what": "A black-box frequency-domain map that linearizes a device's harmonic spectrum around a large-signal periodic operating point set by one (or more) 'large' tones. The canonical single-large-tone form for each scattered spectral component is b_pk = X_F_pk(|A11|) * P^k + sum over (q,l) of [ X_S_pk,ql(|A11|) * P^(k-l) * a_ql  +  X_T_pk,ql(|A11|) * P^(k+l) * conj(a_ql) ], where P = exp(j*phase(A11)) is the phase reference (LSOP phase normalization). X_F is the large-signal harmonic response, X_S/X_T are the sensitivities of harmonic k to small perturbations a at harmonic l. The conjugate (X_T) term is mandatory because the dependence on small signals is 'non-analytic linear' (depends on both a and conj(a)) under large-signal drive — this is the same fact behind 'hot S22 needs 6 not 4 parameters'. In the small-signal limit X_T->0 and X-params reduce to S-params. Extracted from NVNA measurement or from HB sim of a transistor-level netlist; consumed directly by HB simulators (ADS X-parameter generator/component).",
+            "where_used": "Keysight/Agilent (David E. Root, Jan Verspecht, Jason Horn, Mihai Marcu) — productized in Keysight ADS and on PNA-X/NVNA instruments; Modelithics ships X-parameter device models for ADS. The de-facto industrial nonlinear behavioral standard for PA/transistor/MMIC blocks in HB design flows. Textbook: Root/Verspecht/Horn/Marcu, 'X-Parameters' (Cambridge, 2013).",
+            "strengths": [
+              "Cascadable: X-params of individually characterized blocks compose to predict a chain's nonlinear transfer, all inside HB",
+              "Correctly predicts harmonic amplitudes/phases AND small-tone sidebands/mixing onto each harmonic (X_S/X_T), so it captures spur generation around a driven LSOP",
+              "Native HB citizen — frequency-domain table that the simulator evaluates per spectral line; very fast vs transistor-level HB",
+              "Exact reduction to S-parameters / hot-S in appropriate limits, so it degrades gracefully toward linear regimes"
+            ],
+            "weaknesses": [
+              "Standard form is referenced to a SINGLE large tone (the carrier); validity of the spectral linearization degrades when a second perturbation grows large (it is a first-order/Jacobian map in the small a, not a full multi-large-tone model)",
+              "Load dependence: classic X-params assume a near-50ohm LSOP; load-dependent X-params require load-tuner NVNA acquisition or embedding and add cost/dimensionality",
+              "Table-based interpolation of X_F/X_S/X_T over (power, freq, bias, load) can create derivative/smoothness issues that hurt HB convergence if not C1/C2-continuous",
+              "Captures device/PA nonlinear scattering, not specifically a power-rail-as-input element; using it for an LDO supply port means treating the supply as a bias dimension, which inflates the model"
+            ],
+            "supply_handling": "Zout(f): only as the harmonic-l self term X_S_2k,2k (output reflection at each harmonic) around the LSOP — i.e. a 'hot' output admittance, NOT a clean wideband Zout(f). PSRR(f)/supply modulation: only if bias/supply is added as an explicit X-parameter dimension (augmented/bias-dependent X-params); standard X-params do not model a supply input port at all. Noise PSD: not part of core X-params (noise is handled by a separate cyclostationary/Pnoise mechanism). Discrete spurs: predicted as small-signal sidebands at fc +/- fd via X_S (lower-sideband-from-a) and X_T (upper-sideband-from-conj-a) — this is exactly the mechanism for supply-ripple-induced sidebands IF the ripple is injected as a small a-wave. Under HB/PSS: it IS the frequency-domain HB primitive, so 'robustness under HB' = good provided the underlying tables are smooth and the perturbation stays small.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Hot S-parameters / large-signal small-signal (LSSS) scattering ('6 = 4 + 2')",
+            "what": "Small-signal S-parameters measured/defined around an active large-signal operating point (e.g. a PA driven by a power tone). Verspecht's key result is that a self-consistent description needs SIX real parameters per port pair, not four: b2 = S22*a2 + T22*conj(a2) (plus the S21 driven response), because the relationship between the small reflected wave b2 and small incident a2 is non-analytic — there is both an S term (acts on a2) and a T term (acts on conj(a2), generating the image/lower sideband). Probe tone at fc+fd produces measurable responses at fc, fc+fd AND fc-fd; the fc-fd (conjugate/image) response is what forces the T term. This is the conceptual seed of the PHD/X-parameter X_S/X_T split (Verspecht patent US7038468B2, assignee Keysight).",
+            "where_used": "Jan Verspecht (VUB PhD, multi-frequency Describing Functions) and Marc Vanden Bossche/NMDG, later Agilent/Keysight; ARFTG community. Used as the measurement-theoretic foundation under X-parameters; 'hot S22' is a standard PA stability/output-match characterization on PNA-X.",
+            "strengths": [
+              "Rigorous, measurement-validated treatment of how a SMALL perturbation (e.g. supply ripple, interferer) scatters around a driven carrier — directly the spur/sideband problem",
+              "Makes explicit that upper and lower sidebands are coupled (S vs T / conjugate term) — essential for correct sideband phase and asymmetry",
+              "Reduces to ordinary S-parameters when the large signal -> 0; intuitive extension of linear two-port theory"
+            ],
+            "weaknesses": [
+              "A linearization: valid only while the perturbation is small relative to the carrier-set LSOP (true for low-level supply spurs, breaks for large ripple)",
+              "Defined per fixed LSOP (power, bias, load); a sweep of operating points is needed to cover a design space",
+              "Pure two-port RF framing — does not by itself give a wideband noise PSD or a low-frequency PSRR(f); needs augmentation"
+            ],
+            "supply_handling": "Zout(f): yes, as 'hot' output reflection (hot-S22) at the carrier and harmonics around the LSOP. PSRR(f): only if a supply/bias port is added as a third measured port (conversion S-params from supply-tone to RF sidebands) — this conversion-matrix view is the most rigorous way to express PSRR as a large-signal effect. Noise: not native. Discrete spurs: this is precisely the framework's strength — a discrete supply tone at fc+/-fd maps through S (and conjugate T) to coupled sidebands with correct relative phase. PSS/HB: the S/T conversion matrix is exactly what PAC/PXF (HB or shooting) compute as the periodic small-signal transfer; hot-S is the analytic interpretation of those simulator outputs.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Augmented / bias- and load-dependent X-parameters and supply-as-input (envelope-tracking) behavioral models",
+            "what": "Extensions that add the DC/bias (drain/collector supply) and/or load reflection as explicit model dimensions so that the supply voltage becomes a large-signal input, not just a fixed bias. The supply can then be modulated (envelope tracking) and the model predicts how supply variation remaps gain/phase and generates sidebands/spectral regrowth. Includes simulation- and measurement-based X-parameter models for ET-PAs (supply applied at drain/collector) and load-dependent X-params acquired with an NVNA + load tuner.",
+            "where_used": "Keysight ADS ET-PA design flows; academic/industrial PA groups (Root, Verspecht, Horn et al.; envelope-tracking literature). Used where the supply IS the modulating input (ET-PAs, DPD verification).",
+            "strengths": [
+              "Treats the supply rail as a first-class large-signal input — the correct framing when a regulator's output modulates an RF stage",
+              "Captures cross-modulation between supply (envelope) and RF carrier, i.e. supply-induced sidebands as a large-signal (not just small-signal) effect",
+              "Still lives inside HB/Circuit-Envelope flows; reuses the X-parameter consumer in ADS"
+            ],
+            "weaknesses": [
+              "Dimensionality explosion: tables over (Pin, freq, Vsupply, load) are costly to acquire and store, and interpolation smoothness becomes a real HB-convergence liability",
+              "Designed for the PA/transistor use case (supply at output of an active device), not for characterizing the regulator block itself",
+              "Long-term memory (electrothermal/trapping) still needs the separate memory extension; quasi-static augmented X-params can mispredict low-offset asymmetric sidebands"
+            ],
+            "supply_handling": "Zout(f): hot output impedance per (bias,power) point. PSRR(f): represented implicitly as the supply-port-to-RF-sideband conversion sensitivity at each LSOP — effectively a large-signal PSRR that varies with drive. Noise: not native. Discrete spurs: a discrete supply ripple tone is handled either as a small perturbation (X_S/X_T at the supply port) or, if large, by sampling the envelope axis — good fidelity for ET-style supply modulation. PSS/HB: integrates as an HB/Envelope component; convergence depends entirely on table smoothness across the added supply axis.",
+            "maturity": "emerging"
+          },
+          {
+            "name": "X-parameters with long-term dynamic memory (short-term vs long-term / electrothermal & trapping)",
+            "what": "Adds memory to the otherwise quasi-static spectral map: short-term (modulation-bandwidth) memory and long-term memory from bias/supply networks, self-heating, and charge trapping. The instantaneous spectral response is made a function of slow state variables (temperature, trap occupancy, dynamic bias) so that asymmetric sidebands and bias-/thermal-dependent IM and spectral regrowth under modulated drive are captured (Verspecht et al., IMS 2009/2010; Root/Verspecht/Horn/Marcu book Ch. 6 'Memory').",
+            "where_used": "Keysight research + academia; relevant to wideband modulated PAs where supply/thermal dynamics produce memory. Implemented as memory-augmented X-parameter / dynamic-behavioral models in ADS Circuit Envelope.",
+            "strengths": [
+              "Captures the slow supply/thermal dynamics that make sidebands ASYMMETRIC and frequency-offset dependent — directly relevant to low-offset supply spurs",
+              "Bridges to envelope/transient-envelope analysis where the carrier is fixed but the envelope (and supply) evolves",
+              "Physically motivated decomposition (short- vs long-term) maps onto LDO loop bandwidth vs thermal/bias timescales"
+            ],
+            "weaknesses": [
+              "More parameters and identification effort; risk of overfitting the memory kernels",
+              "Heavier to evaluate; can slow HB/Envelope and complicate convergence",
+              "Still aimed at active-device memory, not a turnkey regulator-supply model"
+            ],
+            "supply_handling": "Zout(f): hot, now with dynamic (memory) variation. PSRR(f): the most complete X-param-family route to a frequency-dependent, asymmetric supply-to-output conversion because memory lets the sideband response differ at +fd vs -fd. Noise: not native (still separate). Discrete spurs: best-in-family for asymmetric, low-offset supply spurs because long-term memory reproduces sideband asymmetry that quasi-static models miss. PSS/HB: typically run in Circuit Envelope (carrier in HB, envelope in time) rather than pure multitone HB; convergence is generally acceptable but evaluation cost is higher.",
+            "maturity": "emerging"
+          },
+          {
+            "name": "PSS/shooting + PAC/PXF/Pnoise small-signal periodic analyses (the simulator-side counterpart to hot-S/X-params)",
+            "what": "Cadence SpectreRF-style flow: PSS (shooting-Newton in time, or HB in frequency) computes the large-signal periodic steady state set by the RF carrier; then PAC/PXF compute the periodic small-signal conversion matrix (how a small tone at any offset maps to every sideband fk +/- fm), and Pnoise computes cyclostationary noise folded to sidebands. Injecting a small supply-ripple tone at the rail and reading the resulting carrier sidebands IS the simulator-computed hot-S/X_S/X_T for the supply port. Ken Kundert's 'Simulation Methods for RF ICs' is the canonical reference; shooting is robust for stiff/strongly-switching circuits, HB for mildly-nonlinear/distortion problems.",
+            "where_used": "Cadence Spectre/SpectreRF (PSS/PAC/PXF/Pnoise/Pstb), Keysight ADS HB+Envelope, industry standard for RFIC. The user's own Cadence PSS/HB target flow.",
+            "strengths": [
+              "Ground truth for spur fidelity: PAC/PXF give the exact periodic conversion gains incl. correct upper/lower sideband (conjugate) phase, and Pnoise gives folded noise PSD — the trio covers Zout, PSRR-as-conversion, noise, and discrete spurs in one consistent framework",
+              "Shooting-PSS handles strongly nonlinear/switching supplies where HB struggles; HB handles many-tone CW distortion where shooting is expensive",
+              "Directly accepts behavioral blocks (Verilog-A/AMS, data tables, S-param/rational models) as the supply element"
+            ],
+            "weaknesses": [
+              "Transistor-level cost is exactly what behavioral LDO models are meant to avoid; PSS+PXF over a fine offset sweep is slow at the system level",
+              "Shooting-Pnoise can MISS low-frequency supply-noise upconversion for large-time-constant supply nodes (documented SpectreRF caveat) — i.e. the very LDO/PSRR mechanism can be under-reported if the model lumps a slow supply pole",
+              "HB convergence is fragile with sharp/discontinuous behavioral nonlinearities; PSS convergence sensitive to tstab/steadyratio and stiff supply loops"
+            ],
+            "supply_handling": "Zout(f): PSS+PAC port impedance at carrier and sidebands. PSRR(f): inject supply tone, read carrier sidebands via PAC/PXF — the rigorous large-signal PSRR. Noise PSD: Pnoise gives cyclostationary, sideband-folded output noise (matches the project's loop-shaped Norton finding). Discrete spurs: directly produced by injecting deterministic supply tones into PSS/PAC; phase and asymmetry come out correctly. PSS/HB convergence: this is the reference flow — its caveats (large-time-constant supply nodes, behavioral discontinuities) are exactly the things a good LDO behavioral model must respect.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Frequency-domain rational-fit (vector-fitting / pole-residue) behavioral macromodels of the regulator itself",
+            "what": "Instead of a device-scattering map, fit the LDO's measured/simulated frequency responses — output impedance Zout(f), PSRR(f), and reference/control-to-output transfer — to rational pole-residue functions (vector fitting), then synthesize an equivalent passive/active network (or Laplace/Verilog-A block) for the simulator. A dedicated USPTO patent (10,599,799) does exactly this for LDOs and charge pumps; vector fitting is the workhorse for guaranteed-passive, causal, low-order multiport macromodels. This is the family the user's project already lives in (Zout + PSRR + shaped-Norton noise + deterministic spur tones).",
+            "where_used": "Power-IC vendors and SI/PI macromodeling (vector fitting from Gustavsen/Semlyen lineage); LDO SPICE macromodels (Rohm, TI, ADI app notes); patent 10,599,799 (LDO/charge-pump frequency-domain fitting). Targets SPICE AC/transient primarily, but the synthesized rational/Laplace block is HB/PSS-consumable.",
+            "strengths": [
+              "Models the SUPPLY ELEMENT directly and compactly: Zout(f), PSRR(f), control transfer as low-order rational functions — exactly the quantities that set spur transfer",
+              "Passivity/causality can be enforced (passive synthesis), which is what gives clean, convergent HB/PSS behavior",
+              "Multiport-capable (supply-in, ref-in, load-out) so PSRR and Zout share one consistent state-space; adds a Norton noise source and deterministic spur tones for the full picture",
+              "Cheap to evaluate in HB/PSS — a handful of poles vs a transistor netlist"
+            ],
+            "weaknesses": [
+              "Linear/LTI by construction: captures Zout/PSRR/noise/spur-transfer in the regime where the LDO behaves linearly (the project's own finding: linear to ~50uA, gm compression by ~1mA, slew at ~5mA) — large-signal load steps / current limit / dropout need added nonlinearity",
+              "Discrete output spurs are added as explicit deterministic sources, not generated by the physics — must be measured/characterized and re-injected with correct amplitude/phase per operating point",
+              "Rational fits can introduce non-minimum-phase / RHP or non-passive artifacts (the project hit a non-minimum-phase PSRR section) that must be policed before HB",
+              "Quality depends on the fidelity of the underlying frequency-domain data and on smooth interpolation across bias/load if the model is operating-point-scheduled"
+            ],
+            "supply_handling": "Zout(f): native and exact-by-fit (Norton/Thevenin rational). PSRR(f): native as a fitted supply-to-output transfer (signed/sectioned fits to get phase right). Noise PSD: add an output-referred shaped Norton source (Sin = Sv*|Yout|^2) plus PSRR path — matches measured loop-shaped, non-white output noise; flicker via Lorentzians. Discrete spurs: injected as deterministic vout tones (amplitude/phase from transient-FFT characterization). PSS/HB: excellent IF passivity/causality/min-phase are enforced and the block is the linear subcircuit feeding the nonlinear core — this is the most HB-convergence-friendly representation of an LDO supply, and the directly relevant approach for fast PSS/HB spur fidelity.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Circuit-envelope and behavioral data-table models in HB (convergence-engineered behavioral blocks)",
+            "what": "General class of equation-defined / Verilog-A / data-table behavioral blocks consumed by HB and Circuit Envelope, with explicit attention to making them HB-convergent: ensuring C1/C2 continuity of nonlinear I-V/Q-V and of table interpolation, keeping each behavioral node connected to a linear element (so HB's linear/nonlinear partition succeeds), and using Krylov solvers, source/oversampling stepping, and adaptive nonlinearity/level ramping for convergence. Circuit Envelope runs the RF carrier in HB while the slow envelope (and supply modulation) advances in time — ideal when supply ripple is slow vs carrier.",
+            "where_used": "Keysight ADS (HB + Circuit Envelope, Genesys Harbec Krylov/APFT solvers, adaptive convergence), Qucs equation-defined/Verilog-A HB models (Brinson), Cadence Spectre HB/Envelope. Standard practice for stitching behavioral blocks into RF flows.",
+            "strengths": [
+              "Directly addresses the central risk: behavioral-block HB convergence — guidance on continuity, partitioning, linear-element-per-node, and solver settings",
+              "Circuit Envelope is the natural home for 'slow supply ripple modulating a fast carrier' — efficient and convergent for supply-induced sidebands",
+              "Accepts the rational-fit LDO macromodel, X-params, and noise/spur sources together in one analysis"
+            ],
+            "weaknesses": [
+              "Convergence is only as good as the block's smoothness — table/Verilog-A discontinuities, hard limiters (current limit, dropout) readily break HB",
+              "Envelope assumes timescale separation (envelope << carrier); fast/wideband supply transients near the carrier violate this",
+              "Tuning solver knobs (steadyratio, tstab, oversample, source-step) is expert work and circuit-specific"
+            ],
+            "supply_handling": "Zout(f)/PSRR(f): carried by whatever linear sub-block (rational fit / S-params) you embed. Noise PSD: via cyclostationary noise of the envelope/HB engine or injected PSD sources. Discrete spurs: handled as additional envelope/baseband tones modulating the supply, or as injected sources; Circuit Envelope reproduces the resulting carrier sidebands efficiently. PSS/HB convergence: this family IS the convergence-engineering layer — its whole point is making behavioral supply blocks converge robustly in HB/Envelope (smoothness, partitioning, solver strategy).",
+            "maturity": "mainstream-production"
+          }
+        ],
+        "relevance_to_spur_pss": "High but asymmetric. The single most important transfer from this family is conceptual and is the hot-S / X_S-X_T (PHD) result: a small supply-rail tone at fc+/-fd scatters around the RF carrier into COUPLED upper/lower sidebands, and you need BOTH the direct term (S / X_S, acting on the ripple a) and the conjugate term (T / X_T, acting on conj(a)) to get sideband amplitude AND relative phase/asymmetry right. That is exactly what Cadence PAC/PXF compute and what the project must reproduce. However, the full X-parameter/PHD machinery is overkill (and wrong-shaped) for an LDO-as-supply: standard X-params reference a single large RF tone and treat supply only as a bias dimension, so they bloat the model and add table-smoothness convergence risk without modeling Zout(f)/PSRR(f)/noise the way a supply element needs. The directly applicable, fast, convergent approach is the rational-fit (vector-fitting) multiport behavioral macromodel of the LDO itself — Zout(f) + PSRR(f) + control transfer as low-order passive/causal pole-residue blocks, plus a loop-shaped Norton noise source and deterministic spur tones injected at vout — which is precisely the architecture the project converged on. The project's own findings (spur band is linear to ~-62 dBc; transient governed by Zout(s); noise loop-shaped not white; spurs deterministic) confirm that a linear-multiport-plus-injected-spurs model is sufficient in the near-carrier small-perturbation regime, and the X_S/X_T insight tells you to keep PSRR a signed/phase-correct (sectioned) transfer so sideband phase/asymmetry is right. For HB/PSS convergence the key levers are: enforce passivity/causality and avoid the non-minimum-phase artifacts vector fitting can introduce; keep the block C1/C2-continuous; ensure every behavioral node touches a linear element so HB partitioning succeeds; and beware the documented SpectreRF shooting-Pnoise caveat that low-frequency supply-noise upconversion can be under-reported at large-time-constant supply nodes (mirror the slow LDO pole carefully). Where the supply ripple is large or the LDO enters compression/current-limit/dropout, escalate from the linear macromodel to a memory-augmented / envelope (large-signal) supply-input model.",
+        "sources": [
+          "X-parameters — Wikipedia: https://en.wikipedia.org/wiki/X-parameters",
+          "Verspecht & Barataud, 'Hot S-Parameter Techniques: 6 = 4 + 2', 66th ARFTG: https://janverspecht.com/pdf/arftg_66th_hots_verspecht.pdf",
+          "Jan Verspecht BVBA profile (Describing Functions, hot-S22, nonlinear scattering functions): https://www.janverspecht.com/HTML/profile.htm",
+          "Verspecht, US Patent 7,038,468 B2 (assignee Keysight) — large-signal S-parameters incl. conjugate-of-incident-wave coefficients (b = S*a + T*conj(a)): https://patents.google.com/patent/US7038468",
+          "Verspecht & Root et al., 'Broad-band Poly-Harmonic Distortion (PHD) behavioral models...', IEEE T-MTT 2005 (PHD/X-param foundation): http://emlab.illinois.edu/ece451/appnotes/phd_mtt05.pdf and https://ieeexplore.ieee.org/document/1528820/",
+          "Root, Verspecht, Horn, Marcu — 'X-Parameters: Characterization, Modeling, and Design of Nonlinear RF and Microwave Components' (Cambridge, 2013), Ch.6 'Memory': https://www.cambridge.org/core/books/abs/xparameters/memory/23D07F5E191CE26DC3F3DD050D67057A",
+          "Verspecht et al., 'Extension of X-parameters to Include Long-Term Dynamic Memory Effects' (IMS 2009): https://www.researchgate.net/publication/224563316",
+          "'Simulation and Measurement-based X-parameter Models for Power Amplifiers with Envelope Tracking' (supply-as-input ET-PA X-params): https://www.researchgate.net/publication/261119455",
+          "Ali et al., 'Multi-Tone Harmonic Balance Optimization for High-Power Amplifiers through Coarse and Fine Models Based on X-Parameters', Sensors 2022: https://pmc.ncbi.nlm.nih.gov/articles/PMC9185358/",
+          "Ken Kundert, 'Simulation Methods for RF Integrated Circuits' (ICCAD'97) — HB vs shooting/PSS, PAC/Pnoise sideband folding: https://kenkundert.com/docs/iccad97.pdf",
+          "Cadence SpectreRF PSS/PAC/PXF/Pnoise tutorial material (shooting vs HB, supply-noise upconversion caveat, steadyratio convergence): https://picture.iczhiku.com/resource/eetop/whkHqstezrQfIBvM.pdf",
+          "Keysight Genesys Harbec (HB) — Krylov/APFT solvers, adaptive convergence (adjusts supply/signal levels, tones, nonlinearity), Verilog-A behavioral blocks: https://www.keysight.com/us/en/lib/resources/training-materials/genesys-harbec-harmonic-balance-simulation-1823632.html",
+          "M. Brinson, 'Qucs Equation-Defined and Verilog-A RF/Higher-Order Behavioral Device Models for Harmonic Balance Circuit Simulation' (HB partitioning/continuity/convergence for behavioral blocks): https://repository.londonmet.ac.uk/3928/1/MikeBrinson_MIXDES2015_Draft2.pdf",
+          "USPTO Patent 10,599,799 — 'Low-dropout regulator and charge pump modeling using frequency-domain fitting methods' (vector-fitting Zout/PSRR/control transfer -> synthesized macromodel): https://image-ppubs.uspto.gov/dirsearch-public/print/downloadPdf/10599799",
+          "'Optimized Power Supply Rejection Ratio Modeling Technique for Simulation of Automotive Low-Dropout Linear Voltage Regulators', Mathematics 2022, 10(7):1150: https://www.mdpi.com/2227-7390/10/7/1150",
+          "Urso & Serdijn, 'Analysis and Design of Power Supply Circuits for RF Oscillators', IEEE TCAS-I 2020 (supply pushing, PSRR, ripple-to-phase-noise/spur): https://bioelectronics.tudelft.nl/~wout/documents/TCAS1_2020_Urso_Serdijn.pdf",
+          "Analog Devices AN-1120, 'Noise Sources in Low Dropout (LDO) Regulators' (output noise PSD, PSRR vs noise): https://www.analog.com/en/resources/app-notes/an-1120.html"
+        ]
+      },
+      {
+        "category": "Machine-learning / data-driven surrogate models for analog/RF/PMIC circuits (NN behavioral models, RNN/state-space NN, neural-ODE, GP/PCE surrogates, ANN macromodels in Verilog-A, ML-in-EDA), assessed for LDO-as-supply-element spur fidelity in PSS/HB",
+        "methods": [
+          {
+            "name": "Continuous-time RNN (CTRNN) behavioral model exported to Verilog-A (Chen/Raginsky/Rosenbaum lineage)",
+            "what": "Data-driven time-domain behavioral model where a discrete-time RNN is fit to input/output port trajectories (node voltages and currents) of a transistor-level IP block, then transformed into a continuous-time RNN (CTRNN) - a set of first-order nonlinear ODEs dx/dt=f(x,u), y=h(x) - and emitted as a Verilog-A module so a commercial simulator integrates it with its own adaptive timestep. The continuous-time form is the key trick: it decouples the learned model from a fixed training timestep so the SPICE/Spectre solver can choose its own steps and interconnect the block with arbitrary loads. This is the canonical 'replace an IP block with a cheap learned macromodel' approach for SoC verification.",
+            "where_used": "Academic, University of Illinois (Zaichen Chen, Maxim Raginsky, Elyse Rosenbaum), EPEPS 2017; influential reference architecture cited by nearly all later Verilog-A NN work. Targeted at SoC/IP-block transient verification (I/O drivers, ESD, analog/RF IPs). Not a vendor product but the de-facto template for ANN-in-Verilog-A.",
+            "strengths": [
+              "Verilog-A export means it drops into Spectre/SPICE and composes with surrounding circuitry - exactly the deployment path an LDO supply macromodel needs",
+              "Continuous-time ODE form is compatible with variable-timestep solvers (avoids the fixed-step trap of discrete RNN/NARX)",
+              "Learns purely from port waveforms, no need for the netlist/IP internals (good for encrypted/foundry IP)",
+              "Captures nonlinear dynamic memory effects (slew, recovery) that a static LUT or pure LTI Zout/PSRR misses"
+            ],
+            "weaknesses": [
+              "Trained and validated in the time domain only; no demonstrated PSS/HB use, and a learned nonlinear ODE is not guaranteed to converge a shooting/HB Jacobian or to be passive",
+              "Plain CTRNN has no stability guarantee - can blow up or fail to converge when interconnected with an unseen load (the exact failure ISS-NODE was created to fix)",
+              "Nothing about frequency-domain Zout(f)/PSRR(f) fidelity, noise PSD, or discrete spurs - these are not in the training objective, so they are accidental at best",
+              "Spur fidelity near a carrier requires sub-microvolt port accuracy across many decades of frequency; a waveform-MSE-trained RNN will not hit that without targeting it"
+            ],
+            "supply_handling": "Handles supply pin as just another input port if you train on (vsupply, iload -> vout) trajectories. In principle the model's small-signal Jacobian along an operating trajectory yields Zout and a vsupply->vout transfer (PSRR), but the literature does NOT verify those against an AC reference. Noise PSD: not modeled (deterministic ODE, no stochastic source). Discrete spurs: only reproducible if excited in training data and the RNN happens to capture the tone - not guaranteed and not a design target. PSS/HB: no published PSS/HB results; convergence robustness under shooting/HB is unproven and the deterministic ODE has no provision for periodic-steady-state spectral accuracy a spur study demands.",
+            "maturity": "emerging (academic). Verilog-A path is real and reusable; spur/PSS use is not demonstrated."
+          },
+          {
+            "name": "Input-to-State-Stable Neural ODE (ISS-NODE) for transient circuit macromodels",
+            "what": "A neural-ODE/CTRNN whose dynamics are parametrized so they are provably input-to-state stable (ISS) with respect to a jointly-learned Lur'e-Postnikov (quadratic-plus-integral) Lyapunov function. ISS guarantees the learned state stays bounded for bounded input and returns to a unique equilibrium at zero input - an inductive bias that makes the macromodel behave when embedded in feedback with unknown loads in a commercial simulator. It directly attacks the #1 practical failure of learned dynamics: a model that validates well but diverges or fails to converge when interconnected at test time with a load not seen in training. Also shown to learn ISS-preserving perturbations for aging/degradation.",
+            "where_used": "Academic, University of Illinois (Alan Yang, Jie Xiong, Maxim Raginsky, Elyse Rosenbaum), arXiv:2202.06453, 2022 (L4DC). Same group as the Verilog-A CTRNN work; explicitly motivated by SoC IP-block macromodels simulated in commercial circuit simulators.",
+            "strengths": [
+              "Provable stability/boundedness is the single most important property for simulator convergence and robustness to unseen loads - exactly the LDO-as-supply-element use case (model sees many different RF loads/decoupling networks)",
+              "Builds on the Verilog-A-exportable CTRNN form, so the deployment path is intact",
+              "Lyapunov constraint improves generalization in novel interconnection configurations (validated by interconnecting with components not seen in training)",
+              "Stability is enforced by construction, not by soft regularization, so it holds everywhere not just on the training set"
+            ],
+            "weaknesses": [
+              "ISS guarantees transient boundedness/convergence to equilibrium, NOT periodic-steady-state existence/uniqueness - it does not by itself certify HB/PSS Jacobian convergence around a periodic orbit driven by a strong RF tone",
+              "Still a deterministic ODE: no native noise PSD, no stochastic spur mechanism",
+              "Demonstrated on digital/analog transient + aging; no Zout(f)/PSRR(f)/spur validation",
+              "ISS is a sufficient inductive bias but can over-damp; an LDO's lightly-damped Zout resonance and supply ripple feedthrough sit near the boundary the constraint pushes away from"
+            ],
+            "supply_handling": "Same port-based handling as the CTRNN; supply enters as an input. Its real contribution to the spur/PSS goal is robustness/convergence: an ISS macromodel is far less likely to break a shooting/HB solve than an unconstrained RNN. But it gives no specific guarantee on spectral spur accuracy, noise PSD, or PSRR(f) shape - those remain a function of the (time-domain only) training data and loss. For a spur study you would still need to (a) verify the linearization gives correct Zout(f)/PSRR(f) and (b) add a noise/spur mechanism separately.",
+            "maturity": "emerging (academic). The most relevant single idea for convergence robustness; spectral spur fidelity unproven."
+          },
+          {
+            "name": "Hybrid Neural-ODE + RNN (NODE-RNN / NCDE-RNN) continuous-time macromodels in Verilog-A",
+            "what": "A 2025 evolution that fuses continuous-time neural differential equations (Neural ODE, and Neural Controlled Differential Equations) with a discrete RNN update at observation points: the neural ODE evolves the hidden state continuously between samples while the RNN injects discrete-event corrections, trained with a hybrid adjoint method. Explicitly framed against TDRNN/NARX, whose fixed timestep and output-feedback cause 'serious simulation accuracy and convergence issues' and instability under a variable-step SPICE solver. Deployed to Verilog-A and validated in circuit emulation. Reported +33% fit over plain NCDE and +24% over CTRNN, validated on PIN diodes in high-power microwave environments capturing nonlinear memory effects.",
+            "where_used": "Academic (Zenghui Chang, Yang Zhang, Hu Tan, Hong Cai Chen, Southeast University), arXiv:2503.22313, 2025. Aimed at high-precision time-domain modeling of circuit IPs and devices (RF amplifiers, drivers, ESD, here PIN diodes).",
+            "strengths": [
+              "Best-in-class statement of WHY discrete RNN/NARX break SPICE convergence (fixed step vs adaptive step, output feedback instability) - directly informs why a spur/PSS model must be continuous-time and stable",
+              "Continuous-time core + Verilog-A deployment + adaptive-step compatibility, with measured accuracy gains over CTRNN/NCDE",
+              "Captures strong nonlinear memory (validated on high-power microwave PIN diode), relevant if LDO drive nonlinearity matters",
+              "NCDE form handles irregular/continuous control inputs cleanly"
+            ],
+            "weaknesses": [
+              "Still purely transient/time-domain; no PSS/HB results and no stability proof (unlike ISS-NODE) - the hybrid discrete-update step could itself introduce non-smoothness that hurts a Newton-based HB/shooting Jacobian",
+              "No frequency-domain Zout/PSRR validation, no noise PSD, no spur spectrum analysis",
+              "Hybrid adjoint training is heavier; reproducibility/tooling immature",
+              "Validation on a two-terminal device, not a multiport supply element with a feedback loop"
+            ],
+            "supply_handling": "Optimized for transient nonlinear memory, not the small-signal frequency-domain quantities a supply-element spur model needs. Zout(f)/PSRR(f) would again come only from linearizing the learned ODE (unverified). No noise, no explicit spur mechanism. The discrete-update component is a potential convergence liability under HB/PSS Newton iterations even though it helps transient accuracy.",
+            "maturity": "emerging/academic-only. State-of-the-art for transient fidelity; not validated for the spectral/PSS goal."
+          },
+          {
+            "name": "State-Space Dynamic Neural Network (SSDNN) with provable stability (Zhang/Cao lineage)",
+            "what": "An earlier, foundational state-space neural-network macromodel for high-speed nonlinear circuits/IC buffers: learns a generalized dynamic NN in state-space form from transient I/O waveforms using adjoint sensitivity, then - critically - derives explicit LOCAL and GLOBAL stability criteria expressed as eigenvalue tests on stability matrices built from the trained internal weights. A trained model can be checked for stability post-hoc and implemented in SPICE-like simulators via an exact circuit representation. This is the original 'NN macromodel you can certify stable and put in a simulator' work and the conceptual ancestor of CTRNN/ISS-NODE. The same group also produced neuro-transfer-function / parametric NN-plus-transfer-function frequency-domain models.",
+            "where_used": "Academic, classic in the IEEE MTT / microwave-CAD community (Y. Cao, R. Ding, Q.-J. Zhang, IEEE T-MTT 2006; related IBIS/IC-buffer modeling). Widely cited in RF/microwave behavioral-modeling and signal-integrity contexts.",
+            "strengths": [
+              "Stability is verifiable via eigenvalue tests - predates and motivates ISS-NODE; good for simulator robustness",
+              "State-space form is naturally simulator-implementable and composable",
+              "Mature, peer-reviewed, validated on high-speed IC buffers (a supply/IO context)",
+              "Companion Zhang-group frequency-domain neuro-TF models DO target S-parameters/Zin/Zout, useful to pair with the time-domain SSDNN"
+            ],
+            "weaknesses": [
+              "Stability criteria are for the autonomous/forced transient response, not a guarantee of HB/PSS periodic-orbit convergence",
+              "Vintage method; tooling and training are dated vs modern autodiff neural-ODE stacks",
+              "Time-domain SSDNN itself does not directly deliver calibrated Zout(f)/PSRR(f); you use the companion frequency-domain NN-TF models for that",
+              "No noise PSD or spur generation; deterministic"
+            ],
+            "supply_handling": "The SSDNN time-domain model gives transient supply response and, via linearization, an approximate Zout/PSRR. The companion Zhang-group neuro-transfer-function models are the part that actually fits frequency-domain Zout(f)/PSRR(f)/S-parameters with passivity/stability enforcement - that pairing is the most directly relevant classical route to the LTI multiport (Zout+PSRR) part of an LDO supply model, which mirrors the user's current physics-based per-block approach. Discrete spurs and noise PSD are out of scope for both. PSS/HB: the frequency-domain TF form is HB-friendly (it IS a frequency response), but the nonlinear SSDNN's PSS convergence is not characterized.",
+            "maturity": "mainstream-production in RF/microwave CAD for behavioral macromodeling (peer-reviewed, decades of use); but not for spur/PSS specifically."
+          },
+          {
+            "name": "ANN large-signal device/macromodel in Verilog-A, validated in Harmonic Balance (GaN-HEMT lineage, Jarndal et al.)",
+            "what": "An artificial neural network (typically MLP / cascade-feedforward) trained on DC-IV and RF large-signal data to represent a device's nonlinear constitutive relations (charges/currents), coded into Verilog-A and run inside the simulator's transient, HARMONIC BALANCE, and envelope engines. This is the family that has actually been exercised under HB and reports convergence and spectral accuracy: ANN GaN-HEMT models validated by single- and two-tone large-signal RF measurements with 'perfect fitting and high convergence rates,' and ~5x faster than table-based models.",
+            "where_used": "Academic + practitioner RF/PA community; commercial-tool-adjacent (Keysight ADS, Cadence). A. Jarndal et al. (Verilog-A-based ANN GaN-HEMT, IEEE 2024; 'Improved Verilog-A Based ANN Modeling Applied to GaN HEMTs,' Advanced Theory and Simulations / Wiley 2025). Earlier ANN-HEMT-in-ADS work (Microwave Journal). Used for power-amplifier design.",
+            "strengths": [
+              "Actually demonstrated to CONVERGE in Harmonic Balance and reproduce single-/two-tone spectra and intermodulation - the only family with real HB spur/IMD validation",
+              "Verilog-A, drops into ADS/Spectre HB/PSS, faster than LUT models",
+              "Because it models smooth charge/current constitutive functions (with continuous derivatives), the HB Jacobian is well-behaved - the right recipe for convergence",
+              "Two-tone IMD = sidebands/spurs around a carrier, which is exactly the spectral quantity an LDO spur study cares about (proof the approach can render spurs in HB)"
+            ],
+            "weaknesses": [
+              "It is a DEVICE/PA model, not a supply-element/regulator model - you would have to recast the LDO as a learned nonlinear two/three-port with a supply pin",
+              "Spurs here are deterministic distortion products of the drive; it does not model an LDO's own noise PSD or internally-generated tones (e.g., from a switching reference/charge pump)",
+              "Smoothness/derivative continuity of the ANN must be engineered (activation choice, no kinks) or HB convergence degrades - a real practical risk",
+              "PSRR(f)/Zout(f) accuracy is only as good as the bias/load coverage of the training set; not a stated objective"
+            ],
+            "supply_handling": "Strongest existing evidence that a Verilog-A ANN can produce CORRECT, CONVERGENT spectra (IMD/harmonics) under HB - i.e., it can render carrier sidebands. Mapping to LDO: model the pass device + loop as smooth nonlinear constitutive functions of (vsupply, vout, iload); the linearization then yields Zout(f) and PSRR(f) automatically, and large-signal supply ripple feedthrough produces sidebands in HB. Noise PSD and stochastic/deterministic intrinsic spurs are NOT covered and must be added by a separate mechanism (noise sources / explicit tone injection). Distortion-of-an-applied-tone spurs ARE in scope; spurs intrinsic to the LDO are not.",
+            "maturity": "mainstream-production-adjacent for RF device/PA modeling (shipped in ADS/Spectre HB flows); not yet applied to LDO supply spur modeling."
+          },
+          {
+            "name": "Neural-network-assisted / NN-based Harmonic Balance solvers",
+            "what": "Instead of (or alongside) being the device model, a neural network is used to accelerate or replace the HB solve itself: a back-propagation NN is trained so its outputs are the steady-state harmonic coefficients that satisfy the nonlinear circuit's HB governing equations, with a convergence theorem showing the training can reach the global minimum. Related work uses augmented NNs with explicit periodic units (plus RNNs) to learn the nonlinear time-domain steady-state of oscillators-with-buffers, i.e., learning the periodic steady state directly.",
+            "where_used": "Academic ('A Neural Network-Based Harmonic Balance Technique for Analysis of Periodic Responses of Nonlinear Circuits,' Circuits Systems and Signal Processing, Springer 2022; Penn State 'Behavioral Modeling of Steady-State Oscillators with Buffers Using Neural Networks'). RF/microwave numerical-methods community.",
+            "strengths": [
+              "Directly targets the PERIODIC STEADY STATE and its harmonic spectrum - conceptually aligned with PSS/HB spur output",
+              "The AugNN/periodic-unit idea explicitly encodes periodicity, so it represents tones/sidebands natively rather than hoping a generic RNN learns a limit cycle",
+              "Can serve as a fast initial guess / homotopy aid to improve HB convergence of a hard nonlinear block"
+            ],
+            "weaknesses": [
+              "These replace or augment the solver; they are not drop-in Verilog-A behavioral models you embed in a commercial PSS/HB run of a larger RF system",
+              "Convergence theorems are for the NN training, not for a commercial-tool HB Newton iteration around the learned block",
+              "Demonstrated on small/canonical nonlinear circuits and oscillators, not multiport LDO-as-supply with calibrated Zout/PSRR/noise",
+              "No noise PSD; spur fidelity to sub-mdBc not shown"
+            ],
+            "supply_handling": "Most natural fit conceptually to a spur/sideband objective because it works in the harmonic domain, but practically it operates at the solver/algorithm level rather than as a supply-element macromodel, so it does not directly give a reusable Zout(f)/PSRR(f)/noise LDO block for someone else's PSS deck. Could be valuable as a convergence accelerator (good periodic-orbit initial guess) for whatever LDO model you do embed.",
+            "maturity": "academic-only."
+          },
+          {
+            "name": "HB surrogate ANN immunity macromodel of a voltage regulator (DPI/EMC)",
+            "what": "A surrogate ANN (multi-hidden-layer MLP) behavioral model of a voltage regulator built specifically to run inside Harmonic Balance and predict the regulator's response to RF disturbance injected on its pins (Direct RF Power Injection / conducted-immunity, including continuous-wave and amplitude-modulated disturbance). The surrogate replaces the transistor-level regulator to cut HB simulation time and conceal IP, and reproduces the device's nonlinear response under large RF disturbance - i.e., it predicts how an injected RF tone perturbs the regulator's DC/spectrum.",
+            "where_used": "Academic + industrial EMC (IEEE T-EMC; industrial automotive voltage-regulator case study). The closest published analog to 'model a regulator as a black box inside HB and see what an RF tone does to it.'",
+            "strengths": [
+              "It is literally a voltage regulator modeled as an ANN surrogate running in HARMONIC BALANCE under an injected RF tone - the most on-point precedent for an LDO-near-carrier HB study",
+              "Handles both CW and amplitude-modulated disturbance, i.e., sidebands/envelope effects around the injected tone",
+              "Designed to reduce HB sim time and hide IP, which is the practical motivation for a behavioral LDO supply model",
+              "Demonstrates ANN+HB convergence for a regulator-class block"
+            ],
+            "weaknesses": [
+              "Goal is EMC immunity (how external RF upsets the regulator), not high-fidelity Zout(f)/PSRR(f)/noise of the regulator as a clean supply - accuracy targets are coarser than spur-fidelity (dBc) work",
+              "No noise PSD modeling and no intrinsic-spur modeling; spurs are intermod of the injected disturbance",
+              "Older surrogate-ANN tech; static MLP mapping in the HB harmonic domain may miss fine memory/loop dynamics",
+              "Fidelity to the sub-mdBc spur levels a supply study often needs is not demonstrated"
+            ],
+            "supply_handling": "Directly addresses supply-pin RF injection in HB and produces the resulting spectrum/sidebands - so it proves the workflow (ANN regulator macromodel + HB + RF tone -> spectral response) is feasible and convergent. But it is tuned for large-disturbance immunity, not for accurate small-signal Zout(f)/PSRR(f), output noise PSD, or low-level discrete spurs. Use it as the workflow template; you would need a much tighter accuracy spec and added noise/spur mechanisms for true spur fidelity.",
+            "maturity": "emerging (peer-reviewed, with an industrial case study); proven in HB but for immunity, not spur-fidelity supply modeling."
+          },
+          {
+            "name": "Gaussian-Process (GP) and Polynomial-Chaos-Expansion (PCE) surrogates (incl. PCE-GP hybrids, stochastic testing)",
+            "what": "Statistical/spectral surrogates that map design or process-variation parameters to circuit performance metrics (gain, bandwidth, PSRR value, transient settling, ripple, yield). GP gives a smooth interpolant with calibrated uncertainty; generalized PCE / stochastic testing expands the response in orthogonal polynomials of random parameters for fast uncertainty quantification with provable convergence when parameter count is small/medium; PCE-GP hybrids (PCEGP) use PCE to set input-dependent GP hyperparameters for non-stationary/heteroscedastic responses. Used to replace expensive SPICE Monte Carlo for yield/variability and for Bayesian optimization of analog sizing.",
+            "where_used": "Academic + EDA-research (Z. Zhang / L. Daniel MIT stochastic testing; broad UQ-for-EDA literature; PoBO for photonic-IC yield; PCEGP 2024). Used in design-space exploration, yield-aware optimization, and variability analysis - not in the inner simulation loop.",
+            "strengths": [
+              "Excellent for parameter->scalar-metric surrogates (e.g., predict PSRR-at-1MHz or settling time vs corner) with uncertainty bars; huge speedup over Monte Carlo for UQ/yield",
+              "PCE has rigorous convergence theory for low/medium parameter dimensionality",
+              "Cheap to evaluate, smooth, good for Bayesian optimization of LDO sizing and for sensitivity analysis"
+            ],
+            "weaknesses": [
+              "These are STATIC input->output regressors over parameters, NOT dynamical simulator-embeddable blocks - they cannot be placed in a netlist and run in PSS/HB",
+              "Do not represent Zout(f)/PSRR(f) as transfer functions, do not generate spectra, do not produce noise PSD or spurs; they predict scalar/curve metrics, not a port behavior the solver iterates on",
+              "Curse of dimensionality: PCE blows up with many parameters; GP scales poorly with large datasets",
+              "No notion of convergence inside an RF simulator because they are never inside one"
+            ],
+            "supply_handling": "Essentially orthogonal to the spur/PSS goal. They can predict a PSRR number, a noise-integrated value, or yield vs corners as a surrogate over design/process knobs, and are very useful for choosing/optimizing an LDO design or for fast corner exploration of your behavioral model's fitted coefficients. But they do NOT provide a Zout(f)/PSRR(f) port, do not emit spurs, do not give a noise PSD usable by a noise analysis, and cannot be embedded in PSS/HB. Treat them as an outer-loop optimization/UQ tool wrapping a real (physics or NN-ODE) behavioral model, not as the supply element itself.",
+            "maturity": "mainstream-production for UQ/yield/optimization (well-established); not applicable as an in-simulator spur/PSS model."
+          },
+          {
+            "name": "Graph-Neural-Network / DNN performance predictors for analog/RF design-space exploration (and analog surrogate frameworks, e.g., LASANA)",
+            "what": "GNNs that ingest a circuit netlist as a graph and predict performance metrics (gain, noise figure, bandwidth, S-parameter-derived figures) data-efficiently across topologies; and broader analog surrogate frameworks (e.g., LASANA, 2025) that learn block-level output/state/energy/latency to plug into architectural simulators. The aim is fast performance prediction or system-level co-simulation, not transistor-accurate port behavior in an RF solver.",
+            "where_used": "Academic (RF-informed GNN, Asadi/Partin-Vaisband, arXiv:2508.16403 2025; LASANA, Ho/Gerstlauer UT Austin, arXiv:2507.10748 2025), and the active ML-for-EDA wave that EDA vendors (Cadence, Synopsys, Siemens) are commercializing for sizing/layout/optimization. Design-space exploration and architecture-level simulation.",
+            "strengths": [
+              "Data-efficient, generalizes across topologies; great for early design exploration and ranking candidate LDO architectures",
+              "GNN respects circuit topology, so it can predict frequency-domain figures from structure",
+              "LASANA-style learned block models speed up large system simulation by orders of magnitude"
+            ],
+            "weaknesses": [
+              "Predict performance metrics / coarse block behavior, NOT a transistor-accurate, simulator-embeddable supply port - explicitly design-space-exploration tools, not PSS/HB blocks",
+              "No Zout(f)/PSRR(f) transfer-function fidelity at the level needed for spurs, no noise PSD, no discrete spur generation",
+              "Accuracy is statistical/aggregate; spur fidelity (dBc) is far outside their stated scope",
+              "No convergence story inside an RF simulator because they live above it"
+            ],
+            "supply_handling": "Not relevant as a supply element in PSS/HB. Useful only at the periphery: a GNN/DNN could pick or pre-size an LDO architecture, or LASANA-style models could carry an LDO's coarse behavior in a system-level (non-RF) sim. They do not model Zout(f), PSRR(f), noise PSD, or spurs at spur-study fidelity and are not embeddable in PSS/HB.",
+            "maturity": "emerging (research), with the ML-in-EDA optimization/exploration subset moving into production tools - but the spur/PSS supply-modeling use is out of scope."
+          }
+        ],
+        "relevance_to_spur_pss": "Moderately relevant as a family, with one clear winner pattern and a lot of noise. The directly useful thread is the continuous-time NN-ODE-in-Verilog-A lineage (Chen 2017 CTRNN -> Yang 2022 ISS-NODE -> Chang 2025 NODE-RNN/NCDE-RNN) plus the ANN-large-signal-in-Verilog-A device family that is actually proven to CONVERGE in Harmonic Balance and render single/two-tone IMD spectra (Jarndal GaN-HEMT), and the HB-surrogate ANN voltage-regulator immunity model - the closest published precedent for 'regulator-as-black-box in HB under an RF tone.' These show the deployment path (Verilog-A), the convergence prerequisites (continuous-time + smooth derivatives + provable stability/ISS), and a real HB spectral result. However, NONE of them targets the trio the user cares about - calibrated Zout(f), PSRR(f), output noise PSD, and low-level DISCRETE spurs at dBc fidelity. NN behavioral models are deterministic ODEs, so noise PSD and intrinsic spurs are not modeled at all and must be bolted on separately; spurs only appear as distortion of an applied tone. GP/PCE and GNN/DNN surrogates are essentially irrelevant to the in-simulator spur/PSS task: they are outer-loop parameter->metric regressors for yield/optimization/exploration, not simulator-embeddable supply ports. Critically for spur fidelity, a learned nonlinear ODE puts the model's Zout/PSRR/spur content at the mercy of its training loss and Jacobian smoothness; without explicitly enforcing (a) correct small-signal frequency response, (b) passivity/stability for HB convergence, and (c) a separate stochastic/deterministic noise+spur mechanism, a generic ML surrogate will not beat the user's current physics-based per-block approach (LTI Zout+PSRR multiport + shaped Norton noise + explicit deterministic spur tones), which already achieves dBc-level fidelity by construction and is inherently HB/PSS-friendly. Net: the ML family contributes the convergence-robustness ideas (ISS / continuous-time / smooth derivatives) and the Verilog-A-in-HB deployment template, and is worth borrowing from for any nonlinear extension (slew, gm compression), but is NOT a turnkey replacement for the linear+spur+noise decomposition when the objective is fast, convergent, low-level spur fidelity near an RF carrier.",
+        "sources": [
+          "Z. Chen, M. Raginsky, E. Rosenbaum, 'Verilog-A compatible recurrent neural network model for transient circuit simulation,' IEEE EPEPS 2017 (DOI 10.1109/EPEPS.2017.8329743); https://experts.illinois.edu/en/publications/verilog-a-compatible-recurrent-neural-network-model-for-transient",
+          "A. Yang, J. Xiong, M. Raginsky, E. Rosenbaum, 'Input-to-State Stable Neural Ordinary Differential Equations with Applications to Transient Modeling of Circuits,' arXiv:2202.06453 (L4DC 2022); https://arxiv.org/pdf/2202.06453",
+          "Z. Chang, Y. Zhang, H. Tan, H. C. Chen, 'Hybrid Time-Domain Behavior Model Based on Neural Differential Equations and RNNs' (NODE-RNN/NCDE-RNN), arXiv:2503.22313, 2025; https://arxiv.org/pdf/2503.22313",
+          "Y. Cao, R. Ding, Q.-J. Zhang, 'State-space dynamic neural network technique for high-speed IC applications: modeling and stability analysis,' IEEE T-MTT 54(6):2398-2409, 2006; https://ieeexplore.ieee.org/document/1643567/",
+          "A. Jarndal et al., 'Verilog-A Based ANN Large Signal Modeling of GaN HEMTs,' IEEE 2024 (https://ieeexplore.ieee.org/document/10479941/) and 'Improved Verilog-A Based Artificial Neural Network Modeling Applied to GaN HEMTs,' Advanced Theory and Simulations (Wiley) 2025, DOI 10.1002/adts.202400645",
+          "'A Neural Network-Based Harmonic Balance Technique for Analysis of Periodic Responses of Nonlinear Circuits,' Circuits Systems and Signal Processing (Springer) 2022, DOI 10.1007/s00034-022-02271-5; https://link.springer.com/article/10.1007/s00034-022-02271-5",
+          "'Behavioral Modeling of Steady-State Oscillators with Buffers Using Neural Networks' (AugNN + periodic unit + RNN), Penn State; https://pure.psu.edu/en/publications/behavioral-modeling-of-steady-state-oscillators-with-buffers-usin/",
+          "'Harmonic Balance Surrogate-Based Immunity Modeling of a Nonlinear Analog Circuit' (ANN voltage-regulator macromodel in HB under DPI/RF injection), IEEE T-EMC; https://ieeexplore.ieee.org/iel7/15/6681916/06472284.pdf and https://www.researchgate.net/publication/260721245",
+          "'Machine Learning-Based Verilog-A Modeling for Power Distribution Network of On-Die Regulator' (vector fitting + NN for on-die regulator PDN), IEEE 2021; https://ieeexplore.ieee.org/document/9505184/",
+          "Z. Zhang, T. A. El-Moselhy, I. M. Elfadel, L. Daniel, 'Stochastic Testing Method for Transistor-Level Uncertainty Quantification Based on Generalized Polynomial Chaos,' arXiv:1409.4831; https://arxiv.org/pdf/1409.4831",
+          "'Polynomial Chaos Expanded Gaussian Process' (PCEGP), arXiv:2405.01052 / MDPI Machine Learning & Knowledge Extraction 8(3):78, 2024; https://www.mdpi.com/2504-4990/8/3/78",
+          "J. Ho, J. A. Boyle, L. Liu, A. Gerstlauer, 'LASANA: Large-Scale Surrogate Modeling for Analog Neuromorphic Architecture Exploration,' arXiv:2507.10748, 2025; https://arxiv.org/pdf/2507.10748",
+          "A. Asadi, L. Popryho, I. Partin-Vaisband, 'RF-Informed Graph Neural Networks for Accurate and Data-Efficient Circuit Performance Prediction,' arXiv:2508.16403, 2025; https://arxiv.org/pdf/2508.16403",
+          "D. E. Root, J. Verspecht et al., X-parameters / Poly-Harmonic Distortion (PHD) behavioral models (contrast point for HB-native nonlinear spectral/spur modeling); https://en.wikipedia.org/wiki/X-parameters and http://emlab.illinois.edu/ece451/appnotes/phd_mtt05.pdf",
+          "Cadence, 'AI in Analog Design' (ML-in-EDA vendor context); https://www.cadence.com/en_US/home/explore/ai-analog-design.html",
+          "'Machine Learning for Electronic Design Automation: A Survey,' arXiv:2102.03357 (ML-in-EDA landscape)"
+        ]
+      },
+      {
+        "category": "Power-Integrity / Power-Delivery-Network (PDN) modeling of voltage regulators and PMICs",
+        "methods": [
+          {
+            "name": "Closed-loop output-impedance Zout(f) one-port (VRM/LDO as a 1-port for PDN co-design)",
+            "what": "The dominant PI view: model the regulator as a single 1-port frequency-dependent output impedance Zout(s)=Vout(s)/Iload(s) seen at the rail. Below the control-loop bandwidth Zout is forced low/near-zero by feedback; near loop crossover it peaks (anti-resonance, set by loop phase margin / Q); above loop bandwidth it is dictated by the passive PDN (Cout ESR/ESL then inductive +20 dB/dec). The regulator's Zout is then composed with package/board/decap impedances and the goal is a FLAT, low-Q target impedance Ztarget = Vripple_allowed / Itransient. Voltage ripple = Zpdn(f) x Iload(f); a flatter/lower-Q PDN yields lower ripple, jitter, EMI and better transient response. This is exactly the 'supply-as-impedance' abstraction.",
+            "where_used": "Mainstream board/package PI engineering. Keysight Power Integrity Boot Camp (Heidi Barnes), PathWave ADS PI flows, Cadence Sigrity/PowerSI/OptimizePI, Ansys SIwave/HFSS-PI, Bode-100/VNA-based VRM characterization. Microwave Journal 'Signal Integrity to Power Integrity' series, Signal Integrity Journal flat-impedance articles.",
+            "strengths": [
+              "Single physically-meaningful transfer function captures load-step/transient behavior and the anti-resonance that dominates ringing",
+              "Composes cleanly with passive decap/package/board impedance (just series/parallel of 1-ports)",
+              "Directly measurable on silicon/board with a VNA (shunt-through), so model is validatable",
+              "Maps naturally to the user's project finding that transient is governed by Zout(s) and that the spur band is linear-multiport"
+            ],
+            "weaknesses": [
+              "Pure 1-port Zout says nothing about supply->output transfer (PSRR) — needs a second port/path",
+              "Single-port small-signal model omits large-signal compression/slew (valid only for small load perturbations, as the project already found ~50uA linear limit)",
+              "Captures noise/ripple only as a response to load current, not as an independent rail noise source",
+              "Q/anti-resonance is sensitive to operating point (Iload-dependent gm, Cout ESR), so one fixed Zout(f) may not generalize across bias"
+            ],
+            "supply_handling": "Zout(f): this IS the method's core deliverable; the loop-shaped peak and the +20dB/dec inductive tail are exactly reproduced. PSRR(f): NOT covered by a 1-port; requires upgrading to a 2-port (Vin->Vout path). Noise PSD: only the response part (Vn = Zout x In_load); intrinsic regulator noise must be added separately. Discrete spurs: not represented unless an explicit current/voltage tone is injected at the port. PSS/HB: a measured Zout must be turned into a rational/pole-residue model (next method) before it is HB/PSS-usable; raw tabular Zout is fine for AC but not directly for periodic-steady-state nonlinear solvers.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Two-port / multiport behavioral macromodel (Zout + PSRR + intrinsic noise as a small-signal N-port)",
+            "what": "Upgrade the 1-port to a small-signal 2-port (or N-port) of the rail: an output-impedance path Zout(f), a supply-rejection path PSRR(f)=Vout/Vin (or its inverse, line transfer), and an intrinsic output-referred noise source. This is the 'supply = impedance + noise + ripple' triplet. The PSRR path lets an upstream supply tone/ripple appear at the regulated output; the noise source carries the regulator's own broadband + flicker PSD; ripple/spurs are injected as deterministic sources. This is precisely the architecture the user's project converged on (per-block swappable Zout + signed-section PSRR + Norton-at-vout noise + deterministic spur tones).",
+            "where_used": "On-die/SoC PI and AMS modeling; appears in PSIJ literature (LDO modeled by its PSRR response), Keysight ADS measurement-based VRM 2-port models, and EMI terminal models (3-terminal Norton). Encoded as Verilog-A/Verilog-AMS or SPICE behavioral (ABM/E,G,H sources) blocks. The user's repo (variants.py / per-block model + selector).",
+            "strengths": [
+              "Separates the three physical mechanisms (load->out, supply->out, intrinsic noise) so each can be fit/validated independently and swapped per architecture",
+              "PSRR path is the right primitive for supply-induced sidebands around a carrier",
+              "Linear/multiport when nonlinearity is negligible (matches the project's <-62 dBc spur finding) -> very fast, very convergent in HB/PSS",
+              "Output-referred shaped-Norton noise (Sin = Sv x |Yout|^2) correctly reproduces loop-shaped, NOT white-through-Zout, noise"
+            ],
+            "weaknesses": [
+              "Each transfer (Zout, PSRR) must itself be a stable, ideally passive rational model or HB/transient can misbehave",
+              "Cross-terms (load-dependent PSRR, intermod between supply tone and load) are dropped in a purely linear 2-port",
+              "PSRR is often non-minimum-phase / sign-changing across frequency (the project's V4 difficulty) — naive magnitude-only fits give wrong sideband phase",
+              "Validation needs both AC (Zout, PSRR) and PSS/Pnoise (noise, spurs), i.e. a multi-analysis harness"
+            ],
+            "supply_handling": "Zout(f): explicit 1-port path. PSRR(f): explicit Vin->Vout path — the key enabler for supply-tone sidebands; must preserve phase/sign to get sideband asymmetry right. Noise PSD: explicit output-referred Norton (white + Lorentzians/flicker), decoupled from Zout so it survives load changes. Discrete spurs: injected as deterministic tones at the output node (the project's transient-FFT-fit spur block). PSS/HB: if every path is a low-order rational/synthesized-RLC block, the model is small, smooth and strongly convergent under HB/PSS/shooting; it adds essentially no stiffness because there's no internal switching/regulation loop to converge.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Rational/pole-residue macromodeling: Vector Fitting (+ passivity enforcement) and equivalent-circuit synthesis",
+            "what": "Fit measured/simulated frequency-domain data (Zout, PSRR, or full Y/Z/S of the rail) to a stable pole-residue rational function H(s)=sum_k r_k/(s-p_k)+d+s*e, with stable poles (real or conjugate pairs). Passivity is verified (Hamiltonian-matrix eigenvalues / half-size test) and enforced (residue-matrix eigenvalue perturbation). The rational model is then realized either as an equivalent RLC/controlled-source SPICE subcircuit (Foster/Cauer-style synthesis) or as a state-space block, or interfaced by recursive convolution / Norton equivalent in transient. This is the bridge that turns a tabular Zout/PSRR into something a nonlinear PSS/HB solver can use.",
+            "where_used": "Gustavsen & Semlyen Vector Fitting (vectfit3, SINTEF Matrix Fitting Toolbox); standard in PI/SI macromodeling, IdEM/Idemworks, Cadence/ADS broadband SPICE model generation, power-grid and interconnect ROM. Widely taught (e.g. NTU PI macromodeling course).",
+            "strengths": [
+              "Turns black-box measured Zout/PSRR into a compact, stable, causal model usable in time- and frequency-domain solvers",
+              "Passivity enforcement guarantees stable transient/HB behavior when connected to active loads",
+              "Low order -> fast and convergent; orders of magnitude smaller than tabular convolution",
+              "Handles Y/Z/S equally; can fit the non-minimum-phase PSRR if real+imag (complex) data are fit (not magnitude only)"
+            ],
+            "weaknesses": [
+              "Passivity enforcement can perturb the fit (accuracy/passivity tradeoff), and for a 1-port noise/PSRR path 'passivity' may be the wrong constraint (PSRR is not a passive immittance, so naive passivity enforcement is inappropriate — must enforce only stability/causality there)",
+              "Magnitude-only fitting loses phase -> wrong sideband phase/asymmetry; needs complex data",
+              "Pole count and expansion choice are heuristic; over-fitting measurement noise creates spurious resonances that become spurious HB tones",
+              "Equivalent-circuit synthesis of complex residues needs controlled sources, which some HB engines handle better than others"
+            ],
+            "supply_handling": "Zout(f): fitted directly; synthesized RLC is HB/PSS-friendly. PSRR(f): fit as a transfer function (stability+causality, NOT passivity); preserves phase for correct sidebands. Noise PSD: the shaped noise source can be implemented as white noise filtered by a fitted rational shaping filter. Discrete spurs: not produced by the rational model itself (it's LTI) — spurs come from injected sources, but the rational Zout correctly shapes/colors how an injected tone appears at the port. PSS/HB: this is the method that makes the others HB-ready — a low-order passive rational block is smooth, has no stiff dynamics, and converges fast; tabular-S convolution by contrast is slow and can be non-causal/non-convergent.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Reduced-order modeling (MOR) of the PDN: Krylov/moment-matching (PRIMA, SPRIM, PVL)",
+            "what": "Projection-based model-order reduction of the (large) linear RLC PDN/power-grid: build a Krylov subspace via block Arnoldi/Lanczos at an expansion point, congruence-project the MNA matrices to a small order q model that matches the first q moments of the transfer function. PRIMA guarantees passivity (and SPRIM additionally preserves block structure/reciprocity and matches twice as many moments for the same cost). Used to compress the passive network around/feeding the regulator (grid, decaps, package) into a compact N-port that the regulator model plugs into.",
+            "where_used": "EDA power-grid analysis and interconnect ROM (Cadence, Synopsys, Ansys back-ends); Pillage/Pileggi/Odabasioglu (PRIMA, ICCAD'97), Freund (PVL/SPRIM). Academic + production for chip-level PDN.",
+            "strengths": [
+              "Massive compression of passive PDN while provably preserving passivity -> stable when coupled to active regulator/load",
+              "Accurate broadband near expansion point; multi-point variants extend bandwidth",
+              "Directly produces a small N-port that composes with the regulator's Zout/PSRR model"
+            ],
+            "weaknesses": [
+              "Reduces only the LINEAR passive network — the regulator's active loop, noise and spurs are NOT captured (must be added as the active 1/2-port)",
+              "Compression collapses with very large port count (power grids have thousands of ports)",
+              "Accuracy concentrated near expansion point; wideband needs higher order or multi-point",
+              "No notion of noise PSD or discrete spurs at all"
+            ],
+            "supply_handling": "Zout(f): the passive part of Zout (decaps, grid, package) is exactly what MOR compresses; combined with the active loop model it gives full Zout. PSRR(f): not modeled (linear passive only). Noise PSD: none. Discrete spurs: none. PSS/HB: the reduced passive N-port is small and passive -> excellent HB/PSS conditioning; it's the right way to keep the surrounding network from bloating the harmonic-balance Jacobian. It is complementary to (not a replacement for) the active regulator behavioral model.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "PMIC/switching-regulator behavioral models for transient: state-space averaging and SIMPLIS PWL/POP+AC",
+            "what": "For switched-mode supplies (and PMIC rails) two production approaches: (a) state-space / average models that hide switching for fast startup/transient/AC and optionally overlay synthetic ripple; (b) SIMPLIS (SIMulation for Piecewise-LInear System), which represents devices as PWL segments and the converter as a cyclic sequence of linear topologies, then uses Periodic Operating Point (POP) to find the switching steady-state limit cycle quickly and an AC-at-POP to extract small-signal frequency response (incl. Zout, control-to-output, and even PSRR) 10-50x faster than SPICE without deriving an average model.",
+            "where_used": "PMIC/DC-DC vendor models (TI, ADI, Infineon), SIMetrix/SIMPLIS, Keysight ADS state-space averaged VRM behavioral models, EMI/ripple system studies. Used to GENERATE the Zout(f)/control-loop data that then feeds the rational/1-port abstraction.",
+            "strengths": [
+              "POP+AC gives accurate switching-aware Zout(f) and loop response without averaging approximations",
+              "Average models give very fast transient/startup for system PI",
+              "Captures the real switching ripple spur comb (fsw and harmonics) that a linear LDO model would miss",
+              "Bridges to the abstract models: run POP/AC to extract Zout/PSRR, then fit rational"
+            ],
+            "weaknesses": [
+              "SIMPLIS/PWL and switching transient are slow and NOT directly compatible with RF HB/PSS near a GHz carrier (huge timescale separation: fsw ~MHz vs carrier ~GHz)",
+              "PWL switching is the opposite of what you want inside a fast spur-fidelity model — too stiff/expensive",
+              "Average models drop the switching spurs that may matter for sidebands; ripple overlay is synthetic",
+              "Vendor encrypted models often won't converge in HB and can't be reduced"
+            ],
+            "supply_handling": "Zout(f): extracted via POP+AC (accurate, switching-aware). PSRR(f): line-to-output via AC-at-POP. Noise PSD: not its strength (deterministic ripple, not stochastic PSD). Discrete spurs: NATURALLY produced (fsw harmonics) — this is where switching spurs come from, but they are far below an RF carrier. PSS/HB: poor fit for fast RF spur modeling — switching PWL/POP is its own steady-state engine, not RF HB; the right use is OFFLINE characterization (extract Zout/PSRR/ripple spectrum) which then becomes injected tones + rational paths in the lightweight HB model.",
+            "maturity": "mainstream-production"
+          },
+          {
+            "name": "Black-box terminal EMI / conducted-emission models: 3-terminal Norton (impedances + noise sources)",
+            "what": "Frequency-domain black-box model of a converter/regulator as a small terminal network: typically 2-3 impedances plus 1-2 independent noise sources (Norton or Thevenin), extracted from terminal measurements, that reproduces the device's terminal impedance AND its emitted noise spectrum independent of source/load (via superposition). Common-mode and differential-mode are separated; CM source impedance is capacitive (falls with f), DM is resistive/inductive (rises with f). Modular-Terminal-Behavioral (MTB) variants superpose per-operating-zone frequency-domain sources to cover the whole period.",
+            "where_used": "Power-electronics EMI/EMC engineering and filter co-design; CPES (Virginia Tech), IET Power Electronics / IEEE TPEL behavioral EMI papers, TI 'Engineer's Guide to EMI in DC-DC' app notes. Realized in SPICE/LTspice or ADS from Touchstone.",
+            "strengths": [
+              "Cleanly separates 'impedance' from 'noise source' — exactly the supply-as-(impedance+noise) abstraction, and explicitly carries a deterministic emission spectrum",
+              "Load/source independent (the whole point) -> reusable across PDN contexts",
+              "Directly measurement-extractable and validated against measured conducted emissions",
+              "Superposition makes multiple noise sources / spurs additive and easy to compose"
+            ],
+            "weaknesses": [
+              "Built for kHz-MHz conducted-EMI band, not GHz RF carriers; impedance extraction assumes LTI terminal behavior",
+              "Linear/superposition assumption breaks if the noise source impedance is operating-point dependent",
+              "Phase of the noise source (needed for sideband asymmetry) is often under-specified vs magnitude",
+              "Not a loop/PSRR model — it's emission-centric, so supply-rejection of an upstream tone isn't its native output"
+            ],
+            "supply_handling": "Zout(f): the terminal impedances ARE a Zout/Yout description. PSRR(f): not native (it models self-emission, not rejection of an injected upstream tone), though a 2-port version can. Noise PSD / spurs: this is its specialty — it carries both broadband emission and the discrete switching-harmonic comb as explicit sources with extracted impedance. PSS/HB: the extracted terminal network is small and (if passivity-enforced) HB-friendly; the deterministic source spectrum maps directly to injected HB tones. Most relevant as the template for 'how to attach a validated discrete-spur source behind an extracted Zout.'",
+            "maturity": "emerging"
+          },
+          {
+            "name": "Supply-noise-to-jitter / sideband mapping: PSRR-based PSIJ and supply-induced phase modulation models",
+            "what": "Analytic/behavioral chain that converts a supply ripple/noise spectrum into output timing jitter or RF phase/amplitude sidebands using the block's PSRR(f) (or supply sensitivity Kvco / delay sensitivity). For drivers: PSIJ = supply ripple x PSRR shaped by edge slope and propagation delay; a 'jitter-aware target impedance' ties PDN Zpdn(f) to a jitter spec. For RF: a supply tone at fm modulates the carrier through PSRR/pushing, producing sidebands at fc +/- fm whose level = (carrier) x (PSRR/pushing at fm). The on-die LDO is analyzed by its PSRR alone and combined with the downstream block's sensitivity (modular: analyze LDO and load separately, then multiply/combine).",
+            "where_used": "High-speed link / clock / PLL / RF-frontend design. EMPSIJ (Efficient Modeling of Power-Supply-Induced Jitter), Missouri S&T PSIJ dissertations, IEEE EMC+SIPI papers on on-die LDO + output buffer, VCO supply-pushing literature; Cadence SpectreRF PSS+Pnoise/HB for sideband verification.",
+            "strengths": [
+              "Directly produces the quantity the user cares about: sideband/spur level near a carrier from a supply tone via PSRR(f)",
+              "Modular (LDO PSRR x load sensitivity) -> few/fast simulations, generalizable across loads",
+              "Connects PDN Zout (which sets the ripple) to PSRR (which converts it) to the final sideband — full chain",
+              "Validatable against measured/simulated phase noise/spur tables"
+            ],
+            "weaknesses": [
+              "Linear-PSRR assumption: large supply swings cause AM/PM conversion and intermod not captured by a single PSRR(f)",
+              "Needs accurate PSRR phase (and pushing sign) for correct upper/lower sideband asymmetry",
+              "Edge-slope/delay approximations are driver-specific; RF-pushing models need the carrier circuit's actual sensitivity",
+              "Combining blocks by multiplication assumes weak interaction / no loading between LDO and load"
+            ],
+            "supply_handling": "Zout(f): used upstream to compute the ripple amplitude (ripple = Zpdn x Iload). PSRR(f): the central operator — converts supply ripple to output sideband; phase critical. Noise PSD: broadband supply PSD x |PSRR|^2 -> output phase-noise skirt; spurs handled identically as discrete lines. Discrete spurs: explicitly the target — a supply spur at fm -> sideband at fc+/-fm at level set by PSRR(fm). PSS/HB: the recommended verification engine is exactly PSS/QPSS/HB + Pnoise/PAC: large tone = carrier, small tone = supply ripple; a lightweight LTI supply block (Zout+PSRR rational paths + injected spur sources) keeps the HB/QPSS problem small and convergent. This family is the most directly aligned with the project's end goal.",
+            "maturity": "mainstream-production"
+          }
+        ],
+        "relevance_to_spur_pss": "Highly relevant, and it directly validates the project's current architecture. The PDN/PI community has independently converged on the same 'supply = impedance + noise + ripple' decomposition the project adopted: (1) a closed-loop Zout(f) 1-port for transient/ringing, (2) a PSRR(f) path that is THE mechanism turning a supply tone into carrier sidebands, (3) an output-referred (Norton-at-vout, loop-shaped) noise PSD, and (4) explicitly injected discrete spur tones (the EMI 3-terminal-Norton 'impedance + independent noise source' template). The key enabling technique for FAST, CONVERGENT PSS/HB is rational/pole-residue macromodeling (Vector Fitting + stability/causality — and for true immittances, passivity — enforcement) plus, for the surrounding passive network, Krylov MOR (PRIMA/SPRIM): both yield small, smooth, well-conditioned blocks that add no stiffness to the harmonic-balance Jacobian, unlike tabular-S convolution or switching PWL/POP models. Two critical, repeatedly-flagged caveats for spur fidelity: (a) PSRR is generally non-minimum-phase/sign-changing, so it must be fit from COMPLEX data and enforced only for stability/causality (NOT passivity) or the sideband phase/asymmetry will be wrong — this matches the project's V4 PSRR difficulty; (b) switching-converter PWL/SIMPLIS and average models belong OFFLINE (to extract Zout/PSRR/ripple-comb), not inside the GHz HB run, because of the MHz-vs-GHz timescale separation. For the actual carrier+ripple analysis, the literature points squarely at QPSS / PSS+PAC / HB+Pnoise with the regulator reduced to a low-order LTI 2-port plus injected tones — exactly the lightweight, linear-multiport model the project found sufficient (spurs <-62 dBc, nonlinearity a red herring).",
+        "sources": [
+          "Microwave Journal, 'Output Impedance ZOUT' and 'Output Impedance ZOUT and VRM Output Noise' (RF Signal Integrity to Power Integrity blog series) - https://www.microwavejournal.com/blogs/32-rf-signal-integrity-to-power-integrity",
+          "Keysight, 'Selecting and Modeling the Voltage Regulator Module (VRM)', PI Boot Camp slides (Heidi Barnes) - https://www.keysight.com/us/en/assets/9921-02187/miscellaneous/03-Slides-PI-Bootcamp-RM-Selection-and-Modeling.pdf",
+          "Keysight, 'Flat Target Z' PI Boot Camp slides (Heidi Barnes) - https://www.keysight.com/zz/en/assets/9921-02185/miscellaneous/01-Slides-PI-BootCamp-Flat-Target-Z-v1.pdf",
+          "Signal Integrity Journal, 'VRM Modeling and Stability Analysis for the Power Integrity Engineer' - https://www.signalintegrityjournal.com/articles/3355",
+          "Signal Integrity Journal, 'Optimizing Power Distribution Networks for Flat Impedance' (2020) - https://www.signalintegrityjournal.com/articles/1715",
+          "Odabasioglu, Celik, Pileggi, 'PRIMA: Passive Reduced-order Interconnect Macromodeling Algorithm', ICCAD 1997 - https://www.cecs.uci.edu/~papers/compendium94-03/papers/1997/iccad97/pdffiles/01d_1.pdf",
+          "Freund et al., 'SPRIM: Structure-Preserving Reduced-order Interconnect Macromodeling'",
+          "Gustavsen & Semlyen, Vector Fitting; SINTEF Vector Fitting / Matrix Fitting Toolbox - https://www.sintef.no/en/software/vector-fitting/",
+          "Passivity enforcement for S-parameter macromodels (residue-eigenvalue perturbation; DC-preserving) - https://www.researchgate.net/publication/224372086 and https://www.researchgate.net/publication/224124637",
+          "Missouri S&T PhD dissertation, 'Analysis and modeling of power supply induced jitter for high speed driver and low dropout voltage regulator' - https://scholarsmine.mst.edu/doctoral_dissertations/3080/",
+          "'Efficient Modeling of Power Supply Induced Jitter in Voltage-Mode Drivers (EMPSIJ)' - https://www.researchgate.net/publication/318125050",
+          "IEEE EMC+SIPI 2021, 'Analysis of Power Supply Induced Jitter of High Speed Output Buffer with On-Die Low-Dropout Voltage Regulator' - https://resourcecenter.ieee.org/conferences/emcsipi-2021/emcsipi20212690",
+          "SIMPLIS documentation, 'What is SIMPLIS', 'POP and AC Analysis', 'Periodic Operating Point' - https://www.simplistechnologies.com/documentation/simplis/",
+          "'Modeling of Conducted Emissions for EMI Analysis of Power Converters: State-of-the-Art Review' - https://www.researchgate.net/publication/344901186",
+          "IEEE Xplore, 'An Approach to Identify Noise-Source Parameters of DC-DC Converter and Predict Conducted Emissions With Different Loads' (3-terminal Norton) - https://ieeexplore.ieee.org/document/9978542/",
+          "Cadence Community RF blog, 'Why Do Shooting and Harmonic Balance Phase Noise Results Differ?' (SpectreRF PSS shooting vs HB, augmented Pnoise) - https://community.cadence.com/cadence_blogs_8/b/rf/posts/why-do-shooting-and-harmonic-balance-phase-noise-results-differ",
+          "SForum 2022, 'Quasi-Periodic Steady-State and Periodic AC Applied for One Large and One Small Signal Tone' (QPSS/PAC for one large + one small tone) - https://sbmicro.org.br/sforum-eventos/sforum2022/",
+          "NTU PI course, 'Time-Domain Simulation - Macromodeling' (pole-residue, recursive convolution, Norton/SPICE realization) - http://cc.ee.ntu.edu.tw/~rbwu/rapid_content/course/pi/PI10_Macromodeling.pdf"
+        ]
+      },
+      {
+        "methods": [
+          {
+            "name": "Passive rational 2-port PSRR=S21 + Zout=S22 (vector-fit Verilog-A) with LPTV PAC/PXF/Pnoise spur translation; op-point parameterization and TVP as extensions",
+            "what": "Recommended composite. Fit supply-to-output PSRR(f) and output impedance Zout(f) to a passive pole-residue rational form via Vector Fitting, realize in SPICE/Verilog-A, add shaped-Norton output noise and forced spur tones. Spurs near a carrier come from LPTV PAC/PXF/Pnoise folding a supply ripple at df to sidebands at k*f0+/-df with phase. Extensions: parameterize Zout/PSRR/poles by load current (X-params/PHD or interpolated fits); TVP compresses the LPTV system to a compact LTI+mixer. Guran 2022 cut PSRR error to 0-7 percent below 500 kHz.",
+            "where_used": "Behavioral LDO/PMIC models (ROHM/TI/ADI); Cadence Spectre/SpectreRF (PSS/HB+pac/pxf/pnoise), ADS (HB, X-params), AFS; vector fitting SINTEF/scikit-rf/IMEC; ADI/TI spur-threshold bench; TVP academic.",
+            "strengths": [
+              "PSRR/Zout phase-correct, dominant near-carrier spur quantities",
+              "passive rational form HB-friendly; passivity is the key convergence lever",
+              "PAC/PXF exact ripple-to-sideband with phase; Pnoise cyclostationary noise",
+              "X-params add load dependence HB-natively; TVP gives a compact sideband model"
+            ],
+            "weaknesses": [
+              "base 2-port linear about one op point (misses gm compression/slew/dropout)",
+              "discrete spurs must be injected as forced tones",
+              "harmonic-count K aliases spurs; large interferers need QPAC/multitone HB",
+              "LUT/ML op-point models stall HB unless smoothed; ML non-passive"
+            ],
+            "supply_handling": "Zout/PSRR as fitted S22/S21 transfers; noise shaped-Norton+PSRR; spurs forced at vout. PSS/HB supply-to-sideband is exact via the conversion matrix (inject at df, appears at k*f0+/-df with phase); Pnoise folds noise PSD to carrier. Passivity/poles and K govern convergence/accuracy; separated supply-tone-vs-carrier favors envelope/multitone HB or QPAC over plain shooting.",
+            "maturity": "mainstream-production"
+          }
+        ],
+        "category": "LDO supply-element modeling for fast PSS/HB spur fidelity",
+        "sources": [
+          "Kundert JSSC 1999",
+          "Guran Math 2022",
+          "Gustavsen Vector Fitting",
+          "ADI Power Part3",
+          "Roychowdhury TVP 1999",
+          "Verspecht/Root X-params"
+        ],
+        "relevance_to_spur_pss": "Highly relevant; endorses the project's approach. The method field gives the recommended composite (passive rational 2-port PSRR/Zout + shaped-Norton noise + forced spurs, then PSS/HB and PAC/PXF/Pnoise to fold spurs to carrier) plus secondary families (op-point/X-param parameterization, TVP reduced LPTV). ML/Volterra are mostly unneeded for a linear spur band and risk non-passive in-loop behavior.</relevance_to_spur_pss>\n</invoke>\n"
+      }
+    ],
+    "synthesis": {
+      "landscape_summary": "The mainstream LDO/supply-modeling landscape splits into four layers that our project touches. (1) Analytical/classical small-signal theory — Rincon-Mora's impedance-divider PSRR (PSRdc=(Aolβ)^-1, zero at BWA, pole at UGF, output pole, ESR zero) and the feedback identity Zout(s)=Zo,ol/(1+T(s)) that explains the inductive +20dB/dec rise and the load-step ring. This is a recipe, not a runnable model; you realize its extracted poles/zeros as a behavioral block. (2) Behavioral macromodeling in Verilog-A/SPICE — either controlled-source equivalent circuits (Boyle/Renesas G-R-L-E ladders) or laplace_nd transfer-function blocks, with a hard Kundert constraint that SpectreRF supports only ddt/idt/idtmod/Laplace state (delay, z-transform, transition/slew/cross, random are hidden-state and either abort or silently kill sideband propagation). (3) Black-box rational/passive macromodeling from the SI/PI world — Vector Fitting (Gustavsen-Semlyen, relaxed/orthonormal variants), Sanathanan-Koerner, and the newer AAA and Loewner fitters, followed by stability/passivity enforcement (Hamiltonian/half-size tests) and RLC+controlled-source synthesis, plus delay-extraction/DEPACT for non-minimum-phase responses. (4) Nonlinear HB-native frequency-domain models — X-parameters/PHD and hot-S (the 6=4+2 / S+conjugate-T result), whose conceptual core (a small supply tone at fc±fd scatters into coupled upper/lower sidebands needing both direct and conjugate terms) is exactly what Cadence PAC/PXF compute and what governs spur amplitude AND phase asymmetry.\n\nThe PDN/power-integrity community has independently converged on precisely the abstraction our project uses: model the regulator as Zout(f) (1-port for transient/ringing/anti-resonance) plus a PSRR(f) path (the operator that turns supply ripple into carrier sidebands) plus an output-referred noise source plus explicitly injected discrete spur tones — the EMI '3-terminal Norton: impedance + independent source' template. The recommended composite from multiple survey agents is verbatim our architecture: passive rational 2-port (PSRR≈S21, Zout≈S22) + shaped-Norton noise + forced spur tones, then PSS/HB with PAC/PXF/Pnoise to fold ripple/noise to sidebands. Op-point parameterization by load current and the finding that the near-carrier spur band is linear (so a linear multiport plus injected tones suffices) are both endorsed.\n\nWhere our project genuinely departs from the mainstream is the hard ban on laplace_nd / s-domain behavioral blocks in favor of pure lumped R/L/C + controlled sources. The survey is split here: the Verilog-A/Kundert camp considers laplace_nd the *best-conditioned* PSS/HB-legal primitive (Beckett: a hand-rolled high-order ddt ODE fails at min timestep where laplace_nd converges), while the SI/PI synthesis camp agrees that a hand-built RLC+controlled-source subckt is the *safest* representation for PSS/HB and notes some simulators evaluate laplace blocks differently in HB vs transient, hurting spur fidelity. So our choice is defensible but is a deliberate trade of fitting expressiveness (especially complex-conjugate and RHP-zero/delay phase) for guaranteed convergence and portability.\n\nThe one place our implementation is provably behind the state of the art is PSRR phase on non-minimum-phase architectures. Our PSRR is realized as i_c(s)=G0+Σ Gᵢ/(1+s/wᵢ) — a bank of signed *first-order, strictly-real-pole* sections (the SK fitter returns None and falls back to a min-phase shelf whenever poles come out complex), multiplied by the same Zout. Signed real sections give sign reversals and magnitude notches but bounded phase; they structurally cannot reproduce the phase of a genuine RHP zero or net loop delay. That is exactly our documented residual: V4 magnitude fits to 0.04 dB but phase is 25° off (the '390° phase race'), and V3's migrating multi-pole leaves a 10° phase residual. The survey points straight at the fixes we have not yet adopted: signed second-order (complex-conjugate RLC) sections, explicit delay extraction (e^-sτ, exact per-harmonic in HB), and AAA/Loewner/delayed-VF fitters that make no minimum-phase assumption.",
+      "comparison_rows": [
+        {
+          "dimension": "Core supply abstraction (what the model IS)",
+          "mainstream": "PDN/PI standard + survey 'recommended composite': passive rational 2-port Zout≈S22 + PSRR≈S21 + output-referred (shaped-Norton) noise + injected discrete spur tones; spurs folded to sidebands by PSS/HB + PAC/PXF/Pnoise.",
+          "ours": "Exactly this: per-block Zout + signed-section PSRR + decoupled Norton-@vout noise + deterministic SIN spur tones at vout, with a PSS/HB fundamental manifest.",
+          "assessment": "Dead even — we independently landed on the textbook-endorsed architecture. No advantage either way; this is the right structure for the spur goal."
+        },
+        {
+          "dimension": "Transfer-function realization primitive",
+          "mainstream": "Two accepted routes: (a) laplace_nd Verilog-A (Kundert/Beckett: best-conditioned, PSS/HB-legal, supports complex poles + non-min-phase fits + explicit delay); (b) synthesized RLC + controlled sources from a pole-residue fit (safest, simulator-agnostic).",
+          "ours": "Route (b) ONLY, by hard constraint: pure R/L/C + VCVS/VCCS/B/SIN, no laplace_nd ever.",
+          "assessment": "Mixed. We get maximal convergence robustness and portability (ngspice→Spectre) and avoid the HB-vs-transient laplace evaluation discrepancy. But we forfeit laplace_nd's easy complex-pole and delay realization — which is the exact tool the mainstream uses for the non-min-phase PSRR phase we are stuck on."
+        },
+        {
+          "dimension": "Zout(f) modeling",
+          "mainstream": "Zout=Zo,ol/(1+T) realized as low-order rational/RLC; complex-pole pair for the resonant peak; VF + passivity enforcement on the (genuinely passive) Zout port; Krylov MOR (PRIMA/SPRIM) for the surrounding passive PDN.",
+          "ours": "(R_a+sL_a)||(ESR+1/sCout) with optional 2nd R-L branch; multi-start bounded LS; Cout auto-extracted; quadratic-in-ln(iload) op-parameterization.",
+          "assessment": "Close, with two gaps. We are inherently passive-by-construction (good, matches the 'enforce passivity only on Zout' rule for free). But (i) we do not explicitly enforce/verify passivity via Hamiltonian tests, and (ii) our fixed 1-2 branch topology under-fits load-migrating multi-pole resonance (V3 pkf residual) where a free-order VF/AAA fit would do better."
+        },
+        {
+          "dimension": "PSRR(f) magnitude+phase, esp. non-minimum-phase",
+          "mainstream": "Fit from COMPLEX data with stability-only (NOT passivity) enforcement; use signed 2nd-order sections, RHP zeros explicit (SK/AAA/Loewner make no min-phase assumption), or delay extraction (e^-sτ, exact per harmonic in HB) for net loop delay.",
+          "ours": "SK-fit i_c=H/Zout but realized as STRICTLY-REAL first-order signed sections (NPS=3); falls back to min-phase shelf if poles are complex. Magnitude excellent (V4 0.04 dB); phase bounded → 25° (V4) / 10° (V3) residual.",
+          "assessment": "Mainstream is clearly ahead here, and this is our dominant residual. Real-pole-only sections cannot carry RHP-zero/delay phase. We correctly use SK (the survey notes SK is arguably cleaner than VF for explicit RHP zeros) but then discard its complex/RHP content at realization."
+        },
+        {
+          "dimension": "Output noise PSD",
+          "mainstream": "Output-referred noise = referred sources × noise gain, but loop/Zout-shaped; survey confirms the correct generalization is a shaped Norton at vout (In=Sv/|Zout|) feeding Pnoise/Hbnoise for cyclostationary sideband folding.",
+          "ours": "Decoupled Norton-@vout: In=Sv_meas/|Zout|, white + 6 Lorentzians fit jointly in log-domain across 3 corners, realized as white-R + R||C sections + VCCS. Explicitly decoupled so it survives Zout topology changes.",
+          "assessment": "We are at or ahead of mainstream. The decoupling fix (so adding a Zout branch doesn't re-shape noise) is a genuinely good engineering refinement that the generic literature does not emphasize. Essentially closed (npsd ≤ ~2-3.6 dB)."
+        },
+        {
+          "dimension": "Discrete spurs",
+          "mainstream": "LTI core never creates tones; inject deterministic periodic sources at vout; PSS/HB folds them to fc±m·fspur. Classical small-signal cannot predict them; NMOS-SF charge-pump is a flagged self-spur source.",
+          "ours": "Deterministic SIN current tones at vout (I_k=vout_amp_k/|Zout(f_k)|), fundamentals only, transient-FFT characterized, with a GCD-fold commensurate/incommensurate PSS fundamental manifest; supply-coupled spurs left to ride the PSRR path from vin.",
+          "assessment": "We are ahead in execution. The fundamentals-only + GCD manifest + 'inject aggressor at vin, not vout' discipline is more rigorous than the generic 'add a tone' advice and correctly respects that downstream nonlinearity regenerates IM products. Closed."
+        },
+        {
+          "dimension": "Op-point / load dependence",
+          "mainstream": "Parameterize fits by load (interpolated fits, or bias/load-dependent X-parameters); smoothness across the axis is a documented HB-convergence liability.",
+          "ours": "Quadratic in ln(iload) through 3 corners {20,121,250µA} with envelope clamping to prevent off-corner overshoot.",
+          "assessment": "Aligned and pragmatic. 3-corner quadratic is lighter than X-param tables and the clamp directly addresses the smoothness/overshoot risk the survey flags. Adequate given the linear near-carrier regime; X-param-grade only needed if large-signal/load-migration coupling matters."
+        },
+        {
+          "dimension": "Fitter algorithm",
+          "mainstream": "Vector Fitting is the de-facto SI/PI standard (relaxed/orthonormal); AAA and Loewner are emerging, parameter-free, auto-order, no min-phase assumption, better at sharp notches/high-Q with few poles; SK for explicit num/den.",
+          "ours": "Bespoke: multi-start bounded LS for Zout (fixed topology), SK iteration for PSRR, log-domain joint LS for noise.",
+          "assessment": "Mainstream tooling is more capable for the hard cases. Our fixed-topology Zout LS under-fits migrating resonances; AAA/Loewner would auto-select order and capture them. Our SK is appropriate but under-exploited (real-pole-only). This is the biggest adoptable-tooling gap."
+        },
+        {
+          "dimension": "Convergence philosophy / PSS-HB robustness",
+          "mainstream": "Keep linear-dominant, C∞, every node touches a linear element (Brinson); enforce passivity on Zout; beware shooting-Pnoise under-reporting LF supply-noise upconversion at slow supply nodes.",
+          "ours": "All-lumped-passive-by-construction guarantees this; no internal regulation loop to stall; inherently smooth.",
+          "assessment": "We are ahead on robustness — our constraint buys exactly the property the survey says is the dominant convergence lever, for free, and across engines (validated in ngspice). The cost is purely expressiveness, paid in the PSRR phase gap."
+        },
+        {
+          "dimension": "Validation harness",
+          "mainstream": "Typically AC for Zout/PSRR + Pnoise for noise + PSS/PAC for spurs, often per single part; survey notes spur work needs complex (mag+phase) data and multi-analysis grading.",
+          "ours": "Unified weighted composite over Zout/PSRR mag+phase, transient load-step, noise PSD, spur match, across ~14 DUT variants; coherent-window transient-FFT for spurs (not .noise).",
+          "assessment": "Ahead. A multi-variant, multi-analysis, phase-aware composite scoring harness is more disciplined than typical published practice and is what lets us even see the V1/V3/V4 phase residuals quantitatively."
+        }
+      ],
+      "where_we_align": [
+        "Core 2-port architecture (Zout S22 + PSRR S21 + shaped-Norton noise + injected spur tones) is verbatim the survey's 'recommended composite' and the PDN/PI community's independently-derived 'supply = impedance + noise + ripple' abstraction.",
+        "Output-referred shaped Norton noise In=Sv/|Zout| is exactly the loop-shaped generalization the noise literature (TI SLAA412/ADI AN-1120 corrected for Zout shaping) points to, feeding Pnoise sideband folding.",
+        "Spurs as deterministic injected tones (LTI core never self-generates) matches the universal finding that rational/linear macromodels only relay tones; spurs must be explicit sources.",
+        "Linear-multiport-suffices for the near-carrier spur band matches both our own measurement (<-62 dBc harmonics) and the survey consensus that the spur band is small-signal/linear, so X-params/Volterra are unnecessary and risk non-passive in-loop behavior.",
+        "Using Sanathanan-Koerner for PSRR identification is endorsed — the survey explicitly notes SK is arguably cleaner than VF when you want RHP zeros explicit in the numerator.",
+        "Passive-by-construction Zout aligns with the rule 'enforce passivity on Zout, never on the active PSRR path' — we get the passive-Zout property structurally and we keep PSRR a free (signed) transfer.",
+        "All-lumped R/L/C + controlled-source synthesis from a pole-residue model is one of the two mainstream-endorsed realizations and is the one the SI/PI camp calls the SAFEST for PSS/HB.",
+        "Op-point parameterization by load current with anti-overshoot (envelope) clamping matches the parameterized-fit approach while directly mitigating the table-smoothness convergence liability the survey flags.",
+        "Keeping noise as PSD sources and spurs as separate injected tones (out of the large-signal balance) matches the Brinson/Kundert HB discipline for behavioral blocks."
+      ],
+      "where_we_differ_for_better": [
+        "Hard ban on laplace_nd in favor of pure lumped R/L/C + controlled sources: deliberately trades fit expressiveness for guaranteed cross-engine PSS/HB/shooting robustness and portability (ngspice ground-truth → Spectre target). Justified because the survey names passivity/smoothness/linear-element-per-node as the DOMINANT convergence lever, and flags that some simulators evaluate laplace blocks differently in HB vs transient (a direct spur-fidelity risk) — our constraint sidesteps that entirely.",
+        "Decoupling the noise Norton from the Zout synthesis (In=Sv/|Zout| with an independent realized network) so adding a 2nd Zout branch does not re-shape the noise — a refinement beyond generic 'shaped Norton' advice; it fixed our V1/V3 noise regression (9.6/21.8→1.0/2.1 dB) when branch B was engaged for Zout.",
+        "Fundamentals-only spur emission with a GCD-fold PSS fundamental manifest and the 'inject the aggressor at vin, let PSRR carry it' rule: more rigorous than 'add a tone at the output' because it (a) avoids double-counting IM products the user's downstream nonlinearity regenerates, and (b) keeps supply-coupled spurs on the physically-correct PSRR path with correct commensurate/incommensurate fundamental bookkeeping for PSS.",
+        "Data-driven per-block selector (auto-choose shelf-vs-bank PSRR, 1-vs-2 Zout branches, spur on/off) rather than one monolithic model — gives zero regression on the 9 min-phase variants while engaging complexity only where data demands it, which is better generalization discipline than a fixed high-order template.",
+        "Unified phase-aware composite scoring across ~14 architectural variants and all analyses, rather than per-part magnitude-only validation — this is why we can even quantify the V4 25°/V3 10° phase residuals that lesser harnesses would miss."
+      ],
+      "where_we_lag": [
+        "PSRR phase on non-minimum-phase architectures is our dominant unresolved residual and the place mainstream is clearly ahead. Our i_c=G0+ΣGᵢ/(1+s/wᵢ) uses STRICTLY-REAL first-order sections (the SK fitter returns None and reverts to a min-phase shelf the moment poles come out complex). Signed real sections give magnitude notches/sign flips but bounded phase — they structurally cannot carry the phase of a genuine RHP zero or net loop delay. Result: V4 magnitude 0.04 dB but phase 25° off; V3 phase 10° off. laplace_nd or signed 2nd-order/delay realizations would close this.",
+        "No complex-conjugate (2nd-order RLC) PSRR sections at all — we only have them on the Zout path. The survey's capless/multi-stage and delay-extraction literature treats complex-pole pairs as essential for resonant/non-min-phase PSRR.",
+        "No explicit transport-delay (e^-sτ) modeling. The survey's delay-extraction/DEPACT/delayed-VF family represents net loop delay with low rational order, and in HB a pure delay is an EXACT per-harmonic phase term — the most direct fix for our 390° 'phase race' that real poles cannot reach.",
+        "Fixed-topology Zout (1-2 R-L branches) under-fits load-migrating multi-pole resonance (V3 resonance migrates 0.27→10 MHz with load). Free-order VF/AAA/Loewner fitters auto-select the order and capture migrating/high-Q resonances with fewer artifacts.",
+        "We do not run an explicit passivity verification/enforcement step (Hamiltonian/half-size test). We are passive-by-construction on Zout so this is low-risk, but we have no automated guard against an accidentally non-passive synthesized network, and no formal stability-only check on the active PSRR path.",
+        "We do not leverage the standard, more powerful fitters (relaxed/orthonormal VF, AAA, Loewner) that the SI/PI world considers baseline — our bespoke LS/SK is adequate for the easy variants but is the limiting factor on the hard ones.",
+        "No use of the hot-S / X_S-X_T (S + conjugate-T) insight to explicitly check upper/lower sideband ASYMMETRY. We rely on PSS/PAC to fold our injected tones; correct sideband asymmetry depends entirely on getting PSRR/Zout phase right, which is exactly our weak spot."
+      ],
+      "adoptable_ideas": [
+        "For Target B AND the Zout/PSRR fidelity task: adopt a real Vector Fitting / AAA fitter (scikit-rf VectorFitting or AAA) as the front-end for Zout and PSRR instead of fixed-topology LS. Auto-order selection directly addresses V3's migrating multi-pole resonance and gives a principled pole count; then synthesize to RLC+controlled-source as we already do. AAA/Loewner additionally make NO minimum-phase assumption, so they capture RHP-zero/notch PSRR magnitude+phase the real-pole bank drops.",
+        "HIGHEST PRIORITY for V4/V3 phase: add signed SECOND-ORDER (complex-conjugate-pole) sections to the PSRR coupling current, realized as RLC + VCCS (no laplace_nd needed — a damped 2nd-order section is a passive RLC driving a VCCS). This lifts the phase ceiling that strictly-real sections impose. Stop discarding the SK fit's complex poles; realize them as RLC sections.",
+        "For the V4 '390° phase race' specifically: do explicit delay extraction H(s)=e^-sτ·H_rational(s) (fit τ by Brent/iterative, Hilbert-causality-checked), then realize the rational part as we do and the e^-sτ as a low-order Bessel/Padé all-pass made of R/L/C + controlled sources (stays within our lumped constraint). In the eventual Spectre HB run the delay is an exact per-harmonic phase term — the cheapest path to correct sideband phase asymmetry.",
+        "Fit PSRR from COMPLEX (real+imag) data with STABILITY-ONLY enforcement, never passivity (PSRR<0 dB / gain is legitimately non-passive). We already fit complex but should add an explicit RHP-pole flip + stability guard and a check that we are not magnitude-only anywhere.",
+        "Add an automated passivity verification (Hamiltonian / half-size singularity test, available in scikit-rf) on the synthesized Zout port as a CI gate in the scoring harness — cheap insurance that a refit never emits a non-passive Zout that would stall Spectre HB.",
+        "Use the hot-S / S+conjugate-T (6=4+2) lens as a validation metric: after PSS+PAC on the emitted model, explicitly compare upper vs lower sideband (fc±fd) amplitude AND phase against the transistor-level reference. This turns our PSRR-phase residual into a directly spur-relevant pass/fail and tells us when phase error actually matters for asymmetry.",
+        "For Target B (real Cadence LDO import): mirror the EMI 3-terminal-Norton extraction workflow — extract Zout(f) and PSRR(f) by AC (shunt-through for Zout), the noise PSD by Pnoise, and the spur comb by coherent transient-FFT, then run the same VF/AAA→RLC pipeline. Beware the documented SpectreRF shooting-Pnoise caveat: a slow LDO supply pole can cause LF supply-noise upconversion to be UNDER-reported — validate noise against HB-Pnoise or a fine PAC sweep, not shooting alone.",
+        "For Target B convergence: keep switching/PWL or SIMPLIS-POP characterization strictly OFFLINE (MHz fsw vs GHz carrier timescale separation makes it unusable inside the HB run); extract Zout/PSRR/ripple-comb from it, then inject as our rational paths + forced tones.",
+        "Consider relaxed Vector Fitting specifically for noisy real-silicon Target-B data — its improved pole relocation handles measurement noise far better than naive SK over the mHz-to-100MHz LDO span where monomial bases are ill-conditioned."
+      ],
+      "verdict": "Our architecture is correct and, in several respects (noise decoupling, spur manifest/aggressor-at-vin discipline, multi-variant phase-aware scoring, convergence-by-construction), ahead of generic published practice — the survey's 'recommended composite' is essentially a description of what we built. The genuine, well-justified departure is banning laplace_nd for pure lumped R/L/C: it buys best-in-class PSS/HB robustness and cross-engine portability at the cost of fit expressiveness. That cost is now concentrated in exactly one place: PSRR (and migrating-Zout) PHASE on non-minimum-phase architectures, because our PSRR coupling current is restricted to strictly-real first-order sections that have a bounded phase ceiling. This is not a reinvention problem (we are not duplicating a standard we ignored) but an under-exploitation problem (we use SK then throw away its complex/RHP content at realization). The single highest-leverage next move is to add signed second-order (complex-conjugate RLC) PSRR sections plus, for the V4 phase race, explicit delay extraction realized as a lumped all-pass — both stay inside the no-laplace constraint — and to swap the fixed-topology Zout LS for a real VF/AAA fitter with auto-order and a Hamiltonian passivity gate. For Target B, reuse this same extract→VF/AAA→RLC pipeline, keep switching characterization offline, validate sideband asymmetry with the hot-S (S+conjugate-T) lens, and watch the shooting-Pnoise LF-upconversion caveat."
+    }
+  }
+}

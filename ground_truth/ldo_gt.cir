@@ -1,0 +1,54 @@
+* Ground-truth LDO: PMOS pass + 5T NMOS-input OTA + R divider
+* Vin=1.05, Vout target 0.9 (Vref 0.6, divider ratio 1.5), Iload nominal 121u
+.include ../models/nmos_lv.mod
+.include ../models/pmos_lv.mod
+
+.param VIN=1.05
+.param VREF=0.6
+.param ILOAD=121u
+.param IB=10u
+.param R1=500k
+.param R2=1meg
+.param COUT=100p
+.param RESR=0.5
+* device sizes
+.param WP=400u  LP=0.2u
+.param WI=10u   LI=0.5u
+.param WM=10u   LM=0.5u
+.param WT=20u   LT=0.5u
+.param WB=20u   LB=0.5u
+
+Vin   vin 0 DC {VIN}
+Vref  vref 0 DC {VREF}
+Iload vout 0 DC {ILOAD}
+
+* ---- pass device (PMOS): source=vin, gate=ng, drain=vout, bulk=vin ----
+mp vout ng vin vin plv W={WP} L={LP}
+
+* ---- 5T OTA: NMOS input pair, PMOS mirror load ----
+* negative fb: M1 gate=fb -> diode side n1 ; M2 gate=vref -> output ng
+m1 n1 fb  vtail 0   nlv W={WI} L={LI}
+m2 ng vref vtail 0  nlv W={WI} L={LI}
+m3 n1 n1  vin   vin plv W={WM} L={LM}
+m4 ng n1  vin   vin plv W={WM} L={LM}
+mtail vtail nb 0 0  nlv W={WT} L={LT}
+
+* ---- tail bias mirror ----
+mb   nb nb 0 0      nlv W={WB} L={LB}
+Ibias vin nb DC {IB}
+
+* ---- feedback divider ----
+R1 vout fb {R1}
+R2 fb 0 {R2}
+
+* ---- on-chip output cap with ESR ----
+Cout vout ncesr {COUT}
+Resr ncesr 0 {RESR}
+
+.control
+op
+print v(vout) v(fb) v(ng) v(n1) v(vtail) v(nb) > op_nodes.txt
+print @mp[id] @m1[id] @m2[id] @m3[id] @m4[id] @mtail[id] > op_currents.txt
+quit
+.endc
+.end

@@ -1,0 +1,8 @@
+当前方案（提取 Zout(f) → vector-fit → Verilog-A laplace_nd 的"理想源 + Zout(s)"宏模型）主要缺点：
+
+小信号线性：Zout 是在 121µA 工作点的线性化，表达不了大 glitch 下的环路 slew / pass 管非线性；LTI 本质只能缩放 I_load 离散谱线，不产生新频率。
+低频地板偏高：提取没扫够低 + 常数 d 项 → 低频 Zout 外推成平地板，没复现环路对低频 Zout 的压制 → VDD 出现宽"三角" skirt，卷到载波(304M)周边成宽边带。
+谐振峰精度吃提取网格：峰附近频点不够密 → vector-fit 把尖峰抹宽(Q 偏低) → 偏置带 Zout 整体抬高 → 同样的宽 skirt。
+laplace_nd 在 PSS/HB 的数值风险：µs 级环路慢极点 vs MHz 基频，shooting 易收敛不干净；卷积/截断可能糊出 skirt（可改无源 RLC 综合规避）。
+没建 PSRR：模型只是 2 端口 Zout，漏掉输入电源(1.05V)经 PSRR 耦合进来的 spur 路径。
+强依赖提取配置：Zout 随 decap 在/不在、op point 对/不对而变；decap 已烘进 Zout，系统仿真里不能再外挂同一个 decap。

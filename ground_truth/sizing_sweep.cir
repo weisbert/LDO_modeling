@@ -1,0 +1,43 @@
+* WP sizing exploration at nominal load: find moderate-inversion pass point
+.include ../models/nmos_lv.mod
+.include ../models/pmos_lv.mod
+.param VIN=1.05
+.param VREF=0.6
+.param ILOAD=121u
+.param IB=10u
+.param R1=500k
+.param R2=1meg
+.param WI=10u   LI=0.5u
+.param WM=10u   LM=0.5u
+.param WT=20u   LT=0.5u
+.param WB=20u   LB=0.5u
+
+Vin   vin 0 DC {VIN}
+Vref  vref 0 DC {VREF}
+Iload vout 0 DC {ILOAD}
+mp vout ng vin vin plv W=60u L=0.3u
+m1 n1 fb  vtail 0   nlv W={WI} L={LI}
+m2 ng vref vtail 0  nlv W={WI} L={LI}
+m3 n1 n1  vin   vin plv W={WM} L={LM}
+m4 ng n1  vin   vin plv W={WM} L={LM}
+mtail vtail nb 0 0  nlv W={WT} L={LT}
+mb   nb nb 0 0      nlv W={WB} L={LB}
+Ibias vin nb DC {IB}
+R1 vout fb {R1}
+R2 fb 0 {R2}
+
+.control
+set wr_singlescale
+echo "WP  vout  ng  |Vsg|  |Vth|  Vov  Vsd  Id  gm" > sizing.txt
+foreach wp 15u 30u 60u 120u 240u
+  alter mp w = $wp
+  op
+  let vsg = -v(ng)+v(vin)
+  let vthp = -@mp[vth]
+  let vov = vsg - vthp
+  let vsd = v(vin)-v(vout)
+  print $wp v(vout) v(ng) vsg vthp vov vsd @mp[id] @mp[gm] >> sizing.txt
+end
+quit
+.endc
+.end

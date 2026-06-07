@@ -1,0 +1,6 @@
+# Python deps for the LDO behavioral-model harness (Python 3.11+ recommended).
+#   python3 -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
+numpy>=1.26
+scipy>=1.15          # scipy.interpolate.AAA: complex-pole PSRR/Zout fitting (added in 1.15)
+matplotlib>=3.8      # score.py overlay plots
+scikit-rf>=0.30      # score.py Zout passivity gate
