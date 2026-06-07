@@ -1,4 +1,29 @@
-# HANDOFF — LDO behavioral-model builder (as of 2026-06-06)
+# HANDOFF — LDO behavioral-model builder (as of 2026-06-07)
+
+## UPDATE (2026-06-07) — published to GitHub + made Linux-portable; phase-plan Tasks 1–3 closed
+**Repo:** https://github.com/weisbert/LDO_modeling (PUBLIC, branch `main`). The user now also works
+the project on a **Linux** box via `git clone`/`git pull`. Added `README.md` (Linux setup +
+quick-start), `requirements.txt` (numpy / scipy≥1.15 for AAA / matplotlib / scikit-rf), `.gitignore`.
+Tracked = source + GT netlists + device cards + emitted models + `results/ref/*.npz` (so `--reuse`
+works after clone) + `matrix.{md,json}` + docs. **Ignored** = `.venv/`, `tools/` (59MB **Windows**
+ngspice — `apt install ngspice` on Linux), `work*/`, paper extracts, generated plots/logs.
+Portability fix: `harness/ng.py` resolves ngspice as `$NGSPICE` → bundled Win exe → `ngspice` on PATH.
+
+**STATUS — phase-fidelity plan COMPLETE (Tasks 1–3):**
+- Task 1 (PSRR non-min-phase PHASE): DONE — complex-conjugate section. pphase v4 25→1, v3 10→2,
+  v1 6→3, v2 3→2; composite v4 5.6→4.0, v3 9.0→6.3; zero regression. (2026-06-06c below.)
+- Task 2 (V4 e^-sτ delay all-pass): MOOT — v4 hit 1° without it.
+- Task 3 (Zout): DONE — scikit-rf passivity gate; Zout-mag residuals proven to be FLOORS (v3 GT
+  non-passive; v1/v2 high-ESR cap underdetermined), not fit bugs. (2026-06-06d below.)
+
+**NEXT = Task 4 — Target B (the real Cadence LDO).** Pipeline to build: import Cadence-extracted
+Zout/PSRR/noise/spur → fit (existing `harness/fit_model.py`: Zout RLC + PSRR real+complex bank +
+Norton noise + spur tones) → emit `.lib`/`.va`. Validation beyond ngspice (no PSS/HB locally):
+run the emitted subckt under **Xyce multi-tone `.HB`** to check 304MHz sideband asymmetry (hot-S =
+S + conjugate-T; asymmetry is carried by PSRR/Zout PHASE, now fixed), and compile the `.va` via
+**OpenVAF→.osdi**, cross-check AC/tran in ngspice v39+ and HB in **VACASK**. Beware SpectreRF
+shooting-Pnoise under-reporting LF supply-noise upconversion. Keep switching/SIMPLIS-POP offline.
+Current matrix (Target-A synthetic variants): `results/generalization/matrix.md`.
 
 ## UPDATE (2026-06-06d) — TASK 3 DONE: scikit-rf Zout passivity gate + Zout residuals proven to be floors
 Added the passivity gate and rigorously characterized the remaining Zout-magnitude error.
