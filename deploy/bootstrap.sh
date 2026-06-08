@@ -83,7 +83,23 @@ exec "$HERE/.venv/bin/python" "$HERE/app/gui/ldo_modeler.py" "$@"
 LAUNCH
 chmod +x "$PREFIX/run_gui"
 
+# one-shot incremental updater: drop ldo_modeler_incremental.tar.gz here, then ./update
+cat > "$PREFIX/update" <<'UPD'
+#!/usr/bin/env bash
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
+TAR="ldo_modeler_incremental.tar.gz"
+[ -f "$TAR" ] || { echo "ERROR: $TAR not found in $HERE -- upload it here first."; exit 1; }
+[ -f "$TAR.sha256" ] && { sed 's/\r$//' "$TAR.sha256" | sha256sum -c; }
+trap 'rm -rf "$HERE/.bundle_incr"' EXIT
+rm -rf "$HERE/.bundle_incr"; mkdir -p "$HERE/.bundle_incr"
+tar xzf "$TAR" -C "$HERE/.bundle_incr"
+bash "$HERE/.bundle_incr/update.sh" "$HERE"
+UPD
+chmod +x "$PREFIX/update"
+
 echo ""
 echo "OK. Launch the GUI with:"
 echo "   $PREFIX/run_gui          (uses the bundled Qt; needs a display / X11 / VNC)"
-echo "Outputs persist under $PREFIX/results ; incremental code updates: ./update.sh $PREFIX"
+echo "Code update: upload ldo_modeler_incremental.tar.gz into $PREFIX, then run  $PREFIX/update"
+echo "Outputs persist under $PREFIX/results"
