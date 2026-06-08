@@ -32,6 +32,10 @@ cp -r "$HERE/app" "$PREFIX/"
 mkdir -p "$PREFIX/results" "$PREFIX/model"
 ln -sfn "$PREFIX/results" "$PREFIX/app/results"
 ln -sfn "$PREFIX/model"   "$PREFIX/app/model"
+# keep the root launchers fresh + present (they must live at the install root, next to .venv)
+for L in run_gui update; do
+    [ -f "$PREFIX/app/deploy/$L" ] && { cp "$PREFIX/app/deploy/$L" "$PREFIX/$L"; chmod +x "$PREFIX/$L"; }
+done
 
 echo "[2/2] re-running smoke test ..."
 # bundled-Qt isolation (same as bootstrap): beat the box's system/Cadence libQt5Core.so.5
