@@ -8,7 +8,7 @@ simulator), so the runtime deps are just numpy / scipy / matplotlib / PyQt5 (no 
 ```
  yellow (Windows, net)                         red (CentOS7, glibc 2.17, no net)
  ─────────────────────                         ─────────────────────────────────
- package.py full        ──tar.gz (145 MB)──▶   bootstrap.sh  →  $ROOT/install/{.venv,wheels,app,results}
+ package.py full        ──tar.gz (145 MB)──▶   bootstrap.sh  →  <your-folder>/install/{.venv,wheels,app,results}
    • cross-download cp311 manylinux2014 wheels    • python3.11 -m venv
    • AUDIT tags  (reject > glibc 2.17)             • pip install --no-index --find-links=wheels
    • freeze requirements.lock                      • smoke: gui --selftest --require-qt
@@ -41,20 +41,22 @@ contourpy 1.3.2, fonttools 4.63, kiwisolver 1.5, PyQt5 5.15.10, **PyQt5-Qt5 5.15
 
 Keep everything under one folder you create. The install must NOT go to `/opt` on a shared box
 (no write permission), and **PREFIX must be an absolute path** or bootstrap's `app/results` symlink
-breaks. Run from the folder holding the tarball:
+breaks. Don't introduce a `ROOT=`-style variable (EDA shells often already export `$ROOT`); use the
+shell's built-in `$PWD` — you never assign it, so nothing in your environment is touched. Run from
+the folder holding the tarball:
 
 ```bash
-ROOT="$(pwd)"
+cd /path/to/your-folder                      # the folder you created; tarball is here ($PWD = it)
 sed 's/\r$//' ldo_modeler_full.tar.gz.sha256 | sha256sum -c   # integrity (tolerates old CRLF sidecar)
 
-mkdir -p "$ROOT/bundle" && tar xzf ldo_modeler_full.tar.gz -C "$ROOT/bundle" && cd "$ROOT/bundle"
-sed -i 's/\r$//' requirements.lock          # no-op on new (LF) bundles; rescues old Windows-built ones
-./bootstrap.sh "$ROOT/install"              # venv + offline pip + smoke test   (ABSOLUTE prefix)
-"$ROOT/install/.venv/bin/python" "$ROOT/install/app/gui/ldo_modeler.py"   # launch GUI
+mkdir -p bundle && tar xzf ldo_modeler_full.tar.gz -C bundle
+sed -i 's/\r$//' bundle/requirements.lock    # no-op on new (LF) bundles; rescues old Windows-built ones
+bash bundle/bootstrap.sh "$PWD/install"      # venv + offline pip + smoke test (ABSOLUTE prefix; bash = no +x needed)
+install/.venv/bin/python install/app/gui/ldo_modeler.py        # launch GUI (from this folder)
 
 # later code-only update (same install/):
-mkdir -p "$ROOT/bundle_incr" && tar xzf ldo_modeler_incremental.tar.gz -C "$ROOT/bundle_incr" && cd "$ROOT/bundle_incr"
-./update.sh "$ROOT/install"              # refresh app/, keep .venv/wheels/results
+mkdir -p bundle_incr && tar xzf ldo_modeler_incremental.tar.gz -C bundle_incr
+bash bundle_incr/update.sh "$PWD/install"    # refresh app/, keep .venv/wheels/results
 ```
 
 - `results/` persists across updates (never overwritten); `.venv/` + `wheels/` are built once
