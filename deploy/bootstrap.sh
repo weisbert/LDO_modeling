@@ -23,7 +23,7 @@ here = pathlib.Path(sys.argv[1])
 m = json.loads((here / "MANIFEST.json").read_text())
 bad = 0
 for rel, want in m.get("checksums", {}).items():
-    p = here / rel
+    p = here / rel.replace("\\", "/")   # tolerate MANIFESTs built on Windows (backslash keys)
     if not p.exists():
         print("   MISSING", rel); bad += 1; continue
     if hashlib.sha256(p.read_bytes()).hexdigest() != want:

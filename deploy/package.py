@@ -122,7 +122,7 @@ def build_full(out):
         input_req_hash=_sha256(HERE / "requirements-gui.txt"),  # input pins (yellow incremental guard)
         wheels=[w.name for w in sorted(wheels.glob("*.whl"))],
         app_dirs=APP_DIRS,
-        checksums={str(p.relative_to(stage)): _sha256(p)
+        checksums={p.relative_to(stage).as_posix(): _sha256(p)  # as_posix: '/' keys, valid on Linux
                    for p in sorted(stage.rglob("*")) if p.is_file()})
     (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), newline="\n")
     print("[6/6] taring bundle ...")
@@ -165,7 +165,7 @@ def build_incremental(out, last_manifest):
         built_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         requirements_hash=last["requirements_hash"],     # must match deployed for update.sh to proceed
         based_on_full=last.get("built_utc"), app_dirs=APP_DIRS,
-        checksums={str(p.relative_to(stage)): _sha256(p)
+        checksums={p.relative_to(stage).as_posix(): _sha256(p)  # as_posix: '/' keys, valid on Linux
                    for p in sorted(stage.rglob("*")) if p.is_file()})
     (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), newline="\n")
     print("[4/4] taring incremental bundle ...")
