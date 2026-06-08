@@ -108,7 +108,7 @@ def build_full(out):
     print(f"      AUDIT PASS ({len(rows)} wheels, all <= glibc 2.17)")
     print("[4/6] freezing requirements.lock ...")
     lock = freeze_lock(wheels)
-    (stage / "requirements.lock").write_text(lock)
+    (stage / "requirements.lock").write_text(lock, newline="\n")  # LF: consumed by pip on Linux
     req_hash = _sha256_text(lock)
     print("[5/6] copying installers + MANIFEST ...")
     for f in ("bootstrap.sh", "update.sh"):
@@ -124,12 +124,12 @@ def build_full(out):
         app_dirs=APP_DIRS,
         checksums={str(p.relative_to(stage)): _sha256(p)
                    for p in sorted(stage.rglob("*")) if p.is_file()})
-    (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
+    (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), newline="\n")
     print("[6/6] taring bundle ...")
     tar = out / "ldo_modeler_full.tar.gz"
     _make_tar(stage, tar)
-    (out / "MANIFEST.full.json").write_text(json.dumps(manifest, indent=2))
-    (tar.with_suffix(".gz.sha256")).write_text(_sha256(tar) + "  " + tar.name + "\n")
+    (out / "MANIFEST.full.json").write_text(json.dumps(manifest, indent=2), newline="\n")
+    (tar.with_suffix(".gz.sha256")).write_text(_sha256(tar) + "  " + tar.name + "\n", newline="\n")  # LF: sha256sum -c on Linux
     print(f"\nDONE -> {tar}  ({tar.stat().st_size/1e6:.1f} MB)\n"
           f"       req-hash {req_hash[:12]}  |  {len(manifest['wheels'])} wheels  |  sha256 sidecar written")
     return tar
@@ -167,11 +167,11 @@ def build_incremental(out, last_manifest):
         based_on_full=last.get("built_utc"), app_dirs=APP_DIRS,
         checksums={str(p.relative_to(stage)): _sha256(p)
                    for p in sorted(stage.rglob("*")) if p.is_file()})
-    (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2))
+    (stage / "MANIFEST.json").write_text(json.dumps(manifest, indent=2), newline="\n")
     print("[4/4] taring incremental bundle ...")
     tar = out / "ldo_modeler_incremental.tar.gz"
     _make_tar(stage, tar)
-    (tar.with_suffix(".gz.sha256")).write_text(_sha256(tar) + "  " + tar.name + "\n")
+    (tar.with_suffix(".gz.sha256")).write_text(_sha256(tar) + "  " + tar.name + "\n", newline="\n")  # LF: sha256sum -c on Linux
     print(f"\nDONE -> {tar}  ({tar.stat().st_size/1e3:.0f} KB)  (no wheels; venv reused on red box)\n"
           f"       carries req-hash {manifest['requirements_hash'][:12]} -- update.sh aborts if the "
           "deployed venv's hash differs.")

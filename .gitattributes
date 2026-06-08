@@ -1,3 +1,5 @@
 # The red-zone installers run under bash on Linux — force LF so a Windows checkout's CRLF
 # never corrupts the shebang / `set -euo pipefail` (would give "bad interpreter").
 *.sh text eol=lf
+# Requirements files are consumed by pip on the Linux red box — force LF too.
+requirements*.txt text eol=lf
