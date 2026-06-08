@@ -73,3 +73,13 @@ def complex_col(arr, ireal=1, iimag=2):
     f = arr[:, 0]
     z = arr[:, ireal] + 1j * arr[:, iimag]
     return f, z
+
+
+def amps(key):
+    """Load-corner key string ('20u','250u','1m','100n',...) -> amps (float). The CANONICAL
+    corner-key->current conversion, tolerant of p/n/u/m/k SI suffixes so corner keys need not
+    be microamps (a mA-rated LDO uses '10m' etc.); bare numbers pass through. Replaces the old
+    `float(il.replace('u','e-6'))` idiom (which raised on any non-'u' key) everywhere."""
+    s = str(key).strip()
+    suf = {"p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3, "k": 1e3}
+    return float(s[:-1]) * suf[s[-1]] if s and s[-1] in suf else float(s)

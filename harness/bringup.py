@@ -67,7 +67,7 @@ def bringup(libs, subckt, xparams=""):
         plf = -20*np.log10(np.abs(H[0]))
         pworst = (-20*np.log10(np.abs(H))).min()
         nmp = _minphase_score(fp, H)
-        base = float(il.replace("u", "e-6"))
+        base = ng.amps(il)
         t, v = bench.measure_loadstep(libs, subckt, bench.LIN_FRAC*base, iload=base, xparams=xparams)
         rd = _ring_decay(t, v)
         flag = ""

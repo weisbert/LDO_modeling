@@ -1,4 +1,58 @@
-# HANDOFF — LDO behavioral-model builder (as of 2026-06-07)
+# HANDOFF — LDO behavioral-model builder (as of 2026-06-08)
+
+## UPDATE (2026-06-08) — GUI modeler + offline airgap deploy BUILT, reworked for usability, reviewed
+Built the whole **manual-TB → modeler** product from `GUI_DEPLOY_PLAN.md` (all 5 phases), then
+reworked it for usability after user feedback. Full detail: **`GUI_DEPLOY_BUILD.md`**; ops runbook:
+**`deploy/操作手册_OPERATIONS.md`** (中文) / `deploy/README.md` (EN); memory `finding-gui-deploy-build`.
+
+**What exists now (all NEW unless noted):**
+- `harness/fit_model.py` (refactor, **zero numerical change**): `predict(P_il,f)` analytic Zout/PSRR/noise
+  (== the fitter), `FitResult` + `fit_variant()` in-process entry, de-hardcoded `121u`→`NOMINAL`,
+  `VREF` param, `--selftest`. `harness/ng.py`: canonical `ng.amps()` (corner-key→amps, p/n/u/m/k) used
+  at all 6 sites (was `float(il.replace("u","e-6"))`, crashed on mA corners).
+- `cadence/import_cadence.py`: Cadence CSV/PSF-ASCII → `results/ref/<name>.npz` (mirrors
+  `CADENCE_EXTRACTION.md`); complex auto-detect; `validate()` guardrails; `match_dir()` folder-matcher.
+- `gui/ldo_modeler.py`: PyQt5 4-tab (Profile/Import/Fit/Compare) over a Qt-free `ModelerCore`;
+  analytic `predict` overlay; **self-contained `--selftest`** (synthesizes a ref when none present, and
+  now CLICKS every button handler with dialogs stubbed).
+- `deploy/`: `audit_wheels.py` (glibc-2.17 gate), `package.py` (full/incremental bundler),
+  `bootstrap.sh`/`update.sh` (red install/update), `dryrun_manylinux2014.sh`, `requirements-gui.txt`.
+
+**Validated (as of this handoff):** matrix gate **0.00 composite delta** on all 14 variants (byte-identical
+`.lib`); GUI `--selftest --require-qt` **PASS**; wheel **AUDIT PASS 15/15 ≤ glibc 2.17** (auditor also
+rejects 2.28/musl/wrong-arch); full(146 MB)+incremental(92 KB) bundles build; red-box smoke is
+self-contained. **Two adversarial review rounds** (multi-agent, each finding verified): 13 + 6 = 19
+findings fixed (critical GUI picker-wipe, mA-corner crash, MEAS_HINTS click-crash, nominal-change grid
+desync, `--ref` widget desync, incremental req-hash guard, update.sh user-data persistence, MANIFEST
+integrity check, emit DUT-desync, Fit re-entrancy/missing-data guards, importer fmt/guardrail hardening).
+
+**Open items / gotchas:**
+- **NOT run locally:** the Docker `manylinux2014` dry-run (no Docker on the Win box) — script provided;
+  the audit already proves the offline install is glibc-2.17-valid. Rehearse with
+  `deploy/dryrun_manylinux2014.sh dist/ldo_modeler_full.tar.gz` where Docker exists.
+- **`dist/` freshness:** rebuilt after the last GUI fix (`package.py incremental`). Re-run
+  `package.py full` only if `deploy/requirements-gui.txt` changes.
+- **PyQt5 5.15.10** was pip-installed into the dev `.venv` for offscreen Qt validation (not in
+  `requirements.txt`; it IS in `deploy/requirements-gui.txt` for the red zone).
+- **Tracked `.va` files show as modified** — cosmetic float-format only (e.g. `121e-6`→`1.210000e-04`,
+  numerically identical; `.va` is not scored). Safe to commit or leave.
+- **Uncommitted:** everything above is unstaged (user's call to commit). `results/ref/myldo.npz`,
+  `dutA/dutB/probe*.npz` are user/legacy scratch (not the 15 tracked refs) — left in place.
+- GUI **Emit** writes to `model/<npz-stem>.{va,lib,_dropout.tbl}` AFTER a successful **Fit** (Emit is
+  disabled until then); a popup now shows the full path + "Open folder".
+
+**Run it:**
+```
+python gui/ldo_modeler.py --ref results/ref/v5_spur.npz     # GUI (Fit -> Emit -> Compare)
+QT_QPA_PLATFORM=offscreen python gui/ldo_modeler.py --selftest --require-qt   # headless gate
+python deploy/package.py full --out dist/                   # build airgap bundle (yellow zone)
+./deploy/bootstrap.sh /opt/ldo_modeler                      # red-zone install (then update.sh)
+PYTHONPATH=harness python harness/run_matrix.py --reuse     # regression matrix (needs ngspice)
+```
+
+**NEXT = Target B (the real Cadence LDO)** — the sole remaining modeling frontier; GUI + `import_cadence`
+are ready to consume real Spectre exports the moment they arrive. See the 2026-06-07 section below +
+memory `next-zout-psrr-phase` (Task 4) and branch `target-b-cadence-bringup`.
 
 ## UPDATE (2026-06-07) — published to GitHub + made Linux-portable; phase-plan Tasks 1–3 closed
 **Repo:** https://github.com/weisbert/LDO_modeling (PUBLIC, branch `main`). The user now also works

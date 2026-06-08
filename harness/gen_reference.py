@@ -88,7 +88,7 @@ def main(vkey="base"):
 
     print("=== Transient load steps (req#1) ===")
     for il in bench.LOADS:
-        base = float(il.replace("u", "e-6"))
+        base = ng.amps(il)
         dI = bench.LIN_FRAC * base
         t, vv = bench.measure_loadstep(libs, sub, dI, iload=base, xparams=xp)
         ref[f"trans_lin_{il}"] = np.c_[t, vv]

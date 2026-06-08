@@ -27,6 +27,17 @@ results/score/
 results/*.png
 results/generalization/*.png
 results/generalization/*.log
+# regression-gate snapshots (temporary; matrix.json/.md are the tracked outputs)
+results/generalization/matrix_baseline.json
+results/generalization/matrix_postrefactor.json
+results/generalization/matrix_postfix.json
+results/generalization/matrix_committed.json
+
+# --- offline deploy bundles (large wheels tarballs; rebuilt by deploy/package.py) ---
+dist/
+
+# --- local Claude Code session state (not project source) ---
+.claude/
 
 # --- OS cruft ---
 .DS_Store

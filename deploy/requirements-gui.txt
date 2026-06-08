@@ -1,0 +1,12 @@
+# Runtime deps for the OFFLINE GUI modeler (analytic-only path; NO simulator, NO scikit-rf).
+# These are the DIRECT pins; transitive deps (pillow/contourpy/kiwisolver/fonttools/cycler/
+# python-dateutil/pyparsing/packaging) are resolved + audited by package.py and frozen into
+# requirements.lock. Versions chosen to still ship manylinux_2_17 (glibc-2.17 / CentOS7) wheels
+# for cp311 x86_64 -- VERIFY with deploy/audit_wheels.py on yellow-zone day 1; downpin on any
+# manylinux_2_28 hit (the #1 airgap risk -- see GUI_DEPLOY_PLAN.md §4).
+numpy==1.26.4
+scipy==1.15.3          ; python_version >= "3.11"   # need >=1.15 for scipy.interpolate.AAA
+matplotlib==3.9.4
+PyQt5==5.15.10
+PyQt5-Qt5==5.15.2      # KEY: 5.15.2 is manylinux2014; 5.15.11+ may need glibc 2.28
+PyQt5-sip==12.15.0

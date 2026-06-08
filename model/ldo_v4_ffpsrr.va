@@ -17,7 +17,7 @@ module ldo_model(vin, vout);
   inout vin, vout;
   electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, nw, nk1, nk2, nk3, nk4, nk5, nk6;
 
-  parameter real iload   = 121e-6 from (0:inf);
+  parameter real iload   = 1.210000e-04 from (0:inf);
   parameter integer slew_en = 0 from [0:1];
   parameter real Cout = 9.715345e-10;   // auto-extracted physical output cap
   parameter real ESR  = 4.993665e+00;   // auto-extracted physical ESR
@@ -35,7 +35,7 @@ module ldo_model(vin, vout);
 
   analog begin
     @(initial_step) begin
-      ic = min(max(iload, 20e-6), 250e-6);
+      ic = min(max(iload, 2.000000e-05), 2.500000e-04);
       u  = ln(ic);
       R_a = min(max(exp((1.453407e-01)*u*u + (2.176536e+00)*u + (1.125983e+01)),1.644857e+01),1.690756e+02);
       L_a = min(max(exp((1.272656e-01)*u*u + (1.840660e+00)*u + (-3.553160e+00)),2.836394e-05),2.845637e-04);

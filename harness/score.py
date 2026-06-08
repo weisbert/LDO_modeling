@@ -128,7 +128,7 @@ def score(lib, subckt, xp="", refpath=None):
         # ---- Transient (linear step, proportional to bias) ----
         tg = ref[f"trans_lin_{il}"]
         t, vg = tg[:, 0], tg[:, 1]
-        base = float(il.replace("u", "e-6"))
+        base = ng.amps(il)
         _, vm = bench.measure_loadstep(lib, subckt, bench.LIN_FRAC * base,
                                        iload=base, xparams=xpil)
         tm = _trans_metrics(t, vg, vm)
@@ -277,7 +277,7 @@ def _plots(rows, lib, subckt, refpath=None):
         # transient
         d = np.load(refpath, allow_pickle=True)[f"trans_lin_{r['il']}"]
         t, vg = d[:, 0], d[:, 1]
-        base = float(r["il"].replace("u", "e-6"))
+        base = ng.amps(r["il"])
         _, vm = bench.measure_loadstep(lib, subckt, bench.LIN_FRAC * base,
                                        iload=base, xparams=f"iload={r['il']}")
         ax[1, 1].plot(t * 1e6, vg * 1e3, label="GT", lw=2)

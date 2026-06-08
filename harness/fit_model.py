@@ -15,6 +15,7 @@ model/ldo_model.lib. Topology (all linear/passive -> HB/PSS-robust, no laplace_n
 Per-load corner {R_a, L_a, Rpass, g_lf, wz, Vn_white} fitted; model selects by `iload`.
 """
 import argparse
+from dataclasses import dataclass
 import numpy as np
 from scipy.optimize import least_squares
 import ng
@@ -22,7 +23,16 @@ import ng
 TWO_PI = 2 * np.pi
 ref = None
 LOADS = []
+NOMINAL = "121u"   # nominal load corner KEY; set per-variant in load() = middle corner
+                   # (contract: 3 corners low/nom/high). Replaces the previously hardcoded
+                   # "121u" so the harness/GUI work for any corner naming / OP.
+VREF = 1.05        # nominal vin the PSRR path is DC-referenced to. EMIT-TIME ONLY -- the
+                   # analytic fit is OP-agnostic -- so the GUI profile can override it
+                   # (CADENCE_EXTRACTION.md "3 things to report" #1) with no fit change.
 C, RC = 1e-9, 0.5          # output cap / ESR -- AUTO-EXTRACTED per variant in load()
+
+
+_amps = ng.amps   # canonical corner-key->amps (see ng.amps); module alias for the emit f-strings
 
 
 def fit_cout_esr():
@@ -32,7 +42,7 @@ def fit_cout_esr():
     the tail directly (not a full fit) is robust to multi-pole mid-band shapes
     (a full fit gets pulled off, e.g. V3 -> 1606pF). Replaces the old hardcoded
     1n/0.5 so the fitter works on LDOs with any output cap."""
-    g = ref["z_121u_hf"] if "z_121u_hf" in ref.files else ref["z_121u"]
+    g = ref[f"z_{NOMINAL}_hf"] if f"z_{NOMINAL}_hf" in ref.files else ref[f"z_{NOMINAL}"]
     f = g[:, 0]; Z = g[:, 1] + 1j * g[:, 2]
     # Cout from the CAPACITIVE band (phase < -45deg, post-resonance): there
     # Z ~ 1/(jwC) so C = -1/(w*Im Z). Using phase selection (not just the HF tail)
@@ -54,11 +64,17 @@ def fit_cout_esr():
     return Cc, Rc
 
 
-def load(vkey="base"):
-    """Load a variant reference and auto-extract its physical Cout/ESR."""
-    global ref, LOADS, C, RC
+def load(vkey="base", nominal=None, vref=None):
+    """Load a variant reference and auto-extract its physical Cout/ESR.
+    nominal: nominal corner KEY (default = middle of `loads`, the contract's nom corner).
+    vref:    nominal vin reference for the emitted model (default = keep module VREF=1.05).
+    Both default to the legacy behavior, so existing callers are unchanged."""
+    global ref, LOADS, NOMINAL, VREF, C, RC
     ref = np.load(ng.ROOT / "results" / "ref" / f"{vkey}.npz", allow_pickle=True)
     LOADS = [str(x) for x in ref["loads"]]
+    NOMINAL = nominal if nominal is not None else LOADS[len(LOADS) // 2]
+    if vref is not None:
+        VREF = float(vref)
     C, RC = fit_cout_esr()
     if "meta_cout" in ref.files:
         print(f"Cout/ESR auto-extracted: {C*1e12:7.1f}pF / {RC:6.3f}ohm   "
@@ -442,7 +458,7 @@ def fit_all():
     for il in LOADS:
         gz = ref[f"z_{il}"]; fz = gz[:, 0]; Z = gz[:, 1] + 1j*gz[:, 2]
         gp = ref[f"p_{il}"]; fp = gp[:, 0]; H = gp[:, 1] + 1j*gp[:, 2]
-        dl = ref["dc_loadreg"]; iv = float(il.replace("u", "e-6"))
+        dl = ref["dc_loadreg"]; iv = ng.amps(il)
         R_a, L_a, R_pl, R_b, L_b = fit_zout(fz, Z)
         G, Q = fit_psrr(fp, H, R_a, L_a, R_pl, R_b, L_b)   # G=[G0,G1,w1,..]; Q=(b0,b1,w0,Qf)
         zfits[il] = (R_a, L_a, R_pl, R_b, L_b)
@@ -478,6 +494,60 @@ def fit_all():
     return P
 
 
+def predict(P_il, f, nfk=None):
+    """ANALYTIC Zout / PSRR / output-noise PSD for ONE load corner, from its fitted
+    params P_il (= one entry of fit_all()'s dict) at frequencies f. Uses the SAME
+    transfer functions the fitter optimizes -- zmodel (Zout), psrr_model (PSRR=i_c*Zout)
+    and the decoupled Norton noise In*|Zout| (In^2 = white floor + Lorentzians, identical
+    to _noise_resid) -- so the GUI's before/after overlay IS the fit quality itself: pure
+    numpy, NO simulator. This is what Tab 4 (Compare) plots against the imported GT.
+
+    nfk: the shared noise-corner freqs (module NFK after a fit; FitResult carries a copy).
+    Returns dict(Zout=complex[], PSRR=complex[], noise=Sv[V/rtHz]) on the given f grid."""
+    if nfk is None:
+        nfk = NFK
+    f = np.asarray(f, dtype=float)
+    zf = (P_il["R_a"], P_il["L_a"], P_il["R_pl"], P_il["R_b"], P_il["L_b"])
+    Z = zmodel(f, *zf)
+    G = [P_il["G0"], P_il["G1"], P_il["w1"], P_il["G2"], P_il["w2"], P_il["G3"], P_il["w3"]]
+    Q = (P_il["pcb0"], P_il["pcb1"], P_il["pcw0"], P_il["pcq"])
+    H = psrr_model(f, *zf, G, Q)
+    In2 = (P_il["gnw"] ** 2) * KT4 * NRk * np.ones_like(f)
+    for k in range(len(nfk)):
+        gk = P_il.get(f"gn{k+1}", 0.0)
+        In2 = In2 + (gk ** 2) * KT4 * NRk / (1.0 + (f / nfk[k]) ** 2)
+    Sv = np.sqrt(In2) * np.abs(Z)
+    return dict(Zout=Z, PSRR=H, noise=Sv)
+
+
+@dataclass
+class FitResult:
+    """Self-contained result of fit_variant(): per-corner params P plus the module-level
+    fit state (Cout/ESR, noise corners, spur tones, nominal corner, Vref) so a caller
+    (the GUI) need not reach into fit_model module globals. Feed P[il] + nfk to predict()."""
+    P: dict
+    loads: list
+    nominal: str
+    cout: float
+    esr: float
+    nfk: list
+    spur_f: list
+    spur_ph: list
+    vref: float
+
+
+def fit_variant(vkey, nominal=None, vref=None):
+    """In-process entry point: load reference <vkey> and fit it -> FitResult. Mirrors what
+    __main__ / run_matrix do (load -> fit_all) but returns a self-contained bundle. emit /
+    emit_va still read module state, so call them immediately after for the same DUT (the
+    harness models one DUT at a time, exactly as the CLI does)."""
+    load(vkey, nominal=nominal, vref=vref)
+    P = fit_all()
+    return FitResult(P=P, loads=list(LOADS), nominal=NOMINAL, cout=C, esr=RC,
+                     nfk=list(NFK), spur_f=list(NSPUR_F), spur_ph=list(NSPUR_PH),
+                     vref=VREF)
+
+
 def fit_spurs(P, zfits):
     """Discrete-spur block (Part B). The GT's measured intrinsic spurs (ref spurs_{il}
     = vout-referred f/amp/phase, characterized by spur_char) are reproduced as
@@ -493,7 +563,7 @@ def fit_spurs(P, zfits):
         return
     F = [float(x) for x in ref["spur_F"]]
     twin0 = float(ref["spur_twin0"])
-    nom = "121u" if "121u" in LOADS else LOADS[len(LOADS) // 2]
+    nom = NOMINAL
     sp_nom = ref[f"spurs_{nom}"]
     NSPUR_F = F
     for k, fk in enumerate(F):
@@ -633,7 +703,7 @@ def _spur_manifest(name):
 
 
 def emit(P, path):
-    vreg121 = P["121u"]["vreg"]
+    vreg121 = P[NOMINAL]["vreg"]
     pwl_tab = build_pwl(vreg121)
     specs = ([("R_a", True), ("L_a", True), ("R_pl", True), ("R_b", True), ("L_b", True),
               ("G0", False), ("G1", False), ("w1", True), ("G2", False), ("w2", True),
@@ -649,7 +719,7 @@ def emit(P, path):
 * CANDIDATE behavioral LDO model  (subckt: ldo_model, ports: vin vout)
 * Fitted to ground-truth by harness/fit_model.py. All linear/passive +
 * controlled sources -> PSS/HB-robust (NO laplace_nd). OP-parameterized by iload
-* via quadratic-in-ln(iload) interpolation through corners {{20u,121u,250u}}.
+* via quadratic-in-ln(iload) interpolation through corners {{{','.join(LOADS)}}}.
 *   Zout = (R_a + sL_a||R_pl) || (R_b+sL_b) || (ESR+1/sCout)  Cout/ESR auto-extracted;
 *          R_pl damps the L rise (inf=peak / finite=plateau); branch B (R_b->inf=off)
 *          adds a 2nd resonance/roll-off for multi-pole LDOs (engaged only if it helps)
@@ -660,8 +730,8 @@ def emit(P, path):
 *   Noise= DECOUPLED Norton @vout: white + {MNOISE} Lorentzian current sections fit to
 *          In=Sv/|Zout| -> output PSD = In*|Zout| exactly, independent of Zout synthesis
 * ============================================================
-.subckt ldo_model vin vout iload=121u slew_en=0
-.param ic = {{min(max(iload,20u),250u)}}
+.subckt ldo_model vin vout iload={NOMINAL} slew_en=0
+.param ic = {{min(max(iload,{LOADS[0]}),{LOADS[-1]})}}
 .param u  = {{ln(ic)}}
 .param VREG121 = {vreg121:.6e}    $ nominal-corner Vreg (DC-curve table reference)
 {defs}
@@ -702,7 +772,7 @@ Rbb  nbb  vreg {{R_b}}
 *      elements must contribute NO thermal noise (else they corrupt the decoupled
 *      Norton noise block). This matches the Verilog-A mirror (which is already
 *      noiseless) and is I-V identical to a resistor in .op/.dc/.ac/.tran. ----
-Vrf  vrf 0 DC 1.05               $ nominal-vin reference (model fit at vin=1.05)
+Vrf  vrf 0 DC {VREF:g}               $ nominal-vin reference (model fit at vin={VREF:g})
 Gd   0   vout vin vrf {{G0}}         $ feedthrough  G0*(vin-1.05)
 Grp1 vin np1 vin np1 {{1/Rp1}}   $ noiseless conductance (= 1/Rp1)
 Cp1  np1 vrf {{Cps}}             $ np1 = LP1(vin), DC-referenced to 1.05
@@ -752,7 +822,7 @@ def emit_va(P, path, tbl_path):
              + [(f"gn{k+1}", True) for k in range(MNOISE)]
              + [(f"sa{k+1}", True) for k in range(len(NSPUR_F))] + [("vreg", False)])
     asg = "\n      ".join(f"{k} = {_pexpr(P, k, ls)};" for k, ls in specs)
-    vreg121 = P["121u"]["vreg"]
+    vreg121 = P[NOMINAL]["vreg"]
     # export dropout table (Vdrop relative to nominal vreg, I) for $table_model
     dl, dd = ref["dc_loadreg"], ref["dc_dropout"]
     il = np.concatenate([dl[::6, 0], dd[dd[:, 0] > 5e-4, 0]])
@@ -790,7 +860,7 @@ def emit_va(P, path, tbl_path):
 //   Noise= DECOUPLED Norton @vout: white-R + {MNOISE} R||C-Lorentzian current sections,
 //          transconducted into vout (gm sets amplitude) -> In*|Zout| = Sv. pnoise/hbnoise.
 //   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout) via $table_model
-// Params interpolated as quadratics in ln(iload) through corners {{20u,121u,250u}}.
+// Params interpolated as quadratics in ln(iload) through corners {{{','.join(LOADS)}}}.
 // ============================================================
 `include "constants.vams"
 `include "disciplines.vams"
@@ -799,7 +869,7 @@ module ldo_model(vin, vout);
   inout vin, vout;
   electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, nw, {nk_nodes};
 
-  parameter real iload   = 121e-6 from (0:inf);
+  parameter real iload   = {_amps(NOMINAL):.6e} from (0:inf);
   parameter integer slew_en = 0 from [0:1];
   parameter real Cout = {C:.6e};   // auto-extracted physical output cap
   parameter real ESR  = {RC:.6e};   // auto-extracted physical ESR
@@ -812,7 +882,7 @@ module ldo_model(vin, vout);
 
   analog begin
     @(initial_step) begin
-      ic = min(max(iload, 20e-6), 250e-6);
+      ic = min(max(iload, {_amps(LOADS[0]):.6e}), {_amps(LOADS[-1]):.6e});
       u  = ln(ic);
       {asg}
       Cps = 1e-12;
@@ -823,7 +893,7 @@ module ldo_model(vin, vout);
     end
 
     // ---- references / DC operating point ----
-    V(vrf) <+ 1.05;                  // nominal-vin reference (no DC coupling)
+    V(vrf) <+ {VREF:g};                  // nominal-vin reference (no DC coupling)
     V(vrg) <+ vreg;                  // regulated output reference (vreg = real var)
 
     // ---- Zout branch C: series Cout + ESR (vout -> vrg) ----
@@ -878,12 +948,50 @@ endmodule
     print(f"wrote {path}\nwrote {tbl_path}")
 
 
+def _selftest(vkey="base"):
+    """Verify predict() reproduces the analytic Zout/PSRR/noise the fitter itself uses
+    (sanity for the GUI Compare overlay): predict at the GT freq grid must match the
+    fit_all per-corner residual metrics exactly. No simulator, fast."""
+    res = fit_variant(vkey)
+    ok = True
+    for il in res.loads:
+        gz = ref[f"z_{il}"]; fz = gz[:, 0]; Zg = gz[:, 1] + 1j * gz[:, 2]
+        gp = ref[f"p_{il}"]; fp = gp[:, 0]; Hg = gp[:, 1] + 1j * gp[:, 2]
+        gn = ref[f"noise_{il}"]; fn = gn[:, 0]
+        pr_z = predict(res.P[il], fz, res.nfk)
+        pr_p = predict(res.P[il], fp, res.nfk)
+        pr_n = predict(res.P[il], fn, res.nfk)
+        zrms = np.sqrt(np.mean((20 * np.log10(np.abs(pr_z["Zout"]) / np.abs(Zg))) ** 2))
+        prms = np.sqrt(np.mean((20 * np.log10(np.abs(pr_p["PSRR"]) / np.abs(Hg))) ** 2))
+        nr = _noise_resid(il, (res.P[il]["R_a"], res.P[il]["L_a"], res.P[il]["R_pl"],
+                              res.P[il]["R_b"], res.P[il]["L_b"]),
+                          res.P[il]["gnw"], [res.P[il][f"gn{k+1}"] for k in range(MNOISE)])
+        # predict's noise must equal the _noise_resid reconstruction at the same grid
+        Smod = pr_n["noise"]
+        nr2 = float(np.sqrt(np.mean((20 * np.log10((Smod + 1e-30) / (gn[:, 1] + 1e-30))) ** 2)))
+        match = abs(zrms - res.P[il]["_zrms"]) < 1e-9 and abs(prms - res.P[il]["_prms"]) < 1e-9 \
+            and abs(nr2 - nr) < 1e-9
+        ok = ok and match
+        print(f"  {il:>5}: predict zrms={zrms:.4f} (fit {res.P[il]['_zrms']:.4f})  "
+              f"prms={prms:.4f} (fit {res.P[il]['_prms']:.4f})  npsd={nr2:.4f} (fit {nr:.4f})  "
+              f"{'OK' if match else 'MISMATCH'}")
+    print(f"selftest {'PASS' if ok else 'FAIL'} (predict == fitter analytic) "
+          f"nominal={res.nominal} vref={res.vref} cout={res.cout*1e12:.1f}pF esr={res.esr:.3f}")
+    return ok
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--variant", default="base")
-    vkey = ap.parse_args().variant
-    load(vkey)
-    P = fit_all()
+    ap.add_argument("--selftest", action="store_true",
+                    help="verify predict() matches the fitter analytic (no emit)")
+    a = ap.parse_args()
+    vkey = a.variant
+    if a.selftest:
+        import sys
+        sys.exit(0 if _selftest(vkey) else 1)
+    res = fit_variant(vkey)
+    P = res.P
     name = "ldo_model" if vkey == "base" else f"ldo_{vkey}"
     mdir = ng.ROOT / "model"
     emit(P, mdir / f"{name}.lib")
