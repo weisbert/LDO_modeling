@@ -8,7 +8,7 @@ simulator), so the runtime deps are just numpy / scipy / matplotlib / PyQt5 (no 
 ```
  yellow (Windows, net)                         red (CentOS7, glibc 2.17, no net)
  ─────────────────────                         ─────────────────────────────────
- package.py full        ──tar.gz (145 MB)──▶   bootstrap.sh  →  <your-folder>/install/{.venv,wheels,app,results}
+ package.py full        ──tar.gz (145 MB)──▶   bootstrap.sh  →  <your-folder>/{.venv,wheels,app,results}
    • cross-download cp311 manylinux2014 wheels    • python3.11 -m venv
    • AUDIT tags  (reject > glibc 2.17)             • pip install --no-index --find-links=wheels
    • freeze requirements.lock                      • smoke: gui --selftest --require-qt
@@ -51,12 +51,12 @@ sed 's/\r$//' ldo_modeler_full.tar.gz.sha256 | sha256sum -c   # integrity (toler
 
 mkdir -p bundle && tar xzf ldo_modeler_full.tar.gz -C bundle
 sed -i 's/\r$//' bundle/requirements.lock    # no-op on new (LF) bundles; rescues old Windows-built ones
-bash bundle/bootstrap.sh "$PWD/install"      # venv + offline pip + smoke test (ABSOLUTE prefix; bash = no +x needed)
-install/.venv/bin/python install/app/gui/ldo_modeler.py        # launch GUI (from this folder)
+bash bundle/bootstrap.sh "$PWD"              # PREFIX = this folder → .venv/app/results land directly here (bash = no +x)
+.venv/bin/python app/gui/ldo_modeler.py      # launch GUI (from this folder)
 
-# later code-only update (same install/):
+# later code-only update (same install dir):
 mkdir -p bundle_incr && tar xzf ldo_modeler_incremental.tar.gz -C bundle_incr
-bash bundle_incr/update.sh "$PWD/install"    # refresh app/, keep .venv/wheels/results
+bash bundle_incr/update.sh "$PWD"            # refresh app/, keep .venv/wheels/results
 ```
 
 - `results/` persists across updates (never overwritten); `.venv/` + `wheels/` are built once
