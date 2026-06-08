@@ -1,5 +1,50 @@
 # HANDOFF — LDO behavioral-model builder (as of 2026-06-08)
 
+## UPDATE (2026-06-08b) — 黄区→红区 deploy VALIDATED end-to-end + one-command update workflow
+The GUI modeler + airgap bundle is now **proven on the real red zone** (EDA box, CentOS7-class,
+**tcsh**, airgapped) at `/data/RFIC3/Hi1108V100_Pilot_C1Xplus/w84368867/workarea/LDO_modeling`:
+`GUI selftest PASS` on the box (analytic core import→fit→predict→emit + Qt render). A chain of
+cross-platform/EDA issues was found & fixed — all on `main`, commits **374ec63..42cb7cc**. Full
+zh ops flow: **`deploy/部署与更新流程.md`**; gotchas: memory `reference-powershell-gotchas`.
+
+**Fixes shipped this session (each pushed):**
+- `deploy/package.ps1` — 黄区 one-command packager (wrapper over `package.py`): auto-find Python 3.11,
+  PyPI preflight, full/incremental. Saved **UTF-8 BOM** (PS 5.1 zh-CN parse). PS 5.1 strips embedded
+  `"` to native exes → version probe is quote-free (`print(maj*100+min)`).
+- `package.py` text artifacts now **LF** (`newline="\n"`): sidecar/lock/MANIFEST were CRLF →
+  `sha256sum -c` failed (filename+`\r`). MANIFEST checksum keys now **`.as_posix()`** (were
+  `str(WindowsPath)`=backslash → bootstrap integrity read ALL files MISSING on Linux); bootstrap also
+  tolerates `\` keys. `.gitattributes` forces LF on `*.sh`, `requirements*.txt`, `deploy/{run_gui,update}`.
+- Install = **self-contained under one user folder; PREFIX = the folder itself** (`bash
+  bundle/bootstrap.sh "$PWD"`), flat (`.venv app wheels results model` directly in it, no `install/`).
+  Use shell **`$PWD`, NOT `ROOT=`** (red box is tcsh → `VAR=val` errors; EDA already exports `$ROOT`).
+  `/opt` is unwritable on the shared box.
+- **Qt isolation (last hurdle):** Cadence/Virtuoso put a conflicting `libQt5Core.so.5` on
+  `$LD_LIBRARY_PATH` (`/software/public/qt/5.15.3_xcb/lib`) → PyQt5 import dies
+  `symbol _ZdaPvm, version Qt_5 not defined`. Fix = prepend the wheel's `PyQt5/Qt5/lib`. `bootstrap.sh`
+  + `update.sh` do it before the smoke; bootstrap writes a `run_gui` that does it for everyday launch.
+- **One-command update:** `deploy/run_gui` + `deploy/update` are standalone executable launchers
+  (single source of truth; bootstrap copies them to PREFIX root, update.sh refreshes them there).
+  Red-box update = drop `ldo_modeler_incremental.tar.gz` in the folder → `./update`.
+- Docs rewritten to the $PWD/flat/run_gui flow: `deploy/操作手册_OPERATIONS.md`, `deploy/README.md`,
+  NEW `deploy/部署与更新流程.md`.
+
+**State of the real red-box install:** it was a **MANUAL** install (the transferred bundle predated
+the LF/posix fixes, so bootstrap's integrity gate tripped; used manual `cp`+venv+offline-pip instead).
+Works (selftest PASS via Qt isolation). Launchers were hand-copied to the root
+(`cp app/deploy/{run_gui,update} . && chmod +x ...`). For a pristine state later: rebuild a fresh
+FULL on 黄区 (now all-fixed) and re-bootstrap — optional; current install is functional.
+
+**Deploy/update — turnkey for FUTURE bundles:**
+- 黄区: `git pull` → `.\deploy\package.ps1` (full) | `-Mode incremental`.
+- 红区 first: `sha256sum -c …`, `mkdir -p bundle && tar xzf …_full.tar.gz -C bundle`,
+  `bash bundle/bootstrap.sh "$PWD"` → `./run_gui` (needs X11/VNC).
+- 红区 update: drop the incremental tar → `./update`.
+
+**NEXT = Target B (unchanged — the real frontier).** Deployment was the enabler; the tool is now live
+where real designs are. Feed a real Cadence LDO's Spectre extraction (`CADENCE_EXTRACTION.md`) →
+`cadence/import_cadence.py` → Fit → Compare → Emit `.lib`/`.va`. See `next-zout-psrr-phase` Task 4.
+
 ## UPDATE (2026-06-08) — GUI modeler + offline airgap deploy BUILT, reworked for usability, reviewed
 Built the whole **manual-TB → modeler** product from `GUI_DEPLOY_PLAN.md` (all 5 phases), then
 reworked it for usability after user feedback. Full detail: **`GUI_DEPLOY_BUILD.md`**; ops runbook:
