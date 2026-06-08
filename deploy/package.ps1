@@ -4,8 +4,11 @@
   Yellow-zone (Windows + network) one-command packager. Thin wrapper over deploy\package.py.
 
   做的事:① 找一个 Python 3.11(优先仓库 .venv,否则 py -3.11,否则 python)
-          ② full 模式先查 PyPI 可达 ③ 调 package.py(跨平台下载红区轮子+审计 glibc≤2.17
+          ② full 模式先软探 PyPI 可达 ③ 调 package.py(跨平台下载红区轮子+审计 glibc≤2.17
              +冻结 lock+写 MANIFEST+sha256+打 tar) ④ 列出要传给红区的文件。
+
+  注意:取 Python 版本用的是“无引号”探测(print(major*100+minor) -> 311),
+  刻意避开 Windows PowerShell 5.1 给原生程序传“含双引号参数”会被吞引号的坑。
 
 .PARAMETER Mode
   full(默认)= 完整包,带轮子,首次部署/依赖改动时用。
@@ -15,7 +18,7 @@
   产物目录(默认 dist)。
 
 .PARAMETER SkipNetCheck
-  跳过 PyPI 可达性预检(代理环境/已确认有网时用)。
+  跳过 PyPI 可达性预检。
 
 .EXAMPLE
   .\deploy\package.ps1                       # 完整包 -> dist\
@@ -55,21 +58,30 @@ else {
 }
 
 # --- 校验确实是 3.11 ---
-$ver = & $exe @pre -c 'import sys;print("%d.%d"%sys.version_info[:2])'
-if ("$ver".Trim() -ne '3.11') {
-    throw "需要 Python 3.11(轮子是 cp311),当前=$ver。试 'py -3.11' 或一个 3.11 的 venv。"
+# 用无引号的版本码探测(3.11 -> 311),避开 PS 5.1 传双引号给原生程序被吞的坑。
+$ver = (& $exe @pre -c 'import sys;print(sys.version_info[0]*100+sys.version_info[1])')
+$ver = "$ver".Trim()
+if ($ver -ne '311') {
+    throw "需要 Python 3.11(轮子是 cp311);探测到版本码=$ver(311=3.11)。试 'py -3.11',或装一个 3.11。"
 }
 
-Write-Host "[pkg] python : $exe $($pre -join ' ')  (v$ver)"
+Write-Host "[pkg] python : $exe $($pre -join ' ')  (3.11)"
 Write-Host "[pkg] mode   : $Mode"
 Write-Host "[pkg] out    : $Out"
 
-# --- full 需联网下轮子:先探 PyPI ---
+# --- full 需联网下轮子:软探 PyPI(纯 PowerShell,失败只告警不中止)---
+# 走代理的黄区里,原始 HEAD 可能误报失败,但 pip 仍会用你配置的代理下载,所以这里不阻断。
 if ($Mode -eq 'full' -and -not $SkipNetCheck) {
     Write-Host "[pkg] 检查 PyPI 可达(full 需联网下载红区轮子)..."
-    & $exe @pre -c 'import urllib.request;urllib.request.urlopen("https://pypi.org/simple/",timeout=8);print("  pypi OK")'
-    if ($LASTEXITCODE -ne 0) {
-        throw "PyPI 不可达。黄区需联网才能 full 打包(增量包不下轮子)。确认有网后可加 -SkipNetCheck 跳过本检查。"
+    try {
+        $req = [System.Net.WebRequest]::Create('https://pypi.org/simple/')
+        $req.Method = 'HEAD'; $req.Timeout = 8000
+        $resp = $req.GetResponse(); $resp.Close()
+        Write-Host "  pypi OK"
+    }
+    catch {
+        Write-Warning "PyPI 预检失败:$($_.Exception.Message)"
+        Write-Warning "若黄区走代理,这多半是误报——下面仍会让 pip 去下载(pip 会用你配的代理)。确认完全无网请 Ctrl+C。"
     }
 }
 
