@@ -8,7 +8,7 @@ simulator), so the runtime deps are just numpy / scipy / matplotlib / PyQt5 (no 
 ```
  yellow (Windows, net)                         red (CentOS7, glibc 2.17, no net)
  ─────────────────────                         ─────────────────────────────────
- package.py full        ──tar.gz (145 MB)──▶   bootstrap.sh  →  /opt/ldo_modeler/{.venv,wheels,app,results}
+ package.py full        ──tar.gz (145 MB)──▶   bootstrap.sh  →  $ROOT/install/{.venv,wheels,app,results}
    • cross-download cp311 manylinux2014 wheels    • python3.11 -m venv
    • AUDIT tags  (reject > glibc 2.17)             • pip install --no-index --find-links=wheels
    • freeze requirements.lock                      • smoke: gui --selftest --require-qt
@@ -39,14 +39,22 @@ contourpy 1.3.2, fonttools 4.63, kiwisolver 1.5, PyQt5 5.15.10, **PyQt5-Qt5 5.15
 
 ## Red zone (CentOS7, glibc 2.17, airgapped)
 
-```bash
-tar xzf ldo_modeler_full.tar.gz -C /tmp/ldo_full && cd /tmp/ldo_full
-./bootstrap.sh /opt/ldo_modeler          # venv + offline pip + smoke test
-/opt/ldo_modeler/.venv/bin/python /opt/ldo_modeler/app/gui/ldo_modeler.py   # launch GUI
+Keep everything under one folder you create. The install must NOT go to `/opt` on a shared box
+(no write permission), and **PREFIX must be an absolute path** or bootstrap's `app/results` symlink
+breaks. Run from the folder holding the tarball:
 
-# later code-only update:
-tar xzf ldo_modeler_incremental.tar.gz -C /tmp/ldo_incr && cd /tmp/ldo_incr
-./update.sh /opt/ldo_modeler             # refresh app/, keep .venv/wheels/results
+```bash
+ROOT="$(pwd)"
+sed 's/\r$//' ldo_modeler_full.tar.gz.sha256 | sha256sum -c   # integrity (tolerates old CRLF sidecar)
+
+mkdir -p "$ROOT/bundle" && tar xzf ldo_modeler_full.tar.gz -C "$ROOT/bundle" && cd "$ROOT/bundle"
+sed -i 's/\r$//' requirements.lock          # no-op on new (LF) bundles; rescues old Windows-built ones
+./bootstrap.sh "$ROOT/install"              # venv + offline pip + smoke test   (ABSOLUTE prefix)
+"$ROOT/install/.venv/bin/python" "$ROOT/install/app/gui/ldo_modeler.py"   # launch GUI
+
+# later code-only update (same install/):
+mkdir -p "$ROOT/bundle_incr" && tar xzf ldo_modeler_incremental.tar.gz -C "$ROOT/bundle_incr" && cd "$ROOT/bundle_incr"
+./update.sh "$ROOT/install"              # refresh app/, keep .venv/wheels/results
 ```
 
 - `results/` persists across updates (never overwritten); `.venv/` + `wheels/` are built once

@@ -10,19 +10,25 @@
 
 ---
 
-## 0. 目录结构（红区安装后）
+## 0. 目录结构（自包含：全部装在你自建的一个文件夹下）
+
+把 tar 包放进你自建的文件夹（任意**可写**位置，如 `~/LDO_modeling` 或 workarea 下的目录；**别用 `/opt`**——共享服务器通常没写权限）。下文约定 `ROOT` = 这个文件夹的**绝对路径**。安装后：
 
 ```
-/opt/ldo_modeler/
-  .venv/                 # 一次性建好的虚拟环境（增量更新不动它）
-  wheels/                # 离线轮子（保留，供以后重建 venv）
-  app/                   # 源码：harness/ cadence/ gui/ deploy/（每次增量更新被整体替换）
-  results/               # 用户数据：导入的 npz —— 持久保留，软链到 app/results
-  model/                 # 用户产物：导出的 .lib/.va/.tbl —— 持久保留，软链到 app/model
-  MANIFEST.deployed.json # 当前已部署包的清单（含 requirements_hash）
-  INSTALL.json           # 安装时间戳 + req-hash（增量更新的校验基准）
+$ROOT/                       # = 你自建的文件夹（如 ~/LDO_modeling）
+  ldo_modeler_full.tar.gz    # 传过来的完整包
+  bundle/                    # 解包出来的安装介质（装完可删）
+  install/                   # 真正的安装（= bootstrap 的 PREFIX）：
+    .venv/                   #   一次性建好的虚拟环境（增量更新不动它）
+    wheels/                  #   离线轮子（保留，供以后重建 venv）
+    app/                     #   源码：harness/ cadence/ gui/ deploy/（增量更新被整体替换）
+    results/                 #   用户数据：导入的 npz —— 持久保留，软链到 app/results
+    model/                   #   用户产物：.lib/.va/.tbl —— 持久保留，软链到 app/model
+    MANIFEST.deployed.json   #   当前已部署包的清单（含 requirements_hash）
+    INSTALL.json             #   安装时间戳 + req-hash（增量更新的校验基准）
 ```
-关键设计：**用户数据 (`results/`、`model/`) 放在 `app/` 之外**，再软链进 `app/`。这样增量更新 `rm -rf app/` 时数据不会丢。
+关键设计：**用户数据 (`results/`、`model/`) 放在 `app/` 之外**，再软链进 `app/`，这样增量更新 `rm -rf app/` 时数据不丢。
+**PREFIX（`install/`）必须用绝对路径**——bootstrap 会建 `app/results → results` 软链，相对路径会让软链指错位置。
 
 ---
 
@@ -30,9 +36,10 @@
 
 ### 1.1 红区（已部署后，日常使用）
 ```bash
-/opt/ldo_modeler/.venv/bin/python /opt/ldo_modeler/app/gui/ldo_modeler.py
+ROOT=/path/to/你的文件夹        # 例如 ~/LDO_modeling（安装时用的那个）
+"$ROOT/install/.venv/bin/python" "$ROOT/install/app/gui/ldo_modeler.py"
 # 想直接载入一份已有参考数据看效果：
-/opt/ldo_modeler/.venv/bin/python /opt/ldo_modeler/app/gui/ldo_modeler.py --ref /opt/ldo_modeler/results/<name>.npz
+"$ROOT/install/.venv/bin/python" "$ROOT/install/app/gui/ldo_modeler.py" --ref "$ROOT/install/results/<name>.npz"
 ```
 
 ### 1.2 黄区/开发机（自检或试用，需先 `pip install PyQt5`）
@@ -108,20 +115,29 @@ deploy/dryrun_manylinux2014.sh dist/ldo_modeler_full.tar.gz
 用审批过的介质把 **`ldo_modeler_full.tar.gz`（及 `.sha256`）** 拷到红区。建议落地后先核对完整性：
 ```bash
 sha256sum -c ldo_modeler_full.tar.gz.sha256
+# 若报 "No such file or directory"、文件名尾巴带 \r：这是 Windows 上生成的旧包（边车 CRLF），改用：
+#   sed 's/\r$//' ldo_modeler_full.tar.gz.sha256 | sha256sum -c
 ```
-（bootstrap 内部还会再用 MANIFEST 的逐文件 sha256 校一遍。）
+（bootstrap 内部还会再用 MANIFEST 的逐文件 sha256 校一遍。新版打包器已把边车/lock 统一写 LF，新包无需 sed。）
 
 ---
 
 ## 5. 红区初次部署（FULL → bootstrap.sh）
 
-前置：红区有 `python3.11` 在 PATH 上（不在 PATH 可用 `PYTHON=/path/to/python3.11` 覆盖）。
+前置：红区有 `python3.11` 在 PATH 上（不在 PATH 可用 `PYTHON=/abs/path/python3.11` 覆盖）。
 
+把 tar 包放进你自建的文件夹，`cd` 进去，然后：
 ```bash
-tar xzf ldo_modeler_full.tar.gz -C /tmp/ldo_full
-cd /tmp/ldo_full
-./bootstrap.sh /opt/ldo_modeler          # 不给参数则默认 /opt/ldo_modeler
+ROOT="$(pwd)"                              # 抓住绝对路径（此刻你应在那个文件夹里，tar 包就在脚下）
+
+mkdir -p "$ROOT/bundle"
+tar xzf ldo_modeler_full.tar.gz -C "$ROOT/bundle"
+cd "$ROOT/bundle"
+sed -i 's/\r$//' requirements.lock         # 旧包（Windows 生成，CRLF）保险；新包是 LF，这步是 no-op
+
+./bootstrap.sh "$ROOT/install"             # PREFIX 用绝对路径！装到 你的文件夹/install
 ```
+> 不传参数时 bootstrap 默认 `/opt/ldo_modeler`——共享服务器一般写不了，所以**显式传一个可写的绝对路径**（如 `$ROOT/install`）。
 `bootstrap.sh` 五步：
 1. **校验完整性**：用 MANIFEST 的 sha256 逐文件核对，发现缺失/损坏即中止。
 2. **铺目录**：拷 `app/ wheels/ requirements.lock`；建持久的 `results/ model/` 并软链进 `app/`。
@@ -140,9 +156,11 @@ cd /tmp/ldo_full
 适用：**只改了代码、依赖没变**（依赖变了必须走 §5 的 FULL）。
 
 ```bash
-tar xzf ldo_modeler_incremental.tar.gz -C /tmp/ldo_incr
-cd /tmp/ldo_incr
-./update.sh /opt/ldo_modeler
+ROOT=/path/to/你的文件夹                    # 安装时那个文件夹的绝对路径
+mkdir -p "$ROOT/bundle_incr"
+tar xzf ldo_modeler_incremental.tar.gz -C "$ROOT/bundle_incr"
+cd "$ROOT/bundle_incr"
+./update.sh "$ROOT/install"                 # 指向同一个 install/
 ```
 `update.sh` 做的事：
 1. **依赖一致性护栏**：比对本包 req-hash 与已部署的 `INSTALL.json`/`MANIFEST.deployed.json`；**不一致就中止**，提示去做 FULL（增量包不带轮子，依赖变了装不上）。
@@ -172,10 +190,14 @@ cd /tmp/ldo_incr
 | 现象 | 处理 |
 |---|---|
 | 黄区打包 `AUDIT FAIL: 需要 glibc > 2.17` | 按提示在 `requirements-gui.txt` 把对应包**降到仍有 manylinux_2_17 轮子的版本**，重跑 `package.py full`。 |
-| 红区 `python3.11 not found` | 装 python3.11，或 `PYTHON=/绝对路径/python3.11 ./bootstrap.sh ...`。 |
+| 红区 `python3.11 not found` | 装 python3.11，或 `PYTHON=/abs/path/python3.11 ./bootstrap.sh "$ROOT/install"`。 |
+| `mkdir: cannot create '/opt/...'：Permission denied` | PREFIX 没写权限。换可写的**绝对**路径：`./bootstrap.sh "$ROOT/install"`（`ROOT="$(pwd)"`，你自建的文件夹）。 |
+| `sha256sum -c` 报 `No such file`/文件名带 `\r` | 旧 Windows 包边车是 CRLF：`sed 's/\r$//' *.sha256 \| sha256sum -c`。新包已写 LF。 |
+| `app/results` 成了坏链 / 启动找不到数据 | bootstrap 的 PREFIX 用了相对路径。删掉 `install/` 重跑，PREFIX 用绝对路径 `"$ROOT/install"`。 |
 | 红区 `INTEGRITY FAIL` | 包在传输中损坏，重新传输（先 `sha256sum -c`）。 |
 | `update.sh` 报依赖变更中止 | 依赖确实变了 → 走 FULL 重新部署。 |
 | 启动报 Qt `xcb` / `libGL` 缺失 | 红区一般装了 Virtuoso（Qt 应用）即具备；否则设 `QT_QPA_PLATFORM_PLUGIN_PATH` 或补 1~2 个 `.so`。无界面自检永远用 `QT_QPA_PLATFORM=offscreen`。 |
+| 纯计算节点 bootstrap 冒烟测试因缺 Qt `.so` 失败 | `SMOKE_REQUIRE_QT=0 ./bootstrap.sh "$ROOT/install"` 跳过强制 Qt（离线装包与 numpy/scipy 仍照常验证）。 |
 | 想确认装好了 | 跑 §1.3 的 `--selftest --require-qt`，输出 `GUI selftest PASS` 即正常。 |
 
 ---
@@ -189,9 +211,11 @@ python deploy/package.py incremental --out dist/     # 增量包（仅代码）
 python deploy/audit_wheels.py dist/_stage_full/wheels # 单独审计轮子
 deploy/dryrun_manylinux2014.sh dist/ldo_modeler_full.tar.gz  # Docker 离线演练
 
-# —— 红区（Linux，无网）——
-sha256sum -c ldo_modeler_full.tar.gz.sha256          # 落地校验
-./bootstrap.sh /opt/ldo_modeler                      # 初次部署（FULL）
-./update.sh   /opt/ldo_modeler                       # 增量更新（INCREMENTAL）
-/opt/ldo_modeler/.venv/bin/python /opt/ldo_modeler/app/gui/ldo_modeler.py   # 启动 GUI
+# —— 红区（Linux，无网；ROOT=你自建文件夹的绝对路径）——
+ROOT="$(pwd)"
+sed 's/\r$//' ldo_modeler_full.tar.gz.sha256 | sha256sum -c        # 落地校验（兼容旧 CRLF 包）
+mkdir -p "$ROOT/bundle"; tar xzf ldo_modeler_full.tar.gz -C "$ROOT/bundle"; cd "$ROOT/bundle"
+./bootstrap.sh "$ROOT/install"                                     # 初次部署（FULL），PREFIX 绝对路径
+./update.sh    "$ROOT/install"                                     # 增量更新（INCREMENTAL）
+"$ROOT/install/.venv/bin/python" "$ROOT/install/app/gui/ldo_modeler.py"   # 启动 GUI
 ```
