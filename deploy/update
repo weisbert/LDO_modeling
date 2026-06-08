@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# One-shot incremental code update for the LDO modeler install.
+# Drop ldo_modeler_incremental.tar.gz into THIS folder (the install dir), then run:  ./update
+# It verifies the checksum, extracts to a temp dir, runs the bundle's update.sh against this
+# install (swaps app/, keeps .venv/wheels/results/model), and cleans up.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
+TAR="ldo_modeler_incremental.tar.gz"
+[ -f "$TAR" ] || { echo "ERROR: $TAR not found in $HERE -- upload it here first."; exit 1; }
+[ -f "$TAR.sha256" ] && { sed 's/\r$//' "$TAR.sha256" | sha256sum -c; }
+trap 'rm -rf "$HERE/.bundle_incr"' EXIT
+rm -rf "$HERE/.bundle_incr"; mkdir -p "$HERE/.bundle_incr"
+tar xzf "$TAR" -C "$HERE/.bundle_incr"
+bash "$HERE/.bundle_incr/update.sh" "$HERE"

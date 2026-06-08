@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Launch the LDO modeler GUI with the BUNDLED Qt (escapes the box's system/Cadence Qt that
+# otherwise shadows the wheel's Qt 5.15.2 -> "symbol _ZdaPvm, version Qt_5 not defined").
+# Place this at the install dir (next to .venv/ app/). Needs a display (X11 forwarding / VNC).
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+QTLIB="$(echo "$HERE"/.venv/lib/python3.*/site-packages/PyQt5/Qt5/lib)"
+export LD_LIBRARY_PATH="$QTLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$HERE/.venv/bin/python" "$HERE/app/gui/ldo_modeler.py" "$@"

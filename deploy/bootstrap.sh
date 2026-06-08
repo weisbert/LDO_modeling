@@ -71,32 +71,11 @@ REQ_HASH="$(grep -o '"requirements_hash"[^,]*' "$PREFIX/MANIFEST.deployed.json" 
 echo "{\"installed_utc\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"requirements_hash\":\"$REQ_HASH\",\"prefix\":\"$PREFIX\"}" \
     > "$PREFIX/INSTALL.json"
 
-# launcher that reproduces the bundled-Qt isolation for everyday GUI use (no env hacking needed)
-cat > "$PREFIX/run_gui" <<'LAUNCH'
-#!/usr/bin/env bash
-# Launch the LDO modeler GUI with the BUNDLED Qt (escapes the box's system/Cadence Qt).
-set -e
-HERE="$(cd "$(dirname "$0")" && pwd)"
-QTLIB="$(echo "$HERE"/.venv/lib/python3.*/site-packages/PyQt5/Qt5/lib)"
-export LD_LIBRARY_PATH="$QTLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-exec "$HERE/.venv/bin/python" "$HERE/app/gui/ldo_modeler.py" "$@"
-LAUNCH
-chmod +x "$PREFIX/run_gui"
-
-# one-shot incremental updater: drop ldo_modeler_incremental.tar.gz here, then ./update
-cat > "$PREFIX/update" <<'UPD'
-#!/usr/bin/env bash
-set -euo pipefail
-HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
-TAR="ldo_modeler_incremental.tar.gz"
-[ -f "$TAR" ] || { echo "ERROR: $TAR not found in $HERE -- upload it here first."; exit 1; }
-[ -f "$TAR.sha256" ] && { sed 's/\r$//' "$TAR.sha256" | sha256sum -c; }
-trap 'rm -rf "$HERE/.bundle_incr"' EXIT
-rm -rf "$HERE/.bundle_incr"; mkdir -p "$HERE/.bundle_incr"
-tar xzf "$TAR" -C "$HERE/.bundle_incr"
-bash "$HERE/.bundle_incr/update.sh" "$HERE"
-UPD
-chmod +x "$PREFIX/update"
+# install the launchers from the single source of truth (deploy/run_gui + deploy/update, shipped
+# into app/deploy/) so the repo file and the deployed file never drift.
+cp "$PREFIX/app/deploy/run_gui" "$PREFIX/run_gui"
+cp "$PREFIX/app/deploy/update"  "$PREFIX/update"
+chmod +x "$PREFIX/run_gui" "$PREFIX/update"
 
 echo ""
 echo "OK. Launch the GUI with:"
