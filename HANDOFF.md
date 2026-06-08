@@ -30,8 +30,11 @@ integrity check, emit DUT-desync, Fit re-entrancy/missing-data guards, importer 
 - **NOT run locally:** the Docker `manylinux2014` dry-run (no Docker on the Win box) — script provided;
   the audit already proves the offline install is glibc-2.17-valid. Rehearse with
   `deploy/dryrun_manylinux2014.sh dist/ldo_modeler_full.tar.gz` where Docker exists.
-- **`dist/` freshness:** rebuilt after the last GUI fix (`package.py incremental`). Re-run
-  `package.py full` only if `deploy/requirements-gui.txt` changes.
+- **`dist/` freshness:** FRESH FULL rebuilt 2026-06-08 for the 红区 first deploy (git SHA `204ade9`,
+  req-hash `832a726`, AUDIT PASS 15/15 ≤ glibc 2.17, sha256 sidecar verified, 49-file MANIFEST). It
+  supersedes the old stale full + incremental — `ldo_modeler_full.tar.gz` (145.9 MB) is what ships to
+  red. Re-run `package.py full` only if `deploy/requirements-gui.txt` changes; `incremental` for
+  code-only updates after the first bootstrap.
 - **PyQt5 5.15.10** was pip-installed into the dev `.venv` for offscreen Qt validation (not in
   `requirements.txt`; it IS in `deploy/requirements-gui.txt` for the red zone).
 - **Tracked `.va` files show as modified** — cosmetic float-format only (e.g. `121e-6`→`1.210000e-04`,
