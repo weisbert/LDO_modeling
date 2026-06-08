@@ -52,7 +52,7 @@ sed 's/\r$//' ldo_modeler_full.tar.gz.sha256 | sha256sum -c   # integrity (toler
 mkdir -p bundle && tar xzf ldo_modeler_full.tar.gz -C bundle
 sed -i 's/\r$//' bundle/requirements.lock    # no-op on new (LF) bundles; rescues old Windows-built ones
 bash bundle/bootstrap.sh "$PWD"              # PREFIX = this folder → .venv/app/results land directly here (bash = no +x)
-.venv/bin/python app/gui/ldo_modeler.py      # launch GUI (from this folder)
+./run_gui                                    # launch GUI (bootstrap-generated; bundled-Qt isolation; needs a display)
 
 # later code-only update (same install dir):
 mkdir -p bundle_incr && tar xzf ldo_modeler_incremental.tar.gz -C bundle_incr

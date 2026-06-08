@@ -53,6 +53,11 @@ echo "[4/5] OFFLINE pip install (--no-index) ..."
     -r "$PREFIX/requirements.lock"
 
 echo "[5/5] smoke test (offscreen Qt import + GUI selftest) ..."
+# Use the BUNDLED Qt, not the box's system/Cadence Qt: EDA boxes put a conflicting libQt5Core.so.5
+# on LD_LIBRARY_PATH -> "symbol _ZdaPvm, version Qt_5 not defined" at import. Prepend our wheel's
+# Qt5/lib so it wins (python3.* glob is robust to the cp311 venv layout).
+QTLIB="$(echo "$PREFIX"/.venv/lib/python3.*/site-packages/PyQt5/Qt5/lib)"
+export LD_LIBRARY_PATH="$QTLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # SMOKE_REQUIRE_QT=1 (default): strict -- Qt MUST import (real red box has Virtuoso's xcb/libGL).
 # Set 0 for a bare container rehearsal that lacks Qt's system .so (the offline pip install +
 # numpy/scipy/matplotlib import is still fully proven; Qt is attempted but not required).
@@ -66,7 +71,19 @@ REQ_HASH="$(grep -o '"requirements_hash"[^,]*' "$PREFIX/MANIFEST.deployed.json" 
 echo "{\"installed_utc\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"requirements_hash\":\"$REQ_HASH\",\"prefix\":\"$PREFIX\"}" \
     > "$PREFIX/INSTALL.json"
 
+# launcher that reproduces the bundled-Qt isolation for everyday GUI use (no env hacking needed)
+cat > "$PREFIX/run_gui" <<'LAUNCH'
+#!/usr/bin/env bash
+# Launch the LDO modeler GUI with the BUNDLED Qt (escapes the box's system/Cadence Qt).
+set -e
+HERE="$(cd "$(dirname "$0")" && pwd)"
+QTLIB="$(echo "$HERE"/.venv/lib/python3.*/site-packages/PyQt5/Qt5/lib)"
+export LD_LIBRARY_PATH="$QTLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$HERE/.venv/bin/python" "$HERE/app/gui/ldo_modeler.py" "$@"
+LAUNCH
+chmod +x "$PREFIX/run_gui"
+
 echo ""
 echo "OK. Launch the GUI with:"
-echo "   $PREFIX/.venv/bin/python $PREFIX/app/gui/ldo_modeler.py"
+echo "   $PREFIX/run_gui          (uses the bundled Qt; needs a display / X11 / VNC)"
 echo "Outputs persist under $PREFIX/results ; incremental code updates: ./update.sh $PREFIX"

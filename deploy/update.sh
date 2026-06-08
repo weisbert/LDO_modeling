@@ -34,6 +34,9 @@ ln -sfn "$PREFIX/results" "$PREFIX/app/results"
 ln -sfn "$PREFIX/model"   "$PREFIX/app/model"
 
 echo "[2/2] re-running smoke test ..."
+# bundled-Qt isolation (same as bootstrap): beat the box's system/Cadence libQt5Core.so.5
+QTLIB="$(echo "$PREFIX"/.venv/lib/python3.*/site-packages/PyQt5/Qt5/lib)"
+export LD_LIBRARY_PATH="$QTLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 QT_QPA_PLATFORM=offscreen "$PREFIX/.venv/bin/python" \
     "$PREFIX/app/gui/ldo_modeler.py" --selftest --require-qt
 
