@@ -34,6 +34,7 @@ column layout is known. The schema below is the source of truth (it mirrors `har
 | `spur_F` | `[K]` | intrinsic fundamental freqs [Hz] (on-chip osc/charge-pump/clock); **empty if none** |
 | `spur_twin0` | scalar | FFT window-start time [s] (the phase reference for `spurs_*` phases) |
 | `spur_binhz` | scalar | FFT bin width [Hz] |
+| `spurs_raw_{il}` | `[T,2]` | **alternative to `spurs_*`**: a RAW intrinsic transient `t[s], vout[V]` (no stimulus), one per corner. If you give these *instead of* the `spurs_*` tables, `import_cadence` auto-FFTs them (coherent window → peak-pick → fundamental classification) and fills `spurs_*` / `spur_F` / `spur_twin0` / `spur_binhz` for you. Export the plain waveform — no calculator FFT in Cadence. Window via `--spur_tstart`, band via `--spur_fmax` (default skips first 20%, scans to 30 MHz). |
 | `meta_cout`, `meta_esr` | scalar | design Cout / ESR (self-consistency check; `nan` ok) |
 | `ibp_xfer_{il}` | `[N,3]` | *optional* bias-port → vout transimpedance `f, Re, Im`; omit if no bias port |
 | `spur_500u` | `[F,2]` | *optional* 8 MHz load-tone FFT `f, amp` (linearity sanity gate) |

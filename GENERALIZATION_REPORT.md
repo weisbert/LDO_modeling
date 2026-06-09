@@ -209,3 +209,80 @@ phase ~1e-5 rad, 0 missed / 0 false; small-signal blocks byte-identical to base.
 5. **Target B** (real Cadence LDO) is unblocked: harness is DUT-generic, the fitter auto-discovers
    Cout / Zout order / PSRR order / noise shape / spur tones, so a characterized real LDO drops in.
    Spur tones import from a measured spectrum or Spectre PSS `.fi` sweep (same `(f,amp,phase)` schema).
+
+
+---
+
+## Round 2 (2026-06-09): four more architectures (v7-v10) -- probing the model's edges
+
+**Question:** push the generalization test past the v1-v6 frontier with four NEW transistor-level
+GT LDOs, each stressing a DISTINCT structural assumption not covered before. Purely ADDITIVE: the 14
+baseline composites stay byte-identical to `matrix_baseline_r1.json` (Gate 1), crossval
+identifiability PASS unchanged (Gate 2), systest baseline rows byte-identical to
+`systest_matrix_baseline_Bcover.md` (Gate 3), `fit_model --selftest` PASS. No shared fit/score code
+was touched -- a poor fit IS the finding.
+
+| variant | stresses | composite (base=3.9) | where the miss surfaces |
+|---|---|---|---|
+| v7_esl | output-cap series ESL: inductive HF Zout tail (model has NO series-L term) | 4.2 | SILENT in-band; systest@1.2GHz FAIL -18.8 dB (-23 dB @2GHz) |
+| v8_dlc | double-LC pi output net: anti-resonance NOTCH (parallel-RLC cannot dip) | 5.6 | notch 21.6 dB miss @112MHz lives in z_hf (composite blind); 5.6 from sub-25MHz |
+| v9_vldo | very-low-dropout (~50mV): LTI validity on the AMPLITUDE axis | 1.7 (best!) | small-signal fits BEST; large LOAD STEP out-of-envelope (dc_dropout knee ~1mA) |
+| v10_3lc | multi-stage PDN (3-cap ladder): >2 Zout resonances exceed the 2-branch order | 57.2 (15x) | everywhere: composite 15x, systest@600MHz FAIL -20 dB |
+
+### The unifying meta-finding: WHICH gate catches each failure
+The four parts map cleanly onto the project's layered gates, and three of the four expose a real
+BLIND SPOT of the in-band composite:
+
+- **v10_3lc -- in-band composite (57).** A 3rd Zout resonance the 2-branch R||L||C cannot realize
+  (an R+L branch has no paired series C, so it cannot synthesize an isolated HF anti-resonance peak).
+  GT |Z| = 14.3 ohm @42MHz / 43 ohm @211MHz vs model ~0.4 / ~0.16 (-21 to -31 dB). The miss is so
+  severe it breaks even the main scoring band. Side effect: the single-Cout autoextract latches onto
+  the 10 nF bulk cap instead of the 200 pF on-die cap. (The fitter DID detect the 211 MHz resonance
+  in the NOISE PSD as a 216 MHz / Q15 Lorentzian -- but the Zout TOPOLOGY cannot place it jointly.)
+- **v8_dlc -- z_121u_hf, NOT the composite.** A deep series-resonance NOTCH (0.05 ohm @112MHz, the
+  Lint*Cd resonance) that a parallel-branch model structurally floors at ESR ~0.5 ohm (a 21.6 dB miss).
+  But the notch is ABOVE the 100 MHz composite-Zout cap and the 8/16/24 MHz bands, so the COMPOSITE
+  IS BLIND to it; the 5.56 comes from the sub-25 MHz roll-off, the 100 MHz-edge zrms, the PSRR
+  resonance imprint (pband 0.39 / pphase 6.4 deg), and transient. The notch itself only shows in z_121u_hf.
+- **v7_esl -- systest @GHz, NOT the composite.** A cap-ESL inductive tail: Zout dips to the ESR floor
+  at the ~200 MHz SRF then RISES inductively (Im @2GHz = wLesl to <2%, |Z| 7.5 ohm). The lumped model
+  has no series-L in the Cout branch, so it stays pinned at ~0.5 ohm. The in-band composite (4.2 ~base)
+  is fully blind; the systest at a 1.2 GHz carrier FAILS at -18.8 dB (-23 dB at the 2 GHz ceiling).
+- **v9_vldo -- dc_dropout / validity envelope, NOT the composite or the systest.** Same device as base,
+  only Vout pushed to ~1.0 V (50 mV headroom). The small-signal blocks fit the BEST of all variants
+  (composite 1.71; supply-ripple systest PASS +0.01 dB), but the 1 mA load step hits dropout (108 mV
+  droop, dropout knee ~1 mA) and the LTI model OVER-droops (136 mV, rings past the dropout clamp).
+  The amplitude-axis limit is invisible to both the small-signal composite and the small-signal systest.
+
+**Takeaway for the tool (and for Target B, a real ~5.8 GHz part):** the in-band composite (Zout scored
+to 100 MHz, PSRR at 8/16/24 MHz) is NECESSARY but NOT SUFFICIENT -- it is blind to (a) HF structural
+features above ~100 MHz (v7 inductive tail, v8 notch) and (b) large-signal validity (v9). The
+complementary gates -- `z_121u_hf`, the systest carrier/sideband test, and the dc_dropout / validity
+envelope -- are exactly what catch the GHz- and amplitude-relevant misses. This is directly load-bearing
+for Target B: a real GHz LDO's package ESL / multi-cap PDN (v7/v8/v10 physics) will be SILENT in the
+composite and only visible through the GHz systest and z_hf. The single clean model EXTENSION this round
+points to is a **series-L term in the Cout branch** (Cout-Resr-Lesl), which would close v7 and help v8/v10.
+
+### Two NEGATIVE / physics findings (the 4th slot was originally planned as a two-notch PSRR part)
+- **Two separated PSRR notches are NOT realizable in a single-loop integrated LDO in-band.** Two supply
+  feedforward paths onto any node merge into ONE effective feedforward (one notch); a two-stage (Miller)
+  core with feedforward at two loop nodes still yields one feature, because the outer loop's
+  amplification does not recover before the inner stage's bandwidth (they share the pass node), and an
+  on-chip LC supply trap at 10s of MHz is unphysical (would need uH). CONCLUSION: the model's
+  single-complex-pair PSRR block actually MATCHES single-loop LDO physics; exceeding it requires a
+  cascade / multi-loop topology (a separate, larger study). [swept + documented; not shipped]
+- **Strong negative-Re Zout needs an oscillator-adjacent design.** Natural loop peaking (aggressive
+  under-compensation) caps minRe at ~ -0.25 ohm = v3_miller's incidental level; a transconductor
+  positive-feedback cell either does nothing (coupling to the ideal reference = AC ground) or shifts the
+  OP. A genuinely strong, wide negative-Re band is oscillator-adjacent and will not converge cleanly. So
+  v3's mild non-passivity is about as ACTIVE as a stable single-loop LDO Zout gets.
+
+Given both, the 4th slot was settled on `v10_3lc` (multi-resonance PDN, a crisp reliably-buildable
+Zout-ORDER stress). All four findings were independently REFUTED-then-confirmed by a 5-agent adversarial
+workflow (confidence 0.90-0.97; attributions verified against re-simulation of the EMITTED models, not
+just the scorer; no-regression re-proven against `matrix_baseline_r1.json`).
+
+### Reproduce
+- `ground_truth/ldo_v{7_esl,8_dlc,9_vldo,10_3lc}.lib` + 4 rows in `harness/variants.py` (additive).
+- `run_matrix.py --reuse` (re-fit from refs) -> rows in `results/generalization/matrix.{md,json}`.
+- `crossval.py --all`, `systest.py --all` for the deeper gates; refs in `results/ref/v{7..10}_*.npz`.

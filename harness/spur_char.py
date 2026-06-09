@@ -44,27 +44,54 @@ quit
     return a[:, 0], a[:, 1]
 
 
-def output_spectrum(lib, subckt, iload, xparams="", dt=DT, tstop=TSTOP, twin=TWIN, extra=""):
-    """Single-sided amplitude+phase spectrum of v(vout) over a coherent window.
-    Returns (f, amp[V peak], phase[rad]). Resampled to a uniform grid so the bins
-    are exactly k/Twin (coherent for tones on that grid)."""
-    t, v = _tran_vout(lib, subckt, iload, xparams, dt, tstop, extra)
-    tg = np.arange(twin[0], twin[1], dt)
+def spectrum_from_tv(t, v, twin=None, dt=None):
+    """Single-sided amp+phase spectrum of a PRE-CAPTURED (t, v) waveform over a coherent
+    window -- the array-only core of output_spectrum (no simulator). This is what lets the
+    Cadence side export a plain transient and have the harness do the FFT/peak-pick itself.
+      twin=(t0, t1) [s] selects the window (t1=None -> end of record); default skips the first
+        20% of the record as settling and uses the rest.
+      dt [s] = uniform resample step (default = median native sample spacing; handles the
+        non-uniform time grid of an adaptive-step transient export).
+    Returns (f, amp[V peak], phase[rad], twin0[s], binhz[Hz]). twin0 is the window start (the
+    phase reference) and binhz the achieved bin width -- store these as spur_twin0/spur_binhz."""
+    t = np.asarray(t, float)
+    v = np.asarray(v, float)
+    if twin is None:
+        t0, t1 = t[0] + 0.2 * (t[-1] - t[0]), t[-1]
+    else:
+        t0, t1 = twin
+        if t1 is None:
+            t1 = t[-1]
+    if dt is None:
+        dt = float(np.median(np.diff(t)))
+    tg = np.arange(t0, t1, dt)
     vg = np.interp(tg, t, v)
     n = len(tg)
     V = np.fft.rfft((vg - vg.mean()) * np.hanning(n)) * (2.0 / n) / 0.5  # hann amp-correct
     f = np.fft.rfftfreq(n, dt)
-    return f, np.abs(V), np.angle(V)
+    return f, np.abs(V), np.angle(V), float(t0), float(1.0 / (n * dt))
+
+
+def output_spectrum(lib, subckt, iload, xparams="", dt=DT, tstop=TSTOP, twin=TWIN, extra=""):
+    """Single-sided amplitude+phase spectrum of v(vout) over a coherent window.
+    Returns (f, amp[V peak], phase[rad]). Resampled to a uniform grid so the bins
+    are exactly k/Twin (coherent for tones on that grid). Runs the transient, then
+    defers the math to spectrum_from_tv (the simulator-free core)."""
+    t, v = _tran_vout(lib, subckt, iload, xparams, dt, tstop, extra)
+    f, amp, ph, _, _ = spectrum_from_tv(t, v, twin=twin, dt=dt)
+    return f, amp, ph
 
 
 def find_spurs(f, amp, fmax=30e6, n_floor=25, snr=6.0, max_spurs=12,
-               min_amp=5e-8, rel_floor=300.0):
+               min_amp=5e-8, rel_floor=300.0, binhz=BINHZ):
     """Pick discrete lines that exceed a local median floor by `snr`x. A line is
     kept only if it ALSO clears an absolute amplitude floor `min_amp` [V] AND is
     within `rel_floor`x of the largest detected line (drops sub-uV numerical
     artifacts on an otherwise floorless model spectrum). Returns dicts (f, amp, snr)
-    sorted by amplitude. n_floor = half-width (bins) of the rolling-median floor."""
-    sel = (f > 5 * BINHZ) & (f <= fmax)
+    sorted by amplitude. n_floor = half-width (bins) of the rolling-median floor.
+    `binhz` sets the near-DC exclusion floor (5*binhz); pass the achieved bin width
+    for an arbitrary-length waveform so the cutoff scales with it."""
+    sel = (f > 5 * binhz) & (f <= fmax)
     fi, ai = f[sel], amp[sel]
     floor = np.array([np.median(ai[max(0, i - n_floor):i + n_floor + 1]) for i in range(len(ai))])
     floor = np.maximum(floor, 1e-18)
@@ -164,6 +191,38 @@ def characterize_corners(libs, subckt, loads, xparams_of, fmax=30e6):
                  float(ph[np.argmin(np.abs(f - fk))])) for fk in F]
         per[il] = np.array(rows) if rows else np.zeros((0, 3))
     return dict(F=F, per=per, funds=funds, prods=prods)
+
+
+def characterize_corners_from_waves(waves, loads, nominal=None, fmax=30e6, twin=None, dt=None):
+    """Array-only twin of characterize_corners: build the per-corner intrinsic-spur table from
+    PRE-CAPTURED raw v(vout) waveforms instead of running sims -- the path import_cadence uses so
+    the Cadence side exports a plain transient (no external stimulus) and the harness does the
+    FFT / peak-pick / fundamental-classification. `waves` maps corner-key -> (t, v) arrays of
+    v(vout). Detects + classifies fundamentals at the NOMINAL corner to FIX the freq list F, then
+    reads amp+phase of those exact bins at every corner (so every corner has the same N tones,
+    ready for amplitude interpolation -- identical contract to characterize_corners). twin/dt are
+    forwarded to spectrum_from_tv (default: skip first 20%, resample at the native median step).
+    Returns dict(F, per, funds, prods, twin0, binhz) -- twin0/binhz are taken from the nominal
+    corner and become spur_twin0/spur_binhz."""
+    nom = str(nominal) if nominal else loads[len(loads) // 2]
+    if nom not in waves:
+        raise ValueError(f"nominal corner '{nom}' has no raw waveform (have {list(waves)})")
+    fn, an, phn, twin0, binhz = spectrum_from_tv(*waves[nom], twin=twin, dt=dt)
+    spurs = find_spurs(fn, an, fmax=fmax, binhz=binhz)
+    for s in spurs:
+        s["phase"] = float(phn[np.argmin(np.abs(fn - s["f"]))])
+    funds, prods = classify_fundamentals(spurs, tol_hz=1.5 * binhz)
+    F = [s["f"] for s in funds]
+    per = {}
+    for il in loads:
+        if il not in waves:
+            per[il] = np.zeros((0, 3))
+            continue
+        f, amp, ph, _, _ = spectrum_from_tv(*waves[il], twin=twin, dt=dt)
+        rows = [(fk, float(amp[np.argmin(np.abs(f - fk))]),
+                 float(ph[np.argmin(np.abs(f - fk))])) for fk in F]
+        per[il] = np.array(rows) if rows else np.zeros((0, 3))
+    return dict(F=F, per=per, funds=funds, prods=prods, twin0=twin0, binhz=binhz)
 
 
 def match_spurs(gt_spurs, model_spurs, tol_hz=2 * BINHZ):

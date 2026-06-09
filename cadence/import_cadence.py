@@ -24,6 +24,11 @@ CSV LAYOUT (defined here; finalize against the real export column order at integ
   * transient `trans_lin`/`trans_big`/`trans_slew` : time[s], vout[V].
   * dc `dc_loadreg`/`dc_dropout` : iload[A], vout[V].   `dc_linereg` : vin[V], vout[V].
   * spurs `spurs` : freq[Hz], amp[V], phase[rad]   (intrinsic vout tones; no stimulus).
+  * spurs_raw `spurs_raw` : time[s], vout[V] -- a RAW intrinsic transient of v(vout) (NO external
+        stimulus), ONE file per corner. When the pre-made spurs_<corner> tables are absent,
+        assemble() auto-FFTs these via spur_char (coherent-window FFT -> peak-pick -> fundamental
+        classification) to build spurs_<corner> + spur_F/spur_twin0/spur_binhz. Export the plain
+        waveform from Cadence; no calculator FFT needed. Window/fmax via profile spur_twin/spur_fmax.
   * `spur_500u` (optional linearity gate) : freq[Hz], amp[V].
 ------------------------------------------------------------------------------------------
 PROGRAMMATIC USE (what the GUI calls):
@@ -172,6 +177,13 @@ def _read_any(path, kind, fmt=None, sv_is_psd2=False):
     return reader(path, kind, fmt=fmt, sv_is_psd2=sv_is_psd2)
 
 
+def _read_wave(path):
+    """Read a raw transient export -> (t, v) float arrays (first two columns). Powers the
+    spurs_raw_<corner> auto-FFT path. Tolerates header/comment/unit rows via _read_table."""
+    _, arr = _read_table(path)
+    return arr[:, 0], arr[:, 1]
+
+
 # --------------------------------------------------------------------------- assemble
 def assemble(profile, files, outpath=None, fmt=None, sv_is_psd2=False):
     """Combine per-(quantity,corner) export files into one results/ref/<name>.npz that
@@ -214,21 +226,42 @@ def assemble(profile, files, outpath=None, fmt=None, sv_is_psd2=False):
     if ("spur_500u", None) in files:
         ref["spur_500u"] = _read_any(files[("spur_500u", None)], "spur_500u")
 
-    # spur fundamentals: take the NOMINAL corner's tone freqs (fit_model.fit_spurs reads the
-    # nominal corner's spur table for phase, and indexes spur_F against it -> they must align).
-    # Fall back to the first non-empty corner only if the nominal corner has no spur table.
-    spur_f = []
-    if f"spurs_{nom}" in ref and ref[f"spurs_{nom}"].size:
-        spur_f = [float(x) for x in ref[f"spurs_{nom}"][:, 0]]
-    else:
+    # --- intrinsic spurs: prefer pre-made (f,amp,phase) tables; else AUTO-FFT raw v(vout)
+    #     waveforms (spurs_raw_<corner>) so the Cadence side exports a plain transient and the
+    #     harness does the FFT / peak-pick / fundamental-classification itself. ---
+    have_tables = any(f"spurs_{il}" in ref for il in loads)
+    raw = {il: files[("spurs_raw", il)] for il in loads if ("spurs_raw", il) in files}
+    if raw and not have_tables:
+        import sys as _sys
+        _sys.path.insert(0, str(ROOT / "harness"))
+        import spur_char
+        waves = {il: _read_wave(p) for il, p in raw.items()}
+        sc = spur_char.characterize_corners_from_waves(
+            waves, loads, nominal=nom,
+            fmax=float(profile.get("spur_fmax", 30e6)),
+            twin=profile.get("spur_twin"))     # (t0,t1)/(t0,None); None -> auto (skip first 20%)
         for il in loads:
-            k = f"spurs_{il}"
-            if k in ref and ref[k].size:
-                spur_f = [float(x) for x in ref[k][:, 0]]
-                break
-    ref["spur_F"] = np.array(spur_f)
-    ref["spur_twin0"] = np.array(float(profile.get("spur_twin0", 0.0)))
-    ref["spur_binhz"] = np.array(float(profile.get("spur_binhz", 15625.0)))
+            if il in sc["per"]:
+                ref[f"spurs_{il}"] = sc["per"][il]
+        ref["spur_F"] = np.array(sc["F"])
+        ref["spur_twin0"] = np.array(float(sc["twin0"]))
+        ref["spur_binhz"] = np.array(float(sc["binhz"]))
+    else:
+        # pre-made-table path: take the NOMINAL corner's tone freqs (fit_model.fit_spurs reads the
+        # nominal corner's spur table for phase and indexes spur_F against it -> they must align).
+        # Fall back to the first non-empty corner only if the nominal corner has no spur table.
+        spur_f = []
+        if f"spurs_{nom}" in ref and ref[f"spurs_{nom}"].size:
+            spur_f = [float(x) for x in ref[f"spurs_{nom}"][:, 0]]
+        else:
+            for il in loads:
+                k = f"spurs_{il}"
+                if k in ref and ref[k].size:
+                    spur_f = [float(x) for x in ref[k][:, 0]]
+                    break
+        ref["spur_F"] = np.array(spur_f)
+        ref["spur_twin0"] = np.array(float(profile.get("spur_twin0", 0.0)))
+        ref["spur_binhz"] = np.array(float(profile.get("spur_binhz", 15625.0)))
 
     REFDIR.mkdir(parents=True, exist_ok=True)
     out = pathlib.Path(outpath) if outpath else (REFDIR / f"{name}.npz")
@@ -297,6 +330,15 @@ def validate(ref):
     if nom and f"z_{nom}_hf" not in ref:
         add("info", "z_hf", f"no z_{nom}_hf (HF Zout) -- Cout/ESR auto-extract falls back to "
             f"z_{nom}; provide the 500 MHz sweep for a robust cap/ESR extraction.")
+    # intrinsic spur summary (esp. useful when auto-FFT'd from spurs_raw waveforms)
+    sf = ref.get("spur_F")
+    if sf is not None and np.size(sf):
+        lines = ", ".join(f"{x/1e6:.4f}MHz" for x in np.ravel(sf)[:6])
+        more = " ..." if np.size(sf) > 6 else ""
+        binhz = float(ref["spur_binhz"]) if "spur_binhz" in ref else float("nan")
+        add("info", "spur_F", f"{np.size(sf)} intrinsic spur fundamental(s): {lines}{more} "
+            f"(bin={binhz/1e3:.2f}kHz, twin0={float(ref.get('spur_twin0', 0))*1e6:.2f}us). "
+            "Confirm these are independent sources (clock/charge-pump), not harmonic/IM products.")
     return warns
 
 
@@ -322,7 +364,7 @@ def match_dir(directory, loads, nominal=None):
 
     files = {}
     for il in loads:
-        for q in ("z", "p", "noise", "trans_lin", "spurs", "ibp"):
+        for q in ("z", "p", "noise", "trans_lin", "spurs", "spurs_raw", "ibp"):
             p = find(f"{q}_{il}")
             if p:
                 files[(q, il)] = p
@@ -351,9 +393,20 @@ if __name__ == "__main__":
     ap.add_argument("--esr", type=float, default=float("nan"))
     ap.add_argument("--vref", type=float, default=1.05)
     ap.add_argument("--dir", default=None, help="directory of <quantity>_<corner>.csv files")
+    ap.add_argument("--spur_twin0", type=float, default=0.0,
+                    help="phase-ref window start [s] for a PRE-MADE spur table (spurs_<corner>)")
+    ap.add_argument("--spur_binhz", type=float, default=15625.0,
+                    help="FFT bin width [Hz] for a PRE-MADE spur table (spurs_<corner>)")
+    ap.add_argument("--spur_fmax", type=float, default=30e6,
+                    help="max spur freq to detect [Hz], RAW-waveform path (spurs_raw_<corner>)")
+    ap.add_argument("--spur_tstart", type=float, default=None,
+                    help="settling skip / FFT window start [s], RAW path (default: skip first 20%%)")
     a = ap.parse_args()
     loads = a.loads.split(",")
-    prof = dict(name=a.name, loads=loads, nominal=a.nominal, cout=a.cout, esr=a.esr, vref=a.vref)
+    prof = dict(name=a.name, loads=loads, nominal=a.nominal, cout=a.cout, esr=a.esr, vref=a.vref,
+                spur_twin0=a.spur_twin0, spur_binhz=a.spur_binhz, spur_fmax=a.spur_fmax)
+    if a.spur_tstart is not None:
+        prof["spur_twin"] = (a.spur_tstart, None)
     files = match_dir(a.dir, loads, a.nominal) if a.dir else {}
     out = assemble(prof, files)
     print(f"wrote {out}")

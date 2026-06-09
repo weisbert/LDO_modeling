@@ -297,8 +297,28 @@ if __name__ == "__main__":
     ap.add_argument("--subckt", default="ldo_model")
     ap.add_argument("--ref", default=None)
     ap.add_argument("--xparams", default="")
+    ap.add_argument("--crossval", action="store_true",
+                    help="ALSO run the out-of-sample guardrails (LOCO / off-grid / "
+                         "identifiability) after the in-sample scorecard")
+    ap.add_argument("--strict", action="store_true",
+                    help="with --crossval: exit nonzero if any guardrail gate FAILs")
+    ap.add_argument("--systest", action="store_true",
+                    help="ALSO run the system LDO+buffer@carrier acceptance test "
+                         "(GT vs emitted model; complex carrier/sideband diff)")
     a = ap.parse_args()
     name = "ldo_model" if a.variant == "base" else f"ldo_{a.variant}"
     lib = a.lib or str(ng.ROOT / "model" / f"{name}.lib")
     refpath = a.ref or str(ng.ROOT / "results" / "ref" / f"{a.variant}.npz")
     score(lib, a.subckt, a.xparams, refpath=refpath)
+    if a.crossval:                          # optional held-out checks; lazy import so
+        import crossval                     # run_matrix (which calls score() directly,
+        rep = crossval.run(a.variant)       # never the CLI) is byte-unaffected
+        if a.strict and not all(v for v in rep["passes"].values() if v is not None):
+            raise SystemExit(1)
+    if a.systest:                           # optional system test; lazy import (same reason
+        import systest                      # as --crossval) -> run_matrix byte-unaffected
+        srep = systest.run(a.variant)
+        # LARGE_SIGNAL (GT nonlinear) / OUT_OF_ENVELOPE withhold the verdict -> not a FAIL;
+        # a strict FAIL is only an in-envelope, GT-linear case that misses the thresholds.
+        if a.strict and srep["in_envelope"] and srep.get("linear", True) and not srep["pass_"]:
+            raise SystemExit(1)

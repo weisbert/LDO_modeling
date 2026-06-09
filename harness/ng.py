@@ -36,7 +36,7 @@ def assemble(tb_text, libs=None):
     return "\n".join(parts) + "\n"
 
 
-def run(deck_text, workdir, outputs=()):
+def run(deck_text, workdir, outputs=(), timeout=180):
     workdir = pathlib.Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
     (workdir / "tb.cir").write_text(deck_text)
@@ -45,7 +45,7 @@ def run(deck_text, workdir, outputs=()):
         if f.exists():
             f.unlink()
     r = subprocess.run([NGSPICE, "-b", "tb.cir"], cwd=str(workdir),
-                       capture_output=True, text=True, timeout=180)
+                       capture_output=True, text=True, timeout=timeout)
     out = {"_rc": r.returncode, "_stdout": r.stdout, "_stderr": r.stderr}
     for o in outputs:
         f = workdir / o

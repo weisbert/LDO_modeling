@@ -78,13 +78,19 @@ def main(vkey="base"):
               f"PSRR LF={-20*np.log10(np.abs(H[0])):4.1f} worst={(-20*np.log10(np.abs(H))).min():4.1f}dB | "
               f"noise wht@200k={np.interp(2e5,fn,Sv)*1e9:5.1f} pk={npk*1e9:6.1f} int={nrms*1e6:.1f}uVrms")
 
-    print("=== HF extension (121u, to 500MHz) -> also Cout/ESR autoextract source ===")
-    fzh, Zh = bench.measure_zout(libs, sub, "121u", xparams=xp, accmd=bench.AC_HF)
-    fph, Hh = bench.measure_psrr(libs, sub, "121u", xparams=xp, accmd=bench.AC_HF)
+    # *_hf ceiling is a per-variant characterization-recipe param (default 500MHz; a GHz part
+    # overrides it via variants[..]["hf_stop"]). The array NAMES keep the nominal "121u" token
+    # (de-hardcoding the nominal corner is the separate deferred R1 item).
+    fstop = v.get("hf_stop") or bench.HF_STOP
+    accmd_hf = bench.ac_hf_cmd(fstop)
+    print(f"=== HF extension (121u, to {fstop/1e6:.0f}MHz) -> also Cout/ESR autoextract source ===")
+    fzh, Zh = bench.measure_zout(libs, sub, "121u", xparams=xp, accmd=accmd_hf)
+    fph, Hh = bench.measure_psrr(libs, sub, "121u", xparams=xp, accmd=accmd_hf)
     ref["z_121u_hf"] = np.c_[fzh, Zh.real, Zh.imag]
     ref["p_121u_hf"] = np.c_[fph, Hh.real, Hh.imag]
-    print(f"  Zout@304MHz={np.interp(304e6,fzh,np.abs(Zh)):.2f}ohm  "
-          f"PSRR@304MHz={-20*np.log10(np.interp(304e6,fph,np.abs(Hh))):.1f}dB")
+    fcar = 0.6 * fstop   # representative carrier-band probe = a fraction of the ceiling (general)
+    print(f"  Zout@{fcar/1e6:.0f}MHz={np.interp(fcar,fzh,np.abs(Zh)):.2f}ohm  "
+          f"PSRR@{fcar/1e6:.0f}MHz={-20*np.log10(np.interp(fcar,fph,np.abs(Hh))):.1f}dB")
 
     print("=== Transient load steps (req#1) ===")
     for il in bench.LOADS:

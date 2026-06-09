@@ -61,6 +61,7 @@ class ModelerCore:
         self.result = None           # fit_model.FitResult
         self._fit_ref = None         # ref_path the current result was fit from (desync guard)
         self.warnings = []
+        self.trans_info = {}         # per-corner trans-ID extraction diagnostics (Tab 5)
 
     # ---- import -----------------------------------------------------------------
     def import_data(self, files, fmt=None, sv_is_psd2=False):
@@ -73,6 +74,37 @@ class ModelerCore:
         self.result = None           # invalidate any prior fit -- it belonged to another ref
         self.warnings = ic.validate(self.ref)
         return self.ref_path, self.warnings
+
+    def import_trans(self, waveforms, plan_json, extra_files=None, outdir=None):
+        """Build a reference from ONE multitone trans-ID run (productionization piece C).
+        `waveforms` = {corner: [band0_wave, band1_wave, ...]} (paths or arrays); `plan_json` =
+        the sidecar emitted by trans_id.emit_stim_va. Converts the waveforms to Zout/PSRR z/p
+        CSVs (+ nominal hf) via trans_import, MERGES with extra_files (the noise/DC the user
+        already picked on Tab 2 -- noise stays a separate .noise), and funnels through the
+        EXISTING import_data() so assemble + guardrails + npz schema are reused, never
+        duplicated. trans-derived z/p WIN over any same-key extra_files. Returns
+        (ref_path, warnings)."""
+        import trans_import
+        plan = trans_import.load_plan(plan_json)
+        outdir = pathlib.Path(outdir) if outdir else (ROOT / "work" / "trans_csv" / self.profile.name)
+        zp_files, info = trans_import.import_run(plan, waveforms, outdir,
+                                                 nominal=self.profile.nominal)
+        self.trans_info = info
+        files = dict(extra_files or {})
+        files.update(zp_files)                 # trans z/p take precedence
+        return self.import_data(files)
+
+    def import_trans_folder(self, folder, plan_json, extra_files=None, outdir=None):
+        """Folder-gesture wrapper: match <corner>_b<band>.* exports in `folder` against the
+        plan, then import_trans. Returns (ref_path, warnings); raises if no corner matched."""
+        import trans_import
+        plan = trans_import.load_plan(plan_json)
+        waveforms = trans_import.match_wave_dir(folder, plan, self.profile.loads)
+        if not waveforms:
+            raise RuntimeError(
+                "no waveform files matched. Expected <corner>_b<band>.csv (e.g. 20u_b0.csv, "
+                "20u_b1.csv, ...) for your load corners, one per band in plan.json.")
+        return self.import_trans(waveforms, plan_json, extra_files=extra_files, outdir=outdir)
 
     def use_existing_ref(self, ref_path):
         """Point at an already-assembled npz (skip import) -- e.g. a Target-A variant."""
@@ -145,6 +177,23 @@ class ModelerCore:
         return dict(Zm=fit_model.predict(self.result.P[il], cg["fz"], self.result.nfk)["Zout"],
                     Hm=fit_model.predict(self.result.P[il], cg["fp"], self.result.nfk)["PSRR"],
                     Sm=fit_model.predict(self.result.P[il], cg["fn"], self.result.nfk)["noise"])
+
+    def text_report(self, outdir=None):
+        """Analytic text MODEL-vs-GT difference report (report.build_report) for the current
+        fit -- the copy-pasteable diagnosis built for an airgapped red zone where you can't
+        screenshot the overlays. Qt-free (works headless); powers the Compare tab's 'Save text
+        report' button. Writes results/score/report_<name>.txt by default. Returns (path, text)."""
+        import report
+        if self.result is None:
+            raise RuntimeError("fit a model first")
+        name = pathlib.Path(self.ref_path).stem
+        txt = report.build_report(self.ref, self.result, name, refpath=str(self.ref_path))
+        if outdir:
+            out = pathlib.Path(outdir) / f"report_{name}.txt"
+            out.write_text(txt, encoding="utf-8")
+        else:
+            out = report.write_report(name, txt)
+        return out, txt
 
 
 # =============================================================================== Qt UI
@@ -250,6 +299,7 @@ if _HAVE_QT:
             self.tabs.addTab(self._tab_import(), "2 · Import data")
             self.tabs.addTab(self._tab_fit(), "3 · Fit")
             self.tabs.addTab(self._tab_compare(), "4 · Compare")
+            self.tabs.addTab(self._tab_transid(), "5 · Trans-ID")
             self.statusBar().showMessage(
                 "Step 1 — set name, supply voltage, and 3 load corners, then 'Apply profile'.")
 
@@ -658,6 +708,11 @@ if _HAVE_QT:
             self.cmp_corner = QComboBox(); self.cmp_corner.addItems(self.core.profile.loads)
             self.cmp_corner.currentIndexChanged.connect(self._refresh_compare)
             row.addWidget(self.cmp_corner); row.addStretch(1)
+            self.cmp_report_btn = QPushButton("Save text report…")
+            self.cmp_report_btn.setToolTip("Write the plain-text model-vs-GT difference report "
+                                           "(copy-pasteable diagnosis; no screenshot needed).")
+            self.cmp_report_btn.clicked.connect(self._save_text_report)
+            row.addWidget(self.cmp_report_btn)
             lay.addLayout(row)
             self.cmp_canvas = _Canvas(2, 3, figsize=(11, 6)); lay.addWidget(self.cmp_canvas)
             self.cmp_err = QLabel("Fit a model to see the overlay."); lay.addWidget(self.cmp_err)
@@ -699,6 +754,105 @@ if _HAVE_QT:
             self.cmp_canvas.draw()
             self.cmp_err.setText(f"corner {il}:  Zout RMS={zrms:.3f}dB  PSRR RMS={prms:.3f}dB  "
                                  f"noise PSD={npsd:.3f}dB  (analytic predict vs imported GT)")
+
+        def _save_text_report(self):
+            if self.core.result is None:
+                QMessageBox.information(self, "Text report", "Fit a model first.")
+                return
+            try:
+                path, txt = self.core.text_report()
+            except Exception as e:
+                QMessageBox.warning(self, "Text report", f"{type(e).__name__}: {e}")
+                return
+            dest, _ = QFileDialog.getSaveFileName(self, "Save text report (a copy)",
+                                                  str(path), "Text (*.txt)")
+            if dest:
+                pathlib.Path(dest).write_text(txt, encoding="utf-8")
+                path = dest
+            QMessageBox.information(self, "Text report",
+                                    f"Wrote model-vs-GT difference report to:\n{path}\n\n"
+                                    "It localizes every mismatch (Zout/PSRR/noise) in plain text -- "
+                                    "paste the whole file to describe the fit.")
+
+        # --- Tab 5: Trans-ID (one multitone transient -> auto Zout/PSRR) ----------
+        def _tab_transid(self):
+            w = QWidget(); lay = QVBoxLayout(w)
+            legend = QLabel(
+                "<b>Multitone trans-ID (auto Zout + PSRR):</b> if you characterized this LDO with "
+                "the Verilog-A multitone stimulus fixture (one transient per band, emitted by "
+                "<code>trans_id.emit_stim_va</code>), point here at the <b>plan.json</b> and the "
+                "<b>folder</b> of exported waveforms named "
+                "<code>&lt;corner&gt;_b&lt;band&gt;.csv</code> (e.g. 20u_b0.csv, 20u_b1.csv …, "
+                "each <code>time, v(vin), v(vout)</code>). It coherently extracts <b>Zout &amp; "
+                "PSRR</b> for every corner and feeds them to Import — no AC sweeps needed.<br>"
+                "<b>Noise + DC still come from Tab 2</b> (a transient carries no device noise); "
+                "tick the box to reuse the files already picked there.")
+            legend.setWordWrap(True)
+            legend.setStyleSheet("background:#eef5ff; padding:7px; border:1px solid #cdddee;")
+            lay.addWidget(legend)
+            form = QFormLayout()
+            self.tid_plan = QLineEdit(); bp = QPushButton("…"); bp.setMaximumWidth(28)
+            bp.clicked.connect(lambda: self._pick_into(self.tid_plan, "plan (*.json);;All (*)"))
+            hp = QHBoxLayout(); hp.addWidget(self.tid_plan); hp.addWidget(bp)
+            self.tid_folder = QLineEdit(); bf = QPushButton("…"); bf.setMaximumWidth(28)
+            bf.clicked.connect(self._pick_trans_folder)
+            hf = QHBoxLayout(); hf.addWidget(self.tid_folder); hf.addWidget(bf)
+            form.addRow("plan.json", hp)
+            form.addRow("waveform folder", hf)
+            lay.addLayout(form)
+            self.tid_merge = QCheckBox("reuse Noise / DC files already picked on Tab 2")
+            self.tid_merge.setChecked(True)
+            lay.addWidget(self.tid_merge)
+            b = QPushButton("Extract z/p from trans   →   Import")
+            b.clicked.connect(self._do_import_trans)
+            lay.addWidget(b)
+            self.tid_log = QTextEdit(); self.tid_log.setReadOnly(True)
+            lay.addWidget(self.tid_log)
+            return w
+
+        def _pick_into(self, edit, filt):
+            fn, _ = QFileDialog.getOpenFileName(self, "Select file", str(ROOT), filt)
+            if fn:
+                edit.setText(fn)
+
+        def _pick_trans_folder(self):
+            d = QFileDialog.getExistingDirectory(self, "Folder with <corner>_b<band> waveforms",
+                                                 str(ROOT))
+            if d:
+                self.tid_folder.setText(d)
+
+        def _do_import_trans(self):
+            if not self._apply_profile():
+                return
+            plan = self.tid_plan.text().strip()
+            folder = self.tid_folder.text().strip()
+            if not plan or not folder:
+                QMessageBox.information(self, "Trans-ID",
+                                       "Pick both a plan.json and a waveform folder.")
+                return
+            extra = None
+            if self.tid_merge.isChecked():       # reuse Noise/DC the user picked on Tab 2
+                extra = {k: v for k, v in self._collect_files().items()
+                         if k[0] in ("noise", "dc_loadreg", "dc_dropout", "dc_linereg",
+                                     "spurs", "spur_500u")}
+            try:
+                path, warns = self.core.import_trans_folder(folder, plan, extra_files=extra)
+            except Exception as e:
+                QMessageBox.critical(self, "Trans-ID import failed", str(e))
+                return
+            corners = ", ".join(self.core.trans_info.keys())
+            txt = f"Wrote {path}\nExtracted Zout/PSRR from trans for corners: {corners}\n"
+            if not warns:
+                txt += "Guardrails: no issues detected.\n"
+            for wn in warns:
+                txt += f"[{wn['level'].upper()}] {wn['quantity']}: {wn['msg']}\n"
+            miss = self._missing_required(self._collect_files())
+            if miss:
+                txt += ("[INFO] still missing (add on Tab 2): " + ", ".join(miss) + "\n")
+            self.tid_log.setText(txt)
+            self.b_emit.setEnabled(False)        # new data invalidates any prior fit
+            self._preview()
+            self.statusBar().showMessage(f"Trans-ID → {path.name}. Add Noise/DC if needed, then Fit.")
 
 
 # =============================================================================== tests
@@ -746,6 +900,71 @@ def _synth_arrays():
     iddc = np.linspace(1e-6, 6e-3, 80)
     A["dc_dropout"] = np.c_[iddc, np.maximum(1.0 - 18.0 * iddc, 0.1)]
     return A, loads, nom
+
+
+def _selftest_transid(A, loads, nom, tmp):
+    """Headless verification of the Tab-5 trans-ID path (no Qt, no simulator): synth a one-band
+    multitone waveform per corner from the reference's Zout/PSRR, run it through
+    ModelerCore.import_trans_folder (-> trans_import -> import_cadence.assemble), and assert the
+    ref gets z/p/noise per corner, recovers Zout/PSRR to tolerance, and is fittable."""
+    import json
+    import trans_id
+    import trans_import
+    pl = trans_id.plan_band(f_lo=1e5, f_hi=1e7, n_per_dec=12, ppp=12)
+    N = pl["N"]; tg = pl["t0"] + pl["dt"] * np.arange(N)
+    va, ib, VDD = trans_id.VA_DEFAULT, trans_id.IB_DEFAULT, trans_id.VDD
+    cin = trans_import._cinterp
+    wdir = tmp / "transwav"; wdir.mkdir(parents=True, exist_ok=True)
+    for il in loads:                              # synth vout/vin = inverse of _spectrum
+        z, p = A[f"z_{il}"], A[f"p_{il}"]
+        Zt = cin(pl["fb"], z[:, 0], z[:, 1] + 1j * z[:, 2])
+        Ht = cin(pl["fa"], p[:, 0], p[:, 1] + 1j * p[:, 2])
+        vin = np.full(N, VDD)
+        for f in pl["fa"]:
+            vin = vin + va * np.sin(2 * np.pi * float(f) * tg)
+        vout = np.full(N, 1.0)
+        for f, Z in zip(pl["fb"], Zt):
+            vout = vout + ib * np.abs(Z) * np.sin(2 * np.pi * float(f) * tg + np.angle(Z))
+        for f, H in zip(pl["fa"], Ht):
+            vout = vout + va * np.abs(H) * np.sin(2 * np.pi * float(f) * tg + np.angle(H))
+        np.savetxt(wdir / f"{il}_b0.csv", np.c_[tg, vin, vout])
+    bj = dict(index=0, f_lo=pl["f_lo"], f_hi=pl["f_hi"], N=int(N), dt=pl["dt"], t0=pl["t0"],
+              fa=[float(x) for x in pl["fa"]], ba=[int(b) for b in pl["ba"]],
+              fb=[float(x) for x in pl["fb"]], bb=[int(b) for b in pl["bb"]])
+    plan_path = wdir / "plan.json"
+    plan_path.write_text(json.dumps(dict(VDD=VDD, va=va, ib=ib, iload=0.0, bands=[bj])))
+
+    core2 = ModelerCore()
+    core2.profile = Profile(name="_gui_transid_selftest", loads=loads, nominal=nom,
+                            cout=float(A["meta_cout"]), esr=float(A["meta_esr"]), vref=1.05)
+    extra = {("noise", il): str(tmp / f"noise_{il}.csv") for il in loads
+             if (tmp / f"noise_{il}.csv").exists()}
+    if (tmp / "dc_loadreg.csv").exists():
+        extra[("dc_loadreg", None)] = str(tmp / "dc_loadreg.csv")
+    path, warns = core2.import_trans_folder(str(wdir), str(plan_path), extra_files=extra)
+    for il in loads:
+        for q in ("z", "p", "noise"):
+            assert f"{q}_{il}" in core2.ref, f"trans-ID ref missing {q}_{il}"
+    assert f"z_{nom}_hf" in core2.ref, "trans-ID ref missing nominal z_hf"
+    zr, pr = core2.ref[f"z_{nom}"], core2.ref[f"p_{nom}"]
+    zg, pg = A[f"z_{nom}"], A[f"p_{nom}"]
+    ez = float(np.max(np.abs(20 * np.log10(np.abs(zr[:, 1] + 1j * zr[:, 2]) /
+                            np.abs(cin(zr[:, 0], zg[:, 0], zg[:, 1] + 1j * zg[:, 2]))))))
+    ep = float(np.max(np.abs(20 * np.log10(np.abs(pr[:, 1] + 1j * pr[:, 2]) /
+                            np.abs(cin(pr[:, 0], pg[:, 0], pg[:, 1] + 1j * pg[:, 2]))))))
+    assert ez < 0.5 and ep < 0.5, f"trans-ID recovery off (Zout {ez:.3f} dB, PSRR {ep:.3f} dB)"
+    core2.fit()
+    assert core2.result is not None, "trans-ID ref not fittable"
+    try:                                          # close + unlink the trans-ID selftest npz
+        import fit_model
+        if getattr(fit_model, "ref", None) is not None and hasattr(fit_model.ref, "close"):
+            fit_model.ref.close()
+        pathlib.Path(path).unlink()
+    except OSError:
+        pass
+    print(f"  trans-ID: import_trans -> z/p/noise OK ({len(loads)} corners; "
+          f"Zout {ez:.3f} dB / PSRR {ep:.3f} dB recovery; fittable)")
+    return True
 
 
 def _selftest(require_qt=False):
@@ -812,6 +1031,9 @@ def _selftest(require_qt=False):
         path.unlink()
     except OSError:
         pass
+
+    # 1b) Trans-ID import path (Tab 5) -- headless, no simulator
+    _selftest_transid(A, loads, nom, tmp)
 
     # 2) Qt layer (offscreen) if available -- build window, REGRESSION-test the import button path
     #    (populate pickers -> apply profile -> collect must survive), render, and screenshot.

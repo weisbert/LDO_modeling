@@ -27,7 +27,35 @@ STEP_DI = {"lin": 50e-6, "big": 1e-3, "slew": 5e-3}   # linear / compression / s
 LIN_FRAC = 0.3        # linear-test step = LIN_FRAC*bias (small perturbation at every corner)
 # --- noise probe (req#2) + HF AC extension ---
 NOISE_CMD = "noise v(vout) Vin dec 20 10 100meg"
-AC_HF = "ac dec 40 10 500meg"
+
+# HF (*_hf) characterization ceiling. This is a characterization-RECIPE parameter, not a model
+# constant: it bounds Zout/PSRR up to the supplied circuit's carrier (see modeling-bandwidth notes
+# -- *_hf cutoff != system max freq). Default 500 MHz brackets the Target-A ~304 MHz carrier; a real
+# GHz part (e.g. Target B ~5.8 GHz) overrides it per-variant via variants[..]["hf_stop"]. Decide the
+# real ceiling from an exploratory 6-10 GHz sweep (don't default to 500 MHz).
+HF_STOP = 500e6      # default *_hf ceiling [Hz]
+
+
+def _fmt_hz(f):
+    """Format a frequency for an ngspice .control sweep as an SI-suffixed literal
+    (ngspice: g=1e9, meg=1e6, k=1e3). Keeps existing decks byte-identical
+    (_fmt_hz(500e6) == '500meg') and reads cleanly at GHz (_fmt_hz(10e9) == '10g')."""
+    f = float(f)
+    if f >= 1e9:
+        return f"{f / 1e9:g}g"
+    if f >= 1e6:
+        return f"{f / 1e6:g}meg"
+    if f >= 1e3:
+        return f"{f / 1e3:g}k"
+    return f"{f:g}"
+
+
+def ac_hf_cmd(fstop=None, dec=40, fstart=10):
+    """Wideband AC sweep command up to the *_hf ceiling (`fstop`, default HF_STOP)."""
+    return f"ac dec {dec} {fstart} {_fmt_hz(HF_STOP if fstop is None else fstop)}"
+
+
+AC_HF = ac_hf_cmd()   # back-compat default == "ac dec 40 10 500meg"
 
 
 def _run(tb, lib, tag, out="out.dat"):

@@ -1,5 +1,15 @@
 # HANDOFF — LDO behavioral-model builder (as of 2026-06-08)
 
+> **Deferred refactors:** see `DEFERRED_REFACTORS.md` (do as one batch AFTER the current
+> Target-B LDO is modeled). Open: **R1** de-hardcode `trans_big`/`trans_slew` + nominal corner
+> (profile-driven); **R2** emitted `.va`/`.lib` has no GND terminal; **R3** VDD hardcoded —
+> not settable/sweepable for HV/nom/LV supply corners (`dc_linereg` characterized but unused).
+> R3 has an OPEN QUESTION for the user (small-signal accuracy needed at off-nominal VDD?).
+> Design-level concerns also recorded: **R4** the feedback loop never tests the real use case
+> (LDO + buffer-at-carrier, model vs real — only block metrics + an 8MHz sanity gate exist);
+> **R5** automate the ~30 manual characterization exports; **R6** real-LDO quality bugs (poor
+> fit / output rail droops / no buffer ripple — tied to R3 DC + Zout-at-carrier coverage).
+
 ## UPDATE (2026-06-08b) — 黄区→红区 deploy VALIDATED end-to-end + one-command update workflow
 The GUI modeler + airgap bundle is now **proven on the real red zone** (EDA box, CentOS7-class,
 **tcsh**, airgapped) at `/data/RFIC3/Hi1108V100_Pilot_C1Xplus/w84368867/workarea/LDO_modeling`:

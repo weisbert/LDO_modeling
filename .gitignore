@@ -9,6 +9,9 @@ __pycache__/
 # --- ngspice: Windows binaries are platform-specific (install ngspice on the target OS) ---
 tools/
 
+# --- xwin MSVC/SDK import-lib cache (large; splatted from Microsoft CDN by xwin, rebuildable) ---
+.xwin-cache/
+
 # --- ngspice run scratch dirs (per-process LDO_WORK; regenerated each run) ---
 work/
 work_*/

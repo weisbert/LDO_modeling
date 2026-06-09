@@ -27,6 +27,18 @@ VARIANTS = {
     "base": dict(libs=[GT], subckt="ldo_gt", xparams="", biasnode="nb",
                  cout=1e-9, esr=0.5, note="Target-A PMOS-pass / 5T-OTA reference"),
 
+    # GHz-carrier coverage demo (B-cover): same ideal-cap ldo_gt, but characterized to a 10 GHz
+    # *_hf ceiling (vs the 500 MHz default) so the system test's validity envelope opens up to a
+    # ~6 GHz carrier (brackets the real Target-B ~5.8 GHz). Proves the recipe is GENERAL -- one
+    # profile number (hf_stop) carries the whole characterize->fit->emit->envelope->coherent-FFT
+    # pipeline to GHz with NO code edits. ldo_gt's Zout rolls off smoothly to its ESR floor through
+    # 10 GHz (exploratory sweep: no inductive/ESL rise), so the lumped model extrapolates correctly.
+    # (This validates the PLUMBING at GHz; real-silicon GHz physics -- ESL/distributed -- is Target B,
+    # guarded by the same exploratory sweep.)
+    "base_ghz": dict(libs=[GT], subckt="ldo_gt", xparams="", biasnode="nb",
+                     cout=1e-9, esr=0.5, hf_stop=10e9,
+                     note="GHz-carrier demo: ldo_gt characterized to 10GHz (B-cover validity envelope at GHz)"),
+
     # ---- A-layer: same topology, swept operating regime ----------------------
     "cout10n": dict(libs=[GT], subckt="ldo_gt", xparams="cout=10n resr=1", biasnode="nb",
                     cout=10e-9, esr=1.0, note="10x output cap + higher ESR (Cout autoextract)"),
@@ -64,6 +76,21 @@ VARIANTS = {
     "v6_spur2": dict(libs=[GROUND / "ldo_v6_spur2.lib"], subckt="ldo_v6_spur2", xparams="",
                      biasnode="nb", cout=1e-9, esr=0.5,
                      note="two INCOMMENSURATE intrinsic tones (1.0MHz + 3.7MHz) -> multi-tone HB stress"),
+
+    # ---- B-layer round 2: 4 new architectures stressing untested assumptions ----
+    # (additive generalization probes; a poor fit IS the finding -- do not touch shared fit/score code)
+    "v7_esl": dict(libs=[GROUND / "ldo_v7_esl.lib"], subckt="ldo_v7_esl", xparams="",
+                   biasnode="nb", cout=1e-9, esr=0.5, hf_stop=2e9,
+                   note="output-cap series ESL: Zout dips at SRF then RISES inductively (no series-L term in model)"),
+    "v8_dlc": dict(libs=[GROUND / "ldo_v8_dlc.lib"], subckt="ldo_v8_dlc", xparams="",
+                   biasnode="nb", cout=4.7e-9, esr=0.5, hf_stop=1e9,
+                   note="double-LC pi output net: 2 resonances + an anti-resonance NOTCH (parallel-RLC can't dip)"),
+    "v9_vldo": dict(libs=[GROUND / "ldo_v9_vldo.lib"], subckt="ldo_v9_vldo", xparams="",
+                    biasnode="nb", cout=1e-9, esr=0.5,
+                    note="very-low-dropout (~50mV): small-signal fits, large steps hit dropout -> validity envelope narrows"),
+    "v10_3lc": dict(libs=[GROUND / "ldo_v10_3lc.lib"], subckt="ldo_v10_3lc", xparams="",
+                    biasnode="nb", cout=200e-12, esr=0.1, hf_stop=1e9,
+                    note="multi-stage PDN (3-cap ladder): >2 Zout resonances -> exceeds the 2-branch RLC order"),
 }
 
 

@@ -595,35 +595,60 @@ def _noise_resid(il, zf, gw, gk):
     return float(np.sqrt(np.mean((20 * np.log10((Smod + 1e-30) / (Sv + 1e-30))) ** 2)))
 
 
+# Interpolation envelope margins. The clamp is TIGHT (was [min/1.5, max*1.5], a loose
+# band-aid that let v3 pcw0->1.245e8 and v1 R_pl->38.4 escape) but kept just wide enough
+# (a fraction of a percent) that it is INACTIVE at the corners -> the deg<=2 poly still
+# passes through every corner exactly -> the 3-corner scorecard is byte-identical, while
+# between/beyond corners every param is bounded to its measured corner envelope.
+CLAMP_M = 1.005      # log (magnitude) params: multiplicative margin on [min, max]
+CLAMP_ADD = 0.005    # linear (signed) params: additive margin as a fraction of the span
+
+
 def _poly(P, key, logspace):
     u = np.array([np.log(P[il]["iv"]) for il in LOADS])
-    y = np.array([P[il][key] for il in LOADS])
+    y = np.array([P[il][key] for il in LOADS], dtype=float)
     y = np.log(y) if logspace else y
-    return np.polyfit(u, y, 2)                  # c2 u^2 + c1 u + c0  (np order: hi->lo)
+    deg = min(len(LOADS) - 1, 2)                # 3 corners -> quadratic; general for 1/2 corners
+    return np.polyfit(u, y, deg)                # np order hi->lo (c2 u^2 + c1 u + c0)
 
 
-def _expr(c, logspace):
-    # c = [c2, c1, c0] ; build ngspice expr in u=ln(ic)
-    body = f"({c[0]:.6e})*u*u + ({c[1]:.6e})*u + ({c[2]:.6e})"
-    return f"exp({body})" if logspace else f"({body})"
+def _body(c):
+    """ngspice/Verilog-A polynomial body in u=ln(ic) for coeffs c (np hi->lo order).
+    For the standard 3-corner (deg-2) case this is byte-identical to the legacy
+    `(c0)*u*u + (c1)*u + (c2)` form, so the emitted at-corner values are unchanged."""
+    d = len(c) - 1
+    parts = []
+    for i, ci in enumerate(c):
+        p = d - i
+        if p == 0:
+            parts.append(f"({ci:.6e})")
+        elif p == 1:
+            parts.append(f"({ci:.6e})*u")
+        elif p == 2:
+            parts.append(f"({ci:.6e})*u*u")
+        else:
+            parts.append(f"({ci:.6e})*u**{p}")
+    return " + ".join(parts)
 
 
 def _pexpr(P, key, logspace):
-    """Interpolation expr for a model param, in u=ln(ic). For LOG-space (magnitude)
-    params the bare exp(quadratic-in-u) is forced exactly through the 3 load corners
-    but a non-monotonic corner pattern lets the parabola overshoot FAR outside the
-    corner envelope at in-range interpolated loads (verified: +15.7dB in the spur
-    band). CLAMP the interpolated value to [min/1.5, max*1.5] of the corner values
-    so off-corner loads stay inside the measured envelope while remaining exact AT
-    the corners. min/max/exp are valid in both ngspice (.param) and Verilog-A."""
+    """Interpolation expr for a model param, in u=ln(ic). The deg<=2 poly is forced
+    exactly through the load corners, but a non-monotonic corner pattern lets it
+    overshoot FAR outside the measured envelope at off-corner loads (verified: +15.7dB
+    in the spur band; v3 pcw0->1.245e8; v1 R_pl->38.4). CLAMP every param to its corner
+    envelope with a small margin so off-corner loads stay inside the measured range
+    while the clamp is INACTIVE at the corners (-> at-corner value, hence the score, is
+    unchanged). LINEAR params are clamped too now (previously unclamped -> pcb1/G2/G3
+    could overshoot). min/max/exp are valid in both ngspice (.param) and Verilog-A."""
     c = _poly(P, key, logspace)
-    body = f"({c[0]:.6e})*u*u + ({c[1]:.6e})*u + ({c[2]:.6e})"
-    if not logspace:
-        return f"({body})"
-    ys = [float(P[il][key]) for il in LOADS]
-    lo = min(ys) / 1.5
-    hi = max(ys) * 1.5
-    return f"min(max(exp({body}),{lo:.6e}),{hi:.6e})"
+    body = _body(c)
+    vals = [float(P[il][key]) for il in LOADS]
+    if logspace:
+        lo, hi = min(vals) / CLAMP_M, max(vals) * CLAMP_M
+        return f"min(max(exp({body}),{lo:.6e}),{hi:.6e})"
+    pad = CLAMP_ADD * (max(vals) - min(vals))
+    lo, hi = min(vals) - pad, max(vals) + pad
+    return f"min(max({body},{lo:.6e}),{hi:.6e})"
 
 
 def build_pwl(vreg121):
