@@ -170,11 +170,11 @@ def _run_pipeline(A, loads, nom, name):
             p = tmp / f"{q}_{il}.csv"
             np.savetxt(p, np.asarray(A[f"{q}_{il}"], float), delimiter=",")
             files[(q, il)] = p
-    for q in ("z_hf", "p_hf"):
-        p = tmp / f"{q}.csv"
-        np.savetxt(p, np.asarray(A[f"{q[0]}_{nom}_hf" if q == "z_hf" else f'p_{nom}_hf'], float),
-                   delimiter=",")
-        files[(q, nom)] = p
+    for q, kk in (("z_hf", f"z_{nom}_hf"), ("p_hf", f"p_{nom}_hf")):
+        if kk in A:
+            p = tmp / f"{q}.csv"
+            np.savetxt(p, np.asarray(A[kk], float), delimiter=",")
+            files[(q, nom)] = p
     for tag in ("big", "slew"):
         p = tmp / f"trans_{tag}.csv"
         np.savetxt(p, np.asarray(A[f"trans_{tag}_{nom}"], float), delimiter=",")
@@ -242,8 +242,22 @@ def part3_resistive_tail():
     print()
 
 
+def part4_no_zhf():
+    print("== part 4 (the user's actual setup): NO z_hf, z swept straight to 40GHz ==")
+    A, loads, nom = _synth_capless(resistive_tail=True)
+    for k in (f"z_{nom}_hf", f"p_{nom}_hf"):
+        del A[k]
+    core, path, warns = _run_pipeline(A, loads, nom, "nozhf")
+    assert not any(w["quantity"] == "z_hf" for w in warns), \
+        "missing-z_hf info should be suppressed when z reaches past 100MHz"
+    _check_fit(core, nom)
+    _cleanup(path)
+    print()
+
+
 if __name__ == "__main__":
     part1_regression()
     part2_bad_zhf()
     part3_resistive_tail()
+    part4_no_zhf()
     print("validate_capless PASS")

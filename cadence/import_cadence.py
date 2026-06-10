@@ -343,9 +343,12 @@ def validate(ref):
                         "sweeps overlap -- check the HF export's scale/units/injection; the "
                         "fitter will distrust it for Cout/ESR extraction.")
     # hf arrays present? (needed for Cout/ESR auto-extraction + RF carrier bound)
-    if nom and f"z_{nom}_hf" not in ref:
-        add("info", "z_hf", f"no z_{nom}_hf (HF Zout) -- Cout/ESR auto-extract falls back to "
-            f"z_{nom}; provide the 500 MHz sweep for a robust cap/ESR extraction.")
+    # -- only worth flagging when the in-band z itself stops low: a z swept wide
+    #    (e.g. straight to 40GHz) serves both roles and needs no separate z_hf.
+    if nom and f"z_{nom}_hf" not in ref and f"z_{nom}" in ref \
+            and float(np.max(ref[f"z_{nom}"][:, 0])) < 1e8:
+        add("info", "z_hf", f"no z_{nom}_hf (HF Zout) and z_{nom} stops below 100MHz -- "
+            "Cout/ESR auto-extract needs the HF tail; extend the z sweep or add z_hf.")
     # intrinsic spur summary (esp. useful when auto-FFT'd from spurs_raw waveforms)
     sf = ref.get("spur_F")
     if sf is not None and np.size(sf):
