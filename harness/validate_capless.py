@@ -97,10 +97,17 @@ def part1_regression():
               f"band-med={med:5.2f} max={mx:6.2f}  {'OK' if same else 'CHANGED!'}")
         assert same, f"{npz.stem}: gate changed extraction on an existing reference"
         n += 1
-    print(f"   {n} references: extraction byte-identical, gate silent\n")
+    print(f"   {n} references: extraction byte-identical, gate silent")
+    # full fit on representative refs: the adaptive noise bank must NOT trigger
+    # (M stays 6 -> the whole fit is computed exactly as before = byte-identical)
+    for vk in ("base", "v3_miller", "v8_dlc"):
+        fit_model.load(vkey=vk)
+        fit_model.fit_all()
+        assert len(fit_model.NFK) == 6, f"{vk}: noise bank adapted on an existing reference"
+    print("   fit check (base/v3/v8): noise bank stayed at 6 sections\n")
 
 
-def _synth_capless(resistive_tail=False):
+def _synth_capless(resistive_tail=False, noisy=False):
     """Arrays mimicking the user's capless part: rds-dominated Zout (0.8ohm LF floor,
     ~700ohm loop peak @10MHz UGB, slow decay to 40GHz), 70dB DC PSRR with a ~27MHz
     0dB notch. resistive_tail=True flattens the phase above 100MHz to ~-0.06deg
@@ -136,8 +143,19 @@ def _synth_capless(resistive_tail=False):
         H = Hpsrr(il, f)
         A[f"z_{il}"] = np.c_[f, Z.real, Z.imag]
         A[f"p_{il}"] = np.c_[f, H.real, H.imag]
-        Sv = np.sqrt((3e-8) ** 2 + (1.2e-7) ** 2 * (1e3 / f) + (np.abs(Z) * 2e-9) ** 2)
-        A[f"noise_{il}"] = np.c_[f, Sv]
+        if noisy:
+            # the real-part noise export: LINEAR frequency grid (pnoise binning) ->
+            # ~no samples below 100kHz, so without grid equalization the fit simply
+            # never sees the steep RTN/flicker tail (-20dB @1kHz failure mode).
+            fn = np.linspace(1e3, 4e10, 400)
+            Zn = np.abs(Zcl(il, fn))
+            In2 = ((2e-9) ** 2 + (5e-7) ** 2 / (1 + (fn / 1.5e3) ** 2) ** 2
+                   + (3e-8) ** 2 * (1e3 / fn))
+            Sv = np.sqrt(In2) * Zn
+            A[f"noise_{il}"] = np.c_[fn, Sv]
+        else:
+            Sv = np.sqrt((3e-8) ** 2 + (1.2e-7) ** 2 * (1e3 / f) + (np.abs(Z) * 2e-9) ** 2)
+            A[f"noise_{il}"] = np.c_[f, Sv]
         t = np.linspace(0, 25e-6, 200)
         A[f"trans_lin_{il}"] = np.c_[t, 1.05 - 0.8 * iv
                                      - 1e-3 * np.exp(-(t - 5e-6) / 2e-6) * (t > 5e-6)]
@@ -275,10 +293,30 @@ def part5_sign_flip():
     print()
 
 
+def part6_linear_noise_grid():
+    print("== part 6 (Target-B noise): LINEAR-grid noise export + steep RTN/flicker tail ==")
+    A, loads, nom = _synth_capless(resistive_tail=True, noisy=True)
+    for k in (f"z_{nom}_hf", f"p_{nom}_hf"):
+        del A[k]
+    core, path, _ = _run_pipeline(A, loads, nom, "noisy")
+    cg = core.gt_corner(nom)
+    pm = core.predict_corner(nom)
+    lf_err = abs(20 * np.log10((pm["Sm"][0] + 1e-30) / (cg["Sg"][0] + 1e-30)))
+    print(f"   LF noise err @ {cg['fn'][0]:.3g}Hz = {lf_err:.1f}dB (was -20dB-class before "
+          f"grid equalization)")
+    assert lf_err < 6.0, f"flicker tail still underfit: {lf_err:.1f}dB at the lowest point"
+    for r in core.fit_residuals():
+        print(f"   {r['il']:>5}: zrms={r['zrms']:.2f} prms={r['prms']:.2f} npsd={r['npsd']:.2f} dB")
+        assert r["npsd"] < 4.5, f"noise residual still high at {r['il']}"
+    _cleanup(path)
+    print()
+
+
 if __name__ == "__main__":
     part1_regression()
     part2_bad_zhf()
     part3_resistive_tail()
     part4_no_zhf()
     part5_sign_flip()
+    part6_linear_noise_grid()
     print("validate_capless PASS")

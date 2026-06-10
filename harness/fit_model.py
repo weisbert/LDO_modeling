@@ -198,7 +198,15 @@ NPC = 1   # PSRR coupling-current COMPLEX (2nd-order, conjugate-pair) sections.
           # N2=1 validated (analyze_psrr_phase.py): N2>=2 overfits/destabilizes.
 SHELF_PH_TRIG = 2.5   # deg: attempt the complex bank if the shelf's PSRR phase RMS
                       # exceeds this even when e_shelf<0.05 (keep-best => zero regression)
-MNOISE = 6   # Norton-@vout noise sections (white floor + MNOISE Lorentzians)
+MNOISE = 6   # Norton-@vout noise sections (white floor + MNOISE Lorentzians);
+             # fit_all() RAISES this (adaptive, max NOISE_M_MAX) when the joint fit
+             # cannot hold the shape -- real capless part: flicker/RTN keeps rising
+             # through the bottom decades while the In-dip at the Zout peak competes
+             # for sections; 6 corners over 6+ decades then sacrifice the LF tail
+             # (-20dB @1kHz on the real 5.8G LDO). All 14 synthetic refs fit <=3.7dB
+             # at M=6, below the trigger -> they never adapt = byte-identical.
+NOISE_ADAPT_TRIG = 4.0   # dB worst-corner Sv log-RMS that triggers growing the bank
+NOISE_M_MAX = 10         # adaptive ceiling (sections are cheap: R||C + VCCS each)
 NFK = []     # module global: shared Lorentzian corner freqs from the last noise fit
 NSPUR_F = []   # module global: intrinsic discrete-spur freqs (Hz, load-independent)
 NSPUR_PH = []  # module global: spur SIN injection phase (rad) at the nominal corner
@@ -444,55 +452,116 @@ def fit_noise_bank(zfits, M=MNOISE):
     for il in LOADS:
         gn = ref[f"noise_{il}"]; f = gn[:, 0]; Sv = gn[:, 1]
         Zmod = np.abs(zmodel(f, *zfits[il]))
-        targets[il] = (f, (Sv / Zmod) ** 2)            # (f, In^2 target)
+        In2 = (Sv / Zmod) ** 2                         # In^2 target
+        # GRID EQUALIZATION: the log-residual weighs every SAMPLE equally, so a
+        # linear-frequency noise export (typical pnoise binning; real 5.8G LDO) puts
+        # ~no samples below 100kHz -> the flicker/RTN tail simply is not in the fit
+        # (-20dB @1kHz). If the grid is not log-uniform, resample onto a uniform log
+        # grid (24/dec) first. Log-uniform exports (all 14 refs) skip this untouched.
+        dl = np.diff(np.log(f))
+        pos = dl[dl > 0]
+        if pos.size and np.max(dl) > 2.5 * np.min(pos):
+            fu = np.logspace(np.log10(f[0]), np.log10(f[-1]),
+                             max(int(24 * np.log10(f[-1] / f[0])), 24))
+            In2 = np.exp(np.interp(np.log(fu), np.log(f), np.log(In2 + 1e-80)))
+            f = fu
+            print(f"      noise grid for {il} is not log-uniform -> "
+                  f"resampled to {len(fu)} log points for the bank fit")
+        targets[il] = (f, In2)
     f0 = targets[LOADS[0]][0][0]; f1 = targets[LOADS[0]][0][-1]
     nL = len(LOADS)
-
-    def model_il(fks, row, f):                          # row=[logwhite, logamp_1..M]
-        out = np.exp(row[0]) * np.ones_like(f)
-        for k in range(M):
-            out = out + np.exp(row[1 + k]) / (1.0 + (f / fks[k]) ** 2)
-        return out
-
     MIN_LOG_GAP = np.log(2.0)              # adjacent corners >= 2x apart (anti-degeneracy)
 
-    def resid(p):
-        fks = np.exp(p[:M])
-        rest = p[M:].reshape(nL, M + 1)
-        r = []
+    def fit_M(M, fks_init=None):
+        def model_il(fks, row, f):                      # row=[logwhite, logamp_1..M]
+            out = np.exp(row[0]) * np.ones_like(f)
+            for k in range(M):
+                out = out + np.exp(row[1 + k]) / (1.0 + (f / fks[k]) ** 2)
+            return out
+
+        def resid(p):
+            fks = np.exp(p[:M])
+            rest = p[M:].reshape(nL, M + 1)
+            r = []
+            for j, il in enumerate(LOADS):
+                f, In2 = targets[il]
+                r.append(np.log(model_il(fks, rest[j], f) + 1e-80) - np.log(In2 + 1e-80))
+            # SEPARATION penalty: keep the M shared corners spread out so two sections
+            # cannot collapse onto one pole (which makes anti-correlated giant amplitudes
+            # -> the +15.7dB inter-corner interpolation overshoot). Pushes adjacent
+            # sorted log-corners >= MIN_LOG_GAP apart.
+            gaps = np.diff(np.sort(p[:M]))
+            r.append(30.0 * np.maximum(0.0, MIN_LOG_GAP - gaps))
+            return np.concatenate(r)
+
+        if fks_init is not None:
+            fks0 = np.log(np.sort(np.asarray(fks_init, float)))
+        else:
+            fks0 = np.log(np.logspace(np.log10(f0 * 1.5), np.log10(f1 / 1.5), M))
+        init = list(fks0)
+        lob = list(np.log(np.full(M, f0 / 5))); hib = list(np.log(np.full(M, f1 * 5)))
+        for il in LOADS:
+            f, In2 = targets[il]
+            init += [float(np.log(In2[-3:].mean() + 1e-80))]
+            init += list(np.log(np.interp(np.exp(fks0), f, In2) + 1e-80))
+            lob += [-200.0] * (M + 1); hib += [60.0] * (M + 1)
+        s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=30000)
+        fks = np.exp(s.x[:M]); rest = s.x[M:].reshape(nL, M + 1)
+        # worst-corner Sv-domain log-RMS (Sv=sqrt(In2)*|Z| with the same Z -> the In2
+        # log-ratio /2 IS the Sv dB error); drives the adaptive-M trigger below
+        worst = 0.0
         for j, il in enumerate(LOADS):
             f, In2 = targets[il]
-            r.append(np.log(model_il(fks, rest[j], f) + 1e-80) - np.log(In2 + 1e-80))
-        # SEPARATION penalty: keep the M shared corners spread out so two sections
-        # cannot collapse onto one pole (which makes anti-correlated giant amplitudes
-        # -> the +15.7dB inter-corner interpolation overshoot). Pushes adjacent
-        # sorted log-corners >= MIN_LOG_GAP apart.
-        gaps = np.diff(np.sort(p[:M]))
-        r.append(30.0 * np.maximum(0.0, MIN_LOG_GAP - gaps))
-        return np.concatenate(r)
+            m = model_il(fks, rest[j], f)
+            worst = max(worst, float(np.sqrt(np.mean(
+                (10.0 * np.log10((m + 1e-80) / (In2 + 1e-80))) ** 2))))
+        order = np.argsort(fks)             # SORT sections ascending by corner freq so
+        fks = fks[order]                    # 'section k' is the same pole at every corner
+        gw, gk = {}, {}
+        for j, il in enumerate(LOADS):
+            gw[il] = float(np.sqrt(max(np.exp(rest[j, 0]), 1e-44) / (KT4 * NRk)))
+            gk[il] = [float(np.sqrt(max(np.exp(rest[j, 1 + k]), 1e-44) / (KT4 * NRk)))
+                      for k in order]
+        return dict(fk=[float(x) for x in fks], gw=gw, gk=gk), worst
 
-    fks0 = np.log(np.logspace(np.log10(f0 * 1.5), np.log10(f1 / 1.5), M))
-    init = list(fks0)
-    lob = list(np.log(np.full(M, f0 / 5))); hib = list(np.log(np.full(M, f1 * 5)))
-    for il in LOADS:
-        f, In2 = targets[il]
-        init += [float(np.log(In2[-3:].mean() + 1e-80))]
-        init += list(np.log(np.interp(np.exp(fks0), f, In2) + 1e-80))
-        lob += [-200.0] * (M + 1); hib += [60.0] * (M + 1)
-    s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=30000)
-    fks = np.exp(s.x[:M]); rest = s.x[M:].reshape(nL, M + 1)
-    order = np.argsort(fks)                 # SORT sections ascending by corner freq so
-    fks = fks[order]                        # 'section k' is the same pole at every corner
-    gw, gk = {}, {}
-    for j, il in enumerate(LOADS):
-        gw[il] = float(np.sqrt(max(np.exp(rest[j, 0]), 1e-44) / (KT4 * NRk)))
-        gk[il] = [float(np.sqrt(max(np.exp(rest[j, 1 + k]), 1e-44) / (KT4 * NRk)))
-                  for k in order]
-    return dict(fk=[float(x) for x in fks], gw=gw, gk=gk)
+    def worst_point_freq(NB):
+        """Frequency where the current bank misfits worst (max log-error over corners)."""
+        fbest, ebest = None, -1.0
+        for il in LOADS:
+            f, In2t = targets[il]
+            m = (NB["gw"][il] ** 2) * KT4 * NRk * np.ones_like(f)
+            for k, fk in enumerate(NB["fk"]):
+                m = m + (NB["gk"][il][k] ** 2) * KT4 * NRk / (1.0 + (f / fk) ** 2)
+            e = np.abs(10.0 * np.log10((m + 1e-80) / (In2t + 1e-80)))
+            j = int(np.argmax(e))
+            if e[j] > ebest:
+                ebest, fbest = float(e[j]), float(f[j])
+        return fbest
+
+    # ADAPTIVE M: start at the legacy M (bit-identical when it suffices). While the
+    # worst corner misfits by > NOISE_ADAPT_TRIG, GREEDILY INSERT one section at the
+    # worst-fit frequency and refit warm-started from the current corners (a fresh
+    # logspace init at larger M lands in worse local minima on these shapes). Stop
+    # when an insertion stops helping -- a residual that no added low-pass section
+    # can remove (e.g. the In-dip at the Zout peak: the bank is monotone-down + white,
+    # it cannot dip below its own HF floor; that is the known loop-noise-shape bound).
+    best, wbest = fit_M(M)
+    while wbest > NOISE_ADAPT_TRIG and len(best["fk"]) < NOISE_M_MAX:
+        fstar = worst_point_freq(best)
+        fstar = float(np.clip(fstar, f0 / 5 * 1.01, f1 * 5 * 0.99))
+        NB2, w2 = fit_M(len(best["fk"]) + 1, fks_init=list(best["fk"]) + [fstar])
+        if w2 < wbest - 1e-9:
+            best, wbest = NB2, w2
+        else:
+            break
+    if len(best["fk"]) != M:
+        print(f"      noise bank ADAPTED: {M} -> {len(best['fk'])} Lorentzians "
+              f"(worst-corner Sv fit {wbest:.2f}dB)")
+    return best
 
 
 def fit_all():
-    global NFK
+    global NFK, MNOISE
     P = {}
     zfits = {}
     print(f"{'load':>5} | {'R_a':>7} {'L_a[uH]':>8} {'R_pl':>9} {'R_b':>9} {'Zrms':>6} | "
@@ -520,6 +589,7 @@ def fit_all():
     # ---- decoupled Norton-@vout noise block (joint over corners) ----
     NB = fit_noise_bank(zfits)
     NFK = NB["fk"]
+    MNOISE = len(NFK)                        # adaptive bank size -> emit/resid follow
     for il in LOADS:
         P[il]["gnw"] = NB["gw"][il]          # gnw/gn1.. avoid ngspice's CASE-INSENSITIVE
         for k in range(MNOISE):              # param clash with PSRR's G1/G2/G3
