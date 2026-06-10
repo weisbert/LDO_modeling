@@ -1056,12 +1056,14 @@ def _selftest(require_qt=False):
         # only fire on a real click (this is exactly the class the MEAS_HINTS bug belonged to).
         import PyQt5.QtWidgets as _QW
         _orig = (_QW.QMessageBox.information, _QW.QMessageBox.warning, _QW.QMessageBox.critical,
-                 _QW.QFileDialog.getExistingDirectory, _QW.QFileDialog.getOpenFileName)
+                 _QW.QFileDialog.getExistingDirectory, _QW.QFileDialog.getOpenFileName,
+                 _QW.QFileDialog.getSaveFileName)
         _QW.QMessageBox.information = staticmethod(lambda *a, **k: None)
         _QW.QMessageBox.warning = staticmethod(lambda *a, **k: None)
         _QW.QMessageBox.critical = staticmethod(lambda *a, **k: None)
         _QW.QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(tmp))
         _QW.QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (str(next(iter(files.values()))), ""))
+        _QW.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: ("", ""))
         try:
             win._show_guidance()             # the Measurement-guidance button (was the MEAS_HINTS crash)
             win._import_folder()             # folder-import (must match the synth CSVs in tmp/)
@@ -1082,7 +1084,15 @@ def _selftest(require_qt=False):
             assert win.e_loads.text() == ",".join(win.core.profile.loads), "refresh_from_profile desync"
         finally:
             (_QW.QMessageBox.information, _QW.QMessageBox.warning, _QW.QMessageBox.critical,
-             _QW.QFileDialog.getExistingDirectory, _QW.QFileDialog.getOpenFileName) = _orig
+             _QW.QFileDialog.getExistingDirectory, _QW.QFileDialog.getOpenFileName,
+             _QW.QFileDialog.getSaveFileName) = _orig
+        try:                                  # the Save-text-report click writes results/score/report_*.txt
+            import report as _rpt
+            _r = _rpt.SCOREDIR / "report__gui_selftest.txt"
+            if _r.exists():
+                _r.unlink()
+        except (OSError, ImportError):
+            pass
         print("  qt: all button handlers exercised OK (guidance / folder-import / import)")
         core.fit(); win._fit_done(core.result)   # the Import click reset the fit -> re-fit for the shot
         app.processEvents()
