@@ -253,8 +253,46 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
         pr("\n  NOTE: transient (load-step droop/ring) and discrete-spur fidelity are NOT in this")
         pr("        analytic report -- they need the ngspice scorer:  python score.py --variant "
            f"{name}")
+
+    # ---- [7] GT digest: log-resampled ground truth, machine-readable. This is the
+    #      AIR-GAP DATA CHANNEL: no npz can cross the gap, but this text can -- pasting
+    #      the report hands the modeler the actual curves to fit against locally.
+    pr("\n[7] GT DIGEST  (log-resampled ground truth, ~5 pts/decade; machine-readable)")
+    pr("    columns: f[Hz], |Z|[ohm], Zph[deg], PSRRatt[dB], Hph[deg], Sv[V/rtHz]")
+    pr("-" * 84)
+    for il in loads:
+        gz = ref[f"z_{il}"]
+        fz = gz[:, 0]
+        grid = np.logspace(np.log10(fz[0]), np.log10(fz[-1]),
+                           max(int(5 * np.log10(fz[-1] / fz[0])) + 1, 8))
+        Z = _cint(grid, fz, gz[:, 1] + 1j * gz[:, 2])
+        cols = [np.abs(Z), np.degrees(np.angle(Z))]
+        gp = ref.get(f"p_{il}")
+        if gp is not None:
+            H = _cint(grid, gp[:, 0], gp[:, 1] + 1j * gp[:, 2])
+            cols += [-20 * np.log10(np.abs(H) + 1e-30), np.degrees(np.angle(H))]
+        else:
+            cols += [np.full(grid.size, np.nan)] * 2
+        gn = ref.get(f"noise_{il}")
+        if gn is not None:
+            Sv = np.exp(np.interp(np.log(grid), np.log(gn[:, 0]),
+                                  np.log(gn[:, 1] + 1e-300), left=np.nan, right=np.nan))
+        else:
+            Sv = np.full(grid.size, np.nan)
+        cols.append(Sv)
+        pr(f"  # corner {il}")
+        for i, fv in enumerate(grid):
+            pr(f"  {fv:.4e}, " + ", ".join(
+                "-" if not np.isfinite(c[i]) else f"{c[i]:.4g}" for c in cols))
     pr("=" * 84)
     return "\n".join(L)
+
+
+def _cint(fq, f, z):
+    """Complex interp in log-f; NaN outside the data range."""
+    re = np.interp(np.log(fq), np.log(f), z.real, left=np.nan, right=np.nan)
+    im = np.interp(np.log(fq), np.log(f), z.imag, left=np.nan, right=np.nan)
+    return re + 1j * im
 
 
 def _diagnose(cnom, cs, result, ref, terms):
