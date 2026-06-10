@@ -60,6 +60,13 @@ def stage_app(stage):
             continue
         shutil.copytree(src, app / d, ignore=shutil.ignore_patterns(
             "__pycache__", "*.pyc", "work", "o.dat", "*.log"))
+    # build fingerprint: surfaced by update.sh and printed in every text report, so a
+    # stale re-applied bundle is visible across the airgap (identical-tar-name trap)
+    app.mkdir(parents=True, exist_ok=True)
+    (app / "BUILD_INFO.json").write_text(json.dumps(dict(
+        git_sha=_git_sha(),
+        built_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())), indent=2),
+        newline="\n")
     return app
 
 

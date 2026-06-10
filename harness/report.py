@@ -15,6 +15,7 @@ Writes results/score/report_<name>.txt and prints it. Covers Zout / PSRR / outpu
 (score.py); this report says so rather than pretending to cover them.
 """
 import argparse
+import json
 import pathlib
 import numpy as np
 
@@ -150,9 +151,21 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
     pr(f"LDO MODEL DIFFERENCE REPORT  --  '{name}'   (analytic predict vs GT, no simulator)")
     pr("=" * 84)
     pr(f"ref={refpath or '(npz)'}   corners={loads}  nominal={nom}  vref={result.vref:.4g}V")
+    try:    # build fingerprint: stamped into app/ by deploy/package.py (air-gap forensics --
+            # identical reports across rounds usually mean a stale bundle was re-applied)
+        bi = json.loads((ng.ROOT / "BUILD_INFO.json").read_text())
+        pr(f"tool build: {bi.get('git_sha', '?')[:9]}  ({bi.get('built_utc', '?')})")
+    except (OSError, ValueError):
+        pr("tool build: dev (no BUILD_INFO.json -- running from the repo)")
     dc, de = float(ref.get("meta_cout", np.nan)), float(ref.get("meta_esr", np.nan))
     pr(f"Cout/ESR: extracted {result.cout*1e12:.1f}pF / {result.esr:.3f}ohm"
        + (f"   design {dc*1e12:.1f}pF / {de:.3f}ohm" if np.isfinite(dc) else "   design n/a"))
+    pr(f"noise bank: {len(nfk)} sections @ fk[Hz] = "
+       + " ".join(f"{x:.3g}" for x in nfk))
+    sfx = ref.get("z_signfix")
+    if sfx is not None and np.size(sfx):
+        pr("NOTE: Zout sign was auto-corrected at import (inverted V/I in the export) for: "
+           + ", ".join(str(x) for x in np.ravel(sfx)))
 
     # ---- [1] where the error is (weighted composite breakdown) ----
     agg = dict(zrms=np.mean([c["zrms"] for c in cs]), zband=np.mean([c["zband"] for c in cs]),

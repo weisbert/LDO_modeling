@@ -17,6 +17,9 @@ dep_hash="$(grep -o '"requirements_hash"[^,]*' "$PREFIX/MANIFEST.deployed.json" 
 [ -z "$dep_hash" ] && dep_hash="$(grep -o '"requirements_hash"[^,]*' "$PREFIX/INSTALL.json" \
             | sed 's/.*: *"//; s/"//')"
 
+bld="$(grep -o '"git_sha"[^,]*' "$HERE/MANIFEST.json" | sed 's/.*: *"//; s/"//')"
+bdt="$(grep -o '"built_utc"[^,]*' "$HERE/MANIFEST.json" | sed 's/.*: *"//; s/"//')"
+echo "   bundle build      : ${bld:0:9} ($bdt)   <-- VERIFY this is the build you expect"
 echo "   bundle req-hash   : ${new_hash:0:12}"
 echo "   deployed req-hash : ${dep_hash:0:12}"
 if [ "$new_hash" != "$dep_hash" ]; then
@@ -45,4 +48,4 @@ QT_QPA_PLATFORM=offscreen "$PREFIX/.venv/bin/python" \
     "$PREFIX/app/gui/ldo_modeler.py" --selftest --require-qt
 
 cp "$HERE/MANIFEST.json" "$PREFIX/MANIFEST.deployed.json"
-echo "OK. app/ updated; venv unchanged."
+echo "OK. app/ updated to build ${bld:0:9}; venv unchanged."
