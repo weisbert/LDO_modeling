@@ -42,8 +42,22 @@ def fit_cout_esr():
     the tail directly (not a full fit) is robust to multi-pole mid-band shapes
     (a full fit gets pulled off, e.g. V3 -> 1606pF). Replaces the old hardcoded
     1n/0.5 so the fitter works on LDOs with any output cap."""
-    g = ref[f"z_{NOMINAL}_hf"] if f"z_{NOMINAL}_hf" in ref.files else ref[f"z_{NOMINAL}"]
+    kz, khf = f"z_{NOMINAL}", f"z_{NOMINAL}_hf"
+    g = ref[khf] if khf in ref.files else ref[kz]
     f = g[:, 0]; Z = g[:, 1] + 1j * g[:, 2]
+    # CROSS-CHECK z_hf against the in-band z where they overlap: a z_hf exported with a
+    # wrong scale/units (real-Cadence trap) silently poisons this extraction while every
+    # other consumer of z_<corner> looks fine. On mismatch, trust z and say so.
+    if khf in ref.files and kz in ref.files:
+        gz = ref[kz]; fz = gz[:, 0]; Zz = gz[:, 1] + 1j * gz[:, 2]
+        m = (fz >= f[0]) & (fz <= f[-1])
+        if m.sum() >= 3:
+            zi = np.interp(np.log(fz[m]), np.log(f), np.abs(Z))
+            mis = float(np.median(np.abs(20 * np.log10(zi / np.abs(Zz[m])))))
+            if mis > 6.0:
+                print(f"  WARNING: z_hf disagrees with z by {mis:.1f}dB (median, overlap band) -> "
+                      f"ignoring z_hf for Cout/ESR; check the z_hf export scale/units")
+                f, Z = fz, Zz
     # Cout from the CAPACITIVE band (phase < -45deg, post-resonance): there
     # Z ~ 1/(jwC) so C = -1/(w*Im Z). Using phase selection (not just the HF tail)
     # keeps C right even when a large ESR floors the tail (e.g. V1 ESR=30 -> Im tiny).
@@ -61,6 +75,34 @@ def fit_cout_esr():
     # ESR from the HF-tail real part (cap impedance smallest there -> Re Z -> ESR)
     tail = f > 0.3 * f[-1]
     Rc = float(max(np.median(Z[tail].real), 1e-3))
+    # GHOST-CAP GATE: in the very band the C estimate came from, a real shunt cap
+    # DOMINATES Z, so |Z| ~ |ESR+1/jwC| there (the extraction's own premise). On a
+    # capless part (HF = rds/parasitics, not 1/jwC; or a near-real Im from a noisy
+    # HF export) the median lands on a huge ghost cap whose branch sits ORDERS below
+    # the measured |Z| -- impossible for a shunt that big (real 5.8G LDO: 14nF
+    # claimed against a 681ohm peak at 10MHz). Judge only on capacitive points
+    # (Im<0 keeps v7-style inductive ESL tails out; the LC tank peak itself has
+    # |phase|<45deg so it never enters `cap` -- no false fire on a high-Q peak,
+    # which sits legitimately ABOVE both branches). If the data sits >12dB above
+    # the branch (or C came out non-positive), fall back to the LARGEST cap whose
+    # impedance clears |Z| everywhere: C = 1/(2pi*max(f*|Z|)) -- it still provides
+    # the final HF rolloff but leaves the R/L branches free to fit the mid-band.
+    band = sel & (Z.imag < 0)
+    ghost = Cc <= 0
+    if not ghost and band.sum() >= 3:
+        zb = np.abs(Rc + 1.0 / (1j * TWO_PI * f[band] * Cc))
+        ghost = bool(np.median(np.abs(Z[band]) / zb) > 4.0)
+    if not ghost:
+        # ...and NOWHERE in the sweep may the data sit far above the claimed branch.
+        # A real LC tank peak does sit above both branches (|Ztot|~Q*|Zc|, Q<~10 in
+        # this family) so the threshold is generous (26dB); a ghost cap misses by
+        # 50dB+. Catches the ghost-C + tail-resistance combo the band test passes.
+        zb = np.abs(Rc + 1.0 / (1j * TWO_PI * f * Cc))
+        ghost = bool(np.max(np.abs(Z) / zb) > 20.0)
+    if ghost:
+        Cc = float(1.0 / (TWO_PI * np.max(f * np.abs(Z))))
+        print(f"  ghost-cap gate: HF band is not a shunt cap (capless part or bad z_hf) -> "
+              f"Cout={Cc*1e12:.2f}pF (envelope fallback), ESR={Rc:.3f}ohm")
     return Cc, Rc
 
 

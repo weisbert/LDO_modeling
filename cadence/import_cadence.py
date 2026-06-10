@@ -326,6 +326,22 @@ def validate(ref):
         if Z.size and Z.max() < 1.05 * Z[0]:
             add("info", f"z_{nom}", "nominal Zout shows no resonance peak above the LF floor "
                 "-- fine for an over-damped LDO, but confirm the sweep covers the output pole.")
+    # --- *_hf must agree with the in-band sweep where they overlap: a *_hf exported
+    #     with a different scale/units (e.g. another injection amplitude) silently
+    #     poisons the Cout/ESR auto-extraction while every per-corner plot looks fine ---
+    for q in ("z", "p"):
+        bk, hk = (f"{q}_{nom}", f"{q}_{nom}_hf") if nom else (None, None)
+        if bk in ref and hk in ref:
+            fb, Ab = ref[bk][:, 0], np.abs(ref[bk][:, 1] + 1j * ref[bk][:, 2])
+            fh, Ah = ref[hk][:, 0], np.abs(ref[hk][:, 1] + 1j * ref[hk][:, 2])
+            m = (fb >= fh[0]) & (fb <= fh[-1])
+            if m.sum() >= 3:
+                hi = np.interp(np.log(fb[m]), np.log(fh), Ah)
+                mis = float(np.median(np.abs(20 * np.log10((hi + 1e-30) / (Ab[m] + 1e-30)))))
+                if mis > 6.0:
+                    add("warn", hk, f"{hk} disagrees with {bk} by {mis:.1f}dB (median) where the "
+                        "sweeps overlap -- check the HF export's scale/units/injection; the "
+                        "fitter will distrust it for Cout/ESR extraction.")
     # hf arrays present? (needed for Cout/ESR auto-extraction + RF carrier bound)
     if nom and f"z_{nom}_hf" not in ref:
         add("info", "z_hf", f"no z_{nom}_hf (HF Zout) -- Cout/ESR auto-extract falls back to "
