@@ -1,4 +1,4 @@
-# HANDOFF — LDO behavioral-model builder (as of 2026-06-08)
+# HANDOFF — LDO behavioral-model builder (as of 2026-06-10)
 
 > **Deferred refactors:** see `DEFERRED_REFACTORS.md` (do as one batch AFTER the current
 > Target-B LDO is modeled). Open: **R1** de-hardcode `trans_big`/`trans_slew` + nominal corner
@@ -9,6 +9,49 @@
 > (LDO + buffer-at-carrier, model vs real — only block metrics + an 8MHz sanity gate exist);
 > **R5** automate the ~30 manual characterization exports; **R6** real-LDO quality bugs (poor
 > fit / output rail droops / no buffer ripple — tied to R3 DC + Zout-at-carrier coverage).
+
+## UPDATE (2026-06-10) — TARGET B ENGAGED: real 5.8G capless LDO, composite 268 → 2.3 (replica)
+
+**State: AWAITING red-zone verification.** The user must apply the **16:31 package (build
+`e0bc231`)**, re-import the same data, Fit, and send the new text report. Expected: composite
+**~2–3** on the real box, header shows `C_ft: 174.4fF` + `noise: HYBRID series bank`. If it
+doesn't match the replica's 2.30, diff report-vs-replica per term — the replica is faithful
+(12.62 vs 13.61 at round 5).
+
+**The air-gap iteration loop (now fully tooled — this is THE workflow for all future rounds):**
+1. Red zone: GUI Compare → "Save text report" → user pastes the report (build fingerprint in
+   the header tells you which code produced it; section **[7] GT DIGEST** carries log-resampled
+   real curves as text).
+2. Yellow zone: `python harness/digest_import.py results/ref/myldo_digest.txt` rebuilds
+   `results/ref/myldo_digest.npz`; iterate locally with
+   `python harness/report.py --variant myldo_digest` (composite 2.30 now); regression =
+   `harness/validate_capless.py` (8 parts) + matrix/crossval/systest + GUI offscreen selftest.
+3. Ship ONE validated incremental package (`.\deploy\package.ps1 -Mode incremental`); user
+   verifies the build sha printed by `bash update`.
+
+**Six rounds of findings on the real part (full story: memory `finding-target-b-first-contact`
++ `finding-target-b-round6`):**
+- R1 ghost-cap: 14nF "extracted" vs 681Ω peak @10MHz = capless part; ghost-cap gate + envelope
+  fallback (`b6a14b7`), z_hf-vs-z guardrail. (No z_hf existed — z swept to 40GHz directly.)
+- R2 Zout sign: phase uniformly ~180° off = testbench V/I inverted; import auto-negates when
+  LF Re(Z)<0 (`ba080ae`). After this, Zout block closed: 0.5dB/2.3°.
+- R3-R5: noise −20dB@1kHz root-caused as STRUCTURAL (In=Sv/|Z| falls −34dB/dec, beyond any
+  Lorentzian sum); grid equalization + adaptive bank (`8a9d453`) shipped but insufficient;
+  build fingerprint (`da46639`) + GT digest channel (`fff0d7a`, `85e19eb`) shipped.
+- R6 (`e0bc231`, agent-flow: 2 analysts ∥ → 2 builds → adversarial review ∥ full regression →
+  fix): **C_ft=174.4fF vin→vout feedthrough** (gated; pband 4-5→0.4dB, GHz PSRR plateau,
+  shelf degeneracy all fixed) + **hybrid series-noise** (voltage bank at branch-A rail node
+  `vrgn` + Norton white floor; gated by Norton-fail>4dB AND win>0.5dB; npsd 7.9→0.4-0.8dB,
+  ngspice-verified) + **emit_va PSRR sign fix** (PRE-EXISTING: compiled .va realized −H, 180°
+  phase, invisible to magnitude checks; OSDI-verified fixed) + **ghost-gate adjudication**
+  (v10_3lc 57.2→160.8 regression from R1 found & fixed: fit both C candidates, keep winner).
+- Deferred minors from the adversarial review: crossval identifiability blind to hybrid
+  sn-keys; fit_cft flat extrapolation when p-grid exceeds z-grid; .lib/.va chain sign comment.
+
+**After red-zone verification, the frontier is system-level:** real-part spurs/transient
+exports (the digest has synthesized DC + no transient → `score.py --variant myldo_digest`
+crashes at `trans_lin_100u`, known); GHz systest against the real 5.8G carrier; then the
+R1-R6 deferred batch. The composite is BLIND to HF features — never skip systest/z_hf gates.
 
 ## UPDATE (2026-06-08b) — 黄区→红区 deploy VALIDATED end-to-end + one-command update workflow
 The GUI modeler + airgap bundle is now **proven on the real red zone** (EDA box, CentOS7-class,
