@@ -215,6 +215,22 @@ def assemble(profile, files, outpath=None, fmt=None, sv_is_psd2=False):
         ref[f"z_{nom}_hf"] = _read_any(files[("z_hf", nom)], "z_hf", fmt=fmt)
     if ("p_hf", nom) in files:
         ref[f"p_{nom}_hf"] = _read_any(files[("p_hf", nom)], "p_hf", fmt=fmt)
+    # --- Zout sign sanity: closed-loop Zout at LF is the (positive) load-regulation
+    #     resistance, so a negative LF Re is impossible for a stable LDO -- it means the
+    #     AC injection direction / V-over-I sign was inverted in the testbench (real
+    #     Target-B trap: |Z| fits fine but phase is uniformly ~180deg off, 167deg RMS).
+    #     Unambiguous -> auto-correct here; validate() turns the marker into a warning. ---
+    fixed = []
+    for k in [f"z_{il}" for il in loads] + [f"z_{nom}_hf"]:
+        if k in ref:
+            a = ref[k]
+            lf = a[:, 0] <= np.min(a[:, 0]) * 10.0
+            if np.median(a[lf, 1]) < 0:
+                ref[k] = np.c_[a[:, 0], -a[:, 1], -a[:, 2]]
+                fixed.append(k)
+    if fixed:
+        ref["z_signfix"] = np.array(fixed)
+
     # nominal-only transients
     if ("trans_big", nom) in files:
         ref[f"trans_big_{nom}"] = _read_any(files[("trans_big", nom)], "trans_big")
@@ -286,6 +302,14 @@ def validate(ref):
 
     def add(level, q, msg):
         warns.append(dict(level=level, quantity=q, msg=msg))
+
+    # --- Zout sign was auto-corrected during assemble (marker key) ---
+    sfx = ref.get("z_signfix")
+    if sfx is not None and np.size(sfx):
+        add("warn", "z", "Zout sign was INVERTED in the export (negative LF real part is "
+            "impossible for a stable LDO; phase would sit ~180deg off across the band). "
+            "AUTO-CORRECTED on import for: " + ", ".join(str(x) for x in np.ravel(sfx))
+            + ". Fix the testbench (1 A AC INTO vout, Z=V/I) to silence this.")
 
     for il in loads:
         # --- PSRR stored as attenuation-dB instead of complex transfer H ---

@@ -206,6 +206,10 @@ def _check_fit(core, nom):
     fm = fz[inb][np.argmax(np.abs(pm["Zm"][inb]))]
     print(f"   GT peak @ {fg/1e6:.2f}MHz  model peak @ {fm/1e6:.2f}MHz  (ratio {fm/fg:.2f})")
     assert 0.3 < fm / fg < 3.0, "model resonance not co-located with GT peak"
+    perr = np.degrees(np.angle(pm["Zm"] * np.conj(cg["Zg"])))   # wrapped phase difference
+    prms = float(np.sqrt(np.mean(perr ** 2)))
+    print(f"   Zout phase RMS err = {prms:.1f}deg")
+    assert prms < 90.0, f"Zout phase off ({prms:.0f}deg RMS) -- sign flip not corrected?"
     for r in core.fit_residuals():
         print(f"   {r['il']:>5}: zrms={r['zrms']:.2f} prms={r['prms']:.2f} npsd={r['npsd']:.2f} dB")
         assert r["zrms"] < 10.0, f"Zout residual still broken at {r['il']}"
@@ -255,9 +259,26 @@ def part4_no_zhf():
     print()
 
 
+def part5_sign_flip():
+    print("== part 5 (Target-B trap): Zout exported with inverted sign (Z = -V/I) ==")
+    A, loads, nom = _synth_capless(resistive_tail=True)
+    for k in (f"z_{nom}_hf", f"p_{nom}_hf"):
+        del A[k]
+    for il in loads:
+        g = A[f"z_{il}"]
+        A[f"z_{il}"] = np.c_[g[:, 0], -g[:, 1], -g[:, 2]]     # the flipped export
+    core, path, warns = _run_pipeline(A, loads, nom, "signflip")
+    assert any(w["quantity"] == "z" and "INVERTED" in w["msg"] for w in warns), \
+        "sign-flip guardrail did not fire"
+    _check_fit(core, nom)
+    _cleanup(path)
+    print()
+
+
 if __name__ == "__main__":
     part1_regression()
     part2_bad_zhf()
     part3_resistive_tail()
     part4_no_zhf()
+    part5_sign_flip()
     print("validate_capless PASS")
