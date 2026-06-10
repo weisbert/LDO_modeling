@@ -152,11 +152,18 @@ class ModelerCore:
         from predict() vs the imported GT -- the Fit-tab scorecard, no simulator."""
         import fit_model
         out = []
+        # nmode/nfkv from the held FitResult: another fit in this process must not
+        # re-dispatch this result's noise reconstruction (module-global trap).
+        nmode = getattr(self.result, "nmode", None)
+        nfkv = getattr(self.result, "nfkv", None)
         for il in self.result.loads:
             cg = self.gt_corner(il)
-            pr_z = fit_model.predict(self.result.P[il], cg["fz"], self.result.nfk)
-            pr_p = fit_model.predict(self.result.P[il], cg["fp"], self.result.nfk)
-            pr_n = fit_model.predict(self.result.P[il], cg["fn"], self.result.nfk)
+            pr_z = fit_model.predict(self.result.P[il], cg["fz"], self.result.nfk,
+                                     nfkv=nfkv, nmode=nmode)
+            pr_p = fit_model.predict(self.result.P[il], cg["fp"], self.result.nfk,
+                                     nfkv=nfkv, nmode=nmode)
+            pr_n = fit_model.predict(self.result.P[il], cg["fn"], self.result.nfk,
+                                     nfkv=nfkv, nmode=nmode)
             zrms = float(np.sqrt(np.mean((20 * np.log10(np.abs(pr_z["Zout"]) / np.abs(cg["Zg"]))) ** 2)))
             prms = float(np.sqrt(np.mean((20 * np.log10(np.abs(pr_p["PSRR"]) / np.abs(cg["Hg"]))) ** 2)))
             npsd = float(np.sqrt(np.mean((20 * np.log10((pr_n["noise"] + 1e-30) / (cg["Sg"] + 1e-30))) ** 2)))
@@ -174,9 +181,14 @@ class ModelerCore:
         """Model overlay for one corner on the GT's own freq grids."""
         import fit_model
         cg = self.gt_corner(il)
-        return dict(Zm=fit_model.predict(self.result.P[il], cg["fz"], self.result.nfk)["Zout"],
-                    Hm=fit_model.predict(self.result.P[il], cg["fp"], self.result.nfk)["PSRR"],
-                    Sm=fit_model.predict(self.result.P[il], cg["fn"], self.result.nfk)["noise"])
+        nmode = getattr(self.result, "nmode", None)
+        nfkv = getattr(self.result, "nfkv", None)
+        return dict(Zm=fit_model.predict(self.result.P[il], cg["fz"], self.result.nfk,
+                                         nfkv=nfkv, nmode=nmode)["Zout"],
+                    Hm=fit_model.predict(self.result.P[il], cg["fp"], self.result.nfk,
+                                         nfkv=nfkv, nmode=nmode)["PSRR"],
+                    Sm=fit_model.predict(self.result.P[il], cg["fn"], self.result.nfk,
+                                         nfkv=nfkv, nmode=nmode)["noise"])
 
     def text_report(self, outdir=None):
         """Analytic text MODEL-vs-GT difference report (report.build_report) for the current

@@ -1,0 +1,131 @@
+// ============================================================
+// Behavioral LDO model for Cadence Spectre  (auto-gen: harness/fit_model.py)
+// Equivalent to model/ldo_model.lib (validated in ngspice). NO laplace_nd.
+//   Zout = (R_a + sL_a||R_pl) || (R_b+sL_b) || (ESR+1/sCout) ; R_pl damps L
+//   PSRR = i_c*Zout, i_c = G0 + sum Gi/(1+s/wi) [real bank] + one signed COMPLEX 2nd-
+//          order section (b0+b1 s)/(1+s/(Q w0)+(s/w0)^2) -> non-min-phase / notch PHASE
+//          (V4/V3). LP filter resistors are noiseless conductances (no thermal noise).
+//   Noise= DECOUPLED Norton @vout: white-R + 0 R||C-Lorentzian current sections,
+//          transconducted into vout (gm sets amplitude) -> In*|Zout| = Sv. pnoise/hbnoise.
+//   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout) via $table_model
+// Params interpolated as quadratics in ln(iload) through corners {100u,200u,300u}.
+// ============================================================
+`include "constants.vams"
+`include "disciplines.vams"
+
+module ldo_model(vin, vout);
+  inout vin, vout;
+  electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, nw, vrgn, nvw, nv1, nv2, nv3, nv4;
+
+  parameter real iload   = 2.000000e-04 from (0:inf);
+  parameter integer slew_en = 0 from [0:1];
+  parameter real Cout = 5.466989e-13;   // auto-extracted physical output cap
+  parameter real ESR  = 2.533715e+00;   // auto-extracted physical ESR
+  parameter real Cft = 1.744391e-13;   // gated vin->vout feedthrough cap
+  parameter real VREG121 = 1.049992e+00;
+  parameter real NRk = 1.000000e+06;   // fixed noise-section resistor (gm sets amplitude)
+  parameter real Cv1 = 7.240878e-10;   // corner 219.8 Hz
+  parameter real Cv2 = 3.241957e-10;   // corner 490.9 Hz
+  parameter real Cv3 = 4.733828e-12;   // corner 3.362e+04 Hz
+  parameter real Cv4 = 1.194299e-13;   // corner 1.333e+06 Hz
+
+  real u, ic, R_a, L_a, R_pl, R_b, L_b, G0, G1, w1, G2, w2, G3, w3, gnw, snw, sn1, sn2, sn3, sn4, vreg, Cps;
+  real pcb0, pcb1, pcw0, pcq, pca1, pca2, Rpc, Lpc, Cpc, gqb1;
+
+  analog begin
+    @(initial_step) begin
+      ic = min(max(iload, 1.000000e-04), 3.000000e-04);
+      u  = ln(ic);
+      R_a = min(max(exp((2.775568e-02)*u*u + (-4.179687e-01)*u + (-7.142423e+00)),1.450562e-01),3.932632e-01);
+      L_a = min(max(exp((3.311289e-02)*u*u + (-3.074334e-01)*u + (-1.476024e+01)),4.138561e-05),1.100357e-04);
+      R_pl = min(max(exp((4.108195e-02)*u*u + (-1.275195e-01)*u + (1.969943e+00)),2.996325e+02),7.608420e+02);
+      R_b = min(max(exp((3.426526e-02)*u*u + (-2.930690e-01)*u + (2.379537e-01)),1.296607e+02),3.468669e+02);
+      L_b = min(max(exp((5.785403e-02)*u*u + (1.369922e-01)*u + (-1.382466e+01)),1.460578e-05),3.816302e-05);
+      G0 = min(max((6.792747e-04)*u*u + (1.354001e-02)*u + (6.833255e-02),1.237868e-03),3.205811e-03);
+      G1 = min(max((-1.654862e-04)*u*u + (-3.627116e-03)*u + (-1.999710e-02),-1.468113e-03),-6.242035e-04);
+      w1 = min(max(exp((3.592998e-02)*u*u + (5.982696e-01)*u + (1.885859e+01)),1.279385e+07),1.327325e+07);
+      G2 = min(max((-2.638903e-04)*u*u + (-5.193330e-03)*u + (-2.585577e-02),-1.096323e-03),-4.059267e-04);
+      w2 = min(max(exp((-1.080524e-02)*u*u + (-2.055300e-01)*u + (7.206380e+00)),3.489836e+03),3.596644e+03);
+      G3 = min(max((-2.313515e-04)*u*u + (-4.356520e-03)*u + (-2.068620e-02),-5.721723e-04),-1.848862e-04);
+      w3 = min(max(exp((2.324227e-02)*u*u + (4.481836e-01)*u + (1.769933e+01)),5.598809e+06),5.945312e+06);
+      pcb0 = min(max((0.000000e+00)*u*u + (0.000000e+00)*u + (0.000000e+00),0.000000e+00),0.000000e+00);
+      pcb1 = min(max((0.000000e+00)*u*u + (0.000000e+00)*u + (0.000000e+00),0.000000e+00),0.000000e+00);
+      pcw0 = min(max(exp((-5.024840e-15)*u*u + (-9.132097e-14)*u + (1.749783e+01)),3.954065e+07),3.993704e+07);
+      pcq = min(max(exp((0.000000e+00)*u*u + (0.000000e+00)*u + (0.000000e+00)),9.950249e-01),1.005000e+00);
+      gnw = min(max(exp((-1.966409e-01)*u*u + (-3.153128e+00)*u + (-2.227458e+01)),4.921533e-05),6.564343e-05);
+      snw = min(max(exp((2.551120e-01)*u*u + (4.218334e+00)*u + (1.351648e+01)),1.983939e-02),2.498245e-02);
+      sn1 = min(max(exp((5.891039e+01)*u*u + (1.007377e+03)*u + (4.271726e+03)),7.730395e-16),1.042616e-04);
+      sn2 = min(max(exp((-4.113443e-04)*u*u + (-7.196494e-03)*u + (4.847708e+00)),1.308471e+02),1.321779e+02);
+      sn3 = min(max(exp((2.344854e-03)*u*u + (4.091825e-02)*u + (2.192930e+00)),7.459856e+00),7.540526e+00);
+      sn4 = min(max(exp((-5.033898e-03)*u*u + (-8.775704e-02)*u + (4.900835e-01)),2.376731e+00),2.404502e+00);
+      vreg = min(max((-2.187484e-05)*u*u + (-4.201515e-04)*u + (1.048000e+00),1.049969e+00),1.050014e+00);
+      Cps = 1e-12;
+      // complex PSRR section: a1=1/(Q.w0), a2=1/w0^2 ; series R-L-C (Cpc fixed)
+      Cpc = 1e-12;
+      pca1 = 1.0/(pcq*pcw0); pca2 = 1.0/(pcw0*pcw0);
+      Rpc = pca1/Cpc; Lpc = pca2/Cpc; gqb1 = pcb1/pca1;
+    end
+
+    // ---- references / DC operating point ----
+    V(vrf) <+ 1.05;                  // nominal-vin reference (no DC coupling)
+    V(vrg) <+ vreg;                  // regulated output reference (vreg = real var)
+
+    // ---- Zout branch C: series Cout + ESR (vout -> vrg) ----
+    I(vout, nC) <+ Cout*ddt(V(vout, nC));
+    V(nC, vrg)  <+ ESR*I(nC, vrg);
+
+    // ---- Zout branch B: optional 2nd R-L (R_b->inf disables it) ----
+    I(vout, nbb) <+ idt(V(vout, nbb))/L_b;
+    V(nbb, vrg)  <+ R_b*I(nbb, vrg);
+
+    // ---- gated vin->vout feedthrough cap (pass-device/package) ----
+    I(vin, vout) <+ Cft*ddt(V(vin, vout));
+
+    // ---- Zout branch A: (L_a || R_pl) + (R_a | nonlinear dropout) ----
+    // L_a||R_pl as summed current contributions (idt form admits the parallel R)
+    I(vout, nA) <+ idt(V(vout, nA))/L_a + V(vout, nA)/R_pl;
+    if (slew_en == 0)
+      V(nA, vrgn) <+ R_a*I(nA, vrgn);
+    else                             // $table_model control string may be Spectre-version specific
+      I(vrgn, nA) <+ $table_model(V(vrgn, nA) - (vreg - VREG121), "ldo_myldo_digest_dropout.tbl", "1L");
+
+    // ---- intrinsic output noise (HYBRID): Norton white floor @vout + a series
+    // voltage-noise bank in branch A (vrg -> vrgn): white + 4 Lorentzian V-sections
+    I(nw)   <+ V(nw)/NRk;
+    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, "nw");
+    I(vout) <+ gnw*V(nw);
+    V(vrgn, vrg) <+ snw*V(nvw) + sn1*V(nv1) + sn2*V(nv2) + sn3*V(nv3) + sn4*V(nv4);
+    I(nvw) <+ V(nvw)/NRk;
+    I(nvw) <+ white_noise(4*`P_K*$temperature/NRk, "nvw");
+    I(nv1) <+ V(nv1)/NRk + Cv1*ddt(V(nv1));
+    I(nv1) <+ white_noise(4*`P_K*$temperature/NRk, "nv1");
+    I(nv2) <+ V(nv2)/NRk + Cv2*ddt(V(nv2));
+    I(nv2) <+ white_noise(4*`P_K*$temperature/NRk, "nv2");
+    I(nv3) <+ V(nv3)/NRk + Cv3*ddt(V(nv3));
+    I(nv3) <+ white_noise(4*`P_K*$temperature/NRk, "nv3");
+    I(nv4) <+ V(nv4)/NRk + Cv4*ddt(V(nv4));
+    I(nv4) <+ white_noise(4*`P_K*$temperature/NRk, "nv4");
+
+    // ---- PSRR path: i_c = G0 + sum Gi*LP_i(vin-1.05) into vout (x Zout) ----
+    // signed real-pole section bank (R_i = 1/(wi*Cps), so 1/R_i = wi*Cps)
+    I(vin, np1) <+ (V(vin) - V(np1))*(w1*Cps);
+    I(np1, vrf) <+ Cps*ddt(V(np1, vrf));
+    I(vin, np2) <+ (V(vin) - V(np2))*(w2*Cps);
+    I(np2, vrf) <+ Cps*ddt(V(np2, vrf));
+    I(vin, np3) <+ (V(vin) - V(np3))*(w3*Cps);
+    I(np3, vrf) <+ Cps*ddt(V(np3, vrf));
+    I(vout)     <+ G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
+                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf));
+
+    // ---- PSRR complex-conjugate 2nd-order section (non-min-phase / notch phase) ----
+    // series R-L-C lowpass state x=V(ncs2,vrf); b0 reads V_C=x, b1 reads V_R=a1*dx/dt.
+    // i_c += (pcb0+pcb1 s)/(1+a1 s+a2 s^2)*(vin-vrf). Inert when pcb0=pcb1=0. No laplace.
+    I(vin, ncs1)  <+ V(vin, ncs1)/Rpc;
+    I(ncs1, ncs2) <+ idt(V(ncs1, ncs2))/Lpc;
+    I(ncs2, vrf)  <+ Cpc*ddt(V(ncs2, vrf));
+    I(vout)       <+ pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1);
+
+    // ---- intrinsic discrete spurs: deterministic current tones @vout ----
+    // (no intrinsic spurs for this variant)
+  end
+endmodule

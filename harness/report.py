@@ -77,14 +77,16 @@ def _slope_db_dec(f, mag):
     return float(np.polyfit(lf, lm, 1)[0])
 
 
-def _corner(ref, P, nfk, il):
+def _corner(ref, P, nfk, il, nmode=None, nfkv=None):
     z, p, n = ref[f"z_{il}"], ref[f"p_{il}"], ref[f"noise_{il}"]
     fz, Zg = z[:, 0], z[:, 1] + 1j * z[:, 2]
     fp, Hg = p[:, 0], p[:, 1] + 1j * p[:, 2]
     fn, Sg = n[:, 0], n[:, 1]
-    Zm = fit_model.predict(P, fz, nfk)["Zout"]
-    Hm = fit_model.predict(P, fp, nfk)["PSRR"]
-    Sm = fit_model.predict(P, fn, nfk)["noise"]
+    # nmode/nfkv from the FitResult (not module globals): the report may be built
+    # from a HELD result after another fit ran in the same process (GUI).
+    Zm = fit_model.predict(P, fz, nfk, nfkv=nfkv, nmode=nmode)["Zout"]
+    Hm = fit_model.predict(P, fp, nfk, nfkv=nfkv, nmode=nmode)["PSRR"]
+    Sm = fit_model.predict(P, fn, nfk, nfkv=nfkv, nmode=nmode)["noise"]
     az, am_ = np.abs(Zg), np.abs(Zm)
     ez = 20 * np.log10((am_ + 1e-30) / (az + 1e-30))
     ezph = _wrapdeg(np.degrees(np.angle(Zm) - np.angle(Zg)))
@@ -141,7 +143,9 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
     P, nfk = result.P, result.nfk
     loads = [str(x) for x in result.loads]
     nom = str(result.nominal)
-    cs = [_corner(ref, P[il], nfk, il) for il in loads]
+    cs = [_corner(ref, P[il], nfk, il,
+                  nmode=getattr(result, "nmode", None),
+                  nfkv=getattr(result, "nfkv", None)) for il in loads]
     cnom = next(c for c in cs if c["il"] == nom)
     L = []
     pr = L.append
@@ -160,8 +164,17 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
     dc, de = float(ref.get("meta_cout", np.nan)), float(ref.get("meta_esr", np.nan))
     pr(f"Cout/ESR: extracted {result.cout*1e12:.1f}pF / {result.esr:.3f}ohm"
        + (f"   design {dc*1e12:.1f}pF / {de:.3f}ohm" if np.isfinite(dc) else "   design n/a"))
-    pr(f"noise bank: {len(nfk)} sections @ fk[Hz] = "
-       + " ".join(f"{x:.3g}" for x in nfk))
+    cft = getattr(result, "cft", 0.0)
+    if cft > 0:
+        pr(f"C_ft: {cft*1e15:.1f}fF (vin->vout feedthrough)")
+    if getattr(result, "nmode", "norton") == "hybrid":   # getattr: old pickled results
+        nfkv = getattr(result, "nfkv", [])
+        pr(f"noise: HYBRID series bank {len(nfkv)} sections @ fvk[Hz] = "
+           + " ".join(f"{x:.3g}" for x in nfkv)
+           + "   (+ Norton white floor @vout)")
+    else:
+        pr(f"noise bank: {len(nfk)} sections @ fk[Hz] = "
+           + " ".join(f"{x:.3g}" for x in nfk))
     sfx = ref.get("z_signfix")
     if sfx is not None and np.size(sfx):
         pr("NOTE: Zout sign was auto-corrected at import (inverted V/I in the export) for: "

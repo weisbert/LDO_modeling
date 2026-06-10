@@ -15,7 +15,7 @@ model/ldo_model.lib. Topology (all linear/passive -> HB/PSS-robust, no laplace_n
 Per-load corner {R_a, L_a, Rpass, g_lf, wz, Vn_white} fitted; model selects by `iload`.
 """
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import least_squares
 import ng
@@ -30,9 +30,102 @@ VREF = 1.05        # nominal vin the PSRR path is DC-referenced to. EMIT-TIME ON
                    # analytic fit is OP-agnostic -- so the GUI profile can override it
                    # (CADENCE_EXTRACTION.md "3 things to report" #1) with no fit change.
 C, RC = 1e-9, 0.5          # output cap / ESR -- AUTO-EXTRACTED per variant in load()
+CFT = 0.0                  # GATED vin->vout feedthrough cap [F]; 0.0 = disabled (legacy
+                           # path byte-identical). Enabled by fit_cft() ONLY when the PSRR
+                           # injection i_c = H/Zout shows an unambiguous jwC tail at every
+                           # corner (real part: package/pass-device Cgd, ~174fF on Target B).
 
 
 _amps = ng.amps   # canonical corner-key->amps (see ng.amps); module alias for the emit f-strings
+
+
+def fit_cft():
+    """Extract + GATE the vin->vout feedthrough cap C_ft from the PSRR transfer's
+    equivalent injection i_c = H/Zout. A physical feedthrough cap (pass-device Cgd /
+    package coupling) makes i_c an exact jwC tail at GHz with a LOAD-INDEPENDENT C
+    (Target B: 172.6/174.7/176.0 fF per corner). Fit ic ~ G_hf + jwC (weighted
+    complex LS, 2 real unknowns) on the TOP 1.5 DECADES of every corner; enable
+    ONLY when the tail is unambiguously a feedthrough cap at EVERY corner:
+      (a) C_LS > 0;
+      (b) per-point rel-std of Im(ic)/(2pi f) over the top decade < 10%;
+      (c) dominance w*C_LS/|ic(f_top)| > 0.5 at the band top;
+      (d) (G_hf + jwC) tail-fit relative RMS < 5%;
+      (e) cross-corner spread of C_LS (max-min)/mean < 20%.
+    Synthetic refs miss by orders of magnitude (base rel-std 81%/dominance 0.08,
+    v3_miller C negative) -> gate stays SILENT and the legacy path is untouched."""
+    global CFT
+    cs = []
+    for il in LOADS:
+        kp = f"p_{il}"
+        kz = f"z_{il}"
+        if kp not in ref.files or kz not in ref.files:
+            return
+        gp = ref[kp]; fp = gp[:, 0]; H = gp[:, 1] + 1j * gp[:, 2]
+        gz = ref[kz]; fz = gz[:, 0]; Zz = gz[:, 1] + 1j * gz[:, 2]
+        if il == NOMINAL:           # the wideband _hf sweeps are nominal-corner-only;
+            khf = f"p_{NOMINAL}_hf"     # use them when they EXTEND the in-band range
+            if khf in ref.files:
+                gh = ref[khf]
+                m = gh[:, 0] > fp[-1]
+                if m.any():
+                    fp = np.concatenate([fp, gh[m, 0]])
+                    H = np.concatenate([H, gh[m, 1] + 1j * gh[m, 2]])
+            kzhf = f"z_{NOMINAL}_hf"
+            if kzhf in ref.files:
+                gh = ref[kzhf]
+                m = gh[:, 0] > fz[-1]
+                if m.any():
+                    fz = np.concatenate([fz, gh[m, 0]])
+                    Zz = np.concatenate([Zz, gh[m, 1] + 1j * gh[m, 2]])
+        # interpolate Z (complex, log-f) onto the H grid -> equivalent injection ic
+        zr = np.interp(np.log(fp), np.log(fz), Zz.real)
+        zi = np.interp(np.log(fp), np.log(fz), Zz.imag)
+        Zi = zr + 1j * zi
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ic = H / Zi
+        # ROBUSTNESS: zero/non-finite H or Z samples (real-export artifacts) poison the
+        # weighted LS (w=1/|ic| -> inf) and the tail reads. Mask them out FIRST; if too
+        # few clean points survive in the fit window, the gate stays silent.
+        good = (np.isfinite(ic) & (np.abs(ic) > 0)
+                & np.isfinite(H) & (np.abs(H) > 0)
+                & np.isfinite(Zi) & (np.abs(Zi) > 0))
+        fp, ic = fp[good], ic[good]
+        if fp.size == 0:
+            return
+        top = fp >= fp[-1] / 10.0 ** 1.5            # top 1.5 decades = the fit band
+        if top.sum() < 8:
+            return
+        ft, yt = fp[top], ic[top]
+        w = 1.0 / np.abs(yt)                        # relative weighting (zeros masked above)
+        A = np.vstack([np.ones(len(ft)), 1j * TWO_PI * ft]).T * w[:, None]
+        b = yt * w
+        try:
+            x, *_ = np.linalg.lstsq(np.vstack([A.real, A.imag]),
+                                    np.concatenate([b.real, b.imag]), rcond=None)
+        except np.linalg.LinAlgError:
+            return
+        g_hf, c_ls = float(x[0]), float(x[1])
+        if not np.isfinite(c_ls) or c_ls <= 0 or not np.isfinite(g_hf):    # (a)
+            return
+        td = fp >= fp[-1] / 10.0                    # top decade = the consistency band
+        cpt = ic[td].imag / (TWO_PI * fp[td])       # per-point capacitance read
+        mu = float(np.mean(cpt))
+        if not np.isfinite(mu) or mu <= 0 or not float(np.std(cpt)) / abs(mu) <= 0.10:  # (b)
+            return
+        if TWO_PI * fp[-1] * c_ls / abs(ic[-1]) < 0.5:                  # (c)
+            return
+        rel = np.abs((g_hf + 1j * TWO_PI * ft * c_ls) - yt) / np.abs(yt)
+        if float(np.sqrt(np.mean(rel ** 2))) > 0.05:                    # (d)
+            return
+        cs.append(c_ls)
+    cmean = float(np.mean(cs))
+    if not np.isfinite(cmean) or cmean <= 0:        # NaN-poisoning guard (final acceptance)
+        return
+    if (max(cs) - min(cs)) / cmean > 0.20:                              # (e)
+        return
+    CFT = cmean
+    print(f"  feedthrough gate: i_c HF tail is jwC -> C_ft={CFT*1e15:.1f}fF "
+          f"(vin->vout cap enabled)")
 
 
 def fit_cout_esr():
@@ -58,6 +151,11 @@ def fit_cout_esr():
                 print(f"  WARNING: z_hf disagrees with z by {mis:.1f}dB (median, overlap band) -> "
                       f"ignoring z_hf for Cout/ESR; check the z_hf export scale/units")
                 f, Z = fz, Zz
+    # GATED C_ft DE-EMBED: the Zout bench AC-grounds vin, so an enabled vin->vout
+    # feedthrough cap shunts the output during the Zout measurement. Remove it so
+    # the remaining branch-C extraction sees the PHYSICAL output cap only.
+    if CFT > 0.0:
+        Z = 1.0 / (1.0 / Z - 1j * TWO_PI * f * CFT)
     # Cout from the CAPACITIVE band (phase < -45deg, post-resonance): there
     # Z ~ 1/(jwC) so C = -1/(w*Im Z). Using phase selection (not just the HF tail)
     # keeps C right even when a large ESR floors the tail (e.g. V1 ESR=30 -> Im tiny).
@@ -100,7 +198,41 @@ def fit_cout_esr():
         zb = np.abs(Rc + 1.0 / (1j * TWO_PI * f * Cc))
         ghost = bool(np.max(np.abs(Z) / zb) > 20.0)
     if ghost:
+        Cc_med = Cc
         Cc = float(1.0 / (TWO_PI * np.max(f * np.abs(Z))))
+        # GHOST ADJUDICATION (multi-stage PDN vs true ghost). The two ratio tests
+        # above cannot tell a REAL bulk cap behind a decoupling ladder (v10_3lc:
+        # 200p on-die + 3n -> 2n -> 8n -> 10n; the L-isolated anti-resonances sit
+        # 40dB+ above the 10nF branch exactly like a ghost does) from a genuinely
+        # impossible shunt (real capless 5.8G part: 14nF vs a 681ohm peak). What
+        # CAN tell them apart is the evidence: fit the full Zout model with each
+        # candidate C and keep the one that explains the measured nominal Zout
+        # (keep-best with a 1dB margin, envelope = the safe default). A true ghost
+        # shorts the band where the data is high -> its fit is FAR worse (digest:
+        # env wins by >10dB); v10's 10nF bulk read wins by ~6dB (composite 57 vs
+        # 161 scored). Gate-silent variants never reach this -> byte-identical.
+        kz2 = f"z_{NOMINAL}"
+        if np.isfinite(Cc_med) and Cc_med > 0 and kz2 in ref.files:
+            gz2 = ref[kz2]
+            fz2, Zz2 = gz2[:, 0], gz2[:, 1] + 1j * gz2[:, 2]
+            sel2 = fz2 >= 1e3                   # the score band (score.py zrms)
+
+            def _zrms_with(cand):
+                global C, RC
+                keep = (C, RC)
+                C, RC = cand, Rc
+                try:
+                    Zm = zmodel(fz2, *fit_zout(fz2, Zz2))
+                    return float(np.sqrt(np.mean(
+                        (20 * np.log10(np.abs(Zm[sel2]) / np.abs(Zz2[sel2]))) ** 2)))
+                finally:
+                    C, RC = keep
+            r_med, r_env = _zrms_with(Cc_med), _zrms_with(Cc)
+            if r_med < r_env - 1.0:
+                print(f"  ghost-cap gate OVERTURNED by evidence: median C={Cc_med*1e12:.2f}pF "
+                      f"fits nominal Zout to {r_med:.2f}dB vs envelope {Cc*1e12:.2f}pF "
+                      f"{r_env:.2f}dB -> real shunt behind a multi-stage PDN; keeping median")
+                return Cc_med, Rc
         print(f"  ghost-cap gate: HF band is not a shunt cap (capless part or bad z_hf) -> "
               f"Cout={Cc*1e12:.2f}pF (envelope fallback), ESR={Rc:.3f}ohm")
     return Cc, Rc
@@ -111,12 +243,14 @@ def load(vkey="base", nominal=None, vref=None):
     nominal: nominal corner KEY (default = middle of `loads`, the contract's nom corner).
     vref:    nominal vin reference for the emitted model (default = keep module VREF=1.05).
     Both default to the legacy behavior, so existing callers are unchanged."""
-    global ref, LOADS, NOMINAL, VREF, C, RC
+    global ref, LOADS, NOMINAL, VREF, C, RC, CFT
+    CFT = 0.0                      # reset per load (multi-variant processes)
     ref = np.load(ng.ROOT / "results" / "ref" / f"{vkey}.npz", allow_pickle=True)
     LOADS = [str(x) for x in ref["loads"]]
     NOMINAL = nominal if nominal is not None else LOADS[len(LOADS) // 2]
     if vref is not None:
         VREF = float(vref)
+    fit_cft()                      # BEFORE fit_cout_esr: de-embed C_ft from Zout
     C, RC = fit_cout_esr()
     if "meta_cout" in ref.files:
         print(f"Cout/ESR auto-extracted: {C*1e12:7.1f}pF / {RC:6.3f}ohm   "
@@ -135,7 +269,10 @@ def zmodel(f, R_a, L_a, R_pl=1e12, R_b=1e12, L_b=1e-12):
     ZA = R_a + (s * L_a * R_pl) / (s * L_a + R_pl)
     ZB = R_b + s * L_b
     ZC = RC + 1.0 / (s * C)
-    return 1.0 / (1.0 / ZA + 1.0 / ZB + 1.0 / ZC)
+    Y = 1.0 / ZA + 1.0 / ZB + 1.0 / ZC
+    if CFT > 0.0:                 # gated vin->vout feedthrough cap: the Zout bench
+        Y = Y + s * CFT            # AC-grounds vin -> C_ft shunts the output
+    return 1.0 / Y
 
 
 def fit_zout(f, Z):
@@ -208,6 +345,13 @@ MNOISE = 6   # Norton-@vout noise sections (white floor + MNOISE Lorentzians);
 NOISE_ADAPT_TRIG = 4.0   # dB worst-corner Sv log-RMS that triggers growing the bank
 NOISE_M_MAX = 10         # adaptive ceiling (sections are cheap: R||C + VCCS each)
 NFK = []     # module global: shared Lorentzian corner freqs from the last noise fit
+NOISE_MODE = "norton"   # noise-block structure: "norton" (legacy Norton current bank
+             # @vout) | "hybrid" (GATED: series voltage-noise bank in branch A + the
+             # Norton white floor). The hybrid is attempted ONLY when the adaptive
+             # Norton fit stalls above NOISE_ADAPT_TRIG (real loop-shaped parts where
+             # In=Sv/|Zout| falls steeper than -20dB/dec at LF) and kept ONLY if
+             # strictly better -- all 14 synthetic refs stay on "norton" untouched.
+NFKV = []    # module global: shared series voltage-bank Lorentzian corner freqs (hybrid)
 NSPUR_F = []   # module global: intrinsic discrete-spur freqs (Hz, load-independent)
 NSPUR_PH = []  # module global: spur SIN injection phase (rad) at the nominal corner
 KT4 = 4 * 1.380649e-23 * 300.0   # 4kT at 300K (resistor thermal-noise scale)
@@ -231,6 +375,8 @@ def psrr_model(f, R_a, L_a, R_pl, R_b, L_b, G, Q=None):
     if Q is not None and (Q[0] != 0.0 or Q[1] != 0.0):
         b0, b1, w0, Qf = Q
         i_c = i_c + (b0 + b1 * s) / (1 + s / (Qf * w0) + (s / w0) ** 2)
+    if CFT > 0.0:                 # gated feedthrough cap injects i = sC_ft*(vin-vout);
+        i_c = i_c + s * CFT        # to 1st order (|H|<<1) that is an extra sC_ft term
     return i_c * Z                                   # vout/vin
 
 
@@ -298,6 +444,8 @@ def _bank_fit(f, H, zf, n1=NPS):
     try:
         Zmod = zmodel(f, *zf)
         ic = H / Zmod
+        if CFT > 0.0:             # psrr_model adds sC_ft itself -> de-tail the bank
+            ic = ic - 1j * TWO_PI * f * CFT          # target (else the tail is fit twice)
         w0lo, w0hi = TWO_PI * f[0] / 10.0, TWO_PI * f[-1] * 10.0
         # ---- AAA init: prune to in-band stable poles, rank, seed ----
         pol, res = _aaa_conj(f, ic)
@@ -406,7 +554,10 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
     shelf_resid = _psrr_resid(f, H, zf, G_shelf, Q0)
     cands = [("shelf", G_shelf, Q0, shelf_resid)]
     # real-only SK bank (the previous non-min-phase path; kept as a fallback candidate)
-    sk = _sk_fit(1j * TWO_PI * f, H / zmodel(f, *zf), NPS)
+    ic_t = H / zmodel(f, *zf)
+    if CFT > 0.0:                 # de-tail: psrr_model adds the sC_ft term itself
+        ic_t = ic_t - 1j * TWO_PI * f * CFT
+    sk = _sk_fit(1j * TWO_PI * f, ic_t, NPS)
     if sk is not None:
         poles, res, d = sk
         secs = sorted([(-p, -r / p) for p, r in zip(poles, res)])   # (w_i=-pole, G_i=-res/pole)
@@ -421,6 +572,37 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
     if bank is not None:
         Gb, Qb = bank
         cands.append(("complex", Gb, Qb, _psrr_resid(f, H, zf, Gb, Qb)))
+    # GATED full-real-bank polish (feedthrough parts only): with C_ft enabled the
+    # de-tailed i_c keeps a +90deg LF high-pass character (G0 ~ -G1 cancellation)
+    # that the 1-section shelf cannot carry, SK refuses (complex poles) and the
+    # AAA-init complex bank degenerates on (Target B: shelf 6.3deg -> 2.3deg).
+    # Polish all NPS real sections from the shelf init on the exact realizable
+    # form; keep-best decides. Gated on CFT -> legacy path byte-identical.
+    if CFT > 0.0:
+        w0lo, w0hi = TWO_PI * f[0] / 10.0, TWO_PI * f[-1] * 10.0
+
+        def unpack3(p):
+            return [p[0], p[1], np.exp(p[2]), p[3], np.exp(p[4]), p[5], np.exp(p[6])]
+
+        def resid3(p):
+            r = np.log(psrr_model(f, *zf, unpack3(p))) - np.log(H)
+            return np.concatenate([r.real, r.imag])
+        p0 = np.array([G_shelf[0], G_shelf[1],
+                       np.log(np.clip(G_shelf[2], w0lo, w0hi)),
+                       0.0, np.log(TWO_PI * f[0] * 10), 0.0,
+                       np.log(TWO_PI * f[len(f) // 2])])
+        lo3 = np.array([-np.inf, -np.inf, np.log(w0lo), -np.inf, np.log(w0lo),
+                        -np.inf, np.log(w0lo)])
+        hi3 = np.array([np.inf, np.inf, np.log(w0hi), np.inf, np.log(w0hi),
+                        np.inf, np.log(w0hi)])
+        try:
+            s3 = least_squares(resid3, p0, bounds=(lo3, hi3), method="trf",
+                               max_nfev=20000)
+            G3 = unpack3(s3.x)
+            if np.all(np.isfinite(G3)):
+                cands.append(("bank3", G3, Q0, _psrr_resid(f, H, zf, G3, Q0)))
+        except Exception:
+            pass
     best = min(cands, key=lambda c: c[3])
     # PREFER the complex bank when adequate. A pure-REAL SK fit of a notch can show a
     # lower ANALYTIC residual yet REALIZE with large phase error (fragile near-pole-zero
@@ -557,11 +739,139 @@ def fit_noise_bank(zfits, M=MNOISE):
     if len(best["fk"]) != M:
         print(f"      noise bank ADAPTED: {M} -> {len(best['fk'])} Lorentzians "
               f"(worst-corner Sv fit {wbest:.2f}dB)")
+    best["worst"] = wbest          # additive: drives the gated hybrid attempt in fit_all
+    return best
+
+
+def _za(f, R_a, L_a, R_pl):
+    """Branch-A series impedance ZA = R_a + jwL_a||R_pl (hybrid noise path only).
+    A series voltage source between the regulation rail and R_a reaches vout via
+    T = Zsh/(ZA+Zsh) = Zout/ZA (Zsh = the parallel rest: branches B, C, gated C_ft;
+    the noise bench load is a current source = AC-open), so T is computed from the
+    SAME zmodel Zout the rest of the fit uses."""
+    s = 1j * TWO_PI * f
+    return R_a + (s * L_a * R_pl) / (s * L_a + R_pl)
+
+
+def fit_noise_hybrid(zfits, M=4):
+    """GATED alternative noise structure ("hybrid"): a VOLTAGE-noise bank in series
+    with branch A (between the regulation source and R_a) + the existing Norton
+    WHITE floor at vout:
+        Sv_model^2 = Vn^2(f)*|T(f)|^2 + (gnw*sqrt(KT4*NRk))^2*|Zout(f)|^2
+        Vn^2(f)    = snw^2*KT4*NRk + sum_k snk^2*KT4*NRk/(1+(f/fvk)^2)
+        T(f)       = Zout(f)/ZA(f),   ZA = R_a + jwL_a||R_pl
+    Why: on a real loop-shaped part In = Sv/|Zout| falls ~-34dB/dec at LF -- steeper
+    than any Lorentzian sum (each falls at most -20dB/dec in amplitude), so the
+    Norton bank stalls (~6.7-6.8dB worst corner on Target B). A voltage bank AHEAD
+    of the output divider carries that shape naturally (prototype: 0.5-0.8dB with 3
+    active Lorentzians whose amplitudes are load-independent to 0.1%).
+    JOINT LS over the load corners, same recipe as fit_noise_bank: shared log corner
+    freqs fvk + per-corner amplitudes, grid equalization for non-log-uniform exports,
+    MIN_LOG_GAP separation penalty on the shared log-corners, log-domain residual,
+    1e-44 amplitude floor before the sqrt->gain conversion. Greedy section insertion
+    up to 8 while worst > NOISE_ADAPT_TRIG (M=4 sufficed on the real part).
+    Returns dict(fkv=[..], snw={il}, snk={il:[..]}, gw={il}, worst=...)."""
+    targets = {}
+    for il in LOADS:
+        gn = ref[f"noise_{il}"]; f = gn[:, 0]; Sv = gn[:, 1]
+        # GRID EQUALIZATION (same rule as fit_noise_bank): resample non-log-uniform
+        # exports onto a uniform log grid so the LF tail is actually in the fit.
+        dl = np.diff(np.log(f))
+        pos = dl[dl > 0]
+        if pos.size and np.max(dl) > 2.5 * np.min(pos):
+            fu = np.logspace(np.log10(f[0]), np.log10(f[-1]),
+                             max(int(24 * np.log10(f[-1] / f[0])), 24))
+            Sv = np.exp(np.interp(np.log(fu), np.log(f), np.log(Sv + 1e-80)))
+            f = fu
+        Z = zmodel(f, *zfits[il])
+        T2 = np.abs(Z / _za(f, zfits[il][0], zfits[il][1], zfits[il][2])) ** 2
+        targets[il] = (f, Sv ** 2, T2, np.abs(Z) ** 2)
+    f0 = targets[LOADS[0]][0][0]; f1 = targets[LOADS[0]][0][-1]
+    nL = len(LOADS)
+    MIN_LOG_GAP = np.log(2.0)              # adjacent corners >= 2x apart (anti-degeneracy)
+
+    def fit_M(M, fks_init=None):
+        def model_il(fks, row, il):        # row = [log snw2, log snk2_1..M, log gw2]
+            f, _, T2, Z2 = targets[il]
+            Vn2 = np.exp(row[0]) * np.ones_like(f)
+            for k in range(M):
+                Vn2 = Vn2 + np.exp(row[1 + k]) / (1.0 + (f / fks[k]) ** 2)
+            return Vn2 * T2 + np.exp(row[M + 1]) * Z2
+
+        def resid(p):
+            fks = np.exp(p[:M])
+            rest = p[M:].reshape(nL, M + 2)
+            r = []
+            for j, il in enumerate(LOADS):
+                Sv2 = targets[il][1]
+                r.append(np.log(model_il(fks, rest[j], il) + 1e-80) - np.log(Sv2 + 1e-80))
+            gaps = np.diff(np.sort(p[:M]))
+            r.append(30.0 * np.maximum(0.0, MIN_LOG_GAP - gaps))
+            return np.concatenate(r)
+
+        if fks_init is not None:
+            fks0 = np.log(np.sort(np.asarray(fks_init, float)))
+        else:
+            fks0 = np.log(np.logspace(np.log10(f0 * 1.5), np.log10(f1 / 1.5), M))
+        init = list(fks0)
+        lob = list(np.log(np.full(M, f0 / 5))); hib = list(np.log(np.full(M, f1 * 5)))
+        for il in LOADS:
+            f, Sv2, T2, Z2 = targets[il]
+            Vt2 = Sv2 / (T2 + 1e-80)             # voltage-domain target (Sv/|T|)^2
+            init += [float(np.log(np.min(Vt2) + 1e-80))]          # snw2: white <= floor
+            init += list(np.log(np.interp(np.exp(fks0), f, Vt2) + 1e-80))
+            init += [float(np.log(np.mean(Sv2[-3:] / (Z2[-3:] + 1e-80)) + 1e-80))]  # gw2
+            lob += [-200.0] * (M + 2); hib += [60.0] * (M + 2)
+        s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=30000)
+        fks = np.exp(s.x[:M]); rest = s.x[M:].reshape(nL, M + 2)
+        # worst-corner Sv-domain log-RMS (Sv^2 log-ratio in 10log10 IS the Sv dB error)
+        worst = 0.0
+        for j, il in enumerate(LOADS):
+            Sv2 = targets[il][1]
+            m = model_il(fks, rest[j], il)
+            worst = max(worst, float(np.sqrt(np.mean(
+                (10.0 * np.log10((m + 1e-80) / (Sv2 + 1e-80))) ** 2))))
+        order = np.argsort(fks)            # SORT ascending so 'section k' is the same
+        fks = fks[order]                   # pole at every corner (emit interpolates)
+        snw, snk, gw = {}, {}, {}
+        for j, il in enumerate(LOADS):
+            snw[il] = float(np.sqrt(max(np.exp(rest[j, 0]), 1e-44) / (KT4 * NRk)))
+            snk[il] = [float(np.sqrt(max(np.exp(rest[j, 1 + k]), 1e-44) / (KT4 * NRk)))
+                       for k in order]
+            gw[il] = float(np.sqrt(max(np.exp(rest[j, M + 1]), 1e-44) / (KT4 * NRk)))
+        return dict(fkv=[float(x) for x in fks], snw=snw, snk=snk, gw=gw), worst
+
+    def worst_point_freq(NH):
+        """Frequency where the hybrid misfits worst (max log-error over corners)."""
+        fbest, ebest = None, -1.0
+        for il in LOADS:
+            f, Sv2, T2, Z2 = targets[il]
+            Vn2 = (NH["snw"][il] ** 2) * KT4 * NRk * np.ones_like(f)
+            for k, fk in enumerate(NH["fkv"]):
+                Vn2 = Vn2 + (NH["snk"][il][k] ** 2) * KT4 * NRk / (1.0 + (f / fk) ** 2)
+            m = Vn2 * T2 + (NH["gw"][il] ** 2) * KT4 * NRk * Z2
+            e = np.abs(10.0 * np.log10((m + 1e-80) / (Sv2 + 1e-80)))
+            j = int(np.argmax(e))
+            if e[j] > ebest:
+                ebest, fbest = float(e[j]), float(f[j])
+        return fbest
+
+    best, wbest = fit_M(M)
+    while wbest > NOISE_ADAPT_TRIG and len(best["fkv"]) < 8:
+        fstar = float(np.clip(worst_point_freq(best), f0 / 5 * 1.01, f1 * 5 * 0.99))
+        NH2, w2 = fit_M(len(best["fkv"]) + 1, fks_init=list(best["fkv"]) + [fstar])
+        if w2 < wbest - 1e-9:
+            best, wbest = NH2, w2
+        else:
+            break
+    best["worst"] = wbest
     return best
 
 
 def fit_all():
-    global NFK, MNOISE
+    global NFK, MNOISE, NOISE_MODE, NFKV
+    NOISE_MODE = "norton"          # reset per fit (precedent: fit_spurs resets NSPUR_*)
+    NFKV = []
     P = {}
     zfits = {}
     print(f"{'load':>5} | {'R_a':>7} {'L_a[uH]':>8} {'R_pl':>9} {'R_b':>9} {'Zrms':>6} | "
@@ -590,31 +900,98 @@ def fit_all():
     NB = fit_noise_bank(zfits)
     NFK = NB["fk"]
     MNOISE = len(NFK)                        # adaptive bank size -> emit/resid follow
-    for il in LOADS:
-        P[il]["gnw"] = NB["gw"][il]          # gnw/gn1.. avoid ngspice's CASE-INSENSITIVE
-        for k in range(MNOISE):              # param clash with PSRR's G1/G2/G3
-            P[il][f"gn{k+1}"] = NB["gk"][il][k]
-        nr = _noise_resid(il, zfits[il], NB["gw"][il], NB["gk"][il])
-        p = P[il]
-        cmark = (f"{p['pcw0']/TWO_PI/1e6:.2f}MHz/Q{p['pcq']:.1f}" if p['_cpx'] else "")
-        print(f"{il:>5} | {p['R_a']:7.2f} {p['L_a']*1e6:8.3f} {p['R_pl']:9.1f} {p['R_b']:9.1f} "
-              f"{p['_zrms']:6.2f} | {p['G0']:+9.2e} {p['G1']:+9.2e} {p['w1']/TWO_PI/1e6:7.3f} "
-              f"{p['_nsec']:3d}{'*' if p['_cpx'] else ' '} {p['_prms']:6.2f} {p['_pph']:5.1f} | "
-              f"{nr:6.2f} {p['vreg']*1e3:7.2f}  {cmark}")
-    print(f"      noise corners fk[Hz] = " + " ".join(f"{x:.3g}" for x in NFK))
+    # GATED hybrid noise structure: attempted ONLY when the adaptive Norton bank
+    # STALLED above the trigger (all 14 synthetic refs fit <=3.7dB -> never fires
+    # there) and kept ONLY if strictly better (keep-best -> zero regression).
+    if NB["worst"] > NOISE_ADAPT_TRIG:
+        NH = fit_noise_hybrid(zfits)
+        # STRUCTURAL-SWITCH MARGIN: only change topology for a clear (>0.5dB) win --
+        # a marginal 0.05dB "improvement" must not flap the emitted structure.
+        if NH["worst"] < NB["worst"] - 0.5:
+            NOISE_MODE = "hybrid"
+            NFKV = NH["fkv"]
+            NFK = []
+            MNOISE = 0
+            print(f"      noise HYBRID engaged: series bank {len(NFKV)} sections @ fvk="
+                  + " ".join(f"{x:.3g}" for x in NFKV)
+                  + f" (worst {NB['worst']:.2f} -> {NH['worst']:.2f} dB)")
+    if NOISE_MODE == "hybrid":
+        for il in LOADS:
+            P[il]["gnw"] = NH["gw"][il]      # Norton WHITE floor gain reused (same name)
+            P[il]["snw"] = NH["snw"][il]     # series-bank white + Lorentzian gains;
+            for k in range(len(NFKV)):       # sn* avoids ngspice's CASE-INSENSITIVE
+                P[il][f"sn{k+1}"] = NH["snk"][il][k]   # clash space (no g/G names)
+            nr = _noise_resid(il, zfits[il], P[il])
+            p = P[il]
+            cmark = (f"{p['pcw0']/TWO_PI/1e6:.2f}MHz/Q{p['pcq']:.1f}" if p['_cpx'] else "")
+            print(f"{il:>5} | {p['R_a']:7.2f} {p['L_a']*1e6:8.3f} {p['R_pl']:9.1f} {p['R_b']:9.1f} "
+                  f"{p['_zrms']:6.2f} | {p['G0']:+9.2e} {p['G1']:+9.2e} {p['w1']/TWO_PI/1e6:7.3f} "
+                  f"{p['_nsec']:3d}{'*' if p['_cpx'] else ' '} {p['_prms']:6.2f} {p['_pph']:5.1f} | "
+                  f"{nr:6.2f} {p['vreg']*1e3:7.2f}  {cmark}")
+    else:
+        for il in LOADS:
+            P[il]["gnw"] = NB["gw"][il]          # gnw/gn1.. avoid ngspice's CASE-INSENSITIVE
+            for k in range(MNOISE):              # param clash with PSRR's G1/G2/G3
+                P[il][f"gn{k+1}"] = NB["gk"][il][k]
+            nr = _noise_resid(il, zfits[il], P[il])
+            p = P[il]
+            cmark = (f"{p['pcw0']/TWO_PI/1e6:.2f}MHz/Q{p['pcq']:.1f}" if p['_cpx'] else "")
+            print(f"{il:>5} | {p['R_a']:7.2f} {p['L_a']*1e6:8.3f} {p['R_pl']:9.1f} {p['R_b']:9.1f} "
+                  f"{p['_zrms']:6.2f} | {p['G0']:+9.2e} {p['G1']:+9.2e} {p['w1']/TWO_PI/1e6:7.3f} "
+                  f"{p['_nsec']:3d}{'*' if p['_cpx'] else ' '} {p['_prms']:6.2f} {p['_pph']:5.1f} | "
+                  f"{nr:6.2f} {p['vreg']*1e3:7.2f}  {cmark}")
+        print(f"      noise corners fk[Hz] = " + " ".join(f"{x:.3g}" for x in NFK))
     fit_spurs(P, zfits)
     return P
 
 
-def predict(P_il, f, nfk=None):
+def noise_model_sv(P_il, f, Z, nfk=None, nfkv=None, nmode=None):
+    """THE shared model output-noise reconstruction Sv [V/rtHz] -- single source of
+    truth used by fit_all's per-corner print (_noise_resid), predict() (the GUI /
+    report / crossval path) and _selftest, so they agree to machine precision.
+    Dispatches on nmode (None -> the module NOISE_MODE of the LAST fit; a held
+    FitResult must pass its own result.nmode/result.nfkv or a later fit in the same
+    process silently re-dispatches it):
+      norton (legacy): Sv = sqrt(In^2)*|Zout|, In^2 = white + Lorentzians @ nfk
+      hybrid (gated):  Sv^2 = Vn^2(f)*|Zout/ZA|^2 + (gnw^2*KT4*NRk)*|Zout|^2,
+                       Vn^2 = (snw^2 + sum snk^2/(1+(f/fvk)^2))*KT4*NRk
+    Z is the COMPLEX zmodel Zout already evaluated at f (so the C_ft shunt, branch B
+    etc. are inherited); nfk/nfkv default to the module state of the last fit."""
+    f = np.asarray(f, dtype=float)
+    if nmode is None:
+        nmode = NOISE_MODE
+    if nmode == "hybrid":
+        if nfkv is None:
+            nfkv = NFKV
+        ZA = _za(f, P_il["R_a"], P_il["L_a"], P_il["R_pl"])
+        T2 = np.abs(Z / ZA) ** 2
+        Vn2 = (P_il.get("snw", 0.0) ** 2) * KT4 * NRk * np.ones_like(f)
+        for k in range(len(nfkv)):
+            sk = P_il.get(f"sn{k+1}", 0.0)
+            Vn2 = Vn2 + (sk ** 2) * KT4 * NRk / (1.0 + (f / nfkv[k]) ** 2)
+        return np.sqrt(Vn2 * T2 + (P_il["gnw"] ** 2) * KT4 * NRk * np.abs(Z) ** 2)
+    if nfk is None:
+        nfk = NFK
+    In2 = (P_il["gnw"] ** 2) * KT4 * NRk * np.ones_like(f)
+    for k in range(len(nfk)):
+        gk = P_il.get(f"gn{k+1}", 0.0)
+        In2 = In2 + (gk ** 2) * KT4 * NRk / (1.0 + (f / nfk[k]) ** 2)
+    return np.sqrt(In2) * np.abs(Z)
+
+
+def predict(P_il, f, nfk=None, nfkv=None, nmode=None):
     """ANALYTIC Zout / PSRR / output-noise PSD for ONE load corner, from its fitted
     params P_il (= one entry of fit_all()'s dict) at frequencies f. Uses the SAME
     transfer functions the fitter optimizes -- zmodel (Zout), psrr_model (PSRR=i_c*Zout)
-    and the decoupled Norton noise In*|Zout| (In^2 = white floor + Lorentzians, identical
-    to _noise_resid) -- so the GUI's before/after overlay IS the fit quality itself: pure
+    and the shared noise reconstruction noise_model_sv (identical to _noise_resid) --
+    so the GUI's before/after overlay IS the fit quality itself: pure
     numpy, NO simulator. This is what Tab 4 (Compare) plots against the imported GT.
 
     nfk: the shared noise-corner freqs (module NFK after a fit; FitResult carries a copy).
+    nfkv: hybrid series-bank corner freqs (module NFKV fallback; FitResult.nfkv copy).
+    nmode: noise-block structure ("norton"|"hybrid"; None -> module NOISE_MODE). A held
+    FitResult MUST pass result.nmode (+ result.nfkv) or a fit of ANOTHER variant in the
+    same process changes what its noise prediction means.
     Returns dict(Zout=complex[], PSRR=complex[], noise=Sv[V/rtHz]) on the given f grid."""
     if nfk is None:
         nfk = NFK
@@ -624,11 +1001,7 @@ def predict(P_il, f, nfk=None):
     G = [P_il["G0"], P_il["G1"], P_il["w1"], P_il["G2"], P_il["w2"], P_il["G3"], P_il["w3"]]
     Q = (P_il["pcb0"], P_il["pcb1"], P_il["pcw0"], P_il["pcq"])
     H = psrr_model(f, *zf, G, Q)
-    In2 = (P_il["gnw"] ** 2) * KT4 * NRk * np.ones_like(f)
-    for k in range(len(nfk)):
-        gk = P_il.get(f"gn{k+1}", 0.0)
-        In2 = In2 + (gk ** 2) * KT4 * NRk / (1.0 + (f / nfk[k]) ** 2)
-    Sv = np.sqrt(In2) * np.abs(Z)
+    Sv = noise_model_sv(P_il, f, Z, nfk=nfk, nfkv=nfkv, nmode=nmode)
     return dict(Zout=Z, PSRR=H, noise=Sv)
 
 
@@ -646,6 +1019,9 @@ class FitResult:
     spur_f: list
     spur_ph: list
     vref: float
+    cft: float = 0.0     # gated vin->vout feedthrough cap (0.0 = gate silent/disabled)
+    nmode: str = "norton"                    # noise-block structure ("norton" | gated "hybrid")
+    nfkv: list = field(default_factory=list)  # hybrid series-bank corner freqs (empty = norton)
 
 
 def fit_variant(vkey, nominal=None, vref=None):
@@ -657,7 +1033,7 @@ def fit_variant(vkey, nominal=None, vref=None):
     P = fit_all()
     return FitResult(P=P, loads=list(LOADS), nominal=NOMINAL, cout=C, esr=RC,
                      nfk=list(NFK), spur_f=list(NSPUR_F), spur_ph=list(NSPUR_PH),
-                     vref=VREF)
+                     vref=VREF, cft=CFT, nmode=NOISE_MODE, nfkv=list(NFKV))
 
 
 def fit_spurs(P, zfits):
@@ -696,14 +1072,11 @@ def fit_spurs(P, zfits):
     print(f"      spur tones ({len(F)}): {amps}")
 
 
-def _noise_resid(il, zf, gw, gk):
-    """Reconstructed-output-PSD log-RMS (dB) vs GT, for the fitted Norton bank."""
+def _noise_resid(il, zf, P_il):
+    """Reconstructed-output-PSD log-RMS (dB) vs GT, for the fitted noise block
+    (dispatches on NOISE_MODE through the shared noise_model_sv reconstruction)."""
     gn = ref[f"noise_{il}"]; f = gn[:, 0]; Sv = gn[:, 1]
-    Zmod = np.abs(zmodel(f, *zf))
-    In2 = (gw ** 2) * KT4 * NRk * np.ones_like(f)
-    for k in range(MNOISE):
-        In2 = In2 + (gk[k] ** 2) * KT4 * NRk / (1.0 + (f / NFK[k]) ** 2)
-    Smod = np.sqrt(In2) * Zmod
+    Smod = noise_model_sv(P_il, f, zmodel(f, *zf))
     return float(np.sqrt(np.mean((20 * np.log10((Smod + 1e-30) / (Sv + 1e-30))) ** 2)))
 
 
@@ -781,8 +1154,25 @@ def build_pwl(vreg121):
 def _noise_net():
     """Build the decoupled Norton-@vout noise bank: white-R floor + MNOISE fixed
     R||C Lorentzian sections, each transconducted into vout (gm = gw/g_k sets the
-    per-corner amplitude). Fixed R=NRk + C set each corner fk; gm is interpolated."""
+    per-corner amplitude). Fixed R=NRk + C set each corner fk; gm is interpolated.
+    HYBRID (gated): keep the white Norton floor, plus a series VOLTAGE-noise bank
+    between the regulation rail (vreg) and branch A's new rail vrgn -- a chain of
+    VCVS sections, each sensing an RC-filtered thermal-noise node (R alone = white,
+    R||C = Lorentzian @ fvk); the E-gain (snw/sn_k) sets each per-corner amplitude.
+    Branch A then hangs off vrgn (Bra line in emit), branches B/C stay on vreg."""
     lines = [f"Rnw  nw 0 {NRk:.6e}", "Gnw  0 vout nw 0 {gnw}      $ white floor"]
+    if NOISE_MODE == "hybrid":
+        K = len(NFKV)
+        lines += ["* series voltage-noise bank (hybrid): vreg -> vrgn feeds branch A",
+                  f"Rvw  nvw 0 {NRk:.6e}",
+                  f"Evw  vreg {'x1' if K else 'vrgn'} nvw 0 {{snw}}     $ white voltage section"]
+        for k in range(K):
+            Ck = 1.0 / (TWO_PI * NFKV[k] * NRk)
+            nxt = f"x{k+2}" if k < K - 1 else "vrgn"
+            lines += [f"Rv{k+1}  nv{k+1} 0 {NRk:.6e}",
+                      f"Cv{k+1}  nv{k+1} 0 {Ck:.6e}        $ corner {NFKV[k]:.4g} Hz",
+                      f"Ev{k+1}  x{k+1} {nxt} nv{k+1} 0 {{sn{k+1}}}"]
+        return "\n".join(lines)
     for k in range(MNOISE):
         Ck = 1.0 / (TWO_PI * NFK[k] * NRk)
         lines += [f"Rn{k+1}  nk{k+1} 0 {NRk:.6e}",
@@ -847,11 +1237,31 @@ def emit(P, path):
               ("G3", False), ("w3", True),
               ("pcb0", False), ("pcb1", False), ("pcw0", True), ("pcq", True), ("gnw", True)]
              + [(f"gn{k+1}", True) for k in range(MNOISE)]
+             + ([("snw", True)] + [(f"sn{k+1}", True) for k in range(len(NFKV))]
+                if NOISE_MODE == "hybrid" else [])
              + [(f"sa{k+1}", True) for k in range(len(NSPUR_F))] + [("vreg", False)])
     defs = "\n".join(f".param {k} = {{{_pexpr(P, k, ls)}}}" for k, ls in specs)
     noise_net = _noise_net()
     spur_net = _spur_net()
     spur_cmt, spur_side = _spur_manifest(path.stem)
+    # gated vin->vout feedthrough cap: load-independent -> emitted LITERAL (like COUT/
+    # ESR, not interpolated). Both fragments render to the EMPTY STRING when the gate
+    # is silent, so the legacy .lib is byte-identical.
+    cft_par = (f"\n.param CFTP={CFT:.6e}    $ gated vin->vout feedthrough cap"
+               if CFT > 0 else "")
+    cft_inst = ("\n* ---- gated vin->vout feedthrough cap (pass-device/package coupling) ----"
+                "\nCft vin vout {CFTP}" if CFT > 0 else "")
+    # branch A's regulation rail: vreg (legacy) or vrgn (hybrid noise: the series
+    # voltage-noise bank from _noise_net sits between vreg and vrgn). Two LITERAL
+    # template fragments so the legacy render stays byte-equal. NOTE the
+    # (vreg-VREG121) inside pwl() is the .param vreg (a NUMBER), not the node --
+    # it stays 'vreg' in BOTH fragments.
+    if NOISE_MODE == "hybrid":
+        bra_line = (f"Bra  vrgn nA I = {{(slew_en > 0.5) ? "
+                    f"pwl(V(vrgn,nA)-(vreg-VREG121),{pwl_tab}) : V(vrgn,nA)/R_a}}")
+    else:
+        bra_line = (f"Bra  vreg nA I = {{(slew_en > 0.5) ? "
+                    f"pwl(V(vreg,nA)-(vreg-VREG121),{pwl_tab}) : V(vreg,nA)/R_a}}")
     txt = f"""* ============================================================
 * CANDIDATE behavioral LDO model  (subckt: ldo_model, ports: vin vout)
 * Fitted to ground-truth by harness/fit_model.py. All linear/passive +
@@ -872,7 +1282,7 @@ def emit(P, path):
 .param u  = {{ln(ic)}}
 .param VREG121 = {vreg121:.6e}    $ nominal-corner Vreg (DC-curve table reference)
 {defs}
-.param COUT={C:.6e} ESR={RC:.6e}    $ auto-extracted physical output cap / ESR
+.param COUT={C:.6e} ESR={RC:.6e}    $ auto-extracted physical output cap / ESR{cft_par}
 .param Cps=1p Rp1={{1/(w1*Cps)}} Rp2={{1/(w2*Cps)}} Rp3={{1/(w3*Cps)}}
 * complex PSRR section: a1=1/(Q.w0), a2=1/w0^2 ; series R-L-C w/ Cpc fixed -> Rpc,Lpc
 .param Cpc=1p pca1={{1/(pcq*pcw0)}} pca2={{1/(pcw0*pcw0)}}
@@ -889,12 +1299,12 @@ La   vout nA  {{L_a}}
 Rpl  vout nA  {{R_pl}}            $ damping across L_a (R_pl->inf = peak; finite = plateau)
 * branch-A conductance: linear R_a (slew_en=0, PSS/HB) OR nonlinear DC-curve w/
 * current-limit+dropout (slew_en=1). La in series stays -> resonance + di/dt slew.
-Bra  vreg nA I = {{(slew_en > 0.5) ? pwl(V(vreg,nA)-(vreg-VREG121),{pwl_tab}) : V(vreg,nA)/R_a}}
+{bra_line}
 Cout vout nC  {{COUT}}
 Resr nC  vreg {{ESR}}
 * ---- optional branch B: 2nd parallel R-L for multi-pole Zout (R_b->inf = off) ----
 Lb   vout nbb {{L_b}}
-Rbb  nbb  vreg {{R_b}}
+Rbb  nbb  vreg {{R_b}}{cft_inst}
 *
 * ---- intrinsic output noise: DECOUPLED Norton current @vout (white + {MNOISE} Lorentzians).
 * Each section = fixed R||C thermal noise (sets corner) x VCCS gm (sets amplitude),
@@ -957,6 +1367,8 @@ def emit_va(P, path, tbl_path):
               ("G3", False), ("w3", True),
               ("pcb0", False), ("pcb1", False), ("pcw0", True), ("pcq", True), ("gnw", True)]
              + [(f"gn{k+1}", True) for k in range(MNOISE)]
+             + ([("snw", True)] + [(f"sn{k+1}", True) for k in range(len(NFKV))]
+                if NOISE_MODE == "hybrid" else [])
              + [(f"sa{k+1}", True) for k in range(len(NSPUR_F))] + [("vreg", False)])
     asg = "\n      ".join(f"{k} = {_pexpr(P, k, ls)};" for k, ls in specs)
     vreg121 = P[NOMINAL]["vreg"]
@@ -979,6 +1391,45 @@ def emit_va(P, path, tbl_path):
         f"    I(nk{k+1}) <+ white_noise(4*`P_K*$temperature/NRk, \"nk{k+1}\");\n"
         f"    I(vout)    <+ gn{k+1}*V(nk{k+1});"
         for k in range(MNOISE))
+    # ---- GATED hybrid noise fragments: branch A's rail (arail), the noise-node
+    # list, the per-section gains/Cv params and the noise contributions are all
+    # selected by NOISE_MODE; the legacy ("norton") selections render BYTE-EQUAL
+    # to the previous unconditional template.
+    arail = "vrgn" if NOISE_MODE == "hybrid" else "vrg"
+    if NOISE_MODE == "hybrid":
+        noise_nodes = "nw, vrgn, nvw" + "".join(f", nv{k+1}" for k in range(len(NFKV)))
+        gvars = ", ".join(["gnw", "snw"] + [f"sn{k+1}" for k in range(len(NFKV))]
+                          + [f"sa{k+1}" for k in range(len(NSPUR_F))])
+        Cn_par = "\n  ".join(
+            f"parameter real Cv{k+1} = {1.0/(TWO_PI*NFKV[k]*NRk):.6e};   // corner {NFKV[k]:.4g} Hz"
+            for k in range(len(NFKV)))
+        sersum = " + ".join(["snw*V(nvw)"]
+                            + [f"sn{k+1}*V(nv{k+1})" for k in range(len(NFKV))])
+        vsec = "\n    ".join(
+            f"I(nv{k+1}) <+ V(nv{k+1})/NRk + Cv{k+1}*ddt(V(nv{k+1}));\n"
+            f"    I(nv{k+1}) <+ white_noise(4*`P_K*$temperature/NRk, \"nv{k+1}\");"
+            for k in range(len(NFKV)))
+        noise_va = (
+            "// ---- intrinsic output noise (HYBRID): Norton white floor @vout + a series\n"
+            f"    // voltage-noise bank in branch A (vrg -> vrgn): white + {len(NFKV)} "
+            "Lorentzian V-sections\n"
+            "    I(nw)   <+ V(nw)/NRk;\n"
+            "    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, \"nw\");\n"
+            "    I(vout) <+ gnw*V(nw);\n"
+            f"    V(vrgn, vrg) <+ {sersum};\n"
+            "    I(nvw) <+ V(nvw)/NRk;\n"
+            "    I(nvw) <+ white_noise(4*`P_K*$temperature/NRk, \"nvw\");\n"
+            f"    {vsec}")
+    else:
+        noise_nodes = f"nw, {nk_nodes}"
+        noise_va = (
+            "// ---- intrinsic output noise: decoupled Norton current @vout ----\n"
+            "    // white floor: R-only node nw (V PSD = 4kT*NRk) transconducted by gw\n"
+            "    I(nw)   <+ V(nw)/NRk;\n"
+            "    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, \"nw\");\n"
+            "    I(vout) <+ gnw*V(nw);\n"
+            f"    // {MNOISE} Lorentzian sections: R||C node nk (corner fk) transconducted by g_k\n"
+            f"    {nsec}")
     # deterministic intrinsic spur tones at vout ($abstime -> correct in tran AND PSS/HB).
     # NEGATIVE sign so I(vout)<+ ... injects current INTO vout (matches the SPICE
     # '0 vout' source order), so the reproduced tone phase matches the GT.
@@ -987,6 +1438,11 @@ def emit_va(P, path, tbl_path):
         for k, (fk, ph) in enumerate(zip(NSPUR_F, NSPUR_PH)))
     if not spur_va:
         spur_va = "// (no intrinsic spurs for this variant)"
+    # gated vin->vout feedthrough cap (load-independent literal; empty when silent)
+    cft_par_va = (f"\n  parameter real Cft = {CFT:.6e};   // gated vin->vout feedthrough cap"
+                  if CFT > 0 else "")
+    cft_va = ("\n\n    // ---- gated vin->vout feedthrough cap (pass-device/package) ----"
+              "\n    I(vin, vout) <+ Cft*ddt(V(vin, vout));" if CFT > 0 else "")
     va = f"""// ============================================================
 // Behavioral LDO model for Cadence Spectre  (auto-gen: harness/fit_model.py)
 // Equivalent to model/ldo_model.lib (validated in ngspice). NO laplace_nd.
@@ -1004,12 +1460,12 @@ def emit_va(P, path, tbl_path):
 
 module ldo_model(vin, vout);
   inout vin, vout;
-  electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, nw, {nk_nodes};
+  electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, {noise_nodes};
 
   parameter real iload   = {_amps(NOMINAL):.6e} from (0:inf);
   parameter integer slew_en = 0 from [0:1];
   parameter real Cout = {C:.6e};   // auto-extracted physical output cap
-  parameter real ESR  = {RC:.6e};   // auto-extracted physical ESR
+  parameter real ESR  = {RC:.6e};   // auto-extracted physical ESR{cft_par_va}
   parameter real VREG121 = {vreg121:.6e};
   parameter real NRk = {NRk:.6e};   // fixed noise-section resistor (gm sets amplitude)
   {Cn_par}
@@ -1039,23 +1495,17 @@ module ldo_model(vin, vout);
 
     // ---- Zout branch B: optional 2nd R-L (R_b->inf disables it) ----
     I(vout, nbb) <+ idt(V(vout, nbb))/L_b;
-    V(nbb, vrg)  <+ R_b*I(nbb, vrg);
+    V(nbb, vrg)  <+ R_b*I(nbb, vrg);{cft_va}
 
     // ---- Zout branch A: (L_a || R_pl) + (R_a | nonlinear dropout) ----
     // L_a||R_pl as summed current contributions (idt form admits the parallel R)
     I(vout, nA) <+ idt(V(vout, nA))/L_a + V(vout, nA)/R_pl;
     if (slew_en == 0)
-      V(nA, vrg) <+ R_a*I(nA, vrg);
+      V(nA, {arail}) <+ R_a*I(nA, {arail});
     else                             // $table_model control string may be Spectre-version specific
-      I(vrg, nA) <+ $table_model(V(vrg, nA) - (vreg - VREG121), "{tbl_path.name}", "1L");
+      I({arail}, nA) <+ $table_model(V({arail}, nA) - (vreg - VREG121), "{tbl_path.name}", "1L");
 
-    // ---- intrinsic output noise: decoupled Norton current @vout ----
-    // white floor: R-only node nw (V PSD = 4kT*NRk) transconducted by gw
-    I(nw)   <+ V(nw)/NRk;
-    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, "nw");
-    I(vout) <+ gnw*V(nw);
-    // {MNOISE} Lorentzian sections: R||C node nk (corner fk) transconducted by g_k
-    {nsec}
+    {noise_va}
 
     // ---- PSRR path: i_c = G0 + sum Gi*LP_i(vin-1.05) into vout (x Zout) ----
     // signed real-pole section bank (R_i = 1/(wi*Cps), so 1/R_i = wi*Cps)
@@ -1065,8 +1515,10 @@ module ldo_model(vin, vout);
     I(np2, vrf) <+ Cps*ddt(V(np2, vrf));
     I(vin, np3) <+ (V(vin) - V(np3))*(w3*Cps);
     I(np3, vrf) <+ Cps*ddt(V(np3, vrf));
-    I(vout)     <+ G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
-                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf));
+    // NEGATIVE sign so I(vout)<+ ... injects current INTO vout (matches the SPICE
+    // 'G* 0 vout' source order / the .lib +H realization; same convention as spurs).
+    I(vout)     <+ -(G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
+                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf)));
 
     // ---- PSRR complex-conjugate 2nd-order section (non-min-phase / notch phase) ----
     // series R-L-C lowpass state x=V(ncs2,vrf); b0 reads V_C=x, b1 reads V_R=a1*dx/dt.
@@ -1074,7 +1526,7 @@ module ldo_model(vin, vout);
     I(vin, ncs1)  <+ V(vin, ncs1)/Rpc;
     I(ncs1, ncs2) <+ idt(V(ncs1, ncs2))/Lpc;
     I(ncs2, vrf)  <+ Cpc*ddt(V(ncs2, vrf));
-    I(vout)       <+ pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1);
+    I(vout)       <+ -(pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1));   // INTO vout (see bank above)
 
     // ---- intrinsic discrete spurs: deterministic current tones @vout ----
     {spur_va}
@@ -1101,8 +1553,7 @@ def _selftest(vkey="base"):
         zrms = np.sqrt(np.mean((20 * np.log10(np.abs(pr_z["Zout"]) / np.abs(Zg))) ** 2))
         prms = np.sqrt(np.mean((20 * np.log10(np.abs(pr_p["PSRR"]) / np.abs(Hg))) ** 2))
         nr = _noise_resid(il, (res.P[il]["R_a"], res.P[il]["L_a"], res.P[il]["R_pl"],
-                              res.P[il]["R_b"], res.P[il]["L_b"]),
-                          res.P[il]["gnw"], [res.P[il][f"gn{k+1}"] for k in range(MNOISE)])
+                              res.P[il]["R_b"], res.P[il]["L_b"]), res.P[il])
         # predict's noise must equal the _noise_resid reconstruction at the same grid
         Smod = pr_n["noise"]
         nr2 = float(np.sqrt(np.mean((20 * np.log10((Smod + 1e-30) / (gn[:, 1] + 1e-30))) ** 2)))
@@ -1113,7 +1564,9 @@ def _selftest(vkey="base"):
               f"prms={prms:.4f} (fit {res.P[il]['_prms']:.4f})  npsd={nr2:.4f} (fit {nr:.4f})  "
               f"{'OK' if match else 'MISMATCH'}")
     print(f"selftest {'PASS' if ok else 'FAIL'} (predict == fitter analytic) "
-          f"nominal={res.nominal} vref={res.vref} cout={res.cout*1e12:.1f}pF esr={res.esr:.3f}")
+          f"nominal={res.nominal} vref={res.vref} cout={res.cout*1e12:.1f}pF esr={res.esr:.3f}"
+          + (f" cft={res.cft*1e15:.1f}fF" if res.cft > 0 else "")
+          + (f" nmode={res.nmode}" if getattr(res, "nmode", "norton") == "hybrid" else ""))
     return ok
 
 

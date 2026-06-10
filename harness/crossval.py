@@ -53,9 +53,11 @@ UNIDENT_REL = 1e-3      # column-norm / max column-norm below this => unidentifi
 RANKDEF_REL = 1e-9      # sigma_min / sigma_max below this => rank-deficient (cond~inf)
 SWITCH_RATIO = 1e3      # max/min of a param across corners above this => switch-like
 
-# Per-param interpolation spec MIRRORING fit_model.emit()'s `specs`
-# (fit_model.py:708-713), restricted to the keys predict() consumes. (key, logspace).
-# There is no public accessor; keep in sync if emit's spec list ever changes.
+# Per-param interpolation spec MIRRORING fit_model.emit()'s `specs`, restricted to
+# the keys predict() consumes. (key, logspace). There is no public accessor; keep in
+# sync if emit's spec list ever changes -- INCLUDING its conditional tails (gn{k}
+# Norton Lorentzian gains; snw/sn{k} when the gated hybrid noise mode engaged),
+# which _specs() mirrors from the fit_model module state of the last fit.
 _ZP_SPECS = [("R_a", True), ("L_a", True), ("R_pl", True), ("R_b", True), ("L_b", True),
              ("G0", False), ("G1", False), ("w1", True), ("G2", False), ("w2", True),
              ("G3", False), ("w3", True),
@@ -63,7 +65,11 @@ _ZP_SPECS = [("R_a", True), ("L_a", True), ("R_pl", True), ("R_b", True), ("L_b"
 
 
 def _specs():
-    return _ZP_SPECS + [(f"gn{k+1}", True) for k in range(fit_model.MNOISE)]
+    sp = _ZP_SPECS + [(f"gn{k+1}", True) for k in range(fit_model.MNOISE)]
+    if getattr(fit_model, "NOISE_MODE", "norton") == "hybrid":
+        sp = sp + [("snw", True)] + [(f"sn{k+1}", True)
+                                     for k in range(len(fit_model.NFKV))]
+    return sp
 
 
 # ---------------------------------------------------------------- interpolation
@@ -122,6 +128,8 @@ def _gate(insample, heldout):
 def loco(res, refnpz):
     """Leave-one-load-corner-out cross-validation (analytic, no ngspice)."""
     P, nfk, loads = res.P, res.nfk, res.loads
+    nmode = getattr(res, "nmode", None)              # pin the FitResult's noise mode
+    nfkv = getattr(res, "nfkv", None)                # (predict must not read globals)
     specs = _specs()
     amps = {il: ng.amps(il) for il in loads}
     corners = []
@@ -135,12 +143,14 @@ def loco(res, refnpz):
         gp = refnpz[f"p_{h}"]; fp, Hg = gp[:, 0], gp[:, 1] + 1j * gp[:, 2]
         gn = refnpz[f"noise_{h}"]; fn, Sg = gn[:, 0], gn[:, 1]
 
-        zi = _zrms(fz, fit_model.predict(P[h], fz, nfk)["Zout"], Zg)
-        zo = _zrms(fz, fit_model.predict(interp, fz, nfk)["Zout"], Zg)
-        pi = _prms(fp, fit_model.predict(P[h], fp, nfk)["PSRR"], Hg)
-        po = _prms(fp, fit_model.predict(interp, fp, nfk)["PSRR"], Hg)
-        ni = scoremod._noise_metrics(fn, Sg, fn, fit_model.predict(P[h], fn, nfk)["noise"])["psd_rms"]
-        no = scoremod._noise_metrics(fn, Sg, fn, fit_model.predict(interp, fn, nfk)["noise"])["psd_rms"]
+        zi = _zrms(fz, fit_model.predict(P[h], fz, nfk, nfkv=nfkv, nmode=nmode)["Zout"], Zg)
+        zo = _zrms(fz, fit_model.predict(interp, fz, nfk, nfkv=nfkv, nmode=nmode)["Zout"], Zg)
+        pi = _prms(fp, fit_model.predict(P[h], fp, nfk, nfkv=nfkv, nmode=nmode)["PSRR"], Hg)
+        po = _prms(fp, fit_model.predict(interp, fp, nfk, nfkv=nfkv, nmode=nmode)["PSRR"], Hg)
+        ni = scoremod._noise_metrics(fn, Sg, fn, fit_model.predict(
+            P[h], fn, nfk, nfkv=nfkv, nmode=nmode)["noise"])["psd_rms"]
+        no = scoremod._noise_metrics(fn, Sg, fn, fit_model.predict(
+            interp, fn, nfk, nfkv=nfkv, nmode=nmode)["noise"])["psd_rms"]
 
         corners.append(dict(
             corner=h, kind=kind,
@@ -186,10 +196,16 @@ def offgrid(res, vkey):
         fz, Zg = gz[:, 0], gz[:, 1] + 1j * gz[:, 2]
         fp, Hg = gp[:, 0], gp[:, 1] + 1j * gp[:, 2]
         fn, Sg = gn[:, 0], gn[:, 1]
-        base_z = max(base_z, _zrms(fz, fit_model.predict(P[il], fz, res.nfk)["Zout"], Zg))
-        base_p = max(base_p, _prms(fp, fit_model.predict(P[il], fp, res.nfk)["PSRR"], Hg))
+        base_z = max(base_z, _zrms(fz, fit_model.predict(
+            P[il], fz, res.nfk, nfkv=getattr(res, "nfkv", None),
+            nmode=getattr(res, "nmode", None))["Zout"], Zg))
+        base_p = max(base_p, _prms(fp, fit_model.predict(
+            P[il], fp, res.nfk, nfkv=getattr(res, "nfkv", None),
+            nmode=getattr(res, "nmode", None))["PSRR"], Hg))
         base_n = max(base_n, scoremod._noise_metrics(
-            fn, Sg, fn, fit_model.predict(P[il], fn, res.nfk)["noise"])["psd_rms"])
+            fn, Sg, fn, fit_model.predict(
+                P[il], fn, res.nfk, nfkv=getattr(res, "nfkv", None),
+                nmode=getattr(res, "nmode", None))["noise"])["psd_rms"])
 
     rows = []
     for m in mids:
