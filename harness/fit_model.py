@@ -1160,24 +1160,24 @@ def _noise_net():
     VCVS sections, each sensing an RC-filtered thermal-noise node (R alone = white,
     R||C = Lorentzian @ fvk); the E-gain (snw/sn_k) sets each per-corner amplitude.
     Branch A then hangs off vrgn (Bra line in emit), branches B/C stay on vreg."""
-    lines = [f"Rnw  nw 0 {NRk:.6e}", "Gnw  0 vout nw 0 {gnw}      $ white floor"]
+    lines = [f"Rnw  nw gnd {NRk:.6e}", "Gnw  gnd vout nw gnd {gnw}      $ white floor"]
     if NOISE_MODE == "hybrid":
         K = len(NFKV)
         lines += ["* series voltage-noise bank (hybrid): vreg -> vrgn feeds branch A",
-                  f"Rvw  nvw 0 {NRk:.6e}",
-                  f"Evw  vreg {'x1' if K else 'vrgn'} nvw 0 {{snw}}     $ white voltage section"]
+                  f"Rvw  nvw gnd {NRk:.6e}",
+                  f"Evw  vreg {'x1' if K else 'vrgn'} nvw gnd {{snw}}     $ white voltage section"]
         for k in range(K):
             Ck = 1.0 / (TWO_PI * NFKV[k] * NRk)
             nxt = f"x{k+2}" if k < K - 1 else "vrgn"
-            lines += [f"Rv{k+1}  nv{k+1} 0 {NRk:.6e}",
-                      f"Cv{k+1}  nv{k+1} 0 {Ck:.6e}        $ corner {NFKV[k]:.4g} Hz",
-                      f"Ev{k+1}  x{k+1} {nxt} nv{k+1} 0 {{sn{k+1}}}"]
+            lines += [f"Rv{k+1}  nv{k+1} gnd {NRk:.6e}",
+                      f"Cv{k+1}  nv{k+1} gnd {Ck:.6e}        $ corner {NFKV[k]:.4g} Hz",
+                      f"Ev{k+1}  x{k+1} {nxt} nv{k+1} gnd {{sn{k+1}}}"]
         return "\n".join(lines)
     for k in range(MNOISE):
         Ck = 1.0 / (TWO_PI * NFK[k] * NRk)
-        lines += [f"Rn{k+1}  nk{k+1} 0 {NRk:.6e}",
-                  f"Cn{k+1}  nk{k+1} 0 {Ck:.6e}        $ corner {NFK[k]:.4g} Hz",
-                  f"Gn{k+1}  0 vout nk{k+1} 0 {{gn{k+1}}}"]
+        lines += [f"Rn{k+1}  nk{k+1} gnd {NRk:.6e}",
+                  f"Cn{k+1}  nk{k+1} gnd {Ck:.6e}        $ corner {NFK[k]:.4g} Hz",
+                  f"Gn{k+1}  gnd vout nk{k+1} gnd {{gn{k+1}}}"]
     return "\n".join(lines)
 
 
@@ -1189,10 +1189,10 @@ def _spur_net():
         return ""
     lines = ["* ---- intrinsic discrete spurs: deterministic current tones @vout ----",
              "* (DC=0 AC=0 -> inert in .op/.dc/.ac/.noise; vout tone = I_k*|Zout(f_k)|).",
-             "* Node order '0 vout' injects current INTO vout (matches the noise/PSRR",
+             "* Node order 'gnd vout' injects current INTO vout (matches the noise/PSRR",
              "* sign convention) so the reproduced tone phase matches the GT."]
     for k, (fk, ph) in enumerate(zip(NSPUR_F, NSPUR_PH)):
-        lines.append(f"Isp{k+1} 0 vout DC 0 AC 0 SIN(0 {{sa{k+1}}} {fk:.6e} 0 0 {np.degrees(ph):.4f})")
+        lines.append(f"Isp{k+1} gnd vout DC 0 AC 0 SIN(0 {{sa{k+1}}} {fk:.6e} 0 0 {np.degrees(ph):.4f})")
     return "\n".join(lines)
 
 
@@ -1229,9 +1229,49 @@ def _spur_manifest(name):
     return cmt, side
 
 
+def _linereg_poly():
+    """Low-order polynomial of the characterized DC line-regulation curve Vout(vin),
+    for the R3-L1 settable-VDD DC shift (emit/emit_va). Returns (coeffs hi->lo, vlo,
+    vhi, maxerr). When the ref has no dc_linereg sweep (or it is the digest's
+    synthesized flat placeholder) the emitted shift evaluates to EXACTLY 0 at any
+    vdd, so the legacy DC behavior is preserved."""
+    if ref is None or "dc_linereg" not in ref.files:
+        return np.array([0.0]), float(VREF), float(VREF), 0.0
+    lr = ref["dc_linereg"]
+    vin, vo = lr[:, 0], lr[:, 1]
+    deg = int(min(4, max(1, len(vin) - 1)))
+    c = np.polyfit(vin, vo, deg)
+    err = float(np.max(np.abs(np.polyval(c, vin) - vo)))
+    return c, float(vin.min()), float(vin.max()), err
+
+
+def _polybody(c, var):
+    """Polynomial expression string in `var` for coeffs c (np hi->lo order); valid in
+    both ngspice .param braces and Verilog-A."""
+    d = len(c) - 1
+    parts = []
+    for i, ci in enumerate(c):
+        p = d - i
+        if p == 0:
+            parts.append(f"({ci:.6e})")
+        elif p == 1:
+            parts.append(f"({ci:.6e})*{var}")
+        else:
+            parts.append(f"({ci:.6e})*" + "*".join([var] * p))
+    return " + ".join(parts)
+
+
 def emit(P, path):
     vreg121 = P[NOMINAL]["vreg"]
     pwl_tab = build_pwl(vreg121)
+    # R3-L1: settable supply (vdd) + DC line-reg tracking from the characterized
+    # dc_linereg curve, plus an optional direct Vout-DC override (voutdc).
+    lrc, lrlo, lrhi, lrerr = _linereg_poly()
+    lrnom = float(np.polyval(lrc, np.clip(VREF, lrlo, lrhi)))
+    lrbody = _polybody(lrc, "vddc")
+    if lrerr > 5e-3:
+        print(f"  emit: dc_linereg poly fit residual {lrerr*1e3:.1f}mV "
+              f"(deg {len(lrc)-1}; knee smoothing -- check low-VDD DC if it matters)")
     specs = ([("R_a", True), ("L_a", True), ("R_pl", True), ("R_b", True), ("L_b", True),
               ("G0", False), ("G1", False), ("w1", True), ("G2", False), ("w2", True),
               ("G3", False), ("w3", True),
@@ -1258,12 +1298,18 @@ def emit(P, path):
     # it stays 'vreg' in BOTH fragments.
     if NOISE_MODE == "hybrid":
         bra_line = (f"Bra  vrgn nA I = {{(slew_en > 0.5) ? "
-                    f"pwl(V(vrgn,nA)-(vreg-VREG121),{pwl_tab}) : V(vrgn,nA)/R_a}}")
+                    f"pwl(V(vrgn,nA)-(vregeff-VREG121),{pwl_tab}) : V(vrgn,nA)/R_a}}")
     else:
         bra_line = (f"Bra  vreg nA I = {{(slew_en > 0.5) ? "
-                    f"pwl(V(vreg,nA)-(vreg-VREG121),{pwl_tab}) : V(vreg,nA)/R_a}}")
+                    f"pwl(V(vreg,nA)-(vregeff-VREG121),{pwl_tab}) : V(vreg,nA)/R_a}}")
     txt = f"""* ============================================================
-* CANDIDATE behavioral LDO model  (subckt: ldo_model, ports: vin vout)
+* CANDIDATE behavioral LDO model  (subckt: ldo_model, ports: vin vout gnd)
+* Instance params: iload (OP current), slew_en (0=linear PSS/HB core),
+*   vdd    = supply DC operating point [V] (default {VREF:g} = characterized nominal);
+*            sets the PSRR DC reference AND shifts Vout DC along the characterized
+*            dc_linereg curve (clamped to its measured span [{lrlo:g},{lrhi:g}]V)
+*   voutdc = direct Vout DC override [V] (0 = use the characterized DC; >0 pins
+*            Vout(iload) to this value, small-signal blocks unchanged)
 * Fitted to ground-truth by harness/fit_model.py. All linear/passive +
 * controlled sources -> PSS/HB-robust (NO laplace_nd). OP-parameterized by iload
 * via quadratic-in-ln(iload) interpolation through corners {{{','.join(LOADS)}}}.
@@ -1277,22 +1323,27 @@ def emit(P, path):
 *   Noise= DECOUPLED Norton @vout: white + {MNOISE} Lorentzian current sections fit to
 *          In=Sv/|Zout| -> output PSD = In*|Zout| exactly, independent of Zout synthesis
 * ============================================================
-.subckt ldo_model vin vout iload={NOMINAL} slew_en=0
+.subckt ldo_model vin vout gnd iload={NOMINAL} slew_en=0 vdd={VREF:g} voutdc=0
 .param ic = {{min(max(iload,{LOADS[0]}),{LOADS[-1]})}}
 .param u  = {{ln(ic)}}
 .param VREG121 = {vreg121:.6e}    $ nominal-corner Vreg (DC-curve table reference)
 {defs}
+* ---- R3-L1: settable supply / output DC (defaults reproduce the characterized DC) ----
+.param vddc = {{min(max(vdd,{lrlo:.6e}),{lrhi:.6e})}}    $ vdd clamped to the dc_linereg span
+.param lrsh = {{{lrbody} - ({lrnom:.6e})}}    $ DC line-reg shift vs characterized nominal
+.param vregeff = {{vreg + lrsh + ((voutdc > 0) ? (voutdc - (vreg + lrsh - R_a*ic)) : 0)}}
 .param COUT={C:.6e} ESR={RC:.6e}    $ auto-extracted physical output cap / ESR{cft_par}
 .param Cps=1p Rp1={{1/(w1*Cps)}} Rp2={{1/(w2*Cps)}} Rp3={{1/(w3*Cps)}}
 * complex PSRR section: a1=1/(Q.w0), a2=1/w0^2 ; series R-L-C w/ Cpc fixed -> Rpc,Lpc
 .param Cpc=1p pca1={{1/(pcq*pcw0)}} pca2={{1/(pcw0*pcw0)}}
 .param Rpc={{pca1/Cpc}} Lpc={{pca2/Cpc}} gqb1={{pcb1/pca1}}
 *
-* ---- DC operating point: regulated Vreg (constant). vin->vout coupling is
-*      handled ENTIRELY by the PSRR path below (small-signal-consistent: its DC
-*      limit g_lf*R_a = the measured PSRR LF). A broadband line-reg term here
-*      would create a parasitic flat PSRR floor, so it is intentionally omitted.
-Breg vreg 0 V = {{vreg}}
+* ---- DC operating point: regulated Vreg (constant per instance; vregeff adds the
+*      R3-L1 vdd line-reg shift / voutdc override). AC vin->vout coupling is handled
+*      ENTIRELY by the PSRR path below (small-signal-consistent: its DC limit
+*      g_lf*R_a = the measured PSRR LF). A broadband line-reg term here would
+*      create a parasitic flat PSRR floor, so it is intentionally omitted.
+Breg vreg gnd V = {{vregeff}}
 *
 * ---- Zout: branch A (R_a + L_a) || branch C (ESR+Cout) || branch B (opt) ----
 La   vout nA  {{L_a}}
@@ -1312,24 +1363,24 @@ Rbb  nbb  vreg {{R_b}}{cft_inst}
 * above -> immune to branch-B re-shaping; fit to In=Sv/|Zout| across load corners.
 {noise_net}
 *
-* ---- PSRR path: i_c = G0 + sum_i Gi*LP_i(vin-1.05), injected into vout (x Zout).
+* ---- PSRR path: i_c = G0 + sum_i Gi*LP_i(vin-vdd), injected into vout (x Zout).
 *      Bank of signed first-order real-pole sections (+ one complex section below).
 *      The LP filter resistors are realized as NOISELESS VCCS-conductances (Grp*),
 *      NOT physical R: the PSRR coupling is a signal-transfer path, so its filter
 *      elements must contribute NO thermal noise (else they corrupt the decoupled
 *      Norton noise block). This matches the Verilog-A mirror (which is already
 *      noiseless) and is I-V identical to a resistor in .op/.dc/.ac/.tran. ----
-Vrf  vrf 0 DC {VREF:g}               $ nominal-vin reference (model fit at vin={VREF:g})
-Gd   0   vout vin vrf {{G0}}         $ feedthrough  G0*(vin-1.05)
+Vrf  vrf gnd DC {{vdd}}              $ supply DC reference (settable; default = fit vin)
+Gd   gnd vout vin vrf {{G0}}         $ feedthrough  G0*(vin-vdd)
 Grp1 vin np1 vin np1 {{1/Rp1}}   $ noiseless conductance (= 1/Rp1)
-Cp1  np1 vrf {{Cps}}             $ np1 = LP1(vin), DC-referenced to 1.05
-Gs1  0   vout np1 vrf {{G1}}         $ G1*(LP1(vin)-1.05)
+Cp1  np1 vrf {{Cps}}             $ np1 = LP1(vin), DC-referenced to vdd
+Gs1  gnd vout np1 vrf {{G1}}         $ G1*(LP1(vin)-vdd)
 Grp2 vin np2 vin np2 {{1/Rp2}}
 Cp2  np2 vrf {{Cps}}
-Gs2  0   vout np2 vrf {{G2}}         $ G2*(LP2(vin)-1.05)  (0 if min-phase)
+Gs2  gnd vout np2 vrf {{G2}}         $ G2*(LP2(vin)-vdd)  (0 if min-phase)
 Grp3 vin np3 vin np3 {{1/Rp3}}
 Cp3  np3 vrf {{Cps}}
-Gs3  0   vout np3 vrf {{G3}}         $ G3*(LP3(vin)-1.05)  (0 if min-phase)
+Gs3  gnd vout np3 vrf {{G3}}         $ G3*(LP3(vin)-vdd)  (0 if min-phase)
 * ---- PSRR complex-conjugate 2nd-order section: carries non-min-phase / notch
 *      PHASE that the real shelf cannot. Series Rpc-Lpc-Cpc lowpass state x=V(ncs2,vrf);
 *      Gqb0 reads V_C=x, Gqb1 reads V_R=a1*dx/dt -> i_c += (pcb0+pcb1 s)/(1+a1 s+a2 s^2).
@@ -1338,8 +1389,8 @@ Gs3  0   vout np3 vrf {{G3}}         $ G3*(LP3(vin)-1.05)  (0 if min-phase)
 Grpc vin  ncs1 vin ncs1 {{1/Rpc}}    $ noiseless conductance (= 1/Rpc)
 Lpc  ncs1 ncs2 {{Lpc}}
 Cpc  ncs2 vrf  {{Cpc}}
-Gqb0 0 vout ncs2 vrf {{pcb0}}        $ inject b0*x
-Gqb1 0 vout vin  ncs1 {{gqb1}}       $ inject b1*dx/dt = (b1/a1)*V_R
+Gqb0 gnd vout ncs2 vrf {{pcb0}}      $ inject b0*x
+Gqb1 gnd vout vin  ncs1 {{gqb1}}     $ inject b1*dx/dt = (b1/a1)*V_R
 {spur_net}
 .ends ldo_model
 {spur_cmt}
@@ -1361,7 +1412,14 @@ def _va_expr(c, logspace):
 def emit_va(P, path, tbl_path):
     """Emit an equivalent Verilog-A model for Cadence Spectre. Mirrors the validated
     SPICE topology. Noise is a decoupled Norton @vout (white + MNOISE R||C-Lorentzian
-    sections -> matches In=Sv/|Zout|). Nonlinear dropout via $table_model reading .tbl."""
+    sections -> matches In=Sv/|Zout|). Nonlinear dropout via $table_model reading .tbl.
+    R2: explicit gnd port (no global-ground references -- the model floats with its
+    bench). R3-L1: vdd (supply DC reference + dc_linereg DC tracking) and voutdc
+    (direct output-DC override) instance parameters; defaults reproduce the
+    characterized behavior exactly."""
+    lrc, lrlo, lrhi, _lrerr = _linereg_poly()
+    lrnom = float(np.polyval(lrc, np.clip(VREF, lrlo, lrhi)))
+    lrbody = _polybody(lrc, "vddc")
     specs = ([("R_a", True), ("L_a", True), ("R_pl", True), ("R_b", True), ("L_b", True),
               ("G0", False), ("G1", False), ("w1", True), ("G2", False), ("w2", True),
               ("G3", False), ("w3", True),
@@ -1387,9 +1445,9 @@ def emit_va(P, path, tbl_path):
         f"parameter real Cn{k+1} = {1.0/(TWO_PI*NFK[k]*NRk):.6e};   // corner {NFK[k]:.4g} Hz"
         for k in range(MNOISE))
     nsec = "\n    ".join(
-        f"I(nk{k+1}) <+ V(nk{k+1})/NRk + Cn{k+1}*ddt(V(nk{k+1}));\n"
-        f"    I(nk{k+1}) <+ white_noise(4*`P_K*$temperature/NRk, \"nk{k+1}\");\n"
-        f"    I(vout)    <+ gn{k+1}*V(nk{k+1});"
+        f"I(nk{k+1}, gnd) <+ V(nk{k+1}, gnd)/NRk + Cn{k+1}*ddt(V(nk{k+1}, gnd));\n"
+        f"    I(nk{k+1}, gnd) <+ white_noise(4*`P_K*$temperature/NRk, \"nk{k+1}\");\n"
+        f"    I(vout, gnd)    <+ gn{k+1}*V(nk{k+1}, gnd);"
         for k in range(MNOISE))
     # ---- GATED hybrid noise fragments: branch A's rail (arail), the noise-node
     # list, the per-section gains/Cv params and the noise contributions are all
@@ -1403,38 +1461,38 @@ def emit_va(P, path, tbl_path):
         Cn_par = "\n  ".join(
             f"parameter real Cv{k+1} = {1.0/(TWO_PI*NFKV[k]*NRk):.6e};   // corner {NFKV[k]:.4g} Hz"
             for k in range(len(NFKV)))
-        sersum = " + ".join(["snw*V(nvw)"]
-                            + [f"sn{k+1}*V(nv{k+1})" for k in range(len(NFKV))])
+        sersum = " + ".join(["snw*V(nvw, gnd)"]
+                            + [f"sn{k+1}*V(nv{k+1}, gnd)" for k in range(len(NFKV))])
         vsec = "\n    ".join(
-            f"I(nv{k+1}) <+ V(nv{k+1})/NRk + Cv{k+1}*ddt(V(nv{k+1}));\n"
-            f"    I(nv{k+1}) <+ white_noise(4*`P_K*$temperature/NRk, \"nv{k+1}\");"
+            f"I(nv{k+1}, gnd) <+ V(nv{k+1}, gnd)/NRk + Cv{k+1}*ddt(V(nv{k+1}, gnd));\n"
+            f"    I(nv{k+1}, gnd) <+ white_noise(4*`P_K*$temperature/NRk, \"nv{k+1}\");"
             for k in range(len(NFKV)))
         noise_va = (
             "// ---- intrinsic output noise (HYBRID): Norton white floor @vout + a series\n"
             f"    // voltage-noise bank in branch A (vrg -> vrgn): white + {len(NFKV)} "
             "Lorentzian V-sections\n"
-            "    I(nw)   <+ V(nw)/NRk;\n"
-            "    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, \"nw\");\n"
-            "    I(vout) <+ gnw*V(nw);\n"
+            "    I(nw, gnd)   <+ V(nw, gnd)/NRk;\n"
+            "    I(nw, gnd)   <+ white_noise(4*`P_K*$temperature/NRk, \"nw\");\n"
+            "    I(vout, gnd) <+ gnw*V(nw, gnd);\n"
             f"    V(vrgn, vrg) <+ {sersum};\n"
-            "    I(nvw) <+ V(nvw)/NRk;\n"
-            "    I(nvw) <+ white_noise(4*`P_K*$temperature/NRk, \"nvw\");\n"
+            "    I(nvw, gnd) <+ V(nvw, gnd)/NRk;\n"
+            "    I(nvw, gnd) <+ white_noise(4*`P_K*$temperature/NRk, \"nvw\");\n"
             f"    {vsec}")
     else:
         noise_nodes = f"nw, {nk_nodes}"
         noise_va = (
             "// ---- intrinsic output noise: decoupled Norton current @vout ----\n"
             "    // white floor: R-only node nw (V PSD = 4kT*NRk) transconducted by gw\n"
-            "    I(nw)   <+ V(nw)/NRk;\n"
-            "    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, \"nw\");\n"
-            "    I(vout) <+ gnw*V(nw);\n"
+            "    I(nw, gnd)   <+ V(nw, gnd)/NRk;\n"
+            "    I(nw, gnd)   <+ white_noise(4*`P_K*$temperature/NRk, \"nw\");\n"
+            "    I(vout, gnd) <+ gnw*V(nw, gnd);\n"
             f"    // {MNOISE} Lorentzian sections: R||C node nk (corner fk) transconducted by g_k\n"
             f"    {nsec}")
     # deterministic intrinsic spur tones at vout ($abstime -> correct in tran AND PSS/HB).
     # NEGATIVE sign so I(vout)<+ ... injects current INTO vout (matches the SPICE
     # '0 vout' source order), so the reproduced tone phase matches the GT.
     spur_va = "\n    ".join(
-        f"I(vout) <+ -sa{k+1}*sin(`M_TWO_PI*{fk:.6e}*$abstime + ({ph:.6f}));"
+        f"I(vout, gnd) <+ -sa{k+1}*sin(`M_TWO_PI*{fk:.6e}*$abstime + ({ph:.6f}));"
         for k, (fk, ph) in enumerate(zip(NSPUR_F, NSPUR_PH)))
     if not spur_va:
         spur_va = "// (no intrinsic spurs for this variant)"
@@ -1453,17 +1511,25 @@ def emit_va(P, path, tbl_path):
 //   Noise= DECOUPLED Norton @vout: white-R + {MNOISE} R||C-Lorentzian current sections,
 //          transconducted into vout (gm sets amplitude) -> In*|Zout| = Sv. pnoise/hbnoise.
 //   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout) via $table_model
+// Ports: vin vout gnd (explicit ground -- no global-ground references inside).
+// Instance params: iload, slew_en, vdd (supply DC ref + dc_linereg Vout tracking),
+//   voutdc (>0 pins Vout DC; 0 = characterized). Defaults = characterized behavior.
 // Params interpolated as quadratics in ln(iload) through corners {{{','.join(LOADS)}}}.
 // ============================================================
 `include "constants.vams"
 `include "disciplines.vams"
 
-module ldo_model(vin, vout);
-  inout vin, vout;
-  electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, {noise_nodes};
+module ldo_model(vin, vout, gnd);
+  inout vin, vout, gnd;
+  electrical vin, vout, gnd, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, {noise_nodes};
 
   parameter real iload   = {_amps(NOMINAL):.6e} from (0:inf);
   parameter integer slew_en = 0 from [0:1];
+  parameter real vdd    = {VREF:g};   // supply DC operating point [V]: PSRR DC reference
+                                    // + dc_linereg Vout-DC tracking (clamped to the
+                                    // characterized span [{lrlo:g},{lrhi:g}]V)
+  parameter real voutdc = 0 from [0:inf);   // >0: pin Vout DC at this iload [V]
+                                            // (0 = characterized DC; small-signal unchanged)
   parameter real Cout = {C:.6e};   // auto-extracted physical output cap
   parameter real ESR  = {RC:.6e};   // auto-extracted physical ESR{cft_par_va}
   parameter real VREG121 = {vreg121:.6e};
@@ -1472,6 +1538,7 @@ module ldo_model(vin, vout);
 
   real u, ic, R_a, L_a, R_pl, R_b, L_b, G0, G1, w1, G2, w2, G3, w3, {gvars}, vreg, Cps;
   real pcb0, pcb1, pcw0, pcq, pca1, pca2, Rpc, Lpc, Cpc, gqb1;
+  real vddc, lrsh, vregeff;
 
   analog begin
     @(initial_step) begin
@@ -1483,11 +1550,15 @@ module ldo_model(vin, vout);
       Cpc = 1e-12;
       pca1 = 1.0/(pcq*pcw0); pca2 = 1.0/(pcw0*pcw0);
       Rpc = pca1/Cpc; Lpc = pca2/Cpc; gqb1 = pcb1/pca1;
+      // R3-L1: vdd line-reg DC shift (characterized dc_linereg poly) / voutdc override
+      vddc = min(max(vdd, {lrlo:.6e}), {lrhi:.6e});
+      lrsh = {lrbody} - ({lrnom:.6e});
+      vregeff = (voutdc > 0) ? voutdc + R_a*ic : vreg + lrsh;
     end
 
     // ---- references / DC operating point ----
-    V(vrf) <+ {VREF:g};                  // nominal-vin reference (no DC coupling)
-    V(vrg) <+ vreg;                  // regulated output reference (vreg = real var)
+    V(vrf, gnd) <+ vdd;              // supply DC reference (settable; no DC coupling)
+    V(vrg, gnd) <+ vregeff;          // regulated output reference (incl. R3-L1 shift)
 
     // ---- Zout branch C: series Cout + ESR (vout -> vrg) ----
     I(vout, nC) <+ Cout*ddt(V(vout, nC));
@@ -1503,22 +1574,22 @@ module ldo_model(vin, vout);
     if (slew_en == 0)
       V(nA, {arail}) <+ R_a*I(nA, {arail});
     else                             // $table_model control string may be Spectre-version specific
-      I({arail}, nA) <+ $table_model(V({arail}, nA) - (vreg - VREG121), "{tbl_path.name}", "1L");
+      I({arail}, nA) <+ $table_model(V({arail}, nA) - (vregeff - VREG121), "{tbl_path.name}", "1L");
 
     {noise_va}
 
-    // ---- PSRR path: i_c = G0 + sum Gi*LP_i(vin-1.05) into vout (x Zout) ----
+    // ---- PSRR path: i_c = G0 + sum Gi*LP_i(vin-vdd) into vout (x Zout) ----
     // signed real-pole section bank (R_i = 1/(wi*Cps), so 1/R_i = wi*Cps)
-    I(vin, np1) <+ (V(vin) - V(np1))*(w1*Cps);
+    I(vin, np1) <+ V(vin, np1)*(w1*Cps);
     I(np1, vrf) <+ Cps*ddt(V(np1, vrf));
-    I(vin, np2) <+ (V(vin) - V(np2))*(w2*Cps);
+    I(vin, np2) <+ V(vin, np2)*(w2*Cps);
     I(np2, vrf) <+ Cps*ddt(V(np2, vrf));
-    I(vin, np3) <+ (V(vin) - V(np3))*(w3*Cps);
+    I(vin, np3) <+ V(vin, np3)*(w3*Cps);
     I(np3, vrf) <+ Cps*ddt(V(np3, vrf));
-    // NEGATIVE sign so I(vout)<+ ... injects current INTO vout (matches the SPICE
-    // 'G* 0 vout' source order / the .lib +H realization; same convention as spurs).
-    I(vout)     <+ -(G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
-                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf)));
+    // NEGATIVE sign so I(vout,gnd)<+ ... injects current INTO vout (matches the SPICE
+    // 'G* gnd vout' source order / the .lib +H realization; same convention as spurs).
+    I(vout, gnd) <+ -(G0*V(vin, vrf) + G1*V(np1, vrf)
+                   + G2*V(np2, vrf) + G3*V(np3, vrf));
 
     // ---- PSRR complex-conjugate 2nd-order section (non-min-phase / notch phase) ----
     // series R-L-C lowpass state x=V(ncs2,vrf); b0 reads V_C=x, b1 reads V_R=a1*dx/dt.
@@ -1526,7 +1597,7 @@ module ldo_model(vin, vout);
     I(vin, ncs1)  <+ V(vin, ncs1)/Rpc;
     I(ncs1, ncs2) <+ idt(V(ncs1, ncs2))/Lpc;
     I(ncs2, vrf)  <+ Cpc*ddt(V(ncs2, vrf));
-    I(vout)       <+ -(pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1));   // INTO vout (see bank above)
+    I(vout, gnd)  <+ -(pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1));   // INTO vout (see bank above)
 
     // ---- intrinsic discrete spurs: deterministic current tones @vout ----
     {spur_va}

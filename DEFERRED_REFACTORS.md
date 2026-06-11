@@ -68,7 +68,15 @@ read by both `gen_reference` and `score`.
 
 ## R2 — Emitted `.va` (and `.lib`) has no GND terminal
 
-**Status:** OPEN — batch with R1/R3 after the current real LDO is modeled.
+**Status:** **DONE 2026-06-11** (after Target-B small-signal verification closed the deferral
+condition). `module ldo_model(vin, vout, gnd)` / `.subckt ldo_model vin vout gnd ...`; every
+internal reference re-railed to the gnd port (no global-node access remains — proven by the
+floating-ground test in `harness/validate_r2r3.py`: gnd lifted −0.317 V, Zout delta 0.00 dB).
+Harness benches auto-detect the DUT port count (`bench.subckt_ports`/`bench.xline`) so the
+2-port GT subckts and the 3-port model share one bench. Matrix value-identical 19/19; the
+compiled 3-port `.va` reproduces the `.lib` to 0.0000 dB / 0.0000° (OSDI AC cross-check).
+**Red-zone note: the Cadence symbol must be RE-CREATED with the third (gnd) pin after the
+next package update.**
 
 **Raised:** 2026-06-08, user instantiated the emitted Verilog-A symbol in Cadence.
 
@@ -94,7 +102,17 @@ wireable terminal.
 
 ## R3 — VDD is not a settable / sweepable supply on the emitted model
 
-**Status:** OPEN — batch with R1/R2 after the current real LDO is modeled.
+**Status:** **L1 DONE 2026-06-11** (user decision: L1 suffices, L2 not needed for now).
+Instance params on both emits: `vdd` (supply DC operating point, default = characterized
+nominal; drives the PSRR reference `vrf` AND shifts Vout DC along a deg-≤4 polynomial of the
+previously-unused `ref["dc_linereg"]` curve, clamped to its measured span) and `voutdc`
+(>0 pins Vout DC at the instance iload; 0 = characterized). Acceptance
+(`harness/validate_r2r3.py`): vdd tracking follows GT linereg to ≤3.7 mV incl. the 0.9 V
+dropout knee; voutdc pins exactly; defaults reproduce the characterized DC to <0.1 mV.
+**L2 (small-signal Zout/PSRR/noise AT off-nominal VDD, the vin×iload second interpolation
+axis) remains OPEN** — needs per-supply-corner red-zone exports; revisit if the supply-corner
+small-signal fidelity ever matters. NOTE the L1 semantics: the operating point comes from the
+`vdd` PARAMETER; sweeping the vin SOURCE shows only the (correct) small-signal line-reg slope.
 
 **Raised:** 2026-06-08. User: "Q'ing the symbol there's nowhere to set VDD; I will run high /
 nominal / low supply corners, so VDD must be changeable."

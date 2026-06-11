@@ -161,7 +161,7 @@ def _plan(fc, delta, nbeat=NBEAT, ppp=PTS_PER_PERIOD, nset=NSET):
 
 
 # -------------------------------------------------------------------------- testbench / FFT
-def _deck(subckt, xparams, plan, ibuf, k, vrip, Inom, voutdc):
+def _deck(libs, subckt, xparams, plan, ibuf, k, vrip, Inom, voutdc):
     """LDO DUT + supply-ripple aggressor on vin + vout-dependent (mixing) buffer on vout."""
     w = 2.0 * math.pi * plan["fc"]
     gm = ibuf * k                        # supply-push transconductance (the mixer term)
@@ -169,7 +169,7 @@ def _deck(subckt, xparams, plan, ibuf, k, vrip, Inom, voutdc):
     bexpr = (f"{ibuf:.8e}*sin({w:.10e}*time)"
              f"+{gm:.8e}*(V(vout)-({voutdc:.8e}))*sin({w:.10e}*time)")
     return f"""* system test: LDO + buffer @ carrier
-Xdut vin vout {subckt} {xparams}
+{bench.xline(libs, subckt, xparams)}
 Vin vin 0 DC 1.05 SIN(1.05 {vrip:.8e} {plan['delta']:.8e})
 Iload vout 0 DC {Inom:.8e}
 Bbuf vout 0 I = {bexpr}
@@ -185,7 +185,7 @@ quit
 
 def _run_tb(libs, subckt, xparams, plan, ibuf, k, vrip, Inom, voutdc, tag):
     libs = list(libs) if isinstance(libs, (list, tuple)) else [libs]
-    tb = _deck(subckt, xparams, plan, ibuf, k, vrip, Inom, voutdc)
+    tb = _deck(libs, subckt, xparams, plan, ibuf, k, vrip, Inom, voutdc)
     r = ng.run(ng.assemble(tb, libs=libs), bench.WORK / f"sys_{tag}",
                outputs=["out.dat"], timeout=SYS_TIMEOUT)
     if r["out.dat"] is None:

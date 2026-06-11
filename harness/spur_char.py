@@ -25,7 +25,7 @@ def _tran_vout(lib, subckt, iload, xparams="", dt=DT, tstop=TSTOP, extra=""):
     import bench
     libs = list(lib) if isinstance(lib, (list, tuple)) else [lib]
     tb = f"""* intrinsic output-spectrum transient
-Xdut vin vout {subckt} {xparams}
+{bench.xline(libs, subckt, xparams)}
 Vin vin 0 DC 1.05
 Iload vout 0 DC {iload}
 {extra}

@@ -418,7 +418,7 @@ def part8_hybrid_noise():
     assert "Bra  vrgn nA" in txt, ".lib branch A not re-railed to vrgn"
     assert ".param snw" in txt, ".lib lacks the snw param"
     vtxt = va.read_text()
-    assert "vrgn" in vtxt and "V(vrgn, vrg) <+ snw*V(nvw)" in vtxt, \
+    assert "vrgn" in vtxt and "V(vrgn, vrg) <+ snw*V(nvw, gnd)" in vtxt, \
         ".va lacks the series voltage-bank realization"
     print(f"   emitted {lib.name}: vrgn/Evw fragments present; .va has the series bank")
     _cleanup(path)

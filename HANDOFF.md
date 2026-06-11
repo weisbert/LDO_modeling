@@ -1,4 +1,23 @@
-# HANDOFF — LDO behavioral-model builder (as of 2026-06-10)
+# HANDOFF — LDO behavioral-model builder (as of 2026-06-11)
+
+## UPDATE (2026-06-11c) — R2 + R3-L1 SHIPPED: gnd port + settable vdd/voutdc on the emitted model
+
+User confirmed the deferred interface gaps were real ("the .va still has only vin/vout, and I
+can't set Vout's DC") — both were R2/R3 in DEFERRED_REFACTORS.md, deferral condition (Target-B
+modeled) met this morning. Shipped in one pass (user chose **R3 = L1 only**; L2 = vin×iload
+small-signal axis stays OPEN pending need):
+- **R2**: `.va` = `module ldo_model(vin, vout, gnd)`, `.lib` = `.subckt ldo_model vin vout gnd`;
+  ALL internal references re-railed (zero global-ground access — floating-gnd test: lift gnd
+  −0.317V, Zout delta 0.00dB). Benches auto-detect DUT port count (`bench.xline`) so 2-port GT
+  and 3-port model share one bench. **Red zone must RE-CREATE the Cadence symbol (3 pins).**
+- **R3-L1**: instance params `vdd` (PSRR DC reference + Vout-DC tracking along the previously
+  UNUSED `dc_linereg` curve, poly deg≤4 clamped to its span) + `voutdc` (>0 pins Vout DC at the
+  instance iload). Defaults reproduce the characterized DC exactly.
+- **Validated**: `harness/validate_r2r3.py` (NEW, 4 gates) PASS — float-gnd 0.00dB / vdd
+  tracking ≤3.7mV incl. the 0.9V dropout knee / voutdc pin exact / default DC exact; matrix
+  **19/19 value-identical**; validate_capless PASS (one stale text assertion updated);
+  GUI selftest PASS; OpenVAF-compiled 3-port `.va` == `.lib` to **0.0000dB/0.0000°** (OSDI AC).
+- Still open in the R-batch: R1 (profile-driven step sizes), R3-L2, R8 ($table_model).
 
 > **Deferred refactors:** see `DEFERRED_REFACTORS.md` (do as one batch AFTER the current
 > Target-B LDO is modeled). Open: **R1** de-hardcode `trans_big`/`trans_slew` + nominal corner

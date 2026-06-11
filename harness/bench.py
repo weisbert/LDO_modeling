@@ -1,4 +1,4 @@
-"""Canonical measurement bench, parameterized by DUT (subckt name + lib file).
+﻿"""Canonical measurement bench, parameterized by DUT (subckt name + lib file).
 
 Same stimuli are applied to the ground-truth LDO and to any candidate model,
 so model-vs-GT comparison is apples-to-apples. This is the core of the
@@ -66,9 +66,54 @@ def _run(tb, lib, tag, out="out.dat"):
     return r[out][1]
 
 
+_PORTS_CACHE = {}
+
+
+def subckt_ports(lib, subckt):
+    """Port count of `.subckt <subckt> ...` in the lib file(s): node tokens before the
+    first param=value token. The emitted model gained an explicit gnd port (R2) while
+    the GT subckts remain 2-port -- one bench serves both via this detection.
+    Defaults to 2 when the definition is not found (legacy behavior)."""
+    import re
+    libs = tuple(str(p) for p in (lib if isinstance(lib, (list, tuple)) else [lib]))
+    key = None
+    try:
+        key = (libs, subckt.lower(),
+               tuple(os.path.getmtime(p) for p in libs if os.path.exists(p)))
+        if key in _PORTS_CACHE:
+            return _PORTS_CACHE[key]
+    except OSError:
+        pass
+    n = 2
+    pat = re.compile(rf"^\s*\.subckt\s+{re.escape(subckt)}\s+(.*)$", re.IGNORECASE)
+    for p in libs:
+        try:
+            for line in open(p, encoding="utf-8", errors="replace"):
+                m = pat.match(line)
+                if m:
+                    toks = m.group(1).split()
+                    n = sum(1 for t in toks if "=" not in t)
+                    break
+            else:
+                continue
+            break
+        except OSError:
+            continue
+    if key is not None:
+        _PORTS_CACHE[key] = n
+    return n
+
+
+def xline(lib, subckt, xparams="", inst="Xdut"):
+    """DUT instantiation line for the standard vin/vout bench. A 3-port DUT (the
+    emitted model's explicit gnd, R2) gets its ground tied to node 0."""
+    gndtie = " 0" if subckt_ports(lib, subckt) >= 3 else ""
+    return f"{inst} vin vout{gndtie} {subckt} {xparams}"
+
+
 def measure_zout(lib, subckt, iload, xparams="", accmd=AC):
     tb = f"""* Zout
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05
 Iload vout 0 DC {iload} AC 0
 Iac 0 vout AC 1
@@ -85,7 +130,7 @@ quit
 
 def measure_psrr(lib, subckt, iload, xparams="", accmd=AC):
     tb = f"""* PSRR
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05 AC 1
 Iload vout 0 DC {iload}
 .control
@@ -104,7 +149,7 @@ def measure_noise(lib, subckt, iload, xparams=""):
     intrinsic LDO self-noise (Vin is an ideal DC source -> contributes no noise),
     so this is exactly the target a Norton output-noise source must reproduce."""
     tb = f"""* output noise PSD
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05 AC 1
 Iload vout 0 DC {iload}
 .control
@@ -125,7 +170,7 @@ def measure_loadstep(lib, subckt, dI, iload=STEP_BASE, xparams=""):
     onto a uniform STEP_DT grid so GT and model are directly comparable."""
     b = iload
     tb = f"""* load step
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05
 Iload vout 0 PWL(0 {b:g} {STEP_T0:g} {b:g} {STEP_T0+1e-9:g} {b+dI:g} {STEP_T1:g} {b+dI:g} {STEP_T1+1e-9:g} {b:g} {STEP_TSTOP:g} {b:g})
 .control
@@ -144,7 +189,7 @@ quit
 
 def measure_dc_loadreg(lib, subckt, xparams="", istop="500u", istep="2u"):
     tb = f"""* dc load reg
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05
 Iload vout 0 DC 1u
 .control
@@ -161,7 +206,7 @@ quit
 
 def measure_dc_linereg(lib, subckt, iload="121u", xparams=""):
     tb = f"""* dc line reg
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05
 Iload vout 0 DC {iload}
 .control
@@ -192,7 +237,7 @@ def ring_freq(t, v, t0=STEP_T0, win=3e-6, fmin=3e5):
 
 def measure_spur(lib, subckt, amp="500u", iload="121u", xparams=""):
     tb = f"""* spur / nonlinearity probe (pure {FTONE:g} Hz load tone)
-Xdut vin vout {subckt} {xparams}
+{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05
 Iload vout 0 DC {iload}
 Itone vout 0 DC 0 SIN(0 {amp} {FTONE})

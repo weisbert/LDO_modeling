@@ -8,17 +8,25 @@
 //   Noise= DECOUPLED Norton @vout: white-R + 6 R||C-Lorentzian current sections,
 //          transconducted into vout (gm sets amplitude) -> In*|Zout| = Sv. pnoise/hbnoise.
 //   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout) via $table_model
+// Ports: vin vout gnd (explicit ground -- no global-ground references inside).
+// Instance params: iload, slew_en, vdd (supply DC ref + dc_linereg Vout tracking),
+//   voutdc (>0 pins Vout DC; 0 = characterized). Defaults = characterized behavior.
 // Params interpolated as quadratics in ln(iload) through corners {20u,121u,250u}.
 // ============================================================
 `include "constants.vams"
 `include "disciplines.vams"
 
-module ldo_model(vin, vout);
-  inout vin, vout;
-  electrical vin, vout, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, nw, nk1, nk2, nk3, nk4, nk5, nk6;
+module ldo_model(vin, vout, gnd);
+  inout vin, vout, gnd;
+  electrical vin, vout, gnd, vrg, nA, nC, nbb, np1, np2, np3, vrf, ncs1, ncs2, nw, nk1, nk2, nk3, nk4, nk5, nk6;
 
   parameter real iload   = 1.210000e-04 from (0:inf);
   parameter integer slew_en = 0 from [0:1];
+  parameter real vdd    = 1.05;   // supply DC operating point [V]: PSRR DC reference
+                                    // + dc_linereg Vout-DC tracking (clamped to the
+                                    // characterized span [0.9,1.3]V)
+  parameter real voutdc = 0 from [0:inf);   // >0: pin Vout DC at this iload [V]
+                                            // (0 = characterized DC; small-signal unchanged)
   parameter real Cout = 9.720720e-10;   // auto-extracted physical output cap
   parameter real ESR  = 2.997746e+00;   // auto-extracted physical ESR
   parameter real VREG121 = 9.011906e-01;
@@ -32,6 +40,7 @@ module ldo_model(vin, vout);
 
   real u, ic, R_a, L_a, R_pl, R_b, L_b, G0, G1, w1, G2, w2, G3, w3, gnw, gn1, gn2, gn3, gn4, gn5, gn6, vreg, Cps;
   real pcb0, pcb1, pcw0, pcq, pca1, pca2, Rpc, Lpc, Cpc, gqb1;
+  real vddc, lrsh, vregeff;
 
   analog begin
     @(initial_step) begin
@@ -66,11 +75,15 @@ module ldo_model(vin, vout);
       Cpc = 1e-12;
       pca1 = 1.0/(pcq*pcw0); pca2 = 1.0/(pcw0*pcw0);
       Rpc = pca1/Cpc; Lpc = pca2/Cpc; gqb1 = pcb1/pca1;
+      // R3-L1: vdd line-reg DC shift (characterized dc_linereg poly) / voutdc override
+      vddc = min(max(vdd, 9.000000e-01), 1.300000e+00);
+      lrsh = (-9.641010e+00)*vddc*vddc*vddc*vddc + (4.378899e+01)*vddc*vddc*vddc + (-7.433767e+01)*vddc*vddc + (5.590457e+01)*vddc + (-1.481593e+01) - (8.991185e-01);
+      vregeff = (voutdc > 0) ? voutdc + R_a*ic : vreg + lrsh;
     end
 
     // ---- references / DC operating point ----
-    V(vrf) <+ 1.05;                  // nominal-vin reference (no DC coupling)
-    V(vrg) <+ vreg;                  // regulated output reference (vreg = real var)
+    V(vrf, gnd) <+ vdd;              // supply DC reference (settable; no DC coupling)
+    V(vrg, gnd) <+ vregeff;          // regulated output reference (incl. R3-L1 shift)
 
     // ---- Zout branch C: series Cout + ESR (vout -> vrg) ----
     I(vout, nC) <+ Cout*ddt(V(vout, nC));
@@ -86,45 +99,45 @@ module ldo_model(vin, vout);
     if (slew_en == 0)
       V(nA, vrg) <+ R_a*I(nA, vrg);
     else                             // $table_model control string may be Spectre-version specific
-      I(vrg, nA) <+ $table_model(V(vrg, nA) - (vreg - VREG121), "ldo_esr_hi_dropout.tbl", "1L");
+      I(vrg, nA) <+ $table_model(V(vrg, nA) - (vregeff - VREG121), "ldo_esr_hi_dropout.tbl", "1L");
 
     // ---- intrinsic output noise: decoupled Norton current @vout ----
     // white floor: R-only node nw (V PSD = 4kT*NRk) transconducted by gw
-    I(nw)   <+ V(nw)/NRk;
-    I(nw)   <+ white_noise(4*`P_K*$temperature/NRk, "nw");
-    I(vout) <+ gnw*V(nw);
+    I(nw, gnd)   <+ V(nw, gnd)/NRk;
+    I(nw, gnd)   <+ white_noise(4*`P_K*$temperature/NRk, "nw");
+    I(vout, gnd) <+ gnw*V(nw, gnd);
     // 6 Lorentzian sections: R||C node nk (corner fk) transconducted by g_k
-    I(nk1) <+ V(nk1)/NRk + Cn1*ddt(V(nk1));
-    I(nk1) <+ white_noise(4*`P_K*$temperature/NRk, "nk1");
-    I(vout)    <+ gn1*V(nk1);
-    I(nk2) <+ V(nk2)/NRk + Cn2*ddt(V(nk2));
-    I(nk2) <+ white_noise(4*`P_K*$temperature/NRk, "nk2");
-    I(vout)    <+ gn2*V(nk2);
-    I(nk3) <+ V(nk3)/NRk + Cn3*ddt(V(nk3));
-    I(nk3) <+ white_noise(4*`P_K*$temperature/NRk, "nk3");
-    I(vout)    <+ gn3*V(nk3);
-    I(nk4) <+ V(nk4)/NRk + Cn4*ddt(V(nk4));
-    I(nk4) <+ white_noise(4*`P_K*$temperature/NRk, "nk4");
-    I(vout)    <+ gn4*V(nk4);
-    I(nk5) <+ V(nk5)/NRk + Cn5*ddt(V(nk5));
-    I(nk5) <+ white_noise(4*`P_K*$temperature/NRk, "nk5");
-    I(vout)    <+ gn5*V(nk5);
-    I(nk6) <+ V(nk6)/NRk + Cn6*ddt(V(nk6));
-    I(nk6) <+ white_noise(4*`P_K*$temperature/NRk, "nk6");
-    I(vout)    <+ gn6*V(nk6);
+    I(nk1, gnd) <+ V(nk1, gnd)/NRk + Cn1*ddt(V(nk1, gnd));
+    I(nk1, gnd) <+ white_noise(4*`P_K*$temperature/NRk, "nk1");
+    I(vout, gnd)    <+ gn1*V(nk1, gnd);
+    I(nk2, gnd) <+ V(nk2, gnd)/NRk + Cn2*ddt(V(nk2, gnd));
+    I(nk2, gnd) <+ white_noise(4*`P_K*$temperature/NRk, "nk2");
+    I(vout, gnd)    <+ gn2*V(nk2, gnd);
+    I(nk3, gnd) <+ V(nk3, gnd)/NRk + Cn3*ddt(V(nk3, gnd));
+    I(nk3, gnd) <+ white_noise(4*`P_K*$temperature/NRk, "nk3");
+    I(vout, gnd)    <+ gn3*V(nk3, gnd);
+    I(nk4, gnd) <+ V(nk4, gnd)/NRk + Cn4*ddt(V(nk4, gnd));
+    I(nk4, gnd) <+ white_noise(4*`P_K*$temperature/NRk, "nk4");
+    I(vout, gnd)    <+ gn4*V(nk4, gnd);
+    I(nk5, gnd) <+ V(nk5, gnd)/NRk + Cn5*ddt(V(nk5, gnd));
+    I(nk5, gnd) <+ white_noise(4*`P_K*$temperature/NRk, "nk5");
+    I(vout, gnd)    <+ gn5*V(nk5, gnd);
+    I(nk6, gnd) <+ V(nk6, gnd)/NRk + Cn6*ddt(V(nk6, gnd));
+    I(nk6, gnd) <+ white_noise(4*`P_K*$temperature/NRk, "nk6");
+    I(vout, gnd)    <+ gn6*V(nk6, gnd);
 
-    // ---- PSRR path: i_c = G0 + sum Gi*LP_i(vin-1.05) into vout (x Zout) ----
+    // ---- PSRR path: i_c = G0 + sum Gi*LP_i(vin-vdd) into vout (x Zout) ----
     // signed real-pole section bank (R_i = 1/(wi*Cps), so 1/R_i = wi*Cps)
-    I(vin, np1) <+ (V(vin) - V(np1))*(w1*Cps);
+    I(vin, np1) <+ V(vin, np1)*(w1*Cps);
     I(np1, vrf) <+ Cps*ddt(V(np1, vrf));
-    I(vin, np2) <+ (V(vin) - V(np2))*(w2*Cps);
+    I(vin, np2) <+ V(vin, np2)*(w2*Cps);
     I(np2, vrf) <+ Cps*ddt(V(np2, vrf));
-    I(vin, np3) <+ (V(vin) - V(np3))*(w3*Cps);
+    I(vin, np3) <+ V(vin, np3)*(w3*Cps);
     I(np3, vrf) <+ Cps*ddt(V(np3, vrf));
-    // NEGATIVE sign so I(vout)<+ ... injects current INTO vout (matches the SPICE
-    // 'G* 0 vout' source order / the .lib +H realization; same convention as spurs).
-    I(vout)     <+ -(G0*(V(vin) - V(vrf)) + G1*(V(np1) - V(vrf))
-                   + G2*(V(np2) - V(vrf)) + G3*(V(np3) - V(vrf)));
+    // NEGATIVE sign so I(vout,gnd)<+ ... injects current INTO vout (matches the SPICE
+    // 'G* gnd vout' source order / the .lib +H realization; same convention as spurs).
+    I(vout, gnd) <+ -(G0*V(vin, vrf) + G1*V(np1, vrf)
+                   + G2*V(np2, vrf) + G3*V(np3, vrf));
 
     // ---- PSRR complex-conjugate 2nd-order section (non-min-phase / notch phase) ----
     // series R-L-C lowpass state x=V(ncs2,vrf); b0 reads V_C=x, b1 reads V_R=a1*dx/dt.
@@ -132,7 +145,7 @@ module ldo_model(vin, vout);
     I(vin, ncs1)  <+ V(vin, ncs1)/Rpc;
     I(ncs1, ncs2) <+ idt(V(ncs1, ncs2))/Lpc;
     I(ncs2, vrf)  <+ Cpc*ddt(V(ncs2, vrf));
-    I(vout)       <+ -(pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1));   // INTO vout (see bank above)
+    I(vout, gnd)  <+ -(pcb0*V(ncs2, vrf) + gqb1*V(vin, ncs1));   // INTO vout (see bank above)
 
     // ---- intrinsic discrete spurs: deterministic current tones @vout ----
     // (no intrinsic spurs for this variant)
