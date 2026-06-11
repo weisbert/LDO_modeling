@@ -1574,7 +1574,11 @@ module ldo_model(vin, vout, gnd);
     if (slew_en == 0)
       V(nA, {arail}) <+ R_a*I(nA, {arail});
     else                             // $table_model control string may be Spectre-version specific
-      I({arail}, nA) <+ $table_model(V({arail}, nA) - (vregeff - VREG121), "{tbl_path.name}", "1L");
+      // ABSOLUTE table path from emit time: $table_model resolves a bare name against the
+      // SIMULATOR RUN DIR (not the .va location) -> "open failed" in ADE. Re-emit (or edit
+      // this one line) if the table file is moved. (A `parameter string` override would be
+      // cleaner but crashes OpenVAF and is unverified on non-Spectre simulators.)
+      I({arail}, nA) <+ $table_model(V({arail}, nA) - (vregeff - VREG121), "{str(tbl_path.resolve()).replace(chr(92), '/')}", "1L");
 
     {noise_va}
 

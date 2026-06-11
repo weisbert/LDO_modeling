@@ -25,30 +25,44 @@ REFDIR = ROOT / "results" / "ref"
 
 
 def parse_digest(text):
-    """-> dict corner -> ndarray[N,6] (nan for '-'), in file order."""
-    corners = {}
-    cur = None
+    """-> (corners, dcblocks): corner -> ndarray[N,6] (nan for '-') in file order, plus
+    optional '# dcblock <name>' 2-column DC curves (dc_loadreg/dc_linereg/dc_dropout --
+    newer red-zone reports carry them so the replica's DC is real, not synthesized)."""
+    corners, dcblocks = {}, {}
+    cur = curdc = None
     for raw in text.splitlines():
         line = raw.strip()
         m = re.match(r"#\s*corner\s+(\S+)", line)
         if m:
-            cur = m.group(1)
+            cur, curdc = m.group(1), None
             corners[cur] = []
             continue
-        if not line or line.startswith("#") or cur is None:
+        m = re.match(r"#\s*dcblock\s+(\S+)", line)
+        if m:
+            curdc, cur = m.group(1), None
+            dcblocks[curdc] = []
+            continue
+        if not line or line.startswith("#"):
             continue
         toks = [t.strip() for t in line.split(",")]
-        if len(toks) < 6:
+        if curdc is not None and len(toks) >= 2:
+            try:
+                dcblocks[curdc].append([float(toks[0]), float(toks[1])])
+            except ValueError:
+                pass
+            continue
+        if cur is None or len(toks) < 6:
             continue
         try:
             row = [float("nan") if t == "-" else float(t) for t in toks[:6]]
         except ValueError:
             continue
         corners[cur].append(row)
-    return {il: np.array(rows, float) for il, rows in corners.items() if rows}
+    return ({il: np.array(rows, float) for il, rows in corners.items() if rows},
+            {k: np.array(v, float) for k, v in dcblocks.items() if len(v) >= 2})
 
 
-def check_sufficiency(corners):
+def check_sufficiency(corners, synth_dc=None):
     """Digest SUFFICIENCY screen: the air-gap digest is a lossy, log-resampled copy of
     the real GT -- a fit on an inadequate digest converges confidently to the wrong
     model and there is no held-out data on this side of the gap to catch it. Returns
@@ -97,13 +111,22 @@ def check_sufficiency(corners):
         elif pfin.sum() < 0.5 * len(f):
             out.append(("INFO", f"corner {il}: PSRR sampled at only {int(pfin.sum())}/{len(f)} "
                                 f"digest points"))
-    out.append(("INFO", "DC curves (loadreg/linereg/dropout) are SYNTHESIZED from LF Re(Zout) "
-                        "-- the digest carries no DC sweeps; dc_dropout / slew_en=1 large-signal "
-                        "behavior is a placeholder, do not trust it for a real part"))
+    if synth_dc is None or synth_dc == ["dc_loadreg", "dc_linereg", "dc_dropout"]:
+        out.append(("INFO", "DC curves (loadreg/linereg/dropout) are SYNTHESIZED from LF Re(Zout) "
+                            "-- the digest carries no DC sweeps; dc_dropout / slew_en=1 large-signal "
+                            "behavior is a placeholder, do not trust it for a real part"))
+    elif synth_dc:
+        out.append(("INFO", f"DC curves partially real: {synth_dc} SYNTHESIZED (absent from the "
+                            f"digest), the rest carried as '# dcblock' data"))
+    else:
+        out.append(("INFO", "all three DC curves (loadreg/linereg/dropout) carried as REAL "
+                            "'# dcblock' data -- slew_en=1 dropout table and vdd line-reg "
+                            "tracking are real on this replica"))
     return out
 
 
-def build_ref(corners, name, vref=1.05):
+def build_ref(corners, name, vref=1.05, dcblocks=None):
+    dcblocks = dcblocks or {}
     loads = list(corners.keys())
     ref = {"loads": np.array(loads),
            "meta_cout": np.array(np.nan), "meta_esr": np.array(np.nan),
@@ -120,19 +143,33 @@ def build_ref(corners, name, vref=1.05):
         nk = np.isfinite(a[:, 5])
         ref[f"noise_{il}"] = np.c_[f[nk], a[nk, 5]]
         rdc[il] = float(Z.real[0])              # LF Re(Zout) ~ DC output resistance
-    # synthesized DC curves (the digest carries no DC sweeps): linear load-reg from
-    # the mean LF Re(Z); flat line-reg; dropout = load-reg extended (placeholder)
+    # DC curves: REAL when the digest carries '# dcblock' sections (newer red-zone
+    # reports); otherwise SYNTHESIZED placeholders -- linear load-reg from the mean
+    # LF Re(Z); flat line-reg; dropout = load-reg extended.
     rmean = float(np.mean(list(rdc.values())))
     imax = max(float(il.replace("u", "e-6").replace("m", "e-3")) for il in loads)
-    idc = np.linspace(imax / 400, 4 * imax, 80)
-    ref["dc_loadreg"] = np.c_[idc, vref - rmean * idc]
-    vdc = np.linspace(vref + 0.05, vref + 0.4, 40)
-    ref["dc_linereg"] = np.c_[vdc, vref + 0 * vdc]
-    iddc = np.linspace(imax / 400, 10 * imax, 80)
-    ref["dc_dropout"] = np.c_[iddc, np.maximum(vref - rmean * iddc, 0.2 * vref)]
+    synth = []
+    if "dc_loadreg" in dcblocks:
+        ref["dc_loadreg"] = dcblocks["dc_loadreg"]
+    else:
+        idc = np.linspace(imax / 400, 4 * imax, 80)
+        ref["dc_loadreg"] = np.c_[idc, vref - rmean * idc]
+        synth.append("dc_loadreg")
+    if "dc_linereg" in dcblocks:
+        ref["dc_linereg"] = dcblocks["dc_linereg"]
+    else:
+        vdc = np.linspace(vref + 0.05, vref + 0.4, 40)
+        ref["dc_linereg"] = np.c_[vdc, vref + 0 * vdc]
+        synth.append("dc_linereg")
+    if "dc_dropout" in dcblocks:
+        ref["dc_dropout"] = dcblocks["dc_dropout"]
+    else:
+        iddc = np.linspace(imax / 400, 10 * imax, 80)
+        ref["dc_dropout"] = np.c_[iddc, np.maximum(vref - rmean * iddc, 0.2 * vref)]
+        synth.append("dc_dropout")
     out = REFDIR / f"{name}.npz"
     np.savez(out, **ref)
-    return out, loads
+    return out, loads, synth
 
 
 def main():
@@ -142,14 +179,15 @@ def main():
     ap.add_argument("--vref", type=float, default=1.05)
     a = ap.parse_args()
     p = pathlib.Path(a.digest)
-    corners = parse_digest(p.read_text(encoding="utf-8"))
+    corners, dcblocks = parse_digest(p.read_text(encoding="utf-8"))
     if not corners:
         sys.exit("no '# corner' blocks parsed -- is this a [7] GT DIGEST paste?")
     name = a.name or p.stem
-    out, loads = build_ref(corners, name, vref=a.vref)
+    out, loads, synth_dc = build_ref(corners, name, vref=a.vref, dcblocks=dcblocks)
     print(f"wrote {out}   corners={loads} "
-          f"({', '.join(str(len(corners[il])) + 'pts' for il in loads)})")
-    checks = check_sufficiency(corners)
+          f"({', '.join(str(len(corners[il])) + 'pts' for il in loads)})"
+          + (f"   dcblocks={sorted(dcblocks)}" if dcblocks else ""))
+    checks = check_sufficiency(corners, synth_dc=synth_dc)
     nwarn = sum(1 for lv, _ in checks if lv == "WARN")
     print(f"\nDIGEST SUFFICIENCY ({nwarn} warning(s)):")
     for lv, msg in checks:

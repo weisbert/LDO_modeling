@@ -19,6 +19,25 @@ small-signal axis stays OPEN pending need):
   GUI selftest PASS; OpenVAF-compiled 3-port `.va` == `.lib` to **0.0000dB/0.0000°** (OSDI AC).
 - Still open in the R-batch: R1 (profile-driven step sizes), R3-L2, R8 ($table_model).
 
+**Follow-up (same day): slew_en=1 table-path bug + digest now carries DC curves.**
+- User hit `$table_model error: Open data table file 'myldo_dropout.tbl' failed` in ADE:
+  emit_va wrote a BARE filename, which the simulator resolves against its RUN DIR. Fixed:
+  the `.va` now embeds the **emit-time ABSOLUTE path** (red zone emits on the red box ->
+  path valid there; re-emit or edit one line if the table moves). A `parameter string`
+  override was tried first and REVERTED — it **crashes OpenVAF** (rc=101 internal panic)
+  and is unverified on the red-zone's non-Spectre simulator. Workaround for an already-
+  emitted model: copy the .tbl next to input.scs or hand-edit the path.
+- User confirmed the RED-ZONE myldo.npz has REAL dc_loadreg/dropout (the "synthesized DC"
+  caveat applies only to the LOCAL digest replica). To close that gap, report [7] now
+  appends `# dcblock dc_loadreg/dc_linereg/dc_dropout` (≤64 rows each) and digest_import
+  parses them (real curves win, synthesis = fallback for old digests; sufficiency INFO
+  says which). Roundtrip base: DC curves recovered to ≤0.0005mV.
+- slew_en guidance (user asked): **0 for PSS/HB** (linear validated core, convergence);
+  **1 only for large-signal transient/dropout studies** — legitimate on the red box (real
+  DC data), meaningless on the local replica until a dcblock-carrying digest arrives.
+- Re-validated: matrix 19/19 value-identical, GUI selftest PASS, validate_capless PASS,
+  OSDI AC == .lib 0.0000dB/0.0000° on the literal-path 3-port `.va`.
+
 > **Deferred refactors:** see `DEFERRED_REFACTORS.md` (do as one batch AFTER the current
 > Target-B LDO is modeled). Open: **R1** de-hardcode `trans_big`/`trans_slew` + nominal corner
 > (profile-driven); **R2** emitted `.va`/`.lib` has no GND terminal; **R3** VDD hardcoded —

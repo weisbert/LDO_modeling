@@ -337,6 +337,19 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
         for i, fv in enumerate(grid):
             pr(f"  {fv:.4e}, " + ", ".join(
                 "-" if not np.isfinite(c[i]) else f"{c[i]:.4g}" for c in cols))
+    # DC curves (corner-independent), so the yellow-zone replica gets the REAL
+    # load-reg / line-reg / dropout instead of synthesized placeholders -- makes the
+    # replica's slew_en=1 dropout table and the vdd line-reg tracking real too.
+    for key, desc in (("dc_loadreg", "iload[A], vout[V]"),
+                      ("dc_linereg", "vin[V], vout[V]"),
+                      ("dc_dropout", "iload[A], vout[V]")):
+        d = ref.get(key)
+        if d is None or len(d) < 2:
+            continue
+        idx = np.unique(np.linspace(0, len(d) - 1, min(len(d), 64)).astype(int))
+        pr(f"  # dcblock {key}  (columns: {desc})")
+        for i in idx:
+            pr(f"  {d[i, 0]:.6e}, {d[i, 1]:.6e}")
     pr("=" * 84)
     return "\n".join(L)
 

@@ -99,7 +99,11 @@ module ldo_model(vin, vout, gnd);
     if (slew_en == 0)
       V(nA, vrg) <+ R_a*I(nA, vrg);
     else                             // $table_model control string may be Spectre-version specific
-      I(vrg, nA) <+ $table_model(V(vrg, nA) - (vregeff - VREG121), "ldo_esr_hi_dropout.tbl", "1L");
+      // ABSOLUTE table path from emit time: $table_model resolves a bare name against the
+      // SIMULATOR RUN DIR (not the .va location) -> "open failed" in ADE. Re-emit (or edit
+      // this one line) if the table file is moved. (A `parameter string` override would be
+      // cleaner but crashes OpenVAF and is unverified on non-Spectre simulators.)
+      I(vrg, nA) <+ $table_model(V(vrg, nA) - (vregeff - VREG121), "C:/code/LDO_modeling/model/ldo_esr_hi_dropout.tbl", "1L");
 
     // ---- intrinsic output noise: decoupled Norton current @vout ----
     // white floor: R-only node nw (V PSD = 4kT*NRk) transconducted by gw
