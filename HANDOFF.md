@@ -38,6 +38,17 @@ small-signal axis stays OPEN pending need):
 - Re-validated: matrix 19/19 value-identical, GUI selftest PASS, validate_capless PASS,
   OSDI AC == .lib 0.0000dB/0.0000° on the literal-path 3-port `.va`.
 
+**Follow-up 2 (same day): `$table_model` ELIMINATED — dropout PWL now INLINE (R8 CLOSED).**
+User asked why the table was a separate file at all (it isn't big) — no hard reason, it was
+just Spectre's built-in. `emit_va` now emits the dropout curve as a closed-form sum-of-max
+PWL expression (== 1-D linear interpolation, linear end extrapolation): single-file `.va`
+deliverable (the table-path bug class is gone for good), pure-VAMS portable, and the FULL
+`.va` now OpenVAF-compiles — slew_en=1 locally verified for the first time (OSDI DC sweep
+1µA–5.9mA vs the `.lib` pwl: max 0.012 mV). `.tbl` still written but as a data record only.
+GOTCHA recorded: openvaf's linker drops an import-lib `<name>.lib` next to its output — it
+CLOBBERED `model/ldo_model.lib` once during validation (recovered by re-emit; compile COPIES
+in a scratch dir, never in `model/`).
+
 > **Deferred refactors:** see `DEFERRED_REFACTORS.md` (do as one batch AFTER the current
 > Target-B LDO is modeled). Open: **R1** de-hardcode `trans_big`/`trans_slew` + nominal corner
 > (profile-driven); **R2** emitted `.va`/`.lib` has no GND terminal; **R3** VDD hardcoded —

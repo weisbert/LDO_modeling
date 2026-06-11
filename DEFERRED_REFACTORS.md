@@ -340,9 +340,18 @@ trans-ID productionization round (`REMEDIATION_HANDOFF.md` ROUND R5-prod), and R
 
 ## R8 — Emitted MODEL `.va` does not OpenVAF-compile (`$table_model` dropout branch)
 
-**Status:** OPEN — low priority; only needed if LOCAL OpenVAF/VACASK HB-validation of the *model*
-`.va` is wanted (e.g. for Target B). The `.va`'s intended target (Cadence Spectre) DOES support
-`$table_model`, so this is a local-toolchain gap, not a model defect.
+**Status:** **CLOSED 2026-06-11** — `$table_model` ELIMINATED entirely (user asked why the
+table was a separate file at all; answer: no hard reason, it was just Spectre's built-in).
+`emit_va` now inlines the dropout curve as a closed-form PWL
+(`i = i1 + g1*(v-v1) + sum dg_k*max(v-v_k, 0)` == 1-D linear interpolation, linear end
+extrapolation). Wins: single-file deliverable (kills the run-dir table-path bug class for
+good), pure-VAMS portability (no `$table_model` version variance on non-Spectre simulators),
+and the FULL `.va` (both slew branches) now OpenVAF-compiles → the slew_en=1 path is locally
+verifiable for the first time (OSDI DC sweep vs the `.lib` pwl: max 0.012 mV over
+1µA–5.9mA). The `.tbl` file is still written as a human-readable data record but is NOT
+read by anything. CAUTION for local validation scripts: compile `.va` COPIES in a scratch
+dir — openvaf's linker drops an import-library `<name>.lib` next to its output and will
+CLOBBER the emitted SPICE `.lib`.
 
 **Raised:** 2026-06-09, during the round-2 (v7–v10) `.va` compile-check (continuation of the
 "a `.va` only counts once it compiles" rule).

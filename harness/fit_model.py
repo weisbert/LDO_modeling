@@ -1409,10 +1409,32 @@ def _va_expr(c, logspace):
     return f"exp({body})" if logspace else f"({body})"
 
 
+def _pwl_va_expr(vd, cur, var="vdrp"):
+    """Closed-form Verilog-A expression for linear interpolation through the
+    (vdrop, iload) table: I = i1 + g1*(v-v1) + sum_k (g_k - g_{k-1})*max(v-v_k, 0).
+    Identical to a 1-D linear table lookup inside the table; linear END
+    extrapolation with the first/last segment slope. Replaces $table_model +
+    the external .tbl (R8: run-dir path fragility, not OpenVAF-compilable)."""
+    g = np.diff(cur) / np.diff(vd)
+    terms = [f"({cur[0]:.6e}) + ({g[0]:.6e})*({var}-({vd[0]:.6e}))"]
+    for k in range(1, len(g)):
+        dg = g[k] - g[k - 1]
+        if dg == 0.0:
+            continue
+        terms.append(f"({dg:.6e})*max({var}-({vd[k]:.6e}),0)")
+    # wrap ~4 terms per line so the generated .va stays diffable
+    lines = []
+    for i in range(0, len(terms), 4):
+        lines.append(" + ".join(terms[i:i + 4]))
+    return ("\n                       + ").join(lines)
+
+
 def emit_va(P, path, tbl_path):
     """Emit an equivalent Verilog-A model for Cadence Spectre. Mirrors the validated
     SPICE topology. Noise is a decoupled Norton @vout (white + MNOISE R||C-Lorentzian
-    sections -> matches In=Sv/|Zout|). Nonlinear dropout via $table_model reading .tbl.
+    sections -> matches In=Sv/|Zout|). Nonlinear dropout (slew_en=1) is an INLINE
+    closed-form PWL of the DC curve -- single-file deliverable, no external table
+    (the .tbl is still written as a data record but is NOT read by the .va).
     R2: explicit gnd port (no global-ground references -- the model floats with its
     bench). R3-L1: vdd (supply DC reference + dc_linereg DC tracking) and voutdc
     (direct output-DC override) instance parameters; defaults reproduce the
@@ -1430,14 +1452,17 @@ def emit_va(P, path, tbl_path):
              + [(f"sa{k+1}", True) for k in range(len(NSPUR_F))] + [("vreg", False)])
     asg = "\n      ".join(f"{k} = {_pexpr(P, k, ls)};" for k, ls in specs)
     vreg121 = P[NOMINAL]["vreg"]
-    # export dropout table (Vdrop relative to nominal vreg, I) for $table_model
+    # dropout table (Vdrop relative to nominal vreg, I): INLINED as a closed-form PWL
+    # expression; the .tbl file is still written as a human-readable data record only.
     dl, dd = ref["dc_loadreg"], ref["dc_dropout"]
     il = np.concatenate([dl[::6, 0], dd[dd[:, 0] > 5e-4, 0]])
     vo = np.concatenate([dl[::6, 1], dd[dd[:, 0] > 5e-4, 1]])
     vd = vreg121 - vo
     o = np.argsort(vd); vd, il = vd[o], il[o]
     keep = np.concatenate([[True], np.diff(vd) > 1e-5]); vd, il = vd[keep], il[keep]
-    tbl_path.write_text("\n".join(f"{v:.6e} {i:.6e}" for v, i in zip(vd, il)) + "\n")
+    tbl_path.write_text("* data record only -- the emitted .va inlines this curve\n"
+                        + "\n".join(f"{v:.6e} {i:.6e}" for v, i in zip(vd, il)) + "\n")
+    pwl_expr = _pwl_va_expr(vd, il)
     nk_nodes = ", ".join(f"nk{k+1}" for k in range(MNOISE))
     gvars = ", ".join(["gnw"] + [f"gn{k+1}" for k in range(MNOISE)]
                       + [f"sa{k+1}" for k in range(len(NSPUR_F))])
@@ -1510,7 +1535,7 @@ def emit_va(P, path, tbl_path):
 //          (V4/V3). LP filter resistors are noiseless conductances (no thermal noise).
 //   Noise= DECOUPLED Norton @vout: white-R + {MNOISE} R||C-Lorentzian current sections,
 //          transconducted into vout (gm sets amplitude) -> In*|Zout| = Sv. pnoise/hbnoise.
-//   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout) via $table_model
+//   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout), INLINE PWL
 // Ports: vin vout gnd (explicit ground -- no global-ground references inside).
 // Instance params: iload, slew_en, vdd (supply DC ref + dc_linereg Vout tracking),
 //   voutdc (>0 pins Vout DC; 0 = characterized). Defaults = characterized behavior.
@@ -1538,7 +1563,7 @@ module ldo_model(vin, vout, gnd);
 
   real u, ic, R_a, L_a, R_pl, R_b, L_b, G0, G1, w1, G2, w2, G3, w3, {gvars}, vreg, Cps;
   real pcb0, pcb1, pcw0, pcq, pca1, pca2, Rpc, Lpc, Cpc, gqb1;
-  real vddc, lrsh, vregeff;
+  real vddc, lrsh, vregeff, vdrp;
 
   analog begin
     @(initial_step) begin
@@ -1573,12 +1598,14 @@ module ldo_model(vin, vout, gnd);
     I(vout, nA) <+ idt(V(vout, nA))/L_a + V(vout, nA)/R_pl;
     if (slew_en == 0)
       V(nA, {arail}) <+ R_a*I(nA, {arail});
-    else                             // $table_model control string may be Spectre-version specific
-      // ABSOLUTE table path from emit time: $table_model resolves a bare name against the
-      // SIMULATOR RUN DIR (not the .va location) -> "open failed" in ADE. Re-emit (or edit
-      // this one line) if the table file is moved. (A `parameter string` override would be
-      // cleaner but crashes OpenVAF and is unverified on non-Spectre simulators.)
-      I({arail}, nA) <+ $table_model(V({arail}, nA) - (vregeff - VREG121), "{str(tbl_path.resolve()).replace(chr(92), '/')}", "1L");
+    else begin
+      // nonlinear DC-curve branch (current-limit + dropout): INLINE closed-form PWL of
+      // the characterized (Vdrop, Iload) table -- i = i1 + g1*(v-v1) + sum dg_k*max(v-v_k,0)
+      // == 1-D linear table interpolation, linear end extrapolation. Self-contained
+      // (no external table file -> no run-dir path issues; OpenVAF-compilable, R8 closed).
+      vdrp = V({arail}, nA) - (vregeff - VREG121);
+      I({arail}, nA) <+ {pwl_expr};
+    end
 
     {noise_va}
 
