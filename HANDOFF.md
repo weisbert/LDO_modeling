@@ -1,4 +1,48 @@
-# HANDOFF — LDO behavioral-model builder (as of 2026-06-11)
+# HANDOFF — LDO behavioral-model builder (as of 2026-06-11, end of day)
+
+## NEXT SESSION = trans-ID Verilog-A probe ON THE REAL PART (user-requested experiment)
+
+**Goal:** test on the real 5.8G LDO whether ONE multitone transient per corner really replaces
+the AC Zout/PSRR exports ("是不是真的效果不错") — the R5 idea, already PROVEN on 4 synthetic
+parts (Zout ≤0.45dB, PSRR ≤1.6dB RF; Level-2 dComposite base +0.06 / v1 −0.68 / v3 +2.18 /
+v2 +2.60) and through a compiled-VA fixture (d_path 0.04). See memories
+`finding-trans-id-validation` / `finding-trans-va-pipeline`, results/trans_id/.
+
+**What exists (all on main):** `harness/trans_id.py` — `plan_band`/`emit_stim_va` emit a
+band-split multitone STIMULUS `.va` (+ sidecar JSON plan + README; defaults VDD=1.05,
+va=0.5mV supply tones, ib=1µA vout current tones, 12 tones/dec, IM-de-aliased mod-3 grid,
+half-amp linearity gate ≤0.15dB); `harness/trans_import.py` + **GUI tab 5** import the
+(t, vin, vout) waveform back into a fit-ready npz.
+
+**Red-zone recipe (everything runs ON the box — no air-gap problem):**
+1. Emit the stimulus `.va` for the part's corners/bands (GUI tab 5 or trans_id CLI); set
+   VDD to the real supply.
+2. Virtuoso: compile the stimulus (plain VAMS), instantiate it with the TRANSISTOR-LEVEL
+   LDO at each load corner, run ONE `.tran` per band per corner with the sidecar's exact
+   dt/tstop (coherent windows — do not round them).
+3. Export (t, vin, vout) CSV per band → GUI tab 5 import → Fit → Compare. The GO/NO-GO
+   judgment = diff this fit's report against the AC-import fit (composite 1.81 @76c630d).
+4. Paste both reports back across the gap for the yellow-zone post-mortem.
+
+**Decisions/caveats for next session:**
+- **Band ceiling**: synthetic validation ran in-band (≤100MHz). The real part's AC went to
+  40GHz; a GHz multitone tran needs ps-scale dt = EXPENSIVE. Sensible first experiment:
+  trans-ID the ≤0.5–1GHz band (where the loop lives) and keep the wideband AC for the
+  C_ft/GHz tail (hybrid recipe) — fit_cft needs the HF tail, it will NOT fire from a
+  low-band trans alone.
+- trans-ID recovers Zout+PSRR+DC only — **noise still needs `.noise`, spurs still need the
+  spectrum export**; the trans npz must be merged with those (import side handles it).
+- Known limitation (R7, negative result — do NOT re-attempt a fitter fix): multi-pole PSRR
+  grid sensitivity (+2.2-class on v3). The real part is single-loop + C_ft (base-class
+  shape) — expect good Zout, WATCH the PSRR band/phase terms in the compare.
+- Run the linearity gate at the lightest corner (100µ) before trusting amplitudes.
+- GUI launch gotcha: user runs `./run_gui` in a desktop terminal (agent can't pop X11).
+
+**Red-zone actions queued for the next package update (independent of the experiment):**
+build `.\deploy\package.ps1 -Mode incremental` → `./update` on the box → **re-create the
+Cadence symbol (now 3 pins: vin/vout/gnd)** → re-Emit on the box (single-file `.va`: inline
+PWL dropout, no .tbl dependency, vdd/voutdc instance params) → paste the new report (its
+[7] digest now carries `# dcblock` DC curves → the local replica's DC turns real).
 
 ## UPDATE (2026-06-11c) — R2 + R3-L1 SHIPPED: gnd port + settable vdd/voutdc on the emitted model
 
