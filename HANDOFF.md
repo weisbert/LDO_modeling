@@ -10,6 +10,29 @@
 > **R5** automate the ~30 manual characterization exports; **R6** real-LDO quality bugs (poor
 > fit / output rail droops / no buffer ripple — tied to R3 DC + Zout-at-carrier coverage).
 
+## UPDATE (2026-06-11b) — RED-ZONE VERIFICATION **PASSED**: Target B small-signal CLOSED
+
+The user applied build **76c630d** on the red box and returned the report: **composite
+1.81** (expected ~2–3), header shows `C_ft: 174.4fF` + `noise: HYBRID series bank 4
+sections` ✓, Zout sign auto-correct fired ✓, diagnosis = "All analytic metrics within
+tolerance" — Zout 0.5dB/2.4°, PSRR 0.38dB/2.2°, noise 0.4dB at every corner. **The round-6
+loop (digest→replica→fit→one package) is validated end-to-end; Target B's analytic blocks
+(Zout/PSRR/noise) are DONE.**
+
+Round-7 digest re-imported (51 pts/corner — the peak-densified export worked through the
+loop; sufficiency screen 0 warnings): replica TOTAL **2.01** vs red 1.81 (digest loss, same
+dominant term pband). One flag, BOTH sides: the hybrid bank's 4th section is dead fat —
+red fit put it at 49.4GHz (beyond the 6.3GHz noise-data top, bound-riding), replica at
+2.63MHz and the new noise-pole ident marks it INVISIBLE (+ sn4). Harmless (npsd 0.4dB);
+a fit change (M=3 cap or prune-invisible) is NOT worth re-opening emit for now. Structure
+LOCO: stable on every fold of the round-7 data.
+
+**NEXT (the real frontier is now system-level):** real-part spurs/transient exports (the
+digest has synthesized DC + no transient → `score.py --variant myldo_digest` still crashes
+at `trans_lin_100u`, known); GHz systest against the real 5.8G carrier; then the R1–R6
+deferred batch (VDD corners = R3 first). The composite is BLIND to HF on digest refs (no
+`*_hf` arrays) — the in-band z already reaches 40GHz there, but never skip systest.
+
 ## UPDATE (2026-06-11) — METHODOLOGY REVIEW ROUND: composite RE-BASELINED (P0) + structure gates (P1)
 
 A fresh 3-track methodology review (fitter overfit risks / validation blind spots / verified
@@ -64,11 +87,9 @@ clean (LOCO/off-grid FAILs are the pre-existing known few-corner gaps, unchanged
 
 ## UPDATE (2026-06-10) — TARGET B ENGAGED: real 5.8G capless LDO, composite 268 → 2.3 (replica)
 
-**State: AWAITING red-zone verification.** The user must apply the **16:31 package (build
-`e0bc231`)**, re-import the same data, Fit, and send the new text report. Expected: composite
-**~2–3** on the real box, header shows `C_ft: 174.4fF` + `noise: HYBRID series bank`. If it
-doesn't match the replica's 2.30, diff report-vs-replica per term — the replica is faithful
-(12.62 vs 13.61 at round 5).
+**State: VERIFIED 2026-06-11 (see UPDATE 2026-06-11b above) — composite 1.81 on the real
+box with build 76c630d, C_ft + HYBRID lines present. This section kept for the round-6
+history.**
 
 **The air-gap iteration loop (now fully tooled — this is THE workflow for all future rounds):**
 1. Red zone: GUI Compare → "Save text report" → user pastes the report (build fingerprint in
