@@ -7,7 +7,10 @@ Metrics (per load corner unless noted):
   PSRR : band err + worst-notch + PHASE RMS
   Trans: load-step droop err, settled err, waveform RMS, ring-freq err  (req#1)
   Noise: output-PSD log-RMS + resonance-peak err + integrated-rms err     (req#2)
-  Spur : SANITY gate only (GT harmonics at numerical floor -> not scored)
+  Spur : SANITY gate (16/24MHz dBc) + discrete-tone amplitude AND PHASE fidelity
+  HF   : |Zout|/PSRR RMS in the *_hf extension band (above the in-band AC top,
+         nominal corner) -- only when the ref carries the *_hf arrays
+All phase errors are WRAPPED to +-180deg (angle of the model/GT ratio).
 
     python score.py                       # grade model/ldo_model.lib
     python score.py --lib path --subckt name
@@ -26,8 +29,15 @@ SCOREDIR = ng.ROOT / "results" / "score"
 BANDS = bench.SPUR_BANDS
 _TRAP = getattr(np, "trapezoid", None) or np.trapz
 # composite weights (documented, transparent; lower composite = better)
+# spurph: discrete-spur PHASE (deg) -- HB sidebands superpose coherently, so spur
+#         phase is as load-bearing as amplitude (same per-degree weight as pphase).
+# zhf/phf: |Zout|/PSRR error in the *_hf EXTENSION band (above the in-band AC top,
+#         up to the variant's hf_stop ceiling). Scored only when the reference
+#         carries the *_hf arrays -- closes the "composite is blind to HF" gap
+#         (v7 inductive tail / v8 notch used to be invisible here).
 W = dict(zrms=1.0, zband=3.0, zphase=0.04, pkdb=1.0, pband=2.0,
-         pphase=0.03, trms=0.2, noise=0.5, spur=0.5)
+         pphase=0.03, trms=0.2, noise=0.5, spur=0.5, spurph=0.03,
+         zhf=0.5, phf=0.5)
 
 
 def _interp_mag(f_to, f_from, mag):
@@ -110,7 +120,10 @@ def score(lib, subckt, xp="", refpath=None):
         fm, Zm = bench.measure_zout(lib, subckt, il, xparams=xpil)
         Zmi = _interp_cplx(fz, fm, Zm)
         ez = 20 * np.log10(np.abs(Zmi) / np.abs(Zg))
-        ezph = np.degrees(np.angle(Zmi) - np.angle(Zg))
+        # phase error WRAPPED to +-180deg (angle of the ratio): raw principal-value
+        # subtraction reads a true 2deg error as 358deg when GT/model straddle the
+        # +-180 boundary (report.py/_wrapdeg and fit_all's pph already wrap).
+        ezph = np.degrees(np.angle(Zmi / Zg))
         lo = fz < 1e7
         ipg, ipm = np.argmax(np.abs(Zg) * lo), np.argmax(np.abs(Zmi) * lo)
         # ---- PSRR (mag + phase) ----
@@ -120,7 +133,7 @@ def score(lib, subckt, xp="", refpath=None):
         Hmi = _interp_cplx(fp, fpm, Hm)
         ag, am = _atten(Hg), np.clip(_atten(Hmi), None, 200)
         ep = am - ag
-        epph = np.degrees(np.angle(Hmi) - np.angle(Hg))
+        epph = np.degrees(np.angle(Hmi / Hg))   # wrapped (see ezph above)
         # ---- Noise ----
         gn = ref[f"noise_{il}"]
         fnm, Sm = bench.measure_noise(lib, subckt, il, xparams=xpil)
@@ -168,7 +181,10 @@ def score(lib, subckt, xp="", refpath=None):
     # discrete-spur block: reproduce the GT's intrinsic spur tones (Part B)
     spm = _spur_metrics(ref, lib, subckt, xp, loads)
 
-    _print(rows, extra, spur_dbc, spm)
+    # HF extension block: model vs the *_hf wideband reference above the in-band AC top
+    hfm = _hf_metrics(ref, lib, subckt, xp, loads)
+
+    _print(rows, extra, spur_dbc, spm, hfm)
     _plots(rows, lib, subckt, refpath)
     comp = (W["zrms"]*np.mean([r["zrms"] for r in rows])
             + W["zband"]*np.mean([r["zband"] for r in rows])
@@ -180,6 +196,10 @@ def score(lib, subckt, xp="", refpath=None):
             + W["noise"]*np.mean([r["nm"]["psd_rms"] for r in rows]))
     if spm:                                  # spur fidelity adds to composite only when spurs exist
         comp += W["spur"] * spm["mean_db"] + 2.0 * (spm["n_missed"] + spm["n_false"])
+        if np.isfinite(spm.get("mean_ph_deg", np.nan)):   # coherent-phase fidelity (deg)
+            comp += W["spurph"] * spm["mean_ph_deg"]
+    if hfm:                                  # HF extension fidelity (refs with *_hf arrays)
+        comp += W["zhf"] * hfm["zhf"] + W["phf"] * hfm.get("phf", 0.0)
     print(f"\n>>> composite error score (lower=better): {comp:.1f}")
     summary = dict(
         composite=float(comp),
@@ -196,6 +216,13 @@ def score(lib, subckt, xp="", refpath=None):
         spur_mean_db=(spm["mean_db"] if spm else None),
         spur_missed=(spm["n_missed"] if spm else None),
         spur_false=(spm["n_false"] if spm else None),
+        spur_worst_ph_deg=(spm.get("worst_ph_deg") if spm else None),
+        spur_mean_ph_deg=(spm.get("mean_ph_deg") if spm else None),
+        zhf=(hfm["zhf"] if hfm else None),
+        zhf_phase=(hfm["zhf_phase"] if hfm else None),
+        phf=(hfm.get("phf") if hfm else None),
+        phf_phase=(hfm.get("phf_phase") if hfm else None),
+        hf_fmax=(hfm["fmax"] if hfm else None),
         zpass_synth_ok=bool(all(r["zpass_m"][0] for r in rows)),
         zout_minre_synth=float(min(r["zpass_m"][1] for r in rows)),
         zout_minre_gt=float(min(r["zpass_g"][1] for r in rows)),
@@ -220,7 +247,50 @@ def _spur_metrics(ref, lib, subckt, xp, loads):
     return sc
 
 
-def _print(rows, extra, spur, spm=None):
+def _hf_metrics(ref, lib, subckt, xp, loads):
+    """HF EXTENSION fidelity: re-measure the MODEL with the wideband AC sweep and
+    score it against the stored z/p *_hf reference, in the band ABOVE the in-band
+    AC top only (the in-band part is already scored per corner -- no double count).
+    The composite used to be BLIND here: an RLC model that fits to 100MHz but
+    extrapolates wrong at the carrier (v7 ESL tail, v8 notch) scored clean. Returns
+    None when the reference has no *_hf arrays (e.g. a digest ref whose in-band z
+    already reaches the ceiling -- then zrms covers it)."""
+    nom = "121u" if "121u" in loads else loads[len(loads) // 2]
+    # gen_reference keeps the literal "121u" token in the *_hf array names
+    kz = next((k for k in (f"z_{nom}_hf", "z_121u_hf") if k in ref.files), None)
+    if kz is None:
+        return None
+    gz = ref[kz]
+    fh, Zg = gz[:, 0], gz[:, 1] + 1j * gz[:, 2]
+    ftop_in = float(ref[f"z_{nom}"][:, 0].max())
+    m = fh > ftop_in
+    if m.sum() < 3:
+        return None
+    xpn = (xp + f" iload={nom}").strip()
+    accmd = bench.ac_hf_cmd(float(fh.max()))
+    fm, Zm = bench.measure_zout(lib, subckt, nom, xparams=xpn, accmd=accmd)
+    Zmi = _interp_cplx(fh[m], fm, Zm)
+    ez = 20 * np.log10(np.abs(Zmi) / np.abs(Zg[m]))
+    out = dict(il=nom, fmax=float(fh.max()), f_lo=ftop_in,
+               zhf=float(np.sqrt(np.mean(ez ** 2))),
+               zhf_phase=float(np.sqrt(np.mean(np.degrees(np.angle(Zmi / Zg[m])) ** 2))),
+               zhf_worst=(float(fh[m][np.argmax(np.abs(ez))]), float(ez[np.argmax(np.abs(ez))])))
+    kp = next((k for k in (f"p_{nom}_hf", "p_121u_hf") if k in ref.files), None)
+    if kp is not None:
+        gp = ref[kp]
+        fph, Hg = gp[:, 0], gp[:, 1] + 1j * gp[:, 2]
+        mp = fph > float(ref[f"p_{nom}"][:, 0].max())
+        if mp.sum() >= 3:
+            fpm, Hm = bench.measure_psrr(lib, subckt, nom, xparams=xpn, accmd=accmd)
+            Hmi = _interp_cplx(fph[mp], fpm, Hm)
+            epd = np.clip(_atten(Hmi), None, 200) - _atten(Hg[mp])
+            out["phf"] = float(np.sqrt(np.mean(epd ** 2)))
+            out["phf_phase"] = float(np.sqrt(np.mean(
+                np.degrees(np.angle(Hmi / Hg[mp])) ** 2)))
+    return out
+
+
+def _print(rows, extra, spur, spm=None, hfm=None):
     print(f"\n{'='*92}\nSCORECARD  (errors in dB unless noted; band = 8/16/24MHz spur offsets)\n{'='*92}")
     print(f"{'load':>5} | {'Zrms':>5} {'Zband':>6} {'Zdeg':>5} {'pk_df':>5} {'pk_dB':>6}"
           f" | {'Pband':>6} {'Pdeg':>5} | {'Twrms%':>6} {'Tdroop':>7} | {'Npsd':>5} {'Npk':>5} {'Nrms%':>6}")
@@ -249,10 +319,19 @@ def _print(rows, extra, spur, spm=None):
     ok = (g16 < -45) and (g24 < -45)
     print(f"Spur SANITY gate: 16M={g16:.0f}dBc 24M={g24:.0f}dBc -> {'PASS (linear)' if ok else 'FAIL (nonlinear!)'}")
     if spm:
-        det = "  ".join(f"{r['f']/1e6:.2f}MHz:{r['amp_db']:+.2f}dB" if r['amp_db'] is not None
-                        else f"{r['f']/1e6:.2f}MHz:MISS" for r in spm["rows"])
+        det = "  ".join(
+            f"{r['f']/1e6:.2f}MHz:{r['amp_db']:+.2f}dB/{np.degrees(r['phase_err']):+.1f}deg"
+            if r['amp_db'] is not None else f"{r['f']/1e6:.2f}MHz:MISS" for r in spm["rows"])
         print(f"Discrete SPURS @{spm['il']} ({spm['n_matched']}/{spm['n_gt']} matched, "
-              f"{spm['n_missed']} missed, {spm['n_false']} false): worst {spm['worst_db']:.2f}dB | {det}")
+              f"{spm['n_missed']} missed, {spm['n_false']} false): worst {spm['worst_db']:.2f}dB"
+              f" / {spm['worst_ph_deg']:.1f}deg | {det}")
+    if hfm:
+        wf, wv = hfm["zhf_worst"]
+        print(f"HF extension @{hfm['il']} ({hfm['f_lo']/1e6:.0f}M-{hfm['fmax']/1e6:.0f}MHz): "
+              f"|Z| rms {hfm['zhf']:.2f}dB (worst {wv:+.2f}dB @{wf/1e6:.0f}MHz) "
+              f"phase {hfm['zhf_phase']:.1f}deg"
+              + (f" | PSRR rms {hfm['phf']:.2f}dB phase {hfm['phf_phase']:.1f}deg"
+                 if "phf" in hfm else ""))
 
 
 def _plots(rows, lib, subckt, refpath=None):

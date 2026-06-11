@@ -48,6 +48,61 @@ def parse_digest(text):
     return {il: np.array(rows, float) for il, rows in corners.items() if rows}
 
 
+def check_sufficiency(corners):
+    """Digest SUFFICIENCY screen: the air-gap digest is a lossy, log-resampled copy of
+    the real GT -- a fit on an inadequate digest converges confidently to the wrong
+    model and there is no held-out data on this side of the gap to catch it. Returns
+    a list of (level, msg) where level is 'WARN' (fit quality at risk -- re-export a
+    denser/wider digest) or 'INFO' (known structural limitation)."""
+    out = []
+    for il, a in corners.items():
+        f = a[:, 0]
+        span = np.log10(f[-1] / f[0]) if f[-1] > f[0] else 0.0
+        ppd = (len(f) - 1) / span if span > 0 else float("inf")
+        if ppd < 4.0:
+            out.append(("WARN", f"corner {il}: only {ppd:.1f} pts/decade (<4) over "
+                                f"{span:.1f} decades -- sharp features (resonance Q, "
+                                f"notches) will be aliased; re-export a denser digest"))
+        # resonance sampling: is the |Z| peak resolved above its half-power width?
+        zmag = a[:, 1]
+        ipk = int(np.argmax(zmag))
+        if 0 < ipk < len(f) - 1:
+            half = zmag[ipk] / np.sqrt(2.0)
+            n_half = 1
+            j = ipk - 1
+            while j >= 0 and zmag[j] >= half:
+                n_half += 1; j -= 1
+            j = ipk + 1
+            while j < len(f) and zmag[j] >= half:
+                n_half += 1; j += 1
+            if zmag[ipk] > 2.0 * np.median(zmag) and n_half < 3:
+                out.append(("WARN", f"corner {il}: |Z| resonance at {f[ipk]:.3g}Hz has only "
+                                    f"{n_half} point(s) above half-power -- peak height/Q "
+                                    f"will be underestimated; densify the digest near the peak"))
+        elif ipk in (0, len(f) - 1):
+            out.append(("WARN", f"corner {il}: |Z| peaks at the {'low' if ipk == 0 else 'high'} "
+                                f"band edge ({f[ipk]:.3g}Hz) -- the sweep may be truncated"))
+        # noise LF coverage: flicker/RTN must actually be in the data to be fit
+        nfin = np.isfinite(a[:, 5])
+        if not nfin.any():
+            out.append(("WARN", f"corner {il}: no noise (Sv) data in the digest -- the noise "
+                                f"block will be fit to nothing"))
+        elif f[nfin][0] > 1e3:
+            out.append(("WARN", f"corner {il}: noise data starts at {f[nfin][0]:.3g}Hz (>1kHz) "
+                                f"-- the flicker/LF tail is invisible to the fit"))
+        # PSRR coverage
+        pfin = np.isfinite(a[:, 3]) & np.isfinite(a[:, 4])
+        if not pfin.any():
+            out.append(("WARN", f"corner {il}: no PSRR data in the digest"))
+        elif pfin.sum() < 0.5 * len(f):
+            out.append(("INFO", f"corner {il}: PSRR sampled at only {int(pfin.sum())}/{len(f)} "
+                                f"digest points"))
+    out.append(("INFO", "DC curves (loadreg/linereg/dropout) are SYNTHESIZED from LF Re(Zout) "
+                        "-- the digest carries no DC sweeps; dc_dropout / slew_en=1 large-signal "
+                        "behavior is a placeholder, do not trust it for a real part"))
+    return out
+
+
 def build_ref(corners, name, vref=1.05):
     loads = list(corners.keys())
     ref = {"loads": np.array(loads),
@@ -94,6 +149,11 @@ def main():
     out, loads = build_ref(corners, name, vref=a.vref)
     print(f"wrote {out}   corners={loads} "
           f"({', '.join(str(len(corners[il])) + 'pts' for il in loads)})")
+    checks = check_sufficiency(corners)
+    nwarn = sum(1 for lv, _ in checks if lv == "WARN")
+    print(f"\nDIGEST SUFFICIENCY ({nwarn} warning(s)):")
+    for lv, msg in checks:
+        print(f"  {lv}: {msg}")
 
 
 if __name__ == "__main__":

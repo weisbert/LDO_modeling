@@ -10,6 +10,58 @@
 > **R5** automate the ~30 manual characterization exports; **R6** real-LDO quality bugs (poor
 > fit / output rail droops / no buffer ripple — tied to R3 DC + Zout-at-carrier coverage).
 
+## UPDATE (2026-06-11) — METHODOLOGY REVIEW ROUND: composite RE-BASELINED (P0) + structure gates (P1)
+
+A fresh 3-track methodology review (fitter overfit risks / validation blind spots / verified
+in-code) found the remaining gaps were **phase-blind regression gates** and **in-sample-only
+structure selection**. Six fixes shipped (P0 = scoring, P1 = guardrails). **The composite
+DEFINITION changed → matrix.md is a NEW BASELINE** (old vs new below, every delta attributed).
+
+**P0 — scoring (score.py + report.py + run_matrix.py + spur_char.py):**
+1. **Discrete-spur PHASE now scored** (`W["spurph"]=0.03`/deg, mean|phase err| of matched
+   tones; `spur_worst_ph` matrix column). HB sidebands superpose coherently — the round-6
+   `.va` −H sign bug (180°, invisible to magnitude gates) is the realized failure mode.
+2. **Phase errors WRAPPED to ±180°** (`np.angle(Zmi/Zg)`; score.py:113/123 used raw
+   principal-value subtraction). Fired on exactly one variant: v10_3lc pphase_max 71.5→57.6°
+   (its true error was being inflated across the ±180 boundary). All others byte-equal.
+3. **HF extension terms `zhf`/`phf`** (`W=0.5` each): model re-measured with the wideband AC
+   sweep vs the stored `z/p_*_hf` arrays, scored ABOVE the in-band top only (no double count);
+   gated on the ref having `*_hf` (digest refs don't → **replica composite 2.30 UNCHANGED**,
+   the air-gap loop stays comparable). report.py mirrors both terms analytically.
+
+**Matrix re-baseline (run_matrix --reuse, all 19):** every composite delta = 0.5·(zhf+phf)
+to 3 decimals (+ v10's −0.27 wrap correction). A-layer/base variants +0.1–0.5 (real HF
+extrapolation error, mostly PSRR plateau); **v7_esl 4.2→16.7, v8_dlc 5.6→18.1, v10_3lc
+57→71** — the documented "composite is BLIND to HF" variants now show their tails/notches
+IN the composite (these are model floors pointing to the known series-L extension, not fit
+bugs); v1_nmos 8.9→10.6 (the documented high-ESR Cout floor, now visible at HF too).
+
+**P1 — guardrails (crossval.py + digest_import.py + report.py):**
+4. **Structure-stability LOCO** (`crossval.structloco`, gate #4, `--no-struct` to skip):
+   re-runs the WHOLE structure-selection pipeline (C_ft gate, Cout/ghost-cap, Zout branch-B,
+   PSRR shelf/SK/complex selector, noise topology+adaptive bank, spur table) on each N-1
+   corner subset; any decision that FLIPS sat on its in-sample threshold = data-noise.
+   Full `crossval --all`: **17/19 STABLE** incl. **myldo_digest (real part: C_ft + hybrid
+   reproduce on every 2-corner fold)**. **2 FAILs = real findings: v1_nmos + v2_capless flip
+   the PSRR shelf↔complex selection on the nominal-held-out fold** — both sit at pphase
+   2–3° ≈ `SHELF_PH_TRIG=2.5°` (the review's #1-flagged magic threshold), v1 cascading from
+   a 3.1x Cout shift when the `*_hf` sweep is lost. Known-floor variants, flagged not fixed
+   (a selector retune touches fit/emit -> separate round). crossval_matrix.md now has a
+   `struct` column.
+5. **Identifiability extended** (round-6 deferred item CLOSED): hybrid `snw/sn*` keys (found
+   real-part `sn1` INVISIBLE, ratio 1.3e11), shared noise POLE positions (stacked-corner
+   Jacobian; found `f6@76MHz` invisible on base, `f1@220Hz` on the real part — greedy-fit
+   artifacts, flagged not failed), spur `sa_k` SWITCH guard.
+6. **Digest sufficiency screen** (`digest_import.py check_sufficiency`): WARNs on <4 pts/dec,
+   under-resolved |Z| resonance (<3 pts above half-power), band-edge peaks, missing/LF-blind
+   noise data; always INFOs that DC curves are SYNTHESIZED. Export side: report.py [7] digest
+   now DENSIFIES ~12 extra points around each corner's |Z| peak (current digest: 0 warnings).
+
+**Validated:** fit_model --selftest PASS · GUI offscreen selftest PASS · systest base PASS
+(numbers == Bcover) · replica report TOTAL 2.30 byte-stable · crossval base/v5/digest run
+clean (LOCO/off-grid FAILs are the pre-existing known few-corner gaps, unchanged).
+**Emitted .lib/.va untouched — models are bit-identical; only scoring/validation changed.**
+
 ## UPDATE (2026-06-10) — TARGET B ENGAGED: real 5.8G capless LDO, composite 268 → 2.3 (replica)
 
 **State: AWAITING red-zone verification.** The user must apply the **16:31 package (build

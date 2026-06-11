@@ -24,6 +24,18 @@ PURE INCREMENT (it does not touch fit_model's fit/emit nor score's composite):
                        SWITCH being interpolated as continuous (e.g. R_pl
                        ON/OFF); the rest are low-harm INVISIBLE (dead R_b=1e9,
                        a high-ESR invisible cap). base/v1/v2 Zout -> cond=inf.
+                       Covers the noise block in BOTH topologies (norton gn*,
+                       hybrid snw/sn*), the shared noise POLE positions
+                       (greedy-fit artifacts -> INVISIBLE), and the spur
+                       injection amplitudes (SWITCH guard on interpolation).
+  4. structloco()      STRUCTURE-stability LOCO: re-run the whole structure-
+                       selection pipeline (C_ft gate, Cout/ghost-cap, Zout
+                       branch-B, PSRR shelf/SK/complex selector, noise
+                       topology + adaptive bank, spur table) on each N-1
+                       corner subset. Every one of those selectors is a hard
+                       threshold evaluated in-sample; a decision that FLIPS
+                       when one corner is dropped was sitting on its
+                       threshold -> data-noise, not architecture.
 
 General by construction: everything derives from ref["loads"] and RELATIVE
 thresholds -- no 304MHz / 8-24MHz / 121uA / "3 corners" hardcoded.
@@ -33,6 +45,8 @@ thresholds -- no 304MHz / 8-24MHz / 121uA / "3 corners" hardcoded.
     python crossval.py --variant base --strict  # exit nonzero on any gate FAIL
 """
 import argparse
+import contextlib
+import io
 import json
 import numpy as np
 
@@ -239,6 +253,99 @@ def res_ref(vkey, q, il):
     return _REFCACHE[vkey][f"{q}_{il}"]
 
 
+# ------------------------------------------------------- structure-stability LOCO
+# The parameter-level LOCO above re-INTERPOLATES within a FIXED structure. But every
+# structural decision in fit_model (Zout 2nd branch, PSRR shelf/SK/complex selection,
+# Norton-vs-hybrid noise, adaptive bank size, C_ft gate, ghost-cap adjudication) is a
+# hard threshold evaluated on the SAME data it then fits -- the methodology review's
+# residual exposure. This check re-runs the WHOLE structure-selection pipeline on each
+# N-1 corner subset (what a user who characterized one corner fewer would get) and
+# flags decisions that FLIP: a selection that changes when one corner is dropped was
+# sitting on its threshold, i.e. it is data-noise, not architecture.
+
+_FM_STATE = ["ref", "LOADS", "NOMINAL", "VREF", "C", "RC", "CFT",
+             "NFK", "MNOISE", "NOISE_MODE", "NFKV", "NSPUR_F", "NSPUR_PH"]
+
+
+def _fm_save():
+    return {k: getattr(fit_model, k) for k in _FM_STATE}
+
+
+def _fm_restore(s):
+    for k, v in s.items():
+        setattr(fit_model, k, v)
+
+
+def _structure(P, loads):
+    """Snapshot of every data-driven STRUCTURAL decision of the last fit (module
+    state + per-corner param flags). R_b=1e9 / _cpx=0 are the documented 'off'
+    encodings (fit_zout / fit_psrr)."""
+    return dict(
+        cft_on=bool(fit_model.CFT > 0.0),
+        nmode=str(fit_model.NOISE_MODE),
+        nsec_noise=int(len(fit_model.NFK) if fit_model.NOISE_MODE == "norton"
+                       else len(fit_model.NFKV)),
+        nspur=int(len(fit_model.NSPUR_F)),
+        cout=float(fit_model.C),
+        branchB={il: bool(P[il]["R_b"] < 1e8) for il in loads},
+        psrr_cpx={il: bool(P[il].get("_cpx", 0)) for il in loads},
+    )
+
+
+def structloco(vkey, res, full):
+    """Re-run structure selection per leave-one-corner-out fold; compare each fold's
+    decisions to the full fit's. FLIP (gate-fail): C_ft gate, noise topology, per-
+    retained-corner Zout branch-B / PSRR-complex selection. WARN (report-only):
+    noise-bank section count, spur count, Cout extraction ratio >3x (the nominal-
+    held-out fold legitimately loses the *_hf sweep -> extraction-corner effect)."""
+    loads = list(res.loads)
+    state = _fm_save()
+    folds = []
+    try:
+        for h in loads:
+            retained = [il for il in loads if il != h]
+            # mirror load() on the subset: a user with N-1 corners runs exactly this
+            fit_model.ref = np.load(ng.ROOT / "results" / "ref" / f"{vkey}.npz",
+                                    allow_pickle=True)
+            fit_model.LOADS = list(retained)
+            fit_model.NOMINAL = (res.nominal if res.nominal in retained
+                                 else retained[len(retained) // 2])
+            fit_model.CFT = 0.0
+            with contextlib.redirect_stdout(io.StringIO()):   # fold fits are chatty
+                fit_model.fit_cft()
+                fit_model.C, fit_model.RC = fit_model.fit_cout_esr()
+                P2 = fit_model.fit_all()
+            snap = _structure(P2, retained)
+            flips, warns = [], []
+            if snap["cft_on"] != full["cft_on"]:
+                flips.append(f"C_ft gate {full['cft_on']}->{snap['cft_on']}")
+            if snap["nmode"] != full["nmode"]:
+                flips.append(f"noise mode {full['nmode']}->{snap['nmode']}")
+            for il in retained:
+                if snap["branchB"][il] != full["branchB"][il]:
+                    flips.append(f"Zout branch-B@{il} {full['branchB'][il]}->{snap['branchB'][il]}")
+                if snap["psrr_cpx"][il] != full["psrr_cpx"][il]:
+                    flips.append(f"PSRR complex@{il} {full['psrr_cpx'][il]}->{snap['psrr_cpx'][il]}")
+            if snap["nsec_noise"] != full["nsec_noise"]:
+                warns.append(f"noise sections {full['nsec_noise']}->{snap['nsec_noise']}")
+            if snap["nspur"] != full["nspur"]:
+                warns.append(f"spur count {full['nspur']}->{snap['nspur']}")
+            r = snap["cout"] / (full["cout"] + 1e-300)
+            if r > 3.0 or r < 1.0 / 3.0:
+                warns.append(f"Cout extraction x{r:.2g} (held={h}"
+                             + (", nominal -> *_hf sweep lost" if h == res.nominal else "") + ")")
+            folds.append(dict(held=h, nominal=fit_model.NOMINAL,
+                              flips=flips, warns=warns, snap=snap))
+    finally:
+        _fm_restore(state)
+    ok = not any(f["flips"] for f in folds)
+    return dict(full=full, folds=folds, pass_=ok,
+                note="each fold re-runs the FULL structure-selection pipeline (C_ft gate, "
+                     "Cout/ghost-cap, branch-B, PSRR selector, noise topology/adaptation, "
+                     "spur table) on N-1 corners; a FLIP means that decision sat on its "
+                     "in-sample threshold (data-noise, not architecture).")
+
+
 # ------------------------------------------------------------- identifiability
 def _jacobian(g, params, delta=1e-4):
     """Relative (log-sensitivity) Jacobian of complex transfer g(params): a RELATIVE
@@ -326,11 +433,18 @@ def identifiability(res, refnpz):
                      colnorm_rel={pkeys[j]: float(cn[j] / (cn.max() + 1e-300)) for j in range(len(pkeys))})
     blocks["psrr"] = dict(per_corner=pc, classify=_classify(pkeys, p_colnorms, pvals))
 
-    # ---- Noise: white + MNOISE Lorentzian amplitudes (fixed poles) ----
-    M = fit_model.MNOISE
-    nkeys = ["gnw"] + [f"gn{k+1}" for k in range(M)]
+    # ---- Noise: amplitude params, dispatched on the fitted topology ----
+    # norton: gnw + gn1..gnM Lorentzian-current amplitudes (poles nfk fixed)
+    # hybrid: gnw (Norton white floor) + snw/sn1..snK series voltage-bank amplitudes
+    # (round-6 review deferred item: ident used to be BLIND to the hybrid sn-keys).
+    nmode = getattr(res, "nmode", "norton") or "norton"
+    nfkv = list(getattr(res, "nfkv", []) or [])
+    nfk = list(res.nfk or [])
     K = fit_model.KT4 * fit_model.NRk
-    nfk = res.nfk
+    if nmode == "hybrid":
+        nkeys = ["gnw", "snw"] + [f"sn{k+1}" for k in range(len(nfkv))]
+    else:
+        nkeys = ["gnw"] + [f"gn{k+1}" for k in range(len(nfk))]
     nc, nvals = {}, {k: [] for k in nkeys}
     n_colnorms = []
     for h in loads:
@@ -338,19 +452,68 @@ def identifiability(res, refnpz):
         npar = [P[h][k] for k in nkeys]
         for k in nkeys:
             nvals[k].append(P[h][k])
+        if nmode == "hybrid":
+            zf = [P[h][k] for k in zkeys]
+            Zc = fit_model.zmodel(fn, *zf)
+            T2 = np.abs(Zc / fit_model._za(fn, zf[0], zf[1], zf[2])) ** 2
+            Z2 = np.abs(Zc) ** 2
 
-        def gn(pv, fn=fn):
-            In2 = pv[0] ** 2 * K * np.ones_like(fn)
-            for k in range(len(nfk)):
-                In2 = In2 + pv[1 + k] ** 2 * K / (1.0 + (fn / nfk[k]) ** 2)
-            return np.sqrt(In2) + 0j
+            def gn(pv, fn=fn, T2=T2, Z2=Z2):
+                Vn2 = pv[1] ** 2 * K * np.ones_like(fn)
+                for k in range(len(nfkv)):
+                    Vn2 = Vn2 + pv[2 + k] ** 2 * K / (1.0 + (fn / nfkv[k]) ** 2)
+                return np.sqrt(Vn2 * T2 + pv[0] ** 2 * K * Z2) + 0j
+        else:
+            def gn(pv, fn=fn):
+                In2 = pv[0] ** 2 * K * np.ones_like(fn)
+                for k in range(len(nfk)):
+                    In2 = In2 + pv[1 + k] ** 2 * K / (1.0 + (fn / nfk[k]) ** 2)
+                return np.sqrt(In2) + 0j
         cn, sv, cond = _jacobian(gn, npar)
         n_colnorms.append(cn)
         nc[h] = dict(cond=cond, rank_deficient=bool(sv[-1] < RANKDEF_REL * sv[0]),
                      colnorm_rel={nkeys[j]: float(cn[j] / (cn.max() + 1e-300)) for j in range(len(nkeys))})
     blocks["noise"] = dict(per_corner=nc, classify=_classify(nkeys, n_colnorms, nvals))
 
-    switches = {b: [k for k, d in blocks[b]["classify"].items() if d["cls"] == "SWITCH"]
+    # ---- Noise POLE positions (shared, load-independent -- selected by the greedy
+    # adaptive fit on the same data): Jacobian of the STACKED all-corner Sv wrt each
+    # log corner-freq, amplitudes held at their fitted values. An INVISIBLE pole
+    # (relative column norm < UNIDENT_REL) moves nothing -> an overfit artifact of
+    # the greedy insertion, safe but flagged. ----
+    poles = nfkv if nmode == "hybrid" else nfk
+    if poles:
+        def gpole(pv):
+            out = []
+            for h in loads:
+                fn = refnpz[f"noise_{h}"][:, 0]
+                Zc = fit_model.zmodel(fn, *(P[h][k] for k in zkeys))
+                out.append(fit_model.noise_model_sv(
+                    P[h], fn, Zc,
+                    nfk=(pv if nmode == "norton" else nfk),
+                    nfkv=(pv if nmode == "hybrid" else nfkv), nmode=nmode))
+            return np.concatenate(out) + 0j
+        cn, sv, cond = _jacobian(gpole, list(poles))
+        rel = {f"f{k+1}({poles[k]:.3g}Hz)": float(cn[k] / (cn.max() + 1e-300))
+               for k in range(len(poles))}
+        blocks["noise_poles"] = dict(
+            cond=float(cond), colnorm_rel=rel,
+            invisible=[k for k, v in rel.items() if v < UNIDENT_REL])
+
+    # ---- Spur injection amplitudes sa_k = vout_amp/|Zout(f_k)|: linear in the data
+    # (identifiable by construction), but interpolated quad-in-ln(iload) through
+    # _pexpr like everything else -> the SWITCH check guards that interpolation. ----
+    spur_f = list(getattr(res, "spur_f", []) or [])
+    if spur_f:
+        scl = {}
+        for k in range(len(spur_f)):
+            key = f"sa{k+1}"
+            vals = np.abs(np.array([P[h][key] for h in loads], float))
+            ratio = float(vals.max() / (vals.min() + 1e-300))
+            scl[key] = dict(cls=("SWITCH" if ratio > SWITCH_RATIO else "OK"),
+                            ratio=ratio, vals=[float(x) for x in vals])
+        blocks["spur"] = dict(classify=scl)
+
+    switches = {b: [k for k, d in blocks[b].get("classify", {}).items() if d["cls"] == "SWITCH"]
                 for b in blocks}
     # Round 2: fit_model._pexpr now clamps EVERY param to its corner envelope, so a switch
     # param can no longer overshoot off-corner -> it is CONTAINED (the harmful part -- nonsense
@@ -362,19 +525,24 @@ def identifiability(res, refnpz):
 
 
 # --------------------------------------------------------------------- runner
-def run(vkey, do_offgrid=True, _print=True):
-    """Fit the variant ONCE, run all three guardrails, write the JSON report.
+def run(vkey, do_offgrid=True, do_struct=True, _print=True):
+    """Fit the variant ONCE, run all four guardrails, write the JSON report.
     Returns the report dict (with overall pass flags). Callers own strict/exit
-    handling (see main() and score.py --strict)."""
+    handling (see main() and score.py --strict). structloco runs LAST (its folds
+    clobber+restore fit_model module state; offgrid's emit() must see the full fit)."""
     refnpz = np.load(ng.ROOT / "results" / "ref" / f"{vkey}.npz", allow_pickle=True)
     res = fit_model.fit_variant(vkey)        # sets module state; single-DUT-per-pass
+    full_snap = _structure(res.P, res.loads)   # capture BEFORE anything re-fits
     L = loco(res, refnpz)
     I = identifiability(res, refnpz)
     O = offgrid(res, vkey) if do_offgrid else None
+    S = structloco(vkey, res, full_snap) if do_struct else None
 
     rep = dict(variant=vkey, loads=list(res.loads), loco=L, identifiability=I, offgrid=O,
+               structure=S,
                passes=dict(loco=L["pass_"], identifiability=I["pass_"],
-                           offgrid=(O["pass_"] if O else None)))
+                           offgrid=(O["pass_"] if O else None),
+                           structure=(S["pass_"] if S else None)))
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / f"{vkey}.json").write_text(json.dumps(rep, indent=2, default=float), encoding="utf-8")
     if _print:
@@ -438,10 +606,34 @@ def _report(rep):
                   f" | {r['noise']['rms']:6.1f} {'ok' if r['noise']['ok'] else '**':>3}")
         print(f"  off-grid gate: {'PASS' if O['pass_'] else 'FAIL (off-grid > 2x in-sample)'}")
 
+    # ---- noise poles / spur (informational sub-blocks) ----
+    npb = rep["identifiability"]["blocks"].get("noise_poles")
+    if npb:
+        inv = npb["invisible"]
+        print(f"  noise-pole ident: cond={_fmt_cond(npb['cond'])}"
+              + (f"  INVISIBLE poles (greedy-fit artifacts): {inv}" if inv else "  all poles live"))
+    spb = rep["identifiability"]["blocks"].get("spur")
+    if spb:
+        sflags = {k: d for k, d in spb["classify"].items() if d["cls"] != "OK"}
+        for k, d in sflags.items():
+            vs = " ".join(f"{x:.3g}" for x in d["vals"])
+            print(f"   spur {d['cls']:>9} {k:<5} ratio={d['ratio']:.1e}  vals=[{vs}]")
+
+    # ---- structure-stability LOCO ----
+    S = rep.get("structure")
+    if S:
+        print("\n[4] STRUCTURE-STABILITY LOCO  (re-run structure selection on each N-1 subset)")
+        for fo in S["folds"]:
+            stat = ("FLIP: " + "; ".join(fo["flips"])) if fo["flips"] else "stable"
+            wtxt = ("  warn: " + "; ".join(fo["warns"])) if fo["warns"] else ""
+            print(f"  held {fo['held']:>6} (nom={fo['nominal']}): {stat}{wtxt}")
+        print(f"  structure gate: {'PASS' if S['pass_'] else 'FAIL (a selection sits on its threshold)'}")
+
     p = rep["passes"]
     print(f"\n  >>> verdict: LOCO={'PASS' if p['loco'] else 'FAIL'}  "
           f"IDENTIFIABILITY={'PASS' if p['identifiability'] else 'FAIL'}  "
-          f"OFFGRID={'PASS' if p['offgrid'] else ('FAIL' if p['offgrid'] is not None else 'skip')}")
+          f"OFFGRID={'PASS' if p['offgrid'] else ('FAIL' if p['offgrid'] is not None else 'skip')}  "
+          f"STRUCTURE={'PASS' if p['structure'] else ('FAIL' if p['structure'] is not None else 'skip')}")
 
 
 def _matrix(reps):
@@ -450,13 +642,14 @@ def _matrix(reps):
     # ~unchanged by clamping). off-grid = deployment-faithful interior interpolation (the metric
     # the clamp improves). EXTRAP end-corners are clamped-to-boundary (deployment-honest) and
     # live in the per-variant detail, not here (they conflate corner-spacing with overfit).
-    cols = ["variant", "loco", "ident", "offgrid", "Z_interp", "P_interp",
+    cols = ["variant", "loco", "ident", "offgrid", "struct", "Z_interp", "P_interp",
             "offgrid_Z", "offgrid_P", "Zout_cond_worst", "switches(contained)"]
     lines = ["| " + " | ".join(cols) + " |", "|" + "|".join("---" for _ in cols) + "|"]
     for r in reps:
         if r is None:
             continue
         L, I, O = r["loco"], r["identifiability"], r["offgrid"]
+        S = r.get("structure")
         interp = [c for c in L["corners"] if c["kind"] == "interp"] or L["corners"]
         zi = max(c["zout"]["heldout"] for c in interp)
         pi = max(c["psrr"]["heldout"] for c in interp)
@@ -468,6 +661,7 @@ def _matrix(reps):
                  "PASS" if L["pass_"] else "FAIL",
                  "PASS" if I["pass_"] else "FAIL",
                  ("PASS" if O["pass_"] else "FAIL") if O else "skip",
+                 ("PASS" if S["pass_"] else "FAIL") if S else "skip",
                  f"{zi:.2f}", f"{pi:.2f}", f"{ogz:.2f}", f"{ogp:.2f}",
                  _fmt_cond(zcond), (";".join(sw) if sw else "-")]
         lines.append("| " + " | ".join(cells) + " |")
@@ -480,13 +674,15 @@ def main():
     ap.add_argument("--all", action="store_true", help="run the whole variant registry")
     ap.add_argument("--strict", action="store_true", help="exit nonzero if any gate FAILs")
     ap.add_argument("--no-offgrid", action="store_true", help="skip the ngspice off-grid sims")
+    ap.add_argument("--no-struct", action="store_true",
+                    help="skip the structure-stability LOCO (N-1 re-fits; ~3x fit cost)")
     a = ap.parse_args()
 
     keys = list(variants.VARIANTS.keys()) if a.all else [a.variant]
     reps = []
     for k in keys:
         try:
-            reps.append(run(k, do_offgrid=not a.no_offgrid))
+            reps.append(run(k, do_offgrid=not a.no_offgrid, do_struct=not a.no_struct))
         except Exception as e:                  # one bad variant must not kill the matrix
             print(f"!!! {k}: {type(e).__name__}: {e}")
             reps.append(None)

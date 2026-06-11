@@ -65,8 +65,11 @@ def run_one(k, reuse=False):
         row["slew_wrms"] = summ["slew_wrms"]
         row["spur_n"] = summ.get("spur_n", 0)
         row["spur_worst_db"] = summ.get("spur_worst_db")
+        row["spur_worst_ph"] = summ.get("spur_worst_ph_deg")
         row["spur_miss"] = summ.get("spur_missed")
         row["spur_false"] = summ.get("spur_false")
+        row["zhf"] = summ.get("zhf")
+        row["phf"] = summ.get("phf")
         row["zpass_ok"] = summ.get("zpass_synth_ok")
         row["minre_gt"] = summ.get("zout_minre_gt")
         # worst-corner sub-metrics (the breakers show here)
@@ -81,6 +84,7 @@ def md_table(rows):
             ("zband_max", "{:.2f}"), ("pkdb_max", "{:.1f}"), ("pkf_121", "{:.2f}"),
             ("pband_max", "{:.2f}"), ("pphase_max", "{:.0f}"), ("npsd_max", "{:.1f}"),
             ("wrms_max", "{:.0f}"), ("spur_n", "{:.0f}"), ("spur_worst_db", "{:.2f}"),
+            ("spur_worst_ph", "{:.1f}"), ("zhf", "{:.2f}"), ("phf", "{:.2f}"),
             ("zpass_ok", "{}"), ("minre_gt", "{:.2f}"),
             ("cout_fit_pF", "{:.0f}"), ("spur16", "{:.0f}")]
     head = "| " + " | ".join(c for c, _ in cols) + " |"

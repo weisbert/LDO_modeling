@@ -24,8 +24,10 @@ import fit_model
 
 SCOREDIR = ng.ROOT / "results" / "score"
 BANDS = [8e6, 16e6, 24e6]
-# same weights as score.py for the terms this analytic report can compute (no trms/spur here)
-W = dict(zrms=1.0, zband=3.0, zphase=0.04, pkdb=1.0, pband=2.0, pphase=0.03, noise=0.5)
+# same weights as score.py for the terms this analytic report can compute (no trms/spur here);
+# zhf/phf mirror score.py's HF-extension terms and engage only when the ref has *_hf arrays
+W = dict(zrms=1.0, zband=3.0, zphase=0.04, pkdb=1.0, pband=2.0, pphase=0.03, noise=0.5,
+         zhf=0.5, phf=0.5)
 TERM_DESC = dict(
     zrms="|Zout| magnitude RMS error (dB)",
     zband="|Zout| error in the 8/16/24 MHz spur bands (dB)",
@@ -34,6 +36,8 @@ TERM_DESC = dict(
     pband="PSRR attenuation error in the spur bands (dB)",
     pphase="PSRR phase RMS error (deg)",
     noise="output-noise PSD log-RMS error (dB)",
+    zhf="|Zout| RMS error in the *_hf extension band (dB)",
+    phf="PSRR RMS error in the *_hf extension band (dB)",
 )
 
 
@@ -185,6 +189,32 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
                zphase=np.mean([c["zphase"] for c in cs]), pkdb=np.mean([abs(c["pkdb"]) for c in cs]),
                pband=np.mean([c["pband"] for c in cs]), pphase=np.mean([c["pphase"] for c in cs]),
                noise=np.mean([c["npsd"] for c in cs]))
+    # HF-extension terms (mirror score.py's zhf/phf): analytic predict on the *_hf grid
+    # above the in-band top. Gated on the ref actually carrying *_hf arrays, so a digest
+    # ref (whose in-band z already reaches the ceiling) keeps its composite UNCHANGED.
+    kzhf = next((k for k in (f"z_{nom}_hf", "z_121u_hf") if k in ref), None)
+    if kzhf is not None:
+        gzh = ref[kzhf]
+        fh, Zgh = gzh[:, 0], gzh[:, 1] + 1j * gzh[:, 2]
+        mh = fh > float(ref[f"z_{nom}"][:, 0].max())
+        if mh.sum() >= 3:
+            predh = fit_model.predict(P[nom], fh[mh], nfk,
+                                      nmode=getattr(result, "nmode", None),
+                                      nfkv=getattr(result, "nfkv", None))
+            ezh = 20 * np.log10((np.abs(predh["Zout"]) + 1e-30) / (np.abs(Zgh[mh]) + 1e-30))
+            agg["zhf"] = float(np.sqrt(np.mean(ezh ** 2)))
+            kphf = next((k for k in (f"p_{nom}_hf", "p_121u_hf") if k in ref), None)
+            if kphf is not None:
+                gph = ref[kphf]
+                fhp, Hgh = gph[:, 0], gph[:, 1] + 1j * gph[:, 2]
+                mp = fhp > float(ref[f"p_{nom}"][:, 0].max())
+                if mp.sum() >= 3:
+                    predp = fit_model.predict(P[nom], fhp[mp], nfk,
+                                              nmode=getattr(result, "nmode", None),
+                                              nfkv=getattr(result, "nfkv", None))
+                    eph = (np.clip(-20 * np.log10(np.abs(predp["PSRR"]) + 1e-30), None, 200)
+                           - (-20 * np.log10(np.abs(Hgh[mp]) + 1e-30)))
+                    agg["phf"] = float(np.sqrt(np.mean(eph ** 2)))
     terms = sorted(((k, W[k] * agg[k], agg[k], W[k]) for k in agg), key=lambda x: -x[1])
     comp = sum(t[1] for t in terms)
     pr("\n[1] WHERE THE ERROR IS  (composite split into weighted terms, worst first)")
@@ -278,6 +308,16 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
         fz = gz[:, 0]
         grid = np.logspace(np.log10(fz[0]), np.log10(fz[-1]),
                            max(int(5 * np.log10(fz[-1] / fz[0])) + 1, 8))
+        # densify around the |Z| resonance: 5/dec under-samples a sharp peak and the
+        # digest is all the modeler gets across the air gap (digest_import's
+        # sufficiency check WARNs on an under-resolved peak; this prevents it).
+        zmag = np.abs(gz[:, 1] + 1j * gz[:, 2])
+        ipk = int(np.argmax(zmag))
+        if 0 < ipk < len(fz) - 1 and zmag[ipk] > 2.0 * float(np.median(zmag)):
+            fpk = fz[ipk]
+            extra = np.logspace(np.log10(max(fpk / 2.2, fz[0])),
+                                np.log10(min(fpk * 2.2, fz[-1])), 12)
+            grid = np.unique(np.concatenate([grid, extra]))
         Z = _cint(grid, fz, gz[:, 1] + 1j * gz[:, 2])
         cols = [np.abs(Z), np.degrees(np.angle(Z))]
         gp = ref.get(f"p_{il}")

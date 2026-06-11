@@ -417,6 +417,18 @@
             ]
           }
         }
+      },
+      "noise_poles": {
+        "cond": 156.59990250102382,
+        "colnorm_rel": {
+          "f1(19.6Hz)": 0.6883923775959926,
+          "f2(299Hz)": 0.5663642555315411,
+          "f3(4.7e+03Hz)": 0.36658573078241324,
+          "f4(5.54e+05Hz)": 0.6850549278255338,
+          "f5(1.23e+06Hz)": 1.0,
+          "f6(2.65e+07Hz)": 0.007124397275674155
+        },
+        "invisible": []
       }
     },
     "switches": {
@@ -426,7 +438,8 @@
       "psrr": [],
       "noise": [
         "gn5"
-      ]
+      ],
+      "noise_poles": []
     },
     "contained": true,
     "pass_": true
@@ -474,9 +487,101 @@
     "pass_": false,
     "lib": "C:\\code\\LDO_modeling\\results\\crossval\\ldo_v1_nmos.lib"
   },
+  "structure": {
+    "full": {
+      "cft_on": false,
+      "nmode": "norton",
+      "nsec_noise": 6,
+      "nspur": 0,
+      "cout": 3.8104041584231915e-10,
+      "branchB": {
+        "20u": false,
+        "121u": false,
+        "250u": false
+      },
+      "psrr_cpx": {
+        "20u": true,
+        "121u": true,
+        "250u": true
+      }
+    },
+    "folds": [
+      {
+        "held": "20u",
+        "nominal": "121u",
+        "flips": [],
+        "warns": [],
+        "snap": {
+          "cft_on": false,
+          "nmode": "norton",
+          "nsec_noise": 6,
+          "nspur": 0,
+          "cout": 3.8104041584231915e-10,
+          "branchB": {
+            "121u": false,
+            "250u": false
+          },
+          "psrr_cpx": {
+            "121u": true,
+            "250u": true
+          }
+        }
+      },
+      {
+        "held": "121u",
+        "nominal": "250u",
+        "flips": [
+          "PSRR complex@20u True->False",
+          "PSRR complex@250u True->False"
+        ],
+        "warns": [
+          "Cout extraction x3.1 (held=121u, nominal -> *_hf sweep lost)"
+        ],
+        "snap": {
+          "cft_on": false,
+          "nmode": "norton",
+          "nsec_noise": 6,
+          "nspur": 0,
+          "cout": 1.1977084038385088e-09,
+          "branchB": {
+            "20u": false,
+            "250u": false
+          },
+          "psrr_cpx": {
+            "20u": false,
+            "250u": false
+          }
+        }
+      },
+      {
+        "held": "250u",
+        "nominal": "121u",
+        "flips": [],
+        "warns": [],
+        "snap": {
+          "cft_on": false,
+          "nmode": "norton",
+          "nsec_noise": 6,
+          "nspur": 0,
+          "cout": 3.8104041584231915e-10,
+          "branchB": {
+            "20u": false,
+            "121u": false
+          },
+          "psrr_cpx": {
+            "20u": true,
+            "121u": true
+          }
+        }
+      }
+    ],
+    "pass_": false,
+    "note": "each fold re-runs the FULL structure-selection pipeline (C_ft gate, Cout/ghost-cap, branch-B, PSRR selector, noise topology/adaptation, spur table) on N-1 corners; a FLIP means that decision sat on its in-sample threshold (data-noise, not architecture)."
+  },
   "passes": {
     "loco": false,
     "identifiability": true,
-    "offgrid": false
+    "offgrid": false,
+    "structure": false
   }
 }

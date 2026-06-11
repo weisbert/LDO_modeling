@@ -247,15 +247,22 @@ def match_spurs(gt_spurs, model_spurs, tol_hz=2 * BINHZ):
 
 
 def score_spurs(gt_spurs, model_spurs, tol_hz=2 * BINHZ):
-    """Scalar spur fidelity: worst/mean |amp error dB| over MATCHED GT spurs, count
-    of missed GT spurs and model-only false spurs. Lower = better."""
+    """Scalar spur fidelity: worst/mean |amp error dB| AND worst/mean |phase error deg|
+    over MATCHED GT spurs, count of missed GT spurs and model-only false spurs.
+    Lower = better. Phase matters as much as amplitude for the PSS/HB end use --
+    sidebands superpose COHERENTLY, so an in-amplitude spur 45deg off still corrupts
+    the carrier spectrum (cf. the emit_va -H sign bug: 180deg, invisible to any
+    magnitude-only gate)."""
     rows, extra = match_spurs(gt_spurs, model_spurs, tol_hz)
     matched = [r for r in rows if r["model_amp"] is not None]
     errs = [abs(r["amp_db"]) for r in matched]
+    pherrs = [abs(np.degrees(r["phase_err"])) for r in matched]
     return dict(n_gt=len(gt_spurs), n_matched=len(matched), n_missed=len(rows) - len(matched),
                 n_false=len(extra),
                 worst_db=float(max(errs)) if errs else float("nan"),
                 mean_db=float(np.mean(errs)) if errs else float("nan"),
+                worst_ph_deg=float(max(pherrs)) if pherrs else float("nan"),
+                mean_ph_deg=float(np.mean(pherrs)) if pherrs else float("nan"),
                 rows=rows, extra=extra)
 
 
