@@ -1,5 +1,9 @@
 # Cadence extraction → data contract (Target B handoff)
 
+> This is the **v1** contract (consumed by `cadence/import_cadence.py` today). Proposed v2
+> extensions — bias-current output pins + the PVT matrix — and the auto-collection brief for
+> the Cadence-VM agent live in `CADENCE_AUTOCOLLECT.md`.
+
 This is the **interface** between Cadence-side extraction of a *real* transistor-level LDO and the
 behavioral-model harness in this repo. If the Cadence side emits exactly the arrays below, bringing
 the real LDO in is just: `cd harness && python fit_model.py --variant <name> && python score.py --variant <name>`.

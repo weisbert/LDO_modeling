@@ -38,6 +38,18 @@ half-amp linearity gate ≤0.15dB); `harness/trans_import.py` + **GUI tab 5** im
 - Run the linearity gate at the lightest corner (100µ) before trusting amplitudes.
 - GUI launch gotcha: user runs `./run_gui` in a desktop terminal (agent can't pop X11).
 
+**Also queued (2026-06-12, after the trans-ID experiment):**
+- **VM-side Cadence auto-collection** — the user will run a personal VM with real Cadence;
+  the agent THERE gets its context from **`CADENCE_AUTOCOLLECT.md`** (project brief + the
+  v1 file matrix + proposed v2 extensions + validation loop). Green-zone follow-up once
+  first data exists: harness support for the v2 arrays (bias-pin blocks, PVT sections).
+- **Bias-current output pins** (`IBP_POLY_500N`/`IBP_POLY_1P8U`/`IPTAT_1P5U`, downstream =
+  VCO/PLL ⇒ fidelity L0+L1+L2: DC(T,vdd) + supply-coupling/output-impedance + noise) — new
+  model pins; collection spec in CADENCE_AUTOCOLLECT.md §4a, emit/fit extension is a future
+  green-zone round.
+- **PVT = route A** (per-cell characterization → per-cell fit → `.lib` SECTIONS; NO cross-PVT
+  interpolation). Rides on auto-collection; do not start before it.
+
 **Red-zone actions queued for the next package update (independent of the experiment):**
 build `.\deploy\package.ps1 -Mode incremental` → `./update` on the box → **re-create the
 Cadence symbol (now 3 pins: vin/vout/gnd)** → re-Emit on the box (single-file `.va`: inline
