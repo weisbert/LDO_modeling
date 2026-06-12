@@ -118,7 +118,50 @@ the real part is queued (HANDOFF.md top). If it lands GO, the script's AC portio
 the `*_hf` tails + noise + spurs, and the tran becomes the backbone. **Structure the script so
 the AC block and a future tran block are interchangeable**; don't wait for the decision to start.
 
-## 6. Validating your collection end-to-end (on the VM)
+## 6. DUT strategy: the VM has NO LDO design (only the tsmc18rf PDK) — that's fine
+
+Nobody hand-builds an LDO for this. The script's correctness is about UNITS/CONVENTIONS/FORMATS,
+not about how good the DUT is. Three tiers, in order:
+
+- **Tier 0 (primary): round-trip our own emitted `.va` — known ground truth.** Spectre simulates
+  Verilog-A natively (`ahdl_include "ldo_v3_miller.va"`; repo `model/` has 14 of them, 3-pin,
+  with built-in noise sources so even `pnoise` is exercised). The loop:
+  `collect(va_model) → import_cadence.assemble → fit → score against the ORIGINAL ref npz in
+  results/ref/` — the composite should land near that variant's known baseline (see
+  `results/matrix*`). Any unit/format/convention bug in your script shows up as a huge composite.
+  Zero PDK, zero schematic, fully quantitative. **Prove the script here first.**
+- **Tier 1 (PDK realism): port one GT netlist to tsmc18rf yourself** — `ground_truth/ldo_gt.lib`
+  etc. are transistor-level ngspice subckts with generic MOS; porting one to a Spectre `.scs`
+  with tsmc18 devices (model names/sections from the PDK's model `.scs` files) is pure TEXT work
+  + CLI iteration — agent time, not user weekend time. It only needs to REGULATE, not be good.
+  This is the tier that tests what tier 0 can't: PDK corner `section=` statements (PVT loop!),
+  real device flicker noise, temperature. Add a 2-mirror PTAT/bias branch to exercise §4a.
+- **Tier 2 (loop mechanics): any trivial DUT.** The PVT × corner × file-matrix orchestration is
+  DUT-agnostic — bring it up on an RC divider if tier 1 lags. Never block on the LDO.
+
+## 7. Agent feedback loop in the Cadence environment
+
+Ranked by iteration speed for an agent:
+
+1. **`spectre` CLI on raw netlists (the tight loop — use this for bring-up).**
+   `spectre tb.scs +escchars =log run.log -format psfascii -raw ./psf` — you write the netlist,
+   run, parse `./psf` (PSF-ASCII; `import_cadence` already best-effort reads it, or use the
+   `psf_utils` pip package), iterate. No GUI, no Maestro, no ADE license — simulator license only.
+   **This mirrors the repo's own architecture** (`bench.py` generates decks, `ng.py` runs them
+   via subprocess): the natural deliverable is a *spectre backend* beside `ng.py`, with the file
+   matrix as backend-agnostic Python that EMITS decks — which is also exactly what makes the
+   later ALPS (red-zone) port a one-layer swap.
+2. **Headless OCEAN for the Maestro layer.** `ocean -nograph -replay run.ocn -log ocean.log`
+   runs unattended; for an ADE Assembler/maestro view use OCEAN XL (`ocnxlBegin()` …
+   `ocnxlRun()` … results API). The loop: agent edits `.ocn` → headless run → read log/results
+   → iterate. Add this as a THIN adapter only after the matrix works via tier-0/CLI — it's what
+   lets the user trigger collection from their interactive maestro setup later.
+3. **skillbridge (live session, optional).** `pip install skillbridge`, load its SKILL server
+   into a Virtuoso session **the user starts** (agents can't pop the GUI — known gotcha), then
+   Python drives the live session. Best for poking at an existing maestro cellview; worst
+   portability. Don't make the deliverable depend on it.
+
+## 8. Validating your collection end-to-end (on the VM)
 
 ```bash
 python -m venv .venv && . .venv/bin/activate && pip install -r requirements.txt
@@ -133,7 +176,7 @@ A healthy real-part fit looks like composite ~2–4 with no gate FAIL (the red-z
 1.81). If Zout shows a huge ghost capacitance, suspect a broken `z_hf` export (this exact bug
 happened once — the guardrail now catches it, but read the warnings).
 
-## 7. Gotchas inherited from earlier rounds
+## 9. Gotchas inherited from earlier rounds
 
 - **GUI**: launch `./run_gui` from a desktop terminal yourself? No — the USER must launch it
   (agent processes can't pop X11/Qt windows reliably); prefer the CLI path above for automation.
@@ -145,7 +188,7 @@ happened once — the guardrail now catches it, but read the warnings).
 - Do NOT re-attempt a fitter fix for multi-pole PSRR grid sensitivity (R7 closed as negative);
   if a fit looks PSRR-limited, the fix is recipe-side (tone/grid placement), not the fitter.
 
-## 8. Out of scope for the VM session
+## 10. Out of scope for the VM session
 
 - Re-tuning fit thresholds (e.g. SHELF_PH_TRIG) or the composite weights — green-zone work with
   the full 19-variant regression matrix behind it.
