@@ -1,6 +1,19 @@
-# HANDOFF — LDO behavioral-model builder (as of 2026-06-11, end of day)
+# HANDOFF — LDO behavioral-model builder (as of 2026-06-12)
 
-## NEXT SESSION = trans-ID Verilog-A probe ON THE REAL PART (user-requested experiment)
+## TWO ENTRY POINTS for the next session — pick by where the user is sitting:
+
+- **At work (red zone access)** → run the **trans-ID Verilog-A probe on the real part**
+  (the section directly below; recipe complete, tooling shipped). Plus the queued package
+  actions (3-pin symbol, re-Emit single-file .va, paste new report with # dcblock).
+- **At home (personal VM with Cadence/Spectre + tsmc18rf)** → bring up the **auto-collection
+  flow**. The agent on the VM reads **`CADENCE_AUTOCOLLECT.md`** (self-contained brief).
+  Day-1 outline: clone repo → venv + ngspice → tier-0 DUT = our own emitted `.va` via
+  spectre CLI (`ahdl_include`, round-trip score vs the known ref-npz baseline = quantitative
+  script proof) → build the file matrix as backend-agnostic Python (a spectre backend beside
+  `ng.py`) → only then tier-1 (port a ground_truth netlist to tsmc18 by text, tests PVT
+  sections/flicker) and the headless-OCEAN Maestro adapter. No LDO needs to be hand-built.
+
+## NEXT SESSION (red zone) = trans-ID Verilog-A probe ON THE REAL PART (user-requested experiment)
 
 **Goal:** test on the real 5.8G LDO whether ONE multitone transient per corner really replaces
 the AC Zout/PSRR exports ("是不是真的效果不错") — the R5 idea, already PROVEN on 4 synthetic
@@ -55,6 +68,34 @@ build `.\deploy\package.ps1 -Mode incremental` → `./update` on the box → **r
 Cadence symbol (now 3 pins: vin/vout/gnd)** → re-Emit on the box (single-file `.va`: inline
 PWL dropout, no .tbl dependency, vdd/voutdc instance params) → paste the new report (its
 [7] digest now carries `# dcblock` DC curves → the local replica's DC turns real).
+
+## UPDATE (2026-06-12) — planning session: bias pins + PVT + VM auto-collection (DOC-ONLY, no code)
+
+User raised three new requirements; decisions made and recorded (commits ba9182c, d4e2086 —
+both documentation; the harness/matrix is untouched since 4beaa9d):
+
+1. **Bias-current output pins** (`IBP_POLY_500N`/`IBP_POLY_1P8U`/`IPTAT_1P5U` on the LDO output,
+   feeding **VCO/PLL**): fidelity ladder offered L0 (DC ideal source) / L1 (+supply coupling,
+   output impedance) / L2 (+noise) — user's downstream is phase-noise-critical ⇒ **all three**.
+   Their µA loading on the LDO needs no mechanism (fold into iload). Collection spec (proposed
+   `biasdc_/biasvdd_/biasxfer_/biasz_/biasnoise_<pin>` arrays) = CADENCE_AUTOCOLLECT.md §4a;
+   harness emit/fit support = a FUTURE green-zone round, deliberately after first real data.
+2. **PVT = route A**: per-PVT-cell characterize→fit→`.lib` SECTIONS (foundry-style selection);
+   cross-PVT interpolation REJECTED (new overfit surface, would touch `_pexpr` + every gate).
+   PTAT-ish quantities are the exception (continuous i(T)). Blocked on auto-collection
+   (matrix = load corners × PVT cells).
+3. **Cadence auto-collection on the user's home VM** → **`CADENCE_AUTOCOLLECT.md`** created:
+   self-contained brief for the VM-side agent (project one-pager, v1 file matrix, v2 arrays,
+   Ocean deliverable with a swappable analysis layer for the eventual ALPS port, validation
+   loop, gotchas). Key additions after user Q&A: the VM has NO LDO design (only tsmc18rf PDK)
+   → §6 three-tier DUT strategy (tier 0 = round-trip our own emitted `.va`, quantitative;
+   tier 1 = agent ports a `ground_truth/*.lib` to tsmc18 by text; tier 2 = trivial DUT for
+   loop mechanics) and §7 agent feedback loop (spectre CLI on raw netlists first — mirrors
+   `bench.py`+`ng.py`, deliverable = a spectre backend; headless `ocean -nograph`/OCEAN XL as
+   the thin Maestro adapter; skillbridge optional, user must start the session).
+
+Agreed ordering: **trans-ID probe → auto-collection (backbone = tran or AC per the probe's
+GO/NO-GO) → bias L0 emit (can interleave) → PVT last.**
 
 ## UPDATE (2026-06-11c) — R2 + R3-L1 SHIPPED: gnd port + settable vdd/voutdc on the emitted model
 
