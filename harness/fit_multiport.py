@@ -50,7 +50,7 @@ def _fm_globals():
     """Save/restore the fit_model module globals we mutate, so each output (and the
     caller's process) is isolated."""
     keys = ("ref", "LOADS", "NOMINAL", "C", "RC", "CFT", "VREF", "NFK", "MNOISE",
-            "NOISE_MODE", "NFKV")
+            "NOISE_MODE", "NFKV", "NSPUR_F", "NSPUR_PH")
     saved = {k: getattr(FM, k) for k in keys}
     try:
         yield
@@ -142,19 +142,26 @@ def _rms_db(model, gt):
 # ----------------------------------------------------------------- current sinks
 def _fit_admittance(f, Y):
     """Y(s) ~ g0 + s*Cp  (sink output conductance + parasitic cap), complex LS in
-    [g0, Cp]. Returns (g0, Cp, rms_db)."""
+    [g0, Cp]. Degenerate-safe: <2 points -> constant g0 only; a non-physical negative
+    parasitic cap is clamped to 0 (a sink cap cannot be negative). Returns (g0, Cp, rms_db)."""
     w = 2 * np.pi * f
+    if f.size < 2:                                    # rank-deficient -> constant model
+        g0 = float(np.mean(Y).real)
+        return g0, 0.0, _rms_db(np.full_like(Y, g0), Y)
     A = np.c_[np.ones_like(w), 1j * w]                # [1, jw]
     x, *_ = np.linalg.lstsq(A, Y, rcond=None)
-    g0, Cp = float(x[0].real), float(x[1].real)
+    g0, Cp = float(x[0].real), max(float(x[1].real), 0.0)   # clamp: parasitic cap >= 0
     Ym = g0 + 1j * w * Cp
     return g0, Cp, _rms_db(Ym, Y)
 
 
 def _fit_cpsrr(f, PI):
     """current-PSRR pi(s) ~ c0 + s*c1 (low order; near-flat for a behavioral sink).
-    Returns (c0_complex, c1_complex, rms_db)."""
+    Degenerate-safe: <2 points -> complex constant c0 only. Returns (c0, c1, rms_db)."""
     w = 2 * np.pi * f
+    if f.size < 2:
+        c0 = complex(np.mean(PI))
+        return c0, 0j, _rms_db(np.full_like(PI, c0), PI)
     A = np.c_[np.ones_like(w), 1j * w]
     x, *_ = np.linalg.lstsq(A, PI, rcond=None)
     c0, c1 = complex(x[0]), complex(x[1])

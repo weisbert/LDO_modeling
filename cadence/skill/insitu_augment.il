@@ -27,10 +27,18 @@
 ;;   load("cadence/skill/insitu_augment.il")
 ;; ============================================================================
 
-;; --- copy the designer TB to the extraction copy (overwrite if present) -----
+;; --- copy the designer TB to the extraction copy (idempotent rebuild) --------
 (defun insituCopyTB (srcLib srcCell dstCell @optional (dstLib srcLib) (view "schematic"))
-  ;; Ref: dbOpenCellViewByType skdfref p.900 ; dbCopyCellView skdfref p.876
-  (let (src dst)
+  ;; Close any open dest cellview + delete the dest cell first, so the copy is robust to a
+  ;; stale/locked prior copy (overwrite=t alone fails if a previous run left it open).
+  ;; Ref: dbGetOpenCellViews skdfref ; ddGetObj/ddDeleteObj ; dbOpenCellViewByType p.900 ;
+  ;;      dbCopyCellView p.876
+  (let (src dst old ddObj)
+    (foreach ocv (dbGetOpenCellViews)
+      (when (and (equal ocv~>cellName dstCell) (equal ocv~>libName dstLib))
+        (dbClose ocv)))
+    (setq ddObj (ddGetObj dstLib dstCell))
+    (when ddObj (ddDeleteObj ddObj))
     (setq src (dbOpenCellViewByType srcLib srcCell view view "r"))
     (unless src (error "insituCopyTB: cannot open %s/%s/%s" srcLib srcCell view))
     (setq dst (dbCopyCellView src dstLib dstCell view nil nil t))   ; overwrite=t
@@ -43,8 +51,9 @@
 ;; --- world position of an instance terminal (geometry-driven connect-by-name) --
 (defun insituTermPoint (inst termName)
   ;; master symbol pin center, transformed by the instance placement. Ref:
-  ;; dbTransformPoint skdfref p.586. Returns (x y) or nil.
-  (let (mt pin fig bb c)
+  ;; dbTransformPoint skdfref p.586. Returns (x y) or nil. NB: wrapped in prog because
+  ;; classic SKILL `return` only escapes an enclosing prog (not a bare let).
+  (prog (mt pin fig bb c)
     (setq mt (car (setof tm inst~>master~>terminals (equal tm~>name termName))))
     (unless mt (return nil))
     (setq pin (car mt~>pins))
@@ -53,7 +62,7 @@
     (setq bb fig~>bBox)
     (setq c (list (quotient (plus (caar bb) (caadr bb)) 2.0)
                   (quotient (plus (cadar bb) (cadadr bb)) 2.0)))
-    (dbTransformPoint c inst~>transform)))
+    (return (dbTransformPoint c inst~>transform))))
 
 
 ;; --- place a 2-terminal source and connect each terminal to a named net ------

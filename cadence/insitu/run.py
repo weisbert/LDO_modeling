@@ -112,26 +112,34 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
         augment.build(m, ws=ws, verbose=False)
     ws["load"](str(SKILL_DIR / "insitu_run.il"))
     ws["insituEnsureTest"](session, test, d["tb_lib"], d["extract_cell"], "spectre")
-    ws["insituEnableOnly"](session, test)
-    allvars = list(augment_design_vars(m))
+    # snapshot the designer's test-enable state and RESTORE it afterwards -- enabling only
+    # our extraction test must not silently leave their ADE reconfigured.
+    snap = ws["insituSnapshotEnabled"](session)
     psf_map, histories = {}, {}
-    for g in groups(m):
-        hot = {_manifest.acm_var(k, v): "1" for k, v in g["hot"]}
-        for var in allvars:                                   # one-hot: this group's vars=1
-            ws["insituPutVar"](session, var, hot.get(var, "0"))
-        ws["insituSubmit"](session)
-        deadline = timeout
-        while deadline > 0:                                    # poll to idle [0 0]
-            st = ws["insituStatus"](session)
-            if st and list(st) == [0, 0]:
-                break
-            time.sleep(2); deadline -= 2
-        hname = ws["insituRename"](session, g["tag"])
-        histories[g["tag"]] = hname
-        pdir = _resolve_psf_dir(ws, session, d, hname, g["tag"])
-        for pt in g["members"]:
-            if pdir is not None:
-                psf_map[pt["tag"]] = pdir
+    try:
+        ws["insituEnableOnly"](session, test)
+        allvars = list(augment_design_vars(m))
+        for g in groups(m):
+            hot = {_manifest.acm_var(k, v): "1" for k, v in g["hot"]}
+            for var in allvars:                               # one-hot: this group's vars=1
+                ws["insituPutVar"](session, var, hot.get(var, "0"))
+            ws["insituSubmit"](session)
+            deadline, started = timeout, False
+            while deadline > 0:                               # poll: confirm start, then idle
+                st = ws["insituStatus"](session)
+                if st and list(st) != [0, 0]:
+                    started = True
+                if st and list(st) == [0, 0] and started:
+                    break
+                time.sleep(2); deadline -= 2
+            hname = ws["insituRename"](session, g["tag"])
+            histories[g["tag"]] = hname
+            pdir = _resolve_psf_dir(ws, session, d, hname, g["tag"])
+            for pt in g["members"]:
+                if pdir is not None:
+                    psf_map[pt["tag"]] = pdir
+    finally:
+        ws["insituRestoreEnabled"](session, snap)             # leave the designer's ADE as found
     return dict(psf_map=psf_map, backend="ade", histories=histories,
                 probe_aliases=None)
 
@@ -141,10 +149,23 @@ def augment_design_vars(m):
     return augment.design_vars(m)
 
 
+def _has_psf(d):
+    """True iff `d` (or a child) actually holds an .ac/.noise PSF -- guards against a
+    resolver returning a stale or empty run dir."""
+    p = pathlib.Path(d)
+    if not p.exists():
+        return False
+    for ext in (".ac", ".noise"):
+        if any(p.rglob(f"*{ext}")):
+            return True
+    return False
+
+
 def _resolve_psf_dir(ws, session, d, hname, tag):
     """Best-effort: locate the PSF tree for a finished run. Tries the ADE analog run dir
     (asiGetAnalogRunDir) and the session's results area, accepting either psf/ (ALPS) or
-    netlist/ (Spectre). Returns a pathlib.Path or None (importmp tries the subdirs)."""
+    netlist/ (Spectre). Only returns a dir that ACTUALLY contains PSF (non-empty), so a
+    stale/previous run dir is not silently accepted. Returns a pathlib.Path or None."""
     cands = []
     try:
         rd = ws["asiGetAnalogRunDir"]()
@@ -152,13 +173,16 @@ def _resolve_psf_dir(ws, session, d, hname, tag):
             cands.append(pathlib.Path(str(rd)))
     except Exception:                                          # noqa: BLE001
         pass
-    # simulation results area: <proj>/<cell>/<hname>/... -- glob for it
+    # the renamed history is the most specific anchor -> prefer it over the bare tag
     for base in cands + [CADENCE]:
         for sub in (f"**/{hname}/**/psf", f"**/{hname}/**/netlist", f"**/{tag}/**/psf"):
-            hits = list(base.glob(sub)) if base.exists() else []
-            if hits:
-                return hits[0].parent
-    return cands[0] if cands else None
+            for hit in (base.glob(sub) if base.exists() else []):
+                if _has_psf(hit.parent):
+                    return hit.parent
+    for c in cands:
+        if _has_psf(c):
+            return c
+    return None
 
 
 # ----------------------------------------------------------------------- dispatch

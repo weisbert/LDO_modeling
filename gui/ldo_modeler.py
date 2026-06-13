@@ -245,9 +245,9 @@ class ExtractCore:
         orchestration over the insitu package + fit_multiport."""
         if self.manifest is None:
             raise RuntimeError("load a manifest first")
-        from insitu import cli, augment
-        if backend == "ade":
-            augment.build(self.manifest)                 # build Test_PMU_extract on the session
+        from insitu import cli
+        # the ade run-drive builds Test_PMU_extract itself (run_ade build_first=True) -- no
+        # double-build here.
         path, npz, _r = cli.produce_npz(self.manifest, backend, session, regenerate)
         self.npz_path = path
         self.gate = cli.gate_vs_gold(npz, tol=tol)
@@ -498,25 +498,14 @@ if _HAVE_QT:
             try:
                 self.core.use_existing_ref(refp)
                 self.core.profile.name = pathlib.Path(refp).stem
-                self._refresh_after_ref_load()
-                self.tabs.setCurrentIndex(3)        # jump to Fit
+                # reuse the GUI's full programmatic-profile sync (Profile + Import grid +
+                # Compare corner dropdown + cout/esr), so Fit/Compare operate on this port.
+                self.refresh_from_profile()
+                self.tabs.setCurrentIndex(3)        # jump to Fit (tab 0=Extract shifted it)
                 self.statusBar().showMessage(f"Loaded port '{port}' ({pathlib.Path(refp).name}) "
                                              "→ Fit, then Compare.")
             except Exception as e:
                 QMessageBox.critical(self, "Load port", f"{type(e).__name__}: {e}")
-
-        def _refresh_after_ref_load(self):
-            """Sync the Profile/Import widgets to a ref loaded programmatically (port send),
-            so Fit/Compare operate on it. Best-effort: only touches widgets that exist."""
-            p = self.core.profile
-            if hasattr(self, "e_name"):
-                self.e_name.setText(p.name)
-            if hasattr(self, "e_loads"):
-                self.e_loads.setText(",".join(p.loads))
-            if hasattr(self, "e_nom"):
-                self.e_nom.clear(); self.e_nom.addItems(p.loads)
-                if p.nominal in p.loads:
-                    self.e_nom.setCurrentText(p.nominal)
 
         # --- Tab 1: Profile ------------------------------------------------------
         def _tab_profile(self):

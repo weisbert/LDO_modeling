@@ -107,8 +107,14 @@ def build(m, ws=None, verbose=True):
                     f"supplies.{s} has no 'tb_src' -- augment needs the TB source instance "
                     f"name driving net {v['net']} to set its acm. Add it to the manifest.")
             ws["insituSetSupplyAcm"](cv, src, _manifest.acm_var("supply", s))
-        # 5) save
-        ws["insituSaveCV"](cv)
+        # 5) check connectivity (extracts the by-name labels) + save. A non-zero schCheck
+        #    ERROR count means an appended source did NOT bind to its DUT net -> the run
+        #    would be mis-wired; fail loudly instead of persisting/running it.
+        chk = ws["insituSaveCV"](cv)
+        if chk and int(chk[0]) > 0:
+            raise RuntimeError(
+                f"augment: schCheck reported {int(chk[0])} error(s) on {ext_cell} "
+                f"(appended stimuli may not bind to the DUT nets) -- aborting before run")
     except Exception:
         try:
             ws["dbClose"](cv)

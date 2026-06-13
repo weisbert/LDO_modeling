@@ -46,7 +46,7 @@
     th))
 
 
-;; --- enable ONLY our extraction test (snapshot/restore is the caller's job) ---
+;; --- enable ONLY our extraction test -----------------------------------------
 (defun insituEnableOnly (sess testName)
   ;; Ref: axlGetTests adexl p.282 ; axlGetTest p.281 ; axlSetEnabled p.156
   (let (sdb names h)
@@ -55,6 +55,27 @@
     (foreach n names
       (setq h (axlGetTest sdb n))
       (when h (axlSetEnabled h (equal n testName))))
+    t))
+
+
+;; --- snapshot / restore the designer's test-enable state (don't mutate the session) ---
+(defun insituSnapshotEnabled (sess)
+  ;; Returns ((name enabled) ...) so the run loop can restore the designer's ADE exactly.
+  ;; Ref: axlGetTests p.282 ; axlGetTest p.281 ; axlGetEnabled (companion of axlSetEnabled
+  ;; p.156; used by simkit pvtRunner).
+  (let (sdb out h)
+    (setq sdb (insituSdb sess))
+    (foreach n (cadr (axlGetTests sdb))
+      (setq h (axlGetTest sdb n))
+      (when h (setq out (cons (list n (axlGetEnabled h)) out))))
+    (reverse out)))
+
+(defun insituRestoreEnabled (sess snap)
+  (let (sdb h)
+    (setq sdb (insituSdb sess))
+    (foreach pair snap
+      (setq h (axlGetTest sdb (car pair)))
+      (when h (axlSetEnabled h (cadr pair))))
     t))
 
 

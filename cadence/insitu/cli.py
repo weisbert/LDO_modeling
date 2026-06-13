@@ -1,5 +1,9 @@
 """P6 -- headless end-to-end CLI (acceptance criterion 1).
 
+Run from the cadence/ directory (or with cadence/ on PYTHONPATH) so the `insitu` package
+and its reused siblings resolve -- the repo convention for all cadence/ tools:
+
+    cd cadence
     python -m insitu doctor   --manifest pmu_top
     python -m insitu augment  --manifest pmu_top
     python -m insitu run-only --manifest pmu_top [--backend spectre_cli|ade]
@@ -55,14 +59,35 @@ def doctor(m, session="fnxSession0"):
 
 
 # ----------------------------------------------------------------------- gate
-def gate_vs_gold(npz_dict, tol=1e-6):
+def gate_vs_gold(npz_dict, tol=1e-6, abs_floor=1e-12):
     """Compare the produced multi-port arrays to the trusted CLI gold within tolerance.
-    Returns (passed, worst_err, detail). Missing gold -> skipped (passed=None)."""
+    Returns (passed, worst_err, detail). Missing gold -> skipped (passed=None).
+
+    The error is a MAGNITUDE-AWARE RELATIVE error per port: max|a-b| / (the port's own
+    gold magnitude). This never goes blind to the small-magnitude ports (y~1e-7, pi~2e-7,
+    noise~7e-8) -- a sign-flipped or doubled current/noise port yields err~1+ and FAILS.
+    For genuinely-zero couple_<a>_<b> ports the scale falls back to the companion output's
+    Zout, so a spurious coupling is still caught. The frequency axis (column 0) is checked
+    explicitly -- a same-shape-but-misaligned grid would otherwise pass silently."""
     if not GOLD.exists():
         return None, 0.0, "no gold reference present -- gate skipped"
     import numpy as np
     gold = np.load(GOLD, allow_pickle=True)
     gkeys = [k for k in gold.files if not k.startswith("meta_") and k != "loads"]
+    gloads = [str(x) for x in gold["loads"]]
+
+    def _scale(k, b):
+        g = float(np.max(np.abs(b[:, 1:])))
+        if g > abs_floor:
+            return g
+        if k.startswith("couple_"):                    # near-zero by design -> companion Zout
+            a_out = k.split("_")[1]
+            for il in gloads:
+                zk = f"z_{a_out}_{il}"
+                if zk in gold.files:
+                    return max(float(np.max(np.abs(gold[zk][:, 1:]))), abs_floor)
+        return abs_floor
+
     worst, worst_k = 0.0, None
     for k in gkeys:
         if k not in npz_dict:
@@ -70,8 +95,9 @@ def gate_vs_gold(npz_dict, tol=1e-6):
         a, b = npz_dict[k], gold[k]
         if a.shape != b.shape:
             return False, float("inf"), f"shape mismatch {k}: {a.shape} vs {b.shape}"
-        num = np.abs(a[:, 1:] - b[:, 1:]); den = np.abs(b[:, 1:]) + 1e-30
-        err = float(min(np.max(num / den), np.max(num)))      # rel OR abs (near-zero couple)
+        if not np.allclose(a[:, 0], b[:, 0], rtol=1e-9, atol=0.0):
+            return False, float("inf"), f"freq-grid mismatch {k}"
+        err = float(np.max(np.abs(a[:, 1:] - b[:, 1:]))) / _scale(k, b)
         if err > worst:
             worst, worst_k = err, k
     return worst <= tol, worst, f"worst={worst:.2e} @ {worst_k}"
@@ -94,8 +120,9 @@ def produce_npz(m, backend, session, regenerate):
 def cmd_run(m, backend, session, regenerate, tol):
     print(f"== insitu run ({backend}) ==")
     if backend == "ade":
-        print("augment: building extraction TB on the live session ...")
-        _augment.build(m)
+        print("augment: building extraction TB on the live session (via run-drive) ...")
+    # NB: the ade run-drive (run_ade, build_first=True) builds Test_PMU_extract itself --
+    # do not double-build here.
     path, npz, r = produce_npz(m, backend, session, regenerate)
     print(f"run: {len(r['psf_map'])} PSF dirs -> npz {path.name} ({len(npz)-3} arrays)")
     passed, worst, detail = gate_vs_gold(npz, tol=tol)
