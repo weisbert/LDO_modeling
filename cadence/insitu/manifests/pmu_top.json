@@ -1,0 +1,33 @@
+{
+  "name": "pmu_top",
+  "_note": "Stand-in PMU manifest. We authored sim_yusheng/PMU_top so we KNOW its roles; on the company box the designer hands a manifest of identical shape for the real PMU (capture-and-augment: only the nets/cells/corners change, not the code).",
+  "dut": {
+    "lib": "sim_yusheng",
+    "cell": "PMU_top",
+    "tb_lib": "sim_yusheng",
+    "tb_cell": "Test_PMU",
+    "tb_inst": "I26",
+    "extract_cell": "Test_PMU_extract"
+  },
+  "ground": "gnd!",
+  "supplies": {
+    "1p0": {"net": "VDD1P0", "dc": 1.05},
+    "1p8": {"net": "VDD1P8", "dc": 1.8}
+  },
+  "v_out": {
+    "pll": {"net": "VDD0P8_PLL", "iload": 500e-6, "vout_dc": 0.8},
+    "vco": {"net": "VDD0P8_VCO", "iload": 500e-6, "vout_dc": 0.8}
+  },
+  "i_out": {
+    "i500n": {"net": "IBIAS_500N", "dc": 0.4, "probe_src": "Vprobe_i500n"},
+    "i1u":   {"net": "IBIAS_1U",   "dc": 0.4, "probe_src": "Vprobe_i1u"}
+  },
+  "bias": {},
+  "leave_alone": ["BIAS_EN", "PLL_EN", "VCO_EN", "PLL_CTRL<3:0>", "VCO_CTRL<3:0>", "TEST_CTRL<3:0>"],
+  "corners": {"pull_from_session": true, "fallback": ["nom"]},
+  "current_psrr_supplies": ["1p0"],
+  "analysis": {
+    "ac": "ac start=10 stop=500M dec=20",
+    "noise": "noise start=10 stop=100M dec=20"
+  }
+}

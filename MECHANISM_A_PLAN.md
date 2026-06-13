@@ -31,12 +31,21 @@ the CLI (criterion 1) and the GUI (criterion 2) are thin layers over it.
 
 ## Integration posture (decided 2026-06-13)
 
-LDO modeling ships **standalone** for now — a self-contained `insitu/` package + its own
-GUI, NOT integrated into simkit. The user will consider absorbing it into simkit **later,
-once the flow is mature**. So: build self-contained with a clean core↔CLI↔GUI seam; **copy
-simkit's proven pvtRunner call sequence into our own `insitu_run.il` — do NOT import or
-depend on the simkit package.** Designing the core to be cleanly liftable makes the future
-simkit absorption a port, not a rewrite — but we pay zero coupling cost now.
+LDO modeling stays **standalone** (NOT integrated into simkit) for now; the user will
+consider folding it into simkit **later, once mature**. So copy simkit's proven pvtRunner
+call sequence into our own `insitu_run.il` — do NOT import/depend on the simkit package.
+
+**There is ALREADY an LDO-modeling GUI** on `main`: `gui/ldo_modeler.py` — a Qt-free
+`ModelerCore` (import→fit→predict→emit, fully `--selftest`-able headless) under a thin
+5-tab PyQt5 shell (Profile · Import · Fit · Compare · Trans-ID), plus a `deploy/` offline
+airgap pipeline. Its architecture (Qt-free core + thin shell + selftest) is exactly the
+seam we want — **mechanism A EXTENDS this GUI; it does NOT build a new one** (see P7). The
+new in-situ Extract front-half produces the SAME npz the existing Import tab already
+consumes, so the two converge at the npz firewall.
+
+**Branch unified (2026-06-13):** all of this now lives on `main` (merge `10845f3` brought
+the Cadence/Spectre bring-up + PMU stand-in onto main alongside the GUI/deploy line). Build
+mechanism A on `main`. The old `target-b-cadence-bringup` branch is superseded.
 
 ## North-star invariant (why Monday is "just a new manifest")
 
@@ -53,7 +62,8 @@ local) to the real PMU (ALPS, cluster) is: **swap the manifest + point at the re
 | `cadence/extract_pmu.py` | The **proven analysis recipe** (8-point matrix: Zout/PSRR×2sup/noise/coupling/admittance/current-PSRR). Port the *stimulus+read logic*, re-route from CLI to ADE. |
 | `cadence/psf.py` | PSF reader — unchanged. |
 | `cadence/skill_lib.py` | The skillbridge `Workspace.open()` pattern — run-drive uses the same `ws['axl...']()` calls. |
-| `cadence/import_cadence.py` (`assemble`) | The npz contract writer — **generalize** single-port → multi-port. |
+| `cadence/import_cadence.py` (main's 457-line GUI version: `assemble(profile,files)` / `from_psf(path,kind,fmt)` / `validate` / `match_dir`) | The npz contract writer the GUI uses — **add multi-port functions alongside**, don't break the GUI's existing single-port API. |
+| `gui/ldo_modeler.py` (`ModelerCore` Qt-free core + 5-tab shell + `--selftest`) + `deploy/` | **The GUI to EXTEND** (criterion 2): add an Extract tab + `ExtractCore`; generalize `ModelerCore` import/fit/compare to multi-port. Keep the Qt-free-core architecture + airgap pipeline. |
 | `harness/fit_model.py` | The per-output fitters (zmodel/psrr/noise) — **reuse as building blocks** in a multi-port loop. |
 | `simkit/skill/pvtRunner.il` | The **run-drive reference**: `axlRunAllTests` Submit → poll `axlGetRunStatus` → `axlSetHistoryName`; test/corner enable via `axlGetTests`/`axlGetCorners`/`axlSetEnabled`. Borrow the proven sequence (don't depend on the whole package). |
 
@@ -84,8 +94,10 @@ supply → series-insert 1 V AC vsource + save out nodes / probe currents; i_out
 ### P0 — Scaffold + confirm environment (small)
 - New package `cadence/insitu/` (manifest, augment, run, import, cli, gui) + SKILL under
   `cadence/skill/insitu_*.il`.
-- Confirm: skillbridge live to `fnxSession0`; the Qt binding simkit uses (`grep` simkit
-  python) is importable here; `Test_PMU` opens.
+- Confirm: skillbridge live to `fnxSession0`; **PyQt5 importable** (the GUI's binding —
+  check on the experimental box; this dev VM may lack it, and the `--selftest` path stays
+  Qt-free regardless); **`python gui/ldo_modeler.py --selftest` passes** (post-merge
+  integrity check that merge `10845f3` didn't break the GUI's `ModelerCore`); `Test_PMU` opens.
 - **Deliverable:** `insitu/__init__.py`, package importable; a `insitu doctor` CLI that
   prints session + Qt + DUT availability.
 
@@ -146,17 +158,23 @@ supply → series-insert 1 V AC vsource + save out nodes / probe currents; i_out
   one-screen summary (points run, npz path, fit error table, pass/fail vs CLI baseline).
 - **Deliverable:** one command, cold→done, on the experimental box.
 
-### P7 — GUI  ← **acceptance criterion 2**
-- `insitu/gui.py` — a **STANDALONE** desktop app (same Qt binding simkit runs on this box,
-  but NOT part of simkit's app; see Integration posture). A thin layer over the P1–P5 core:
-  - **Manifest tab:** load/edit the pin-role manifest (tag pins, set stim kind).
-  - **Run tab:** "Build & Run" button → calls augment+run via skillbridge; live status
-    (poll `axlGetRunStatus`), Maestro history link.
-  - **Results tab:** plot Zout / PSRR×sup / noise / admittance vs freq; show the fit-error
-    table (voltage vs current ports); "Export npz".
-- Must run offline on the experimental box; same app re-points at the real PMU on Monday by
-  loading a different manifest.
-- **Deliverable:** launchable GUI; user clicks through PMU_top end-to-end and sees results.
+### P7 — EXTEND the existing GUI  ← **acceptance criterion 2**
+**Do NOT build a new GUI — extend `gui/ldo_modeler.py`.** It already has a Qt-free
+`ModelerCore` + a 5-tab shell (Profile · Import · Fit · Compare · Trans-ID) + `--selftest`
++ a `deploy/` airgap pipeline. Two additions:
+- **New `ExtractCore` (Qt-free)** wrapping P1–P4 (manifest → augment → run-in-ADE → PSF →
+  npz) via skillbridge — same headless-testable discipline as `ModelerCore`. It PRODUCES the
+  npz that the existing **Import** tab already consumes (the two paths converge at the npz).
+- **New tab "0 · Extract (in-situ)"**: load/edit the pin-role manifest (tag pins, stim kind);
+  "Build & Run" → augment+run via skillbridge with live status (poll `axlGetRunStatus`) +
+  Maestro history link; on success hand the npz to the Import→Fit→Compare flow.
+- **Generalize `ModelerCore` + Fit/Compare tabs to multi-port** (P5): per-output Zout/PSRR×sup/
+  noise + current-port admittance/current-PSRR; overlay + fit-error table break out current
+  ports separately. Keep the Qt-free-core + `--selftest` discipline (add selftest coverage).
+- Runs offline on the experimental box (PyQt5 is on the red box; this dev VM may lack it — the
+  `--selftest` path must stay Qt-free). Monday: same GUI, load a different manifest.
+- **Deliverable:** launch `gui/ldo_modeler.py`, click Extract→Import→Fit→Compare end-to-end on
+  PMU_top, see multi-port results; `--selftest` green.
 
 ---
 

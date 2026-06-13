@@ -1,0 +1,29 @@
+ultracode
+
+构建 Mechanism A —— 把已验证的 in-situ 多端口 LDO 抽取从独立 spectre CLI 改走 ADE-XL/Maestro,并接入项目现有 GUI。
+
+【在 main 分支上干活】分支已统一:Cadence bring-up + PMU stand-in 已合并进 main(merge 10845f3),GUI/deploy 也在 main。旧的 target-b-cadence-bringup 作废。
+
+完整规格:/home/yusheng/cadence_work/Test/workarea/LDO_modeling/MECHANISM_A_PLAN.md —— 先完整读它(8 点矩阵、P0~P7、Reuse 表、Integration posture、分支统一说明都在内)。
+
+背景记忆(MEMORY.md 自动加载,重点):ldo-phase4-production-reality、simkit-mechanism-a-reference、working-mode-ultracode-execution、spectre-va-compile-64bit、feedback-prose-recommendation-over-multiple-choice
+
+两条验收标准:
+1. 程序化端到端:一条 headless 命令(python -m insitu run --manifest pmu_top.json --session fnxSession0)不干预跑通 augment→ADE run→PSF→npz→fit,出模型+报告。
+2. GUI 手测:不另造,【扩展现有 gui/ldo_modeler.py】——它已有 Qt-free ModelerCore + 5-tab 壳(Profile·Import·Fit·Compare·Trans-ID)+ --selftest + deploy/ airgap。加一个 Qt-free ExtractCore + 一个"Extract (in-situ)"tab(manifest→augment→run→npz),其 npz 喂给现有 Import→Fit→Compare;并把 ModelerCore + Fit/Compare 推广到多端口。保留 Qt-free-core + selftest 纪律。实验机现在点通 PMU_top,周一公司换 manifest 再跑。
+
+P0 环境确认(含本次新增任务):skillbridge 活会话 fnxSession0;【验证 PyQt5 可导入】(实验机上;dev VM 可能缺,--selftest 走 Qt-free 路径);【python gui/ldo_modeler.py --selftest 通过】(合并 10845f3 后的完整性检查);Test_PMU 能打开。
+
+硬约束:
+- 现阶段独立、不 import simkit;run-drive 照抄 simkit pvtRunner 的 Submit→poll→Rename 进自己的 insitu_run.il。
+- 所有 SKILL 走 virtuoso-skill 协议(grep 索引→读 PDF→带出处),不凭记忆写签名。skillbridge 活会话 fnxSession0(Workspace.open(),见 cadence/skill_lib.py)。
+- 复用别重造:extract_pmu.py 分析逻辑、cadence/psf.py;cadence/import_cadence.py 是 main 的 457 行 GUI 版(assemble(profile,files)/from_psf(path,kind)/validate/match_dir)——多端口功能【并排新增】,别破坏 GUI 现有单口 API;harness/fit_model.py 的 per-output 拟合器循环复用,别重写。
+- 不改 designer TB 脊柱:抽取源加到 Test_PMU 副本(Test_PMU_extract)。targeted save(manifest 引脚 + 探针:p,电流显式),不用 allpub。比值/PSRR 在 Python 算不在 ADE 表达式算(保 firewall)。
+- 新抽取代码放 cadence/insitu/ + cadence/skill/insitu_*.il;manifest 写 insitu/manifests/pmu_top.json;GUI 改动在 gui/ldo_modeler.py。
+
+P4 硬门:ADE 路 npz 必须在容差内对上已验证的 results/ref/pmu_standin.npz。对不上停下查。
+
+按 P0→P7 顺序建,逐 phase 交付。开始前先读 MECHANISM_A_PLAN.md + 上述记忆。
+
+------------------------------------------------------------------------
+注:本地 main 领先 origin/main 6 个 commit(含 merge 10845f3),尚未 push。若已确认无误可 `git push origin main`。
