@@ -42,6 +42,18 @@ dist/
 # --- local Claude Code session state (not project source) ---
 .claude/
 
+# --- Target B (Cadence/Spectre) scratch + regenerable validation artifacts ---
+cadence/work/
+cadence/work_*/
+# generated OA library (regenerate via: python cadence/skill_lib.py)
+cadence/cds/
+model/*_spectre.lib
+model/*_spectre.va
+model/*_spectre_dropout.tbl
+model/ldo_va_*
+results/ref/*_spectre.npz
+results/ref/va_*.npz
+
 # --- OS cruft ---
 .DS_Store
 Thumbs.db

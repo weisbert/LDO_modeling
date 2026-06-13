@@ -1,0 +1,42 @@
+// vref_bias.va -- SEMI-IDEAL shared reference + bias generator + two current sinks.
+// The supply-coupling coefficients (kc1p0/kc1p8) are the TUNABLE KNOB for the
+// shared-reference experiment: vref couples supply ripple + noise onto BOTH LDO
+// rails (correlated PSRR + correlated noise + output-to-output coupling via finite
+// vref/ibias output impedance). The two sink pins are the current outputs to model.
+`include "constants.vams"
+`include "disciplines.vams"
+
+module vref_bias(vin1p0, vin1p8, vss, vref, ibias, i500n, i1u);
+  inout vin1p0, vin1p8, vss, vref, ibias, i500n, i1u;
+  electrical vin1p0, vin1p8, vss, vref, ibias, i500n, i1u;
+  // --- shared voltage reference (~0.6 V) ---
+  parameter real vref0    = 0.6;
+  parameter real kc1p0    = 5.0e-3;   // KNOB: vref coupling from 1p0
+  parameter real kc1p8    = 1.0e-3;   // KNOB: vref coupling from 1p8
+  parameter real gref     = 0.1;      // vref output conductance (Rout=10ohm, finite -> loading couples)
+  parameter real refnoise = 50e-9;    // vref noise [V/sqrt(Hz)] -> correlated across rails
+  // --- shared bias node (~0.4 V) ---
+  parameter real vbias0   = 0.4;
+  parameter real kcb1p0   = 3.0e-3;   // bias-node supply coupling
+  parameter real gbias    = 0.05;
+  // --- current sinks (the current outputs to model) ---
+  parameter real iset500n = 500e-9;   // 500 nA sink  (param != port i500n)
+  parameter real iset1u   = 1.0e-6;   // 1 uA sink    (param != port i1u)
+  parameter real gsink    = 1.0e-7;   // sink output conductance (admittance to model)
+  parameter real psink    = 2.0e-7;   // current-PSRR [A per V of 1p0]
+  parameter real inoise   = 1.0e-12;  // sink current noise [A/sqrt(Hz)]
+  real vreft, vbiast;
+  analog begin
+    vreft = vref0 + kc1p0*V(vin1p0,vss) + kc1p8*V(vin1p8,vss);
+    I(vref,vss)  <+ gref*(V(vref,vss) - vreft);
+    I(vref,vss)  <+ white_noise(pow(refnoise*gref, 2.0), "ref");
+
+    vbiast = vbias0 + kcb1p0*V(vin1p0,vss);
+    I(ibias,vss) <+ gbias*(V(ibias,vss) - vbiast);
+
+    I(i500n,vss) <+ iset500n + gsink*V(i500n,vss) + psink*V(vin1p0,vss);
+    I(i500n,vss) <+ white_noise(pow(inoise, 2.0), "i500");
+    I(i1u,vss)   <+ iset1u   + gsink*V(i1u,vss)   + psink*V(vin1p0,vss);
+    I(i1u,vss)   <+ white_noise(pow(inoise, 2.0), "i1u");
+  end
+endmodule

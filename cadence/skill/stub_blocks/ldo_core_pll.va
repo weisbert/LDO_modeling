@@ -1,0 +1,26 @@
+// ldo_core_pll.va -- behavioral STAND-IN LDO core (PLL rail) with SHARED vref/ibias.
+// Semi-ideal but with finite Zout, supply PSRR, vref/ibias loading (-> shared-ref
+// output-to-output coupling) and output noise. NOT a real transistor LDO; swappable.
+`include "constants.vams"
+`include "disciplines.vams"
+
+module ldo_core_pll(vin, vss, vref, ibias, vout);
+  inout vin, vss, vref, ibias, vout;
+  electrical vin, vss, vref, ibias, vout;
+  parameter real kvref  = 1.3333;   // vout = kvref*vref  (0.6 -> 0.8 V)
+  parameter real g0     = 8.0;      // output conductance (LF Zout ~ 1/g0 = 0.125 ohm)
+  parameter real cout   = 1n;       // output capacitance (pole)
+  parameter real psrr   = 2.0e-3;   // 1p0 supply feedthrough to vout
+  parameter real kib    = 0.05;     // shared-bias-node sensitivity to vout
+  parameter real gvl    = 1.0e-4;   // current drawn from shared vref (loads it -> coupling)
+  parameter real gibl   = 1.0e-3;   // current drawn from shared ibias node
+  parameter real vnoise = 20e-9;    // output-referred white noise [V/sqrt(Hz)]
+  real vtgt;
+  analog begin
+    vtgt = kvref*V(vref,vss) + psrr*V(vin,vss) + kib*V(ibias,vss);
+    I(vout,vss)  <+ g0*(V(vout,vss) - vtgt) + cout*ddt(V(vout,vss));
+    I(vout,vss)  <+ white_noise(pow(vnoise*g0, 2.0), "out");
+    I(vref,vss)  <+ gvl*V(vref,vss);     // loads shared vref
+    I(ibias,vss) <+ gibl*V(ibias,vss);   // loads shared ibias
+  end
+endmodule
