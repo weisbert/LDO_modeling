@@ -1,0 +1,26 @@
+// ldo_core_vco.va -- behavioral STAND-IN LDO core (VCO rail). Same ports as the PLL
+// core but a DIFFERENT AC signature (larger Cout, lower g0, higher PSRR) so the two
+// modeled outputs are distinguishable -> a real per-output extraction test.
+`include "constants.vams"
+`include "disciplines.vams"
+
+module ldo_core_vco(vin, vss, vref, ibias, vout);
+  inout vin, vss, vref, ibias, vout;
+  electrical vin, vss, vref, ibias, vout;
+  parameter real kvref  = 1.3333;   // vout = kvref*vref  (0.6 -> 0.8 V)
+  parameter real g0     = 3.0;      // lower loop -> LF Zout ~ 0.33 ohm
+  parameter real cout   = 4.7n;     // bigger output cap -> lower pole
+  parameter real psrr   = 5.0e-3;   // worse supply rejection than PLL rail
+  parameter real kib    = 0.08;     // stronger shared-bias sensitivity
+  parameter real gvl    = 1.5e-4;
+  parameter real gibl   = 1.2e-3;
+  parameter real vnoise = 35e-9;    // noisier rail
+  real vtgt;
+  analog begin
+    vtgt = kvref*V(vref,vss) + psrr*V(vin,vss) + kib*V(ibias,vss);
+    I(vout,vss)  <+ g0*(V(vout,vss) - vtgt) + cout*ddt(V(vout,vss));
+    I(vout,vss)  <+ white_noise(pow(vnoise*g0, 2.0), "out");
+    I(vref,vss)  <+ gvl*V(vref,vss);
+    I(ibias,vss) <+ gibl*V(ibias,vss);
+  end
+endmodule
