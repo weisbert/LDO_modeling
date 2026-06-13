@@ -208,6 +208,59 @@ class ModelerCore:
         return out, txt
 
 
+class ExtractCore:
+    """Qt-free in-situ EXTRACTION front-half (Mechanism A): manifest -> augment -> run ->
+    PSF -> multi-port npz, PLUS per-output single-port refs. It PRODUCES the same npz the
+    Import tab already consumes, so the two paths converge at the npz firewall. Same
+    headless-testable discipline as ModelerCore -- no Qt.
+
+    The `ade` backend drives the real Maestro run (needs a live skillbridge session); the
+    `spectre_cli` backend runs fully offline (the dev/CI fixture reusing extract_pmu's PSF),
+    so --selftest exercises the whole front-half without Cadence."""
+
+    def __init__(self):
+        self.manifest = None
+        self.manifest_path = None
+        self.npz_path = None         # the produced multi-port npz
+        self.gate = None             # (passed|None, worst, detail) vs the trusted gold
+        self.report = None           # multi-port fit report text (current ports separate)
+        self.result = None           # fit_multiport result dict
+        self.port_refs = {}          # output -> per-output single-port npz path (for Import)
+
+    def load_manifest(self, name_or_path):
+        """Load + validate a pin-role manifest. Returns the human summary."""
+        from insitu import manifest as M
+        self.manifest = M.load(name_or_path)
+        self.manifest_path = self.manifest.get("_path")
+        return M.summary(self.manifest)
+
+    def plan(self):
+        """The augment plan (session-free preview of what 'Build & Run' will do)."""
+        from insitu import augment
+        return augment.build_plan(self.manifest)
+
+    def run(self, backend="spectre_cli", session="fnxSession0", regenerate=False, tol=1e-6):
+        """augment(ade) -> run -> PSF -> multi-port npz -> gate vs gold -> multi-port fit +
+        per-output single-port refs. Returns dict(npz_path, gate, report, ports). Pure
+        orchestration over the insitu package + fit_multiport."""
+        if self.manifest is None:
+            raise RuntimeError("load a manifest first")
+        from insitu import cli, augment
+        if backend == "ade":
+            augment.build(self.manifest)                 # build Test_PMU_extract on the session
+        path, npz, _r = cli.produce_npz(self.manifest, backend, session, regenerate)
+        self.npz_path = path
+        self.gate = cli.gate_vs_gold(npz, tol=tol)
+        import fit_multiport as FMP
+        self.result = FMP.fit_multiport(path, self.manifest)
+        self.report = FMP.report(self.result)
+        self.port_refs = FMP.export_single_port_refs(path, self.manifest)
+        return dict(npz_path=path, gate=self.gate, report=self.report, ports=self.port_refs)
+
+    def port_list(self):
+        return list(self.port_refs)
+
+
 # =============================================================================== Qt UI
 try:
     from PyQt5 import QtCore, QtWidgets
@@ -250,6 +303,26 @@ if _HAVE_QT:
             try:
                 self.core.fit()
                 self.done.emit(self.core.result)
+            except Exception as e:
+                import traceback
+                self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    class _ExtractWorker(QtCore.QThread):
+        """Run the in-situ extraction (augment->run->PSF->npz->fit) off the UI thread.
+        The ade backend can take a while (a Maestro run); spectre_cli is fast."""
+        done = QtCore.pyqtSignal(object)
+        failed = QtCore.pyqtSignal(str)
+
+        def __init__(self, extract, backend, session, regenerate):
+            super().__init__()
+            self.extract, self.backend = extract, backend
+            self.session, self.regenerate = session, regenerate
+
+        def run(self):
+            try:
+                out = self.extract.run(backend=self.backend, session=self.session,
+                                       regenerate=self.regenerate)
+                self.done.emit(out)
             except Exception as e:
                 import traceback
                 self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -302,18 +375,148 @@ if _HAVE_QT:
         def __init__(self, core=None):
             super().__init__()
             self.core = core or ModelerCore()
+            self.extract = ExtractCore()    # Mechanism A in-situ extraction front-half
             self.file_edits = {}            # (quantity, corner) -> QLineEdit
             self.setWindowTitle("LDO behavioral modeler (offline)")
             self.resize(1180, 820)
             self.tabs = QTabWidget()
             self.setCentralWidget(self.tabs)
+            self.tabs.addTab(self._tab_extract(), "0 · Extract (in-situ)")
             self.tabs.addTab(self._tab_profile(), "1 · Profile")
             self.tabs.addTab(self._tab_import(), "2 · Import data")
             self.tabs.addTab(self._tab_fit(), "3 · Fit")
             self.tabs.addTab(self._tab_compare(), "4 · Compare")
             self.tabs.addTab(self._tab_transid(), "5 · Trans-ID")
             self.statusBar().showMessage(
-                "Step 1 — set name, supply voltage, and 3 load corners, then 'Apply profile'.")
+                "In-situ extraction → Tab 0. Or hand-imported data → Tab 1 Profile.")
+
+        # --- Tab 0: Extract (in-situ, Mechanism A) -------------------------------
+        def _tab_extract(self):
+            w = QWidget(); outer = QVBoxLayout(w)
+            help_ = QLabel(
+                "<b>In-situ extraction (Mechanism A).</b> Point at a <b>pin-role manifest</b> "
+                "(the designer tags each DUT pin: supply / v_out / i_out / leave-alone). "
+                "<b>Build &amp; Run</b> copies the designer's testbench → <i>_extract</i>, appends "
+                "AC stimuli/probes at the tagged nets, runs the analyses, and assembles the "
+                "multi-port npz — which then feeds <b>2 Import → 3 Fit → 4 Compare</b> per output.<br>"
+                "Backend <b>spectre_cli</b> runs offline (dev fixture, reproduces the trusted gold); "
+                "<b>ade</b> drives the real Maestro run (rides Job Setup → cluster at the company).")
+            help_.setWordWrap(True)
+            help_.setStyleSheet("background:#eef5ff; padding:9px; border:1px solid #cdddee;")
+            outer.addWidget(help_)
+
+            form = QFormLayout(); outer.addLayout(form)
+            self.x_manifest = QLineEdit("pmu_top")
+            self.x_manifest.setToolTip("Manifest name (resolved in cadence/insitu/manifests/) "
+                                       "or a path to a manifest JSON.")
+            row = QHBoxLayout(); row.addWidget(self.x_manifest)
+            b_browse = QPushButton("Browse…"); b_browse.clicked.connect(self._x_browse)
+            b_load = QPushButton("Load"); b_load.clicked.connect(self._x_load)
+            row.addWidget(b_browse); row.addWidget(b_load)
+            rw = QWidget(); rw.setLayout(row); form.addRow("Manifest *", rw)
+            self.x_backend = QComboBox(); self.x_backend.addItems(["spectre_cli", "ade"])
+            self.x_backend.setToolTip("spectre_cli: offline dev fixture. ade: live Maestro run "
+                                      "(needs the skillbridge session + analyses configured).")
+            form.addRow("Backend", self.x_backend)
+            self.x_session = QLineEdit("fnxSession0")
+            self.x_session.setToolTip("ADE-XL session name (ade backend only).")
+            form.addRow("Session", self.x_session)
+
+            self.x_summary = QTextEdit(); self.x_summary.setReadOnly(True)
+            self.x_summary.setMaximumHeight(120)
+            self.x_summary.setStyleSheet("font-family:monospace; font-size:11px;")
+            outer.addWidget(self.x_summary)
+
+            brow = QHBoxLayout()
+            self.x_run = QPushButton("Build && Run"); self.x_run.clicked.connect(self._x_run)
+            self.x_run.setEnabled(False)
+            brow.addWidget(self.x_run)
+            self.x_gate = QLabel("—"); brow.addWidget(self.x_gate, 1)
+            outer.addLayout(brow)
+
+            self.x_report = QTextEdit(); self.x_report.setReadOnly(True)
+            self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
+            outer.addWidget(self.x_report, 1)
+
+            srow = QHBoxLayout()
+            srow.addWidget(QLabel("Send output port →"))
+            self.x_port = QComboBox(); srow.addWidget(self.x_port)
+            b_send = QPushButton("Load into Import → Fit"); b_send.clicked.connect(self._x_send)
+            srow.addWidget(b_send); srow.addStretch(1)
+            outer.addLayout(srow)
+            return w
+
+        def _x_browse(self):
+            fn, _ = QFileDialog.getOpenFileName(self, "Pick a manifest JSON",
+                                                str(ROOT / "cadence" / "insitu" / "manifests"),
+                                                "JSON (*.json)")
+            if fn:
+                self.x_manifest.setText(fn)
+
+        def _x_load(self):
+            try:
+                summ = self.extract.load_manifest(self.x_manifest.text().strip())
+                plan = "\n".join(f"  {a:12s} {d}" for a, d in self.extract.plan())
+                self.x_summary.setPlainText(summ + "\n\naugment plan:\n" + plan)
+                self.x_run.setEnabled(True)
+                self.statusBar().showMessage("Manifest loaded — 'Build & Run' to extract.")
+            except Exception as e:
+                QMessageBox.critical(self, "Manifest", f"{type(e).__name__}: {e}")
+
+        def _x_run(self):
+            self.x_run.setEnabled(False); self.x_gate.setText("running…")
+            self.statusBar().showMessage("Extracting (augment → run → PSF → npz → fit)…")
+            self._xw = _ExtractWorker(self.extract, self.x_backend.currentText(),
+                                      self.x_session.text().strip(),
+                                      regenerate=False)
+            self._xw.done.connect(self._x_done)
+            self._xw.failed.connect(self._x_failed)
+            self._xw.start()
+
+        def _x_done(self, out):
+            passed, worst, detail = out["gate"]
+            tag = {True: "PASS", False: "FAIL", None: "SKIP"}[passed]
+            colour = {"PASS": "#157f3b", "FAIL": "#b00020", "SKIP": "#777"}[tag]
+            self.x_gate.setText(f"<b>gate vs gold: <span style='color:{colour}'>{tag}</span></b> "
+                                f"({detail}) — npz {pathlib.Path(out['npz_path']).name}")
+            self.x_report.setPlainText(out["report"])
+            self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
+            self.x_run.setEnabled(True)
+            self.statusBar().showMessage(f"Extraction done — gate {tag}. "
+                                         "Pick an output port and 'Load into Import → Fit'.")
+
+        def _x_failed(self, msg):
+            self.x_gate.setText("FAILED")
+            self.x_run.setEnabled(True)
+            QMessageBox.critical(self, "Extraction failed", msg)
+
+        def _x_send(self):
+            port = self.x_port.currentText()
+            if not port or port not in self.extract.port_refs:
+                return
+            refp = self.extract.port_refs[port]
+            try:
+                self.core.use_existing_ref(refp)
+                self.core.profile.name = pathlib.Path(refp).stem
+                self._refresh_after_ref_load()
+                self.tabs.setCurrentIndex(3)        # jump to Fit
+                self.statusBar().showMessage(f"Loaded port '{port}' ({pathlib.Path(refp).name}) "
+                                             "→ Fit, then Compare.")
+            except Exception as e:
+                QMessageBox.critical(self, "Load port", f"{type(e).__name__}: {e}")
+
+        def _refresh_after_ref_load(self):
+            """Sync the Profile/Import widgets to a ref loaded programmatically (port send),
+            so Fit/Compare operate on it. Best-effort: only touches widgets that exist."""
+            p = self.core.profile
+            if hasattr(self, "e_name"):
+                self.e_name.setText(p.name)
+            if hasattr(self, "e_loads"):
+                self.e_loads.setText(",".join(p.loads))
+            if hasattr(self, "e_nom"):
+                self.e_nom.clear(); self.e_nom.addItems(p.loads)
+                if p.nominal in p.loads:
+                    self.e_nom.setCurrentText(p.nominal)
 
         # --- Tab 1: Profile ------------------------------------------------------
         def _tab_profile(self):
@@ -979,6 +1182,34 @@ def _selftest_transid(A, loads, nom, tmp):
     return True
 
 
+def _selftest_extract():
+    """Headless smoke of the in-situ EXTRACTION front-half (ExtractCore, Qt-free): manifest
+    -> spectre_cli run -> multi-port npz -> gate vs gold -> per-output single-port refs.
+    The spectre_cli fixture (cadence/work_pmu PSF) is gitignored regenerable data that needs
+    Spectre, so a missing fixture is a SKIP (not a failure) -- keeps --selftest green on a
+    box without it while exercising the whole path where present."""
+    try:
+        xc = ExtractCore()
+        summ = xc.load_manifest("pmu_top")
+        assert "v_out" in summ, "manifest summary missing roles"
+        out = xc.run(backend="spectre_cli")
+    except (FileNotFoundError, RuntimeError, ModuleNotFoundError, ImportError) as e:
+        print(f"  extract: SKIPPED -- in-situ fixture/session unavailable ({type(e).__name__})")
+        return
+    passed, _worst, detail = out["gate"]
+    assert passed in (True, None), f"in-situ gate FAILED: {detail}"
+    ports = xc.port_list()
+    assert "pll" in ports and "vco" in ports, f"missing per-output refs: {ports}"
+    assert "VOLTAGE OUTPUTS" in out["report"] and "CURRENT SINKS" in out["report"], "report shape"
+    print(f"  extract: manifest->run->npz->fit OK  gate={'PASS' if passed else 'SKIP'} "
+          f"({detail}); per-output refs={ports}")
+    for p in list(xc.port_refs.values()) + [xc.npz_path]:   # clean gitignored regenerables
+        try:
+            pathlib.Path(p).unlink()
+        except OSError:
+            pass
+
+
 def _selftest(require_qt=False):
     """Headless verification: round-trip a reference through import_cadence -> fit -> predict ->
     emit (the full pipeline), then -- if PyQt5 is importable -- build the window offscreen and
@@ -1046,6 +1277,9 @@ def _selftest(require_qt=False):
 
     # 1b) Trans-ID import path (Tab 5) -- headless, no simulator
     _selftest_transid(A, loads, nom, tmp)
+
+    # 1c) In-situ ExtractCore (Tab 0, Mechanism A) -- Qt-free, offline spectre_cli fixture
+    _selftest_extract()
 
     # 2) Qt layer (offscreen) if available -- build window, REGRESSION-test the import button path
     #    (populate pickers -> apply profile -> collect must survive), render, and screenshot.
