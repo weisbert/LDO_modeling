@@ -11,8 +11,8 @@
   },
   "ground": "gnd!",
   "supplies": {
-    "1p0": {"net": "VDD1P0", "dc": 1.05},
-    "1p8": {"net": "VDD1P8", "dc": 1.8}
+    "1p0": {"net": "VDD1P0", "dc": 1.05, "tb_src": "V3"},
+    "1p8": {"net": "VDD1P8", "dc": 1.8, "tb_src": "V4"}
   },
   "v_out": {
     "pll": {"net": "VDD0P8_PLL", "iload": 500e-6, "vout_dc": 0.8},

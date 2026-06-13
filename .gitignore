@@ -54,6 +54,18 @@ model/ldo_va_*
 results/ref/*_spectre.npz
 results/ref/va_*.npz
 
+# --- Mechanism A (insitu) regenerable outputs ---
+# produced on demand by `python -m insitu run` / fit_multiport --emit; not checked in
+# (the trusted gold results/ref/pmu_standin.npz IS tracked).
+results/ref/*_spectre_cli.npz
+results/ref/*_ade.npz
+results/ref/pmu_standin_pll.npz
+results/ref/pmu_standin_vco.npz
+model/pmu_standin_*.va
+model/pmu_standin_*.lib
+model/pmu_standin_*_dropout.tbl
+cadence/insitu/__pycache__/
+
 # --- OS cruft ---
 .DS_Store
 Thumbs.db
