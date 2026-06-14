@@ -19,6 +19,15 @@ import numpy as np
 
 
 def read_psf(path):
+    # Spectre's psfascii (`-format psfascii`, the dev fixture) is text; ADE/Maestro and
+    # the cluster write BINARY PSF. Dispatch on the bytes so callers (importmp) read
+    # either transparently -- the binary reader returns the identical dict shape and, in
+    # fact, full double precision (psfascii rounds to ~6 sig figs). See cadence/binpsf.py.
+    with open(path, "rb") as _f:
+        _head = _f.read(64)
+    if b"\x00" in _head and not _head.lstrip().startswith(b"HEADER"):
+        import binpsf
+        return binpsf.read_binpsf(path)
     text = open(path).read()
     # isolate the VALUE..END body (section markers sit on their own lines)
     i = text.index("\nVALUE\n") + len("\nVALUE\n")
