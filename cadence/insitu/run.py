@@ -102,18 +102,35 @@ def _ws():
     return Workspace.open()
 
 
+class CancelledError(RuntimeError):
+    """Raised by run_ade when the caller's cancel() returns True mid-run (the GUI Cancel
+    button). A clean, catchable signal -- not a crash -- so the worker can report 'cancelled'
+    rather than a traceback, and the finally-block still restores the designer's ADE state."""
+
+
+def _noop_progress(frac, msg):                                # default: no-op progress sink
+    pass
+
+
 def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
-            poll=None, timeout=600, build_first=True):
+            poll=None, timeout=600, build_first=True, progress=None, cancel=None):
     """Drive the augmented extraction through Maestro: per group set the acm one-hot,
     axlRunAllTests, poll to idle, rename, collect PSF. Returns dict(psf_map, backend,
     histories). Requires a live ADE-XL session whose extract test carries the ac+noise
     analyses + targeted saves (configured once / captured from the designer's state -- see
     augment); this driver automates the test wiring, the one-hot vars and the run.
 
+    progress(frac, msg) -- optional callback for UI feedback (frac in [0,1]); the poll loop
+    reports per-group start/elapsed/done instead of blocking silently up to `timeout`.
+    cancel() -> bool -- optional; checked each poll tick. When it returns True the run aborts
+    with CancelledError after the current SKILL call (the finally-block restores ADE state).
+
     NB: the run TRIGGER (axlRunAllTests) is the production-transferable piece -- it inherits
     the session's Job Setup (cluster+ALPS) Monday with no change."""
     import time
     ws = ws or _ws()
+    progress = progress or _noop_progress
+    cancel = cancel or (lambda: False)
     d = m["dut"]
     if build_first:
         from . import augment
@@ -130,9 +147,15 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
     snap = ws["insituSnapshotEnabled"](session)
     psf_map, histories = {}, {}
     try:
+        if cancel():
+            raise CancelledError("cancelled before run")
         ws["insituEnableOnly"](session, test)
         allvars = list(augment_design_vars(m))
-        for g in groups(m):
+        grps = groups(m)
+        n = len(grps) or 1
+        for i, g in enumerate(grps):
+            base = i / n                                      # this group spans [base, (i+1)/n)
+            progress(base, f"group {i+1}/{n}: {g['tag']} — submitting")
             # enable ONLY this group's analysis (ac groups must not drag noise, which needs
             # an oprobe); for a noise group, point the single oprobe at THIS output's net.
             _adestate.enable_only_analysis(ws, session, test, g["analysis"])
@@ -144,18 +167,27 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
             ws["insituSubmit"](session)
             deadline, started = timeout, False
             while deadline > 0:                               # poll: confirm start, then idle
+                if cancel():                                  # Cancel honoured between ticks
+                    raise CancelledError(f"cancelled during {g['tag']}")
                 st = ws["insituStatus"](session)
                 if st and list(st) != [0, 0]:
                     started = True
                 if st and list(st) == [0, 0] and started:
                     break
+                el = timeout - deadline
+                progress(base, f"group {i+1}/{n}: {g['tag']} — "
+                         f"{'running' if started else 'starting'}… {el}s")
                 time.sleep(2); deadline -= 2
+            if deadline <= 0:                                 # surfaced, not silently skipped
+                progress(base, f"group {i+1}/{n}: {g['tag']} — TIMEOUT after {timeout}s")
             hname = ws["insituRename"](session, g["tag"])
             histories[g["tag"]] = hname
             pdir = _resolve_psf_dir(ws, session, d, hname, g["tag"])
             for pt in g["members"]:
                 if pdir is not None:
                     psf_map[pt["tag"]] = pdir
+            progress((i + 1) / n, f"group {i+1}/{n}: {g['tag']} — "
+                     f"{'collected' if pdir is not None else 'NO PSF'}")
     finally:
         ws["insituRestoreEnabled"](session, snap)             # leave the designer's ADE as found
     return dict(psf_map=psf_map, backend="ade", histories=histories,
@@ -205,11 +237,18 @@ def _resolve_psf_dir(ws, session, d, hname, tag):
 
 # ----------------------------------------------------------------------- dispatch
 def run(m, backend="spectre_cli", **kw):
+    progress = kw.get("progress")
     if backend == "spectre_cli":
-        return run_spectre_cli(m, regenerate=kw.get("regenerate", False))
+        if progress:                                          # synchronous; a coarse tick
+            progress(0.0, "spectre_cli: reading dev-fixture PSF…")
+        r = run_spectre_cli(m, regenerate=kw.get("regenerate", False))
+        if progress:
+            progress(1.0, "spectre_cli: PSF located")
+        return r
     if backend == "ade":
         return run_ade(m, session=kw.get("session", "fnxSession0"),
-                       build_first=kw.get("build_first", True))
+                       build_first=kw.get("build_first", True),
+                       progress=progress, cancel=kw.get("cancel"))
     raise ValueError(f"unknown backend {backend!r} (spectre_cli | ade)")
 
 

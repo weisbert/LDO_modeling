@@ -104,10 +104,13 @@ def gate_vs_gold(npz_dict, tol=1e-6, abs_floor=1e-12):
 
 
 # ----------------------------------------------------------------------- chain
-def produce_npz(m, backend, session, regenerate):
-    """run -> PSF -> multi-port npz dict + write results/ref/<name>_<backend>.npz."""
+def produce_npz(m, backend, session, regenerate, progress=None, cancel=None):
+    """run -> PSF -> multi-port npz dict + write results/ref/<name>_<backend>.npz.
+    progress(frac,msg)/cancel()->bool are forwarded to the ade run-drive for UI feedback
+    and a responsive Cancel; both are no-ops for the synchronous spectre_cli backend."""
     import numpy as np
-    r = _run.run(m, backend=backend, session=session, regenerate=regenerate)
+    r = _run.run(m, backend=backend, session=session, regenerate=regenerate,
+                 progress=progress, cancel=cancel)
     arrays = _imp.from_psf_multiport(psf_map=r.get("psf_map"), root=None, manifest=m,
                                      load="nom", probe_aliases=r.get("probe_aliases"))
     out = {"loads": np.array(["nom"]), **arrays,

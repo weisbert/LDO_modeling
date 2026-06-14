@@ -239,16 +239,19 @@ class ExtractCore:
         from insitu import augment
         return augment.build_plan(self.manifest)
 
-    def run(self, backend="spectre_cli", session="fnxSession0", regenerate=False, tol=1e-6):
+    def run(self, backend="spectre_cli", session="fnxSession0", regenerate=False, tol=1e-6,
+            progress=None, cancel=None):
         """augment(ade) -> run -> PSF -> multi-port npz -> gate vs gold -> multi-port fit +
         per-output single-port refs. Returns dict(npz_path, gate, report, ports). Pure
-        orchestration over the insitu package + fit_multiport."""
+        orchestration over the insitu package + fit_multiport. progress(frac,msg)/cancel()
+        are forwarded to the ade run-drive (UI feedback + a responsive Cancel)."""
         if self.manifest is None:
             raise RuntimeError("load a manifest first")
         from insitu import cli
         # the ade run-drive builds Test_PMU_extract itself (run_ade build_first=True) -- no
         # double-build here.
-        path, npz, _r = cli.produce_npz(self.manifest, backend, session, regenerate)
+        path, npz, _r = cli.produce_npz(self.manifest, backend, session, regenerate,
+                                        progress=progress, cancel=cancel)
         self.npz_path = path
         self.gate = cli.gate_vs_gold(npz, tol=tol)
         import fit_multiport as FMP
@@ -309,20 +312,35 @@ if _HAVE_QT:
 
     class _ExtractWorker(QtCore.QThread):
         """Run the in-situ extraction (augment->run->PSF->npz->fit) off the UI thread.
-        The ade backend can take a while (a Maestro run); spectre_cli is fast."""
+        The ade backend can take a while (a Maestro run); spectre_cli is fast. Streams
+        per-group progress and honours a cooperative Cancel so the UI never looks wedged."""
         done = QtCore.pyqtSignal(object)
         failed = QtCore.pyqtSignal(str)
+        progressed = QtCore.pyqtSignal(float, str)        # frac in [0,1], message
+        cancelled = QtCore.pyqtSignal()
 
         def __init__(self, extract, backend, session, regenerate):
             super().__init__()
             self.extract, self.backend = extract, backend
             self.session, self.regenerate = session, regenerate
+            self._cancel = False
+
+        def cancel(self):
+            """Request cancellation (UI thread). The run-drive checks this between poll
+            ticks / before each group and raises CancelledError -- no thread kill, so the
+            designer's ADE state is still restored by run_ade's finally-block."""
+            self._cancel = True
 
         def run(self):
+            from insitu.run import CancelledError
             try:
                 out = self.extract.run(backend=self.backend, session=self.session,
-                                       regenerate=self.regenerate)
+                                       regenerate=self.regenerate,
+                                       progress=lambda f, m: self.progressed.emit(f, m),
+                                       cancel=lambda: self._cancel)
                 self.done.emit(out)
+            except CancelledError:
+                self.cancelled.emit()
             except Exception as e:
                 import traceback
                 self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -431,8 +449,21 @@ if _HAVE_QT:
             self.x_run = QPushButton("Build && Run"); self.x_run.clicked.connect(self._x_run)
             self.x_run.setEnabled(False)
             brow.addWidget(self.x_run)
+            self.x_cancel = QPushButton("Cancel"); self.x_cancel.clicked.connect(self._x_cancel)
+            self.x_cancel.setEnabled(False); self.x_cancel.setToolTip(
+                "Stop the ade run after the current step (ADE state is restored cleanly).")
+            brow.addWidget(self.x_cancel)
             self.x_gate = QLabel("—"); brow.addWidget(self.x_gate, 1)
             outer.addLayout(brow)
+            # live progress (per measurement group) -- ade runs stream here so the window
+            # never looks wedged; spectre_cli ticks 0->100 quickly.
+            prow = QHBoxLayout()
+            self.x_prog = QtWidgets.QProgressBar(); self.x_prog.setRange(0, 100)
+            self.x_prog.setValue(0); self.x_prog.setTextVisible(False)
+            prow.addWidget(self.x_prog, 1)
+            self.x_progmsg = QLabel(""); self.x_progmsg.setStyleSheet("color:#555; font-size:11px;")
+            prow.addWidget(self.x_progmsg, 2)
+            outer.addLayout(prow)
 
             self.x_report = QTextEdit(); self.x_report.setReadOnly(True)
             self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
@@ -464,16 +495,43 @@ if _HAVE_QT:
                 QMessageBox.critical(self, "Manifest", f"{type(e).__name__}: {e}")
 
         def _x_run(self):
-            self.x_run.setEnabled(False); self.x_gate.setText("running…")
+            self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
+            self.x_gate.setText("running…")
+            self.x_prog.setValue(0); self.x_progmsg.setText("starting…")
             self.statusBar().showMessage("Extracting (augment → run → PSF → npz → fit)…")
             self._xw = _ExtractWorker(self.extract, self.x_backend.currentText(),
                                       self.x_session.text().strip(),
                                       regenerate=False)
             self._xw.done.connect(self._x_done)
             self._xw.failed.connect(self._x_failed)
+            self._xw.progressed.connect(self._x_progress)
+            self._xw.cancelled.connect(self._x_cancelled)
             self._xw.start()
 
+        def _x_progress(self, frac, msg):
+            self.x_prog.setValue(max(0, min(100, int(frac * 100))))
+            self.x_progmsg.setText(msg)
+
+        def _x_cancel(self):
+            if getattr(self, "_xw", None) and self._xw.isRunning():
+                self.x_cancel.setEnabled(False)
+                self.x_progmsg.setText("cancelling — finishing current step…")
+                self._xw.cancel()
+
+        def _x_cancelled(self):
+            self._x_idle()
+            self.x_gate.setText("cancelled")
+            self.x_progmsg.setText("cancelled")
+            self.statusBar().showMessage("Extraction cancelled — ADE state restored. "
+                                         "Adjust and Build & Run again.")
+
+        def _x_idle(self):
+            """Return Tab 0 to the runnable state (re-run is just 'Build & Run' again)."""
+            self.x_run.setEnabled(True); self.x_cancel.setEnabled(False)
+
         def _x_done(self, out):
+            self._x_idle()
+            self.x_prog.setValue(100)
             passed, worst, detail = out["gate"]
             tag = {True: "PASS", False: "FAIL", None: "SKIP"}[passed]
             colour = {"PASS": "#157f3b", "FAIL": "#b00020", "SKIP": "#777"}[tag]
@@ -481,13 +539,14 @@ if _HAVE_QT:
                                 f"({detail}) — npz {pathlib.Path(out['npz_path']).name}")
             self.x_report.setPlainText(out["report"])
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
-            self.x_run.setEnabled(True)
+            self.x_progmsg.setText("done")
             self.statusBar().showMessage(f"Extraction done — gate {tag}. "
                                          "Pick an output port and 'Load into Import → Fit'.")
 
         def _x_failed(self, msg):
+            self._x_idle()
             self.x_gate.setText("FAILED")
-            self.x_run.setEnabled(True)
+            self.x_progmsg.setText("failed")
             QMessageBox.critical(self, "Extraction failed", msg)
 
         def _x_send(self):
