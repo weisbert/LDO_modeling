@@ -1,49 +1,59 @@
 Mechanism A（ADE-native in-situ LDO 抽取）— 下一回合 brief。先读：
   - 记忆 ade-backend-1610-1707-fix、binpsf-binary-format、ldo-phase4-production-reality、
     simkit-mechanism-a-reference
-  - HANDOFF.md 顶部 UPDATE (2026-06-14c)
+  - HANDOFF.md 顶部 UPDATE (2026-06-14d) 和 (14c)
   - 代码：cadence/binpsf.py、cadence/insitu/{adestate,run,cli,augment}.py、gui/ldo_modeler.py
 
-==================== 已完成（已 commit，未 push）====================
+==================== 已完成并已 push（origin/target-b-cadence-bringup）====================
 
-【1610/1707】设计师 ADE 状态继承（adestate.py，经 axlGetToolSession→asiGetSession 桥）已坐实修通。
-【ade 数据读取】binpsf.py 二进制 PSF 读取器已做好并实测：psf.read_psf 按字节自动分派 ascii/binary。
-  AC（51点×34迹）和 noise（141点，含 per-instance STRUCT 迹，标量 out 精确）都用真实 spectre
-  -format psfascii 交叉验证通过（AC 残差 3.9e-6 = psfascii 6位有效数字截断，二进制反而是全精度）。
-  importmp 的 Zout/noise 推导在真实二进制 PSF 上验证通过。test_binpsf.py + cadence/testdata/binpsf 夹具。
-【GUI #4】run_ade 加了 progress(frac,msg)+cancel()；Tab0 进度条+Cancel；超时不再对未 idle 的 run
-  做破坏性 insituRename（否则 ASSEMBLER-2423），干净中止。
-【GUI #1】Tab0 Edit…/New… 内置 manifest JSON 编辑器（Validate 用同一套 manifest.validate + 测量矩阵预览，
-  Save/Save As/模板新建）。
-都跑通：test_binpsf(AC+noise)、spectre_cli gate vs gold 0.00e+00 无回归、离屏 GUI selftest 绿。
-commits：01d8478 / 1fbf108 / 180287a / 06a0e38（+ 上一回合 3b7f000/69f9beb/dc7ec27）。
+8 个 commit 已推到 origin/target-b-cadence-bringup（3b7f000/69f9beb/dc7ec27 + 01d8478/1fbf108/
+180287a/06a0e38 + handoff）。分支小插曲：仓库当时其实在 main 上，commit 落在 main，已 ff 到
+target-b 并推送，本地 main 已 reset 回 origin/main（ea8eee6 没动）。
 
-==================== 本回合要干的 ====================
+- 1610/1707：设计师 ADE 状态继承（adestate.py，axlGetToolSession→asiGetSession 桥）已修通。
+- 二进制 PSF 读取（binpsf.py）：AC + noise 都用真实 spectre psfascii 交叉验证过；psf.read_psf
+  按字节自动分派；importmp 的 Zout/noise 推导在真实二进制 PSF 上验证过。test_binpsf.py + 夹具。
+- GUI #4（进度/取消/超时干净中止）、GUI #1（内置 manifest 编辑器）都做好，离屏 selftest 绿。
 
-[4]（周一，必须用实时会话）config-view 保真度——最后一个真问题。
-   现状：augment.py 的 insituCopyTB(tb_lib, tb_cell, ext_cell, tb_lib, "schematic") 只复制 TB 的
-   schematic 视图，extract test 跑 ext_cell/schematic。但设计师的 "Test" 用 Test_PMU/config，
-   config 可能给 DUT/子块绑定了 extracted/寄生 视图。
-   风险：真 PMU 若 config 绑了寄生视图，schematic 副本会丢掉 RC 寄生 → 抽出的 Zout/PSRR/noise
-   是无寄生的 schematic 级，跟设计师 config 看到的不一致。stand-in 全 schematic 所以现在看不出来。
-   先做：用实时会话查 Test_PMU/config 到底绑了什么视图（hiViewConfig / 看 config 的 view list；
-   走 virtuoso-skill 协议查 SKILL 签名）。若绑了 layout/extracted 视图，则把 extract test 建成一个
-   CONFIG，顶层换成我们 augment 后的 ext schematic，底下继承设计师的 view-binding 规则。
-   坑：skillbridge 会被 Virtuoso 模态框冻住整条通道，遇冻关弹框或重启 Cadence；config-view 激活过
-   旧/坏会话也会冻——只在当前会话上操作。
+==================== 本回合首要：补上"实时一次性全链跑通" ====================
 
-[5]（小，非阻塞）定向 save：现在 save=allpub（binpsf 能正常读，只是多存数据）。
-   axlAddOutputSignal（adexl p.243）做定向保存集是优化项。
+[A]（最重要，要现场实时会话）完整 ade 链的一次干净实测。
+   现状：链路在程序里接通、能跑到触发（group 1/8 submitting→轮询），1610/1707 + binpsf 都成立；
+   GUI #4 的超时中止也在实机上验证过（60s 抛 RuntimeError、恢复 ADE 状态、不做破坏性 rename）。
+   但仿真发起后不结束，ADE 报 "required cellViews not open … Reset the ADE session (Session→Reset)
+   or re-invoke ADE"。已排除"运行中重建 cellview"（build_first=False + 先关 cellview 仍报）。
+   根因：上一回合反复探测（多次 augment 重建、反复开关 cellview、一次卡死恢复）把 ADE 会话搞退化了。
 
-之后：真 PMU bring-up（换 manifest → 用新的 GUI 编辑器改/新建 → Build&Run → 出 npz → fit）。
+   做法（一定要在干净会话上、只跑一次）：
+   1) 先弄干净会话：在 ADE-L 窗口 Session→Reset，或退出重开 ADE，或重启 Cadence。
+   2) 先做一次轻量探活：cd cadence && python3 -c "from skillbridge import Workspace as W; \
+      print(W.open()['plus'](2,3))"（要秒回 5）。
+   3) 然后只跑一次：cd cadence && python -m insitu run --backend ade --session fnxSession0
+      （或 run.run_ade(m, build_first=True, progress=…, timeout=120) 直接驱动、带进度）。
+   4) 千万别在跑之前反复 augment / 开关 cellview——那正是把会话搞退化的元凶。
+   上一个干净会话证过真跑能成（axlRunAllTests 1s 返回、spectre 0 errors、产出 PSF，binpsf 现在能读）。
+   跑成后：psf_map→importmp→npz→gate(对 ade 仅信息性)→fit，确认整条链一口气通。
+
+[4]（周一，同样要实时会话）config-view 保真度。
+   augment.insituCopyTB(...,"schematic") 只复制 TB schematic；设计师 "Test" 用 Test_PMU/config，
+   config 可能绑了 extracted/寄生 视图 → 真 PMU 会丢寄生。先用实时会话查 Test_PMU/config 绑了什么
+   视图；若绑了 layout/extracted，则把 extract test 建成 CONFIG（顶层换我们 augment 后的 ext
+   schematic，底下继承设计师 view-binding）。stand-in 全 schematic 所以现在看不出来。
+   注意：[A] 和 [4] 都要实时会话，可一并在现场做（先做 [A]，因为它顺带把会话弄干净了）。
+
+[5]（小，非阻塞）定向 save：现在 save=allpub（binpsf 能读）；axlAddOutputSignal 做定向保存是优化项。
 
 ==================== 硬约束 / 坑 ====================
-- SKILL 走 virtuoso-skill 协议：grep ~/.claude/skills/virtuoso-skill/assets/function_index.tsv
-  → 读 PDF（/home/yusheng/cadence_work/Test/workarea/SKILL_file/...）→ 带出处，绝不凭记忆写签名。
+- 不要反复探测/重建实时会话：多次 augment 重建 + 反复开关 cellview 会把 ADE 搞成 "required cellViews
+  not open"。要跑就在干净会话上一次跑完。
+- SKILL 走 virtuoso-skill 协议：grep ~/.claude/skills/virtuoso-skill/assets/function_index.tsv →
+  读 PDF（/home/yusheng/cadence_work/Test/workarea/SKILL_file/...）→ 带出处，绝不凭记忆写签名。
+  （已查过：Session→Reset 对应 sevReset(sev)=skart p.821，但它会把会话重置成默认值、会清掉我们继承的
+  vars/analyses；axlResetActive(hsdb)=adexl p.135。这俩都偏重，优先 GUI 里 Session→Reset 或重开 ADE。）
 - skillbridge 模态框冻通道；杀客户端不能取消已在 Virtuoso 里跑的调用；遇冻关弹框或重启 Cadence。
 - 不改设计师脊柱：只动副本 insitu_extract / Test_PMU_extract。保 npz firewall。
 - skillbridge 符号用 from skillbridge import Symbol（Symbol('ac')->'ac）。
 - 实时会话事实：session=fnxSession0，sdb=1001；设计师 test 名 "Test"（manifest dut.ade_src_test 已写）；
   设计师 OP flo=5G/VDD=3/VDD1P0=1.05；spectre ac 字段 start/stop/dec，noise 多 oprobe/iprobe。
-- 验证二进制 PSF 读取：把同一 input.scs 用 spectre -64 -format psfascii 再跑出 ascii 参照对比；
-  二进制-vs-二进制是逐位一致；psfascii 只有 ~6 位有效数字。
+- 验证二进制 PSF：把同一 input.scs 用 spectre -64 -format psfascii 再跑出 ascii 对比；二进制-vs-二进制
+  逐位一致；psfascii 只 ~6 位有效数字。spectre 环境见 cadence/spectre_run.py（CDSHOME/SPECTRE181/license）。

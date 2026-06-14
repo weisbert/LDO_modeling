@@ -1,3 +1,30 @@
+# UPDATE (2026-06-14d) — full-chain LIVE attempt: wired + reaches trigger, but blocked on ADE session-reset
+
+**This session's binpsf/GUI work is committed AND pushed to `origin/target-b-cadence-bringup`** (the 8 commits
+in 14c below). Branch note: the repo was actually on `main` (not target-b); commits were fast-forwarded onto
+target-b and pushed; local `main` reset to `origin/main` (ea8eee6, untouched).
+
+**Full-chain LIVE validation — ATTEMPTED, not yet a clean end-to-end run.** On `fnxSession0`:
+- The chain DOES reach the run trigger (`group 1/8 g_v_out_pll submitting` → poll); the 1610/1707 fix + the
+  binpsf read wiring hold. The binary-PSF read was already proven on REAL ade output (Zout, noise).
+- **BONUS proven live:** the GUI #4 timeout-abort works — at 60s it raised `RuntimeError` cleanly, restored the
+  designer's ADE state, and did NOT run the destructive `insituRename` on a non-idle run.
+- **BLOCKER:** the Maestro run never completes. ADE warns *"You do not have the required cellViews or properties
+  open for this session … purged from virtual memory / schematic closed … Reset the ADE session (Session→Reset)
+  or re-invoke ADE."* Ruled out the mid-run rebuild (`build_first=False` + closing the extract cellview still hits
+  it). Root cause = the ADE session was **degraded by repeated probing this session** (many augment rebuilds +
+  cellview open/close + an earlier wedge recovery).
+
+**To finish (the one thing still owed): a single clean live run.**
+1. Get a CLEAN ADE session: **Session→Reset** in the ADE-L window, or quit+re-invoke ADE, or restart Cadence.
+2. Then run ONCE: `cd cadence && python -m insitu run --backend ade --session fnxSession0`.
+3. **Do NOT** re-run augment / open-close cellviews repeatedly first — that is what degraded the session. The
+   prior CLEAN session proved a real run works (axlRunAllTests 0 in 1.0s, spectre 0 errors, PSF produced).
+
+Pairs naturally with the **[4] config-view fidelity** Monday task — both need the live session.
+
+---
+
 # UPDATE (2026-06-14c) — binary-PSF read DONE (AC+noise) + GUI #4/#1 done; only config-view fidelity left
 
 **Done this ultracode session (committed locally `01d8478`,`1fbf108`,`180287a`,`06a0e38`; NOT pushed until finalized):**
