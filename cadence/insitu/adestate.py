@@ -29,7 +29,7 @@ from skillbridge import Symbol
 # on the designer's test: asiGetAnalysisFieldVal returns '' for a valid-but-empty field and
 # nil for a non-field). We only push manifest tokens whose key is one of these.
 _ANALYSIS_KEYS = ("start", "stop", "dec", "lin", "log", "step", "center", "span", "freq",
-                  "oprobe", "iprobe", "p", "n", "sweeptype", "noisetype")
+                  "oprobe", "iprobe", "p", "n", "outType", "inType", "sweeptype", "noisetype")
 
 
 def _ts(ws, sess, test):
@@ -105,9 +105,11 @@ def set_noise_output(ws, sess, test, onet, ground="gnd!", fields=None):
     net. Re-applies the sweep and enables. Used per-output by the run loop (one noise run per
     v_out). The sev fields p/n/oprobe were confirmed live on the designer's noise analysis."""
     f = dict(fields or {})
+    f["outType"] = "voltage"         # node-pair output mode (vs 'probe'); choices confirmed live
     f["p"] = onet
     f["n"] = ground
     f["oprobe"] = ""                 # clear the probe form so spectre emits `noise (p n)`
+    f["inType"] = "none"             # output-noise only -- no input-referred probe needed/defined
     return config_analysis(ws, sess, test, "noise", f, enable=True)
 
 
@@ -145,10 +147,13 @@ def inherit_state(ws, m, sess, dst_test, verbose=False):
         name, fields = parse_analysis(line)
         if kind == "noise" and m["v_out"]:
             # placeholder output; the run loop overrides per-output (set_noise_output). Use
-            # the VOLTAGE node-pair form (p/n), NOT oprobe -- oprobe=<net> is invalid (SFE-1997).
+            # the VOLTAGE node-pair form (outType=voltage + p/n), NOT oprobe -- oprobe=<net> is
+            # invalid (SFE-1997) and the default outType='probe' ignores p/n.
+            fields["outType"] = "voltage"
             fields.setdefault("p", next(iter(m["v_out"].values()))["net"])
             fields.setdefault("n", m.get("ground", "gnd!"))
             fields["oprobe"] = ""
+            fields["inType"] = "none"
         config_analysis(ws, sess, dst_test, name, fields, enable=True)
         out["analyses"][name] = fields
     if verbose:

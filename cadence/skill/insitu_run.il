@@ -106,11 +106,13 @@
 ;; The session-aggregate axlGetRunStatus(sess) errors once a stale history handle exists
 ;; (rename-heavy runs) and double-counts across histories. Query the run's OWN history:
 (defun insituCurHist (sess)
-  ;; Current history NAME (string) or nil. Ref: axlGetCurrentHistory adexl p.417 ;
-  ;; axlGetHistoryName adexl p.427.
+  ;; Current history NAME (string) or nil. NB: on a fresh/reset session (no run yet)
+  ;; axlGetCurrentHistory returns 0 -- which is TRUTHY in SKILL, NOT nil -- so guard it;
+  ;; axlGetHistoryName(0) otherwise raises an errset-UNcatchable "setup database entry for
+  ;; handle 0". Ref: axlGetCurrentHistory adexl p.417 ; axlGetHistoryName adexl p.427.
   (let (h)
     (setq h (car (errset (axlGetCurrentHistory sess) nil)))
-    (if h (car (errset (axlGetHistoryName h) nil)) nil)))
+    (if (and h (not (equal h 0))) (car (errset (axlGetHistoryName h) nil)) nil)))
 
 (defun insituHistStatus (sess hist)
   ;; (completed total) for ONE history -- DONE when completed>=total. Ref: axlGetRunStatus

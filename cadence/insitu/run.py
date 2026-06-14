@@ -112,6 +112,16 @@ def _noop_progress(frac, msg):                                # default: no-op p
     pass
 
 
+def _cur_hist(ws, session):
+    """The session's current-history NAME, or None. Defensive: on a fresh/reset session
+    axlGetCurrentHistory yields handle 0 whose name lookup raises an errset-uncatchable
+    'setup database entry for handle 0' -- swallow it (no history yet)."""
+    try:
+        return ws["insituCurHist"](session)
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
 # axlGetRunStatus returns (completed, total) points -- NOT an idle code. After submit it
 # resets completed->0 within ~1-2s; _SETTLE bounds how long we wait for that reset before
 # trusting a (N,N) reading as the NEW run's completion (guards the previous run's resting
@@ -182,14 +192,14 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
             # entry for handle 0" -- so we detect the NEW history this submit creates (name
             # != the pre-submit current history) and query THAT history's status. _SETTLE
             # guards a half-initialised read for a sub-poll-interval run.
-            h_prev = ws["insituCurHist"](session)
+            h_prev = _cur_hist(ws, session)
             ws["insituSubmit"](session)
             t_submit = time.time()
             deadline, hcur, started = timeout, None, False
             while deadline > 0:                               # poll until completed==total
                 if cancel():                                  # Cancel honoured between ticks
                     raise CancelledError(f"cancelled during {g['tag']}")
-                name = ws["insituCurHist"](session)
+                name = _cur_hist(ws, session)
                 if name and name != h_prev:
                     hcur = name                               # this submit's own history
                 comp, total = 0, 0
