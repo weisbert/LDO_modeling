@@ -1,3 +1,65 @@
+# UPDATE (2026-06-14) — Mechanism A BUILT + pushed; NEXT SESSION = DEBUG
+
+**State:** Mechanism A (ADE-native in-situ multi-port LDO extraction) is built on `main` and
+pushed to origin (commits `08706dd` → `69ff410` → `cc57fec` → `4f57587`). The full spec is in
+`MECHANISM_A_PLAN.md`; memory `ldo-phase4-production-reality` has the build log. This session
+was the BUILD; **the next conversation is DEBUG** (work-machine bring-up).
+
+## What's built + VERIFIED on the dev/test box
+- **P0/P1** `cadence/insitu/` package + pin-role manifest (`insitu/manifests/pmu_top.json`).
+  Designer tags pins (supply/v_out/i_out/leave_alone); `manifest.measurements()` derives the
+  14-point matrix; `run.groups()` collapses it to **7 runs** (AC superposition).
+- **P4 firewall GATE** (`insitu/importmp.py` + `cli.gate_vs_gold`): manifest-driven PSF→multiport
+  npz reproduces the trusted `results/ref/pmu_standin.npz` to **0.00e+00**. Gate is now
+  magnitude-aware + freq-axis-checked (adversarial mutations FAIL; see commit `4f57587`).
+- **P2 augment** (`cadence/skill/insitu_augment.il` + `insitu/augment.py`) — **LIVE-VERIFIED**:
+  copies `sim_yusheng/Test_PMU` → `Test_PMU_extract` (spine untouched), appends 1A-AC isources
+  at outputs, `acm` on supply sources V3/V4, named probe vsources at sinks; connect-by-name +
+  schCheck (0 errors). Idempotent.
+- **P3 run-drive** (`cadence/skill/insitu_run.il` + `insitu/run.py`): `spectre_cli` backend
+  (offline, reproduces gold EXACTLY) + `ade` backend (axlPutTest/axlSetTestToolArgs/axlPutVar +
+  axlRunAllTests Submit→poll→Rename). **Live-verified:** `insitu_extract` test now in fnxSession0
+  → Test_PMU_extract; design-var one-hot works; snapshot/restore of test-enable round-trips.
+- **P5 fit** (`harness/fit_multiport.py`): reuses fit_model fitters per-output (globals saved/
+  restored) + new current-port fits; report breaks out current-port error separately;
+  export_single_port_refs → per-output npz feeds the EXISTING fit_variant/emit.
+- **P6 CLI** `cd cadence && python -m insitu {doctor,augment,run-only,import,run}` — `run` chains
+  run→PSF→npz→gate→fit→report, exit 0, gate PASS. **Acceptance criterion 1 met.**
+- **P7 GUI** extends `gui/ldo_modeler.py`: Qt-free `ExtractCore` + tab "0 · Extract (in-situ)" →
+  feeds existing Import→Fit→Compare per output. `--selftest` green (incl. Qt path now).
+
+## Test box now (changed this session)
+- **PyQt5 5.15.11 installed user-local** (`~/.local`, `pip install --user PyQt5`). `DISPLAY=:0`.
+  `python3 gui/ldo_modeler.py` opens; `--selftest --require-qt` PASSES offscreen (Extract tab
+  builds, handlers don't crash). Uninstall: `pip uninstall PyQt5 PyQt5-Qt5 PyQt5-sip`.
+
+## DEBUG TARGETS for next session (in priority order)
+1. **Work-machine Qt5 ↔ Cadence conflict** (the user's main worry). Cadence bundles its own Qt;
+   if the GUI is launched from a Cadence-sourced shell / CIW / Cadence's python, PyQt5 loads
+   Cadence's `libQt5*.so` → "Cannot mix incompatible Qt library" / xcb plugin fail. MITIGATION
+   built-in: the GUI is a SEPARATE process talking to Virtuoso over the **skillbridge socket**
+   (no Cadence libs in the GUI process). So: launch from a **CLEAN shell** (don't source
+   env.sh / don't use Cadence's python). **NOT yet tested on the real work machine — that's the
+   first debug.** Fallback: `unset LD_LIBRARY_PATH` / a dedicated venv.
+2. **`ade` backend full Maestro run** — the ONE un-automated step: configure ac/noise analyses
+   + targeted saves on the `Test_PMU_extract` test (or capture the designer's ADE state). The
+   asi analysis-config API (`asiAddAnalysis`, skartistref p.324) is form-field-oriented and was
+   NOT auto-built (sparse docs). Then `python -m insitu run --backend ade` should produce real
+   PSF. Confirm `run._resolve_psf_dir` finds it (ALPS `psf/` vs Spectre `netlist/`).
+3. **GUI Extract tab interactive happy-path** — only smoke-tested (button handlers don't crash);
+   click through Load `pmu_top` → Build & Run → port select → "Load into Import → Fit" for real.
+4. On the company box: swap manifest + DUT for the real PMU (code is DUT-agnostic).
+
+## Reproduce / where things are
+- `cd cadence && python3 -m insitu doctor --manifest pmu_top` (env/session/DUT check)
+- `python3 -m insitu run --manifest pmu_top` (offline end-to-end, gate PASS)
+- `python3 -m insitu augment --manifest pmu_top` (builds Test_PMU_extract in Virtuoso)
+- New code: `cadence/insitu/*.py`, `cadence/skill/insitu_*.il`, `harness/fit_multiport.py`,
+  `gui/ldo_modeler.py` (ExtractCore + tab 0). Manifest: `cadence/insitu/manifests/pmu_top.json`.
+- All SKILL cited via virtuoso-skill index (`~/.claude/skills/virtuoso-skill`).
+
+---
+
 # HANDOFF — LDO behavioral-model builder (as of 2026-06-12)
 
 ## TWO ENTRY POINTS for the next session — pick by where the user is sitting:

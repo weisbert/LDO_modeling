@@ -1,0 +1,31 @@
+我们继续 Mechanism A(ADE-native in-situ LDO 抽取)。上一回合已经 BUILD 完并 push 到 main
+(commits 08706dd→69ff410→cc57fec→4f57587);这一回合是 DEBUG。
+
+先读:HANDOFF.md 最上面的 "UPDATE (2026-06-14)" 段(state + 3 个 debug 目标都在里面),
+以及记忆 ldo-phase4-production-reality、simkit-mechanism-a-reference。
+
+已验证(测试机 + 实时 Cadence 会话 fnxSession0):
+- P4 门控:importmp 对上 gold results/ref/pmu_standin.npz = 0.00;门控已是 magnitude-aware
+  + 查频率轴(对抗性篡改会 FAIL)。
+- P2 augment 实时验证:复制 Test_PMU→Test_PMU_extract,加 isource/probe/supply-acm,
+  connect-by-name + schCheck 0 error,幂等。
+- P3:spectre_cli 离线复现 gold;ade 触发实时验证(insitu_extract 已在 Maestro 里,
+  axlPutVar one-hot OK,test-enable 快照/恢复 round-trip OK)。
+- P6 `cd cadence && python -m insitu run --manifest pmu_top` → gate PASS,exit 0。
+- P7 GUI:gui/ldo_modeler.py 加了 Qt-free ExtractCore + tab "0 · Extract";--selftest 全过
+  (测试机已 pip install --user PyQt5 5.15.11,DISPLAY=:0,窗口能开)。
+
+本回合优先 DEBUG(按序):
+1. 【工作机 Qt5 ↔ Cadence 冲突】用户主要担心的。GUI 是独立进程走 skillbridge socket,
+   理论上从「干净 shell + 非 Cadence 的 python」启动可避开 Cadence 自带 Qt 的 LD_LIBRARY_PATH
+   撞库。还没在真工作机上试过——第一件事就是去工作机实测,出 "Cannot mix incompatible Qt" /
+   xcb 报错就按 HANDOFF 的 fallback(unset LD_LIBRARY_PATH / 独立 venv)调。
+2. 【ade 后端完整 Maestro 跑】唯一没自动化的一步:在 Test_PMU_extract 这个 test 上配 ac/noise
+   分析 + targeted save(asiAddAnalysis 是 form-field API,文档稀,没自动建)或从设计师 ADE
+   state 捕获;然后 `python -m insitu run --backend ade` 出真 PSF,确认 _resolve_psf_dir 找得到
+   (ALPS psf/ vs Spectre netlist/)。
+3. 【GUI Extract tab 真点一遍】目前只 smoke 过(回调不崩),没跑过 happy-path:
+   Load pmu_top → Build & Run → 选口 → Load into Import→Fit。
+
+硬约束不变:SKILL 走 virtuoso-skill 协议(grep 索引→读 PDF→带出处),不凭记忆写签名;
+skillbridge 活会话 fnxSession0;不改设计师 TB 脊柱(只编辑 _extract 副本);保 npz firewall。
