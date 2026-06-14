@@ -23,10 +23,8 @@ def read_psf(path):
     # the cluster write BINARY PSF. Dispatch on the bytes so callers (importmp) read
     # either transparently -- the binary reader returns the identical dict shape and, in
     # fact, full double precision (psfascii rounds to ~6 sig figs). See cadence/binpsf.py.
-    with open(path, "rb") as _f:
-        _head = _f.read(64)
-    if b"\x00" in _head and not _head.lstrip().startswith(b"HEADER"):
-        import binpsf
+    import binpsf
+    if binpsf._is_binary(path):                       # single source of truth for the sniff
         return binpsf.read_binpsf(path)
     text = open(path).read()
     # isolate the VALUE..END body (section markers sit on their own lines)

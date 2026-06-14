@@ -27,6 +27,8 @@ import psf                                               # noqa: E402
 
 BIN = HERE / "testdata" / "binpsf" / "ac_ade_binary.ac"
 ASC = HERE / "testdata" / "binpsf" / "ac_psfascii.ac"
+NBIN = HERE / "testdata" / "binpsf" / "noise_binary.noise"
+NASC = HERE / "testdata" / "binpsf" / "noise_psfascii.noise"
 
 # psfascii prints ~6 significant figures; relative to a port's own magnitude that is a
 # ~1e-5 floor. We assert the binary reader matches the ascii reference within 3e-5.
@@ -75,9 +77,23 @@ def main():
     w2, k2, _ = _worst_rel(via_dispatch, d)
     assert w2 == 0.0, f"psf.read_psf binary dispatch differs from binpsf ({w2:.2e} @ {k2})"
 
-    print(f"PASS  binpsf: 51 pts x 34 traces, freq 10Hz->500MHz; "
-          f"vs psfascii worst={worst:.2e} @ {wkey} (<= {ASCII_PRECISION:.0e}, psfascii 6-sigfig floor); "
-          f"psf.read_psf auto-dispatch exact.")
+    # 4. NOISE PSF: real-valued + per-instance STRUCT traces (the path AC can't exercise).
+    #    The struct traces vary in width per instance and are dropped; only the scalar total
+    #    `out` (what importmp's noise derive reads) must come through, matching psfascii.
+    nb = binpsf.read_binpsf(NBIN)
+    na = psf.read_psf(NASC)
+    assert nb["_sweep"] == "freq" and "out" in nb, f"noise: missing 'out' ({list(nb)})"
+    fb = np.asarray(nb["freq"]).real
+    assert fb.size == na["freq"].size and fb.size > 1, ("noise sweep len", fb.size)
+    assert np.allclose(fb, np.asarray(na["freq"]).real, rtol=1e-9), "noise freq grid mismatch"
+    ob, oa = np.asarray(nb["out"]).real, np.asarray(na["out"]).real
+    assert ob.dtype == float and ob.size == fb.size, ("noise 'out' shape", ob.shape)
+    nrel = float(np.max(np.abs(ob - oa))) / max(float(np.max(np.abs(oa))), 1e-30)
+    assert nrel <= ASCII_PRECISION, f"noise 'out' vs ascii worst={nrel:.2e} > {ASCII_PRECISION:.0e}"
+
+    print(f"PASS  binpsf AC: 51 pts x 34 traces, 10Hz->500MHz, vs psfascii worst={worst:.2e} @ {wkey} "
+          f"(psfascii 6-sigfig floor); auto-dispatch exact. "
+          f"NOISE: {fb.size} pts, scalar 'out' matches psfascii ({nrel:.2e}), struct traces dropped.")
     return 0
 
 

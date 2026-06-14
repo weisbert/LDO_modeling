@@ -143,12 +143,15 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
     _adestate.inherit_state(ws, m, session, test, verbose=False)
     _, noise_fields = _adestate.parse_analysis(m["analysis"].get("noise", "noise"))
     # snapshot the designer's test-enable state and RESTORE it afterwards -- enabling only
-    # our extraction test must not silently leave their ADE reconfigured.
-    snap = ws["insituSnapshotEnabled"](session)
+    # our extraction test must not silently leave their ADE reconfigured. snap is taken
+    # inside the try (with a None guard in finally) so a failure mid-setup never restores
+    # against an un-taken snapshot.
+    snap = None
     psf_map, histories = {}, {}
     try:
         if cancel():
             raise CancelledError("cancelled before run")
+        snap = ws["insituSnapshotEnabled"](session)
         ws["insituEnableOnly"](session, test)
         allvars = list(augment_design_vars(m))
         grps = groups(m)
@@ -178,8 +181,16 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
                 progress(base, f"group {i+1}/{n}: {g['tag']} — "
                          f"{'running' if started else 'starting'}… {el}s")
                 time.sleep(2); deadline -= 2
-            if deadline <= 0:                                 # surfaced, not silently skipped
+            if deadline <= 0:
+                # a hung / over-long run never reached idle. Do NOT insituRename it
+                # (rename is destructive on a non-idle run -> ASSEMBLER-2423) and do NOT
+                # submit the next group over a still-running one -- abort cleanly. The
+                # finally-block restores the designer's ADE; raise so the user investigates.
                 progress(base, f"group {i+1}/{n}: {g['tag']} — TIMEOUT after {timeout}s")
+                raise RuntimeError(
+                    f"group {i+1}/{n} '{g['tag']}' did not finish within {timeout}s "
+                    f"(still running or hung). Raise timeout= or check the ADE/cluster job; "
+                    f"the designer's ADE state has been restored.")
             hname = ws["insituRename"](session, g["tag"])
             histories[g["tag"]] = hname
             pdir = _resolve_psf_dir(ws, session, d, hname, g["tag"])
@@ -189,7 +200,8 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
             progress((i + 1) / n, f"group {i+1}/{n}: {g['tag']} — "
                      f"{'collected' if pdir is not None else 'NO PSF'}")
     finally:
-        ws["insituRestoreEnabled"](session, snap)             # leave the designer's ADE as found
+        if snap is not None:
+            ws["insituRestoreEnabled"](session, snap)         # leave the designer's ADE as found
     return dict(psf_map=psf_map, backend="ade", histories=histories,
                 probe_aliases=None)
 

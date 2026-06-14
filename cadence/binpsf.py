@@ -7,32 +7,35 @@ the SAME dict shape as `psf.read_psf` so the importmp firewall is byte-format ag
 Self-contained (pure struct/numpy, no live session, no external psf lib) -- the npz
 firewall stays standalone, and the same reader handles the cluster's binary output.
 
-Format (reverse-engineered + cross-validated against `spectre -format psfascii` on a
-real ade AC run -- see test_binpsf.py). Big-endian throughout:
+Format (reverse-engineered + cross-validated against `spectre -format psfascii` on real
+ade AC *and* noise runs -- see test_binpsf.py). Big-endian throughout:
 
   file      := [leading word] section* toc
   section   := 0x15(MAJOR=21) endOffset:u32  body            # body spans [.. endOffset)
   HEADER    := property*                                      # name/value pairs
-  property  := 0x21 str str   (string) | 0x22 str u32 (int) | 0x23 str f64 (double)
-  TYPE/TRACE:= 0x16(MINOR=22) endOffset:u32  item*            # then a name->id index tail
-  item      := 0x10(DECL=16)  id:u32  name:str  ...           # type/trace declaration
-  VALUE     := entry*                                         # NON-grouped sweep layout
-  entry     := 0x10(DECL=16)  id:u32  value                   # value: 1 f64 (real) or
-                                                              #        2 f64 (complex re,im)
-  str       := len:u32  bytes (padded up to a 4-byte boundary)
+  property  := 0x21 str str (string) | 0x22 str u32 (int) | 0x23 str f64 (double)
+  TYPE/...  := 0x16(MINOR=22) minorEnd:u32  decl*            # decls span [.. minorEnd)
+  decl      := 0x10(DECL=16) id:u32 name:str ...            # type / trace declaration
+  VALUE     := entry*                                         # one run of points
+  entry     := 0x10(DECL=16) id:u32 value                    # value = N doubles
+  str       := len:u32 bytes (padded up to a 4-byte boundary)
 
-A TYPE declares a physical quantity with a datatype code: 0x0b(11)=real double,
-0x0c(12)=complex (re,im). A TRACE declares a saved signal and references a TYPE by id, so
-each value's width (1 vs 2 doubles) is data-driven -- AC traces are complex, the noise
-`out` trace is real, and both read correctly without hardcoding the analysis.
+Each VALUE entry is `0x10 id <N doubles>` with NO internal markers, and one sweep point
+is the fixed id-sequence [sweepId, trace0, trace1, ...] repeated `sweepPoints` times. AC
+traces are complex (2 doubles); a noise analysis adds a real scalar `out` (1 double) plus
+per-instance STRUCT traces whose width VARIES by instance. Rather than trust a fixed
+width, the VALUE reader walks the KNOWN id sequence and delimits each entry by scanning
+(in whole-double steps) to the next `0x10 <expectedNextId>` -- so any struct width parses
+and stays aligned. Datatype (real vs complex vs struct) is read from the referenced TYPE
+to interpret each scalar; struct traces are consumed but dropped (importmp never needs the
+per-instance noise breakdown, only the scalar `out`).
 """
 import struct
 import numpy as np
 
 _MAJOR, _MINOR, _DECL = 0x15, 0x16, 0x10           # section / sub-section / declaration
 _PROP_STR, _PROP_INT, _PROP_DBL = 0x21, 0x22, 0x23
-_DT_REAL, _DT_COMPLEX = 0x0b, 0x0c                 # datatype codes -> 1 / 2 doubles
-_NDOUBLES = {_DT_REAL: 1, _DT_COMPLEX: 2}
+_DT_REAL, _DT_COMPLEX, _DT_STRUCT = 0x0b, 0x0c, 0x10   # datatype codes
 
 
 class _Cur:
@@ -60,10 +63,16 @@ class _Cur:
 
 
 def _is_binary(path):
-    """True if `path` is a binary PSF (vs psfascii). psfascii is plain text starting
-    with `HEADER`; BINPSF starts with a small-int word and carries NUL bytes."""
+    """True if `path` is a binary PSF (vs psfascii). psfascii is plain text whose first
+    section keyword is `HEADER`; BINPSF opens with a 0x15 MAJOR-section marker (at word 0,
+    or word 1 after a one-word format tag) and carries NUL bytes. The marker check is the
+    primary signal; the NUL fallback only catches odd encodings."""
     with open(path, "rb") as f:
         head = f.read(64)
+    if head[:6] == b"HEADER":
+        return False
+    if len(head) >= 8 and _MAJOR in struct.unpack_from(">II", head, 0):
+        return True
     return b"\x00" in head and not head.lstrip().startswith(b"HEADER")
 
 
@@ -84,13 +93,12 @@ def _sections(b):
     return secs
 
 
-def _skip_minor(c, body_start):
-    """If a section body opens with a 0x16 minor-section header (TYPE/TRACE/SWEEP do),
-    step past its 2-word header; otherwise stay put (HEADER/VALUE have no minor header)."""
-    c.o = body_start
-    if c.u32() == _MINOR:
-        c.o += 8                                      # 0x16 + endOffset
-    return c
+def _minor_range(b, a, z):
+    """A TYPE/SWEEP/TRACE body opens with a 0x16 minor-section header (0x16 + minorEnd);
+    the declarations span [a+8, minorEnd). HEADER/VALUE have none -> (a, z)."""
+    if struct.unpack_from(">I", b, a)[0] == _MINOR:
+        return a + 8, struct.unpack_from(">I", b, a + 4)[0]
+    return a, z
 
 
 # --------------------------------------------------------------------- per-section
@@ -113,84 +121,127 @@ def _read_header(c, a, z):
     return props
 
 
-def _read_types(c, a, z):
-    """TYPE section -> {typeid: ndoubles}. Each item: 0x10 id name <datatype ...>.
-    Only the datatype code (real/complex) is needed; struct/group types are tolerated
-    (they aren't referenced by scalar traces) and default to complex."""
-    _skip_minor(c, a)
-    types = {}
-    while c.o < z and c.u32() == _DECL:
-        c.o += 4
-        tid = c.take_u32()
-        c.take_str()                                  # type name (unused)
-        dt = c.u32(c.o + 4)                            # datatype sits one word after name
-        types[tid] = _NDOUBLES.get(dt, 2)
-        nxt = c.o + 8                                  # advance to the next 0x10 declaration
-        while nxt < z and struct.unpack_from(">I", c.b, nxt)[0] != _DECL:
-            nxt += 4
-        c.o = nxt
-    return types
-
-
-def _read_traces(c, a, z, types):
-    """TRACE section -> ordered [(traceid, name, ndoubles)]. Each item: 0x10 id name
-    typeid; the typeid -> datatype width comes from `types` (default complex)."""
-    _skip_minor(c, a)
+def _read_traces(c, a, z):
+    """TRACE section -> ordered [(traceid, name, typeid)] over its minor range. Each decl:
+    0x10 id name typeid."""
+    lo, hi = _minor_range(c.b, a, z)
+    c.o = lo
     traces = []
-    while c.o < z and c.u32() == _DECL:
+    while c.o + 8 <= hi and c.u32() == _DECL:
         c.o += 4
         tid = c.take_u32()
         name = c.take_str()
         typeid = c.take_u32()
-        traces.append((tid, name, types.get(typeid, 2)))
+        traces.append((tid, name, typeid))
     return traces
+
+
+def _type_datatypes(b, a, z, typeids):
+    """Map each referenced type id -> its datatype code (0x0b real / 0x0c complex /
+    0x10 struct). Located by the `0x10 <id>` decl marker within the TYPE section; the
+    datatype sits two words past the (padded) type name (after a 0-flag word). Robust to
+    the recursive struct grammar (whose bodies contain 0x10 words) because we look up each
+    needed id directly and accept only a valid datatype code."""
+    lo, hi = _minor_range(b, a, z)
+    out = {}
+    for tid in set(typeids):
+        pat = struct.pack(">II", _DECL, tid)
+        i = b.find(pat, lo, hi)
+        while i != -1:
+            o = i + 8
+            n = struct.unpack_from(">I", b, o)[0]            # type name string
+            o += 4 + ((n + 3) & ~3)
+            dt = struct.unpack_from(">I", b, o + 4)[0]       # skip 0-flag word -> datatype
+            if dt in (_DT_REAL, _DT_COMPLEX, _DT_STRUCT):
+                out[tid] = dt
+                break
+            i = b.find(pat, i + 4, hi)                       # false hit (id inside a double)
+    return out
 
 
 def _read_sweep_name(c, a, z):
     """SWEEP section -> the sweep variable name (e.g. 'freq'); first declared item."""
-    _skip_minor(c, a)
-    if c.o < z and c.u32() == _DECL:
+    lo, hi = _minor_range(c.b, a, z)
+    c.o = lo
+    if c.o < hi and c.u32() == _DECL:
         c.o += 4
         c.take_u32()                                  # sweep id (the VALUE entry id is used)
         return c.take_str()
     return "sweep"
 
 
-def _read_values(c, a, toc, sweep_name, traces):
-    """VALUE section -> {name: ndarray}. Non-grouped sweep layout: a flat run of
-    `0x10 id value` entries; the sweep var (real) opens each point, then one entry per
-    saved trace. Width per id is data-driven (1 vs 2 doubles)."""
-    width = {tid: nd for tid, _, nd in traces}
+def _scan_to_marker(b, o, limit, next_id):
+    """From payload start `o`, step in whole-double (8-byte) strides to the next entry
+    marker `0x10 <next_id>`; return that offset. Stepping by 8 only ever lands on a real
+    entry boundary, so a 0x10 inside a double's low word can't false-match. Falls back to
+    `limit` if not found (the final entry runs to the section end)."""
+    p = o
+    while p + 8 <= limit:
+        if struct.unpack_from(">I", b, p)[0] == _DECL and \
+           struct.unpack_from(">I", b, p + 4)[0] == next_id:
+            return p
+        p += 8
+    return limit
+
+
+def _read_values(c, a, z, sweep_name, traces, dt_map, npoints):
+    """VALUE section -> {name: ndarray}. Walk the known per-point id sequence; delimit each
+    entry by scanning to the next expected marker (handles variable-width struct traces).
+    Scalars are stored real/complex per their datatype; struct traces are consumed but
+    dropped (not part of the contract)."""
+    b = c.b
+    sweep_id = c.u32(a + 4)                           # first VALUE entry id (after 0x10 marker)
+    seq = [sweep_id] + [tid for tid, _, _ in traces]
     name_of = {tid: nm for tid, nm, _ in traces}
-    sweep_id = c.u32(a + 4)                            # id of the first entry == sweep var
+    # datatype per id: sweep is real; each trace from its referenced type. A known STRUCT
+    # (per-instance noise breakdown) is dropped; an unknown type is resolved from the actual
+    # payload width at parse time (1 double -> real, 2 -> complex, wider -> struct, dropped).
+    dt_of = {sweep_id: _DT_REAL}
     cols = {sweep_name: []}
     order = [sweep_name]
-    for _, nm, _nd in traces:
-        cols[nm] = []
-        order.append(nm)
-    c.o = a
-    while c.o < toc and c.u32() == _DECL:
-        c.o += 4
-        eid = c.take_u32()
-        if eid == sweep_id:
-            cols[sweep_name].append(c.f64(c.o)); c.o += 8
-        else:
-            nd = width.get(eid, 2)
-            if nd == 1:
-                cols[name_of[eid]].append(c.f64(c.o)); c.o += 8
-            else:
-                cols[name_of[eid]].append(complex(c.f64(c.o), c.f64(c.o + 8))); c.o += 16
-    out = {nm: np.asarray(cols[nm]) for nm in order}
+    for tid, nm, typeid in traces:
+        dt = dt_map.get(typeid)                        # None if the type wasn't located
+        dt_of[tid] = dt
+        if dt != _DT_STRUCT:                           # struct traces never get a column
+            cols[nm] = []
+            order.append(nm)
+
+    total = npoints * len(seq) if npoints else 1 << 30
+    o = a
+    for k in range(total):
+        eid = seq[k % len(seq)]
+        if o + 8 > z or c.u32(o) != _DECL or c.u32(o + 4) != eid:
+            break                                     # alignment lost / truncated -> stop clean
+        o += 8
+        last = (npoints and k == total - 1)
+        nxt = None if last else seq[(k + 1) % len(seq)]
+        end = z if nxt is None else _scan_to_marker(b, o, z, nxt)
+        dt, nd = dt_of[eid], (end - o) // 8
+        nm = sweep_name if eid == sweep_id else name_of[eid]
+        if dt == _DT_REAL or (dt is None and nd == 1):
+            cols[nm].append(c.f64(o))                 # real scalar (sweep var, noise 'out')
+        elif dt == _DT_COMPLEX or (dt is None and nd == 2):
+            cols[nm].append(complex(c.f64(o), c.f64(o + 8)))
+        # else: struct / unexpected width -> consumed but not stored (column left short)
+        o = end
+    # keep only columns that filled to the sweep length -- drops any trace that turned out
+    # wider than a scalar (a mis-typed struct), so the returned arrays are never ragged.
+    npts = len(cols[sweep_name])
+    out = {sweep_name: np.asarray(cols[sweep_name])}
+    for nm in order[1:]:
+        if len(cols[nm]) == npts and npts:
+            out[nm] = np.asarray(cols[nm])
     out["_sweep"] = sweep_name
     return out
 
 
 # --------------------------------------------------------------------------- API
 def read_binpsf(path):
-    """Read a binary PSF file -> {name: ndarray} (the sweep column + every saved trace,
-    complex where Spectre stored a pair, real where it stored a scalar), plus
-    `_sweep` = the sweep variable name. Mirrors cadence/psf.py:read_psf exactly so the
-    importmp read path is identical for ascii and binary inputs."""
+    """Read a binary PSF file -> {name: ndarray} (the sweep column + every saved SCALAR
+    trace, complex where Spectre stored a pair, real where it stored a scalar), plus
+    `_sweep` = the sweep variable name. Mirrors cadence/psf.py:read_psf so the importmp
+    read path is identical for ascii and binary inputs. Per-instance noise STRUCT traces
+    are dropped (the contract uses only the scalar total `out`)."""
     with open(path, "rb") as f:
         b = f.read()
     c = _Cur(b)
@@ -200,14 +251,14 @@ def read_binpsf(path):
                          f"(not a recognised binary PSF?)")
     (h0, h1), (t0, t1), (s0, s1), (r0, r1), (v0, v1) = secs[:5]
     hdr = _read_header(c, h0, h1)
-    if int(hdr.get("PSF groups", 0)):                 # per-instance group data (e.g. noise
-        raise NotImplementedError(                     # contributions) -- not needed for the
-            f"{path}: grouped PSF (PSF groups={hdr['PSF groups']}) not supported; "    # contract
-            "extraction saves scalar node/branch traces only")
-    types = _read_types(c, t0, t1)
-    traces = _read_traces(c, r0, r1, types)
+    if int(hdr.get("PSF groups", 0)):                 # sweep-grouped data -- a layout we have
+        raise NotImplementedError(                     # not needed/seen (our saves give groups=0)
+            f"{path}: grouped PSF (PSF groups={hdr['PSF groups']}) not supported")
+    npoints = int(hdr.get("PSF sweep points", 0))
+    traces = _read_traces(c, r0, r1)
+    dt_map = _type_datatypes(b, t0, t1, [tid for _, _, tid in traces])
     sweep_name = _read_sweep_name(c, s0, s1)
-    return _read_values(c, v0, v1, sweep_name, traces)
+    return _read_values(c, v0, v1, sweep_name, traces, dt_map, npoints)
 
 
 if __name__ == "__main__":
@@ -217,6 +268,6 @@ if __name__ == "__main__":
     for k, v in d.items():
         if k == "_sweep":
             continue
-        nz = np.count_nonzero(v) if v.size else 0
+        nz = int(np.count_nonzero(v)) if v.size else 0
         print(f"  {k:16s} {v.dtype} n={v.size} nz={nz}  "
               f"[{v.flat[0]:.4g} .. {v.flat[-1]:.4g}]" if v.size else f"  {k}: empty")

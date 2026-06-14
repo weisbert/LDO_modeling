@@ -393,6 +393,7 @@ if _HAVE_QT:
     # pins for their DUT. The editor's help panel explains each role; Validate shows the
     # derived measurement matrix before Save.
     _MANIFEST_TEMPLATE = """{
+  "_note": "TEMPLATE — replace every my_* value (my_lib/my_dut_cell/my_testbench) and the example net names (VDD1P0, VOUT, EN) with your design's real lib/cell/net names, then Validate. (_note is ignored by the loader.)",
   "name": "my_ldo",
   "dut": {
     "lib": "my_lib",
@@ -678,6 +679,7 @@ if _HAVE_QT:
             self._xw.failed.connect(self._x_failed)
             self._xw.progressed.connect(self._x_progress)
             self._xw.cancelled.connect(self._x_cancelled)
+            self._xw.finished.connect(self._xw.deleteLater)   # reap the finished QThread
             self._xw.start()
 
         def _x_progress(self, frac, msg):
