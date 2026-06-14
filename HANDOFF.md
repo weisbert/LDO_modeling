@@ -1,3 +1,37 @@
+# UPDATE (2026-06-14c) — binary-PSF read DONE (AC+noise) + GUI #4/#1 done; only config-view fidelity left
+
+**Done this ultracode session (committed locally `01d8478`,`1fbf108`,`180287a`,`06a0e38`; NOT pushed until finalized):**
+- **[1] Binary-PSF reader DONE+proven.** ade/cluster write BINARY PSF; `cadence/psf.py` only read
+  psfascii → `importmp` couldn't read ade output. New **`cadence/binpsf.py`** (standalone, big-endian,
+  npz-firewall-safe) + `psf.read_psf` auto-dispatches on the bytes. Cross-validated vs
+  `spectre -64 -format psfascii` on REAL runs: AC (51 pts × 34 traces; worst 3.9e-6 = psfascii's
+  6-sigfig rounding floor — binary carries full double precision) AND noise (141 pts; per-instance
+  STRUCT traces handled, scalar `out` matches exactly). importmp Zout/noise derive verified on the
+  real binary PSFs. `cadence/test_binpsf.py` + fixtures `cadence/testdata/binpsf/`. Format reference:
+  memory `binpsf-binary-format`.
+- **[2] GUI #4 DONE.** `run_ade` now takes `progress(frac,msg)`+`cancel()`; Tab 0 has a progress bar,
+  per-group live message, and a Cancel button; re-run = Build&Run again. On a poll TIMEOUT it ABORTS
+  cleanly (never `insituRename`s a non-idle run → would throw ASSEMBLER-2423; never submits over a
+  still-running group). Threaded through `run()/cli.produce_npz/ExtractCore.run/_ExtractWorker`.
+- **[3] GUI #1 DONE.** In-GUI manifest editor (`_ManifestEditorDialog`, Tab 0 Edit…/New… buttons):
+  pin-role help panel, Validate (same `manifest.validate` the pipeline uses + measurement-matrix
+  preview), Save/Save-As, New-from-template. Offscreen selftest extended to cover it.
+- **Adversarial multi-agent review** run over all of the above; confirmed findings fixed (the noise
+  STRUCT desync, the timeout-rename hazard, datatype/format-sniff hardening, worker reap).
+- All validated: `test_binpsf` (AC+noise) green, `spectre_cli` gate vs gold 0.00e+00 (no regression),
+  offscreen GUI selftest green.
+
+**Remaining:**
+- **[4] config-view fidelity (Monday, needs the live session).** `augment.insituCopyTB(...,"schematic")`
+  copies only the TB *schematic*; the designer's `Test_PMU/config` may bind extracted/parasitic views,
+  so the real PMU's Zout/PSRR/noise would lose parasitics. Invisible on the all-schematic stand-in.
+  Fix = build the extract test as a CONFIG mirroring the designer's view-bindings (top = our augmented
+  ext schematic). Inspect `Test_PMU/config` live first to decide if it actually binds layout views.
+- **[5] targeted saves (minor, non-blocking).** Still `save=allpub` (binpsf reads it fine);
+  `axlAddOutputSignal` for a targeted save set is an optimization.
+
+---
+
 # UPDATE (2026-06-14b) — ade backend 1610/1707 FIXED + proven live; next = binary-PSF read + GUI
 
 **Done this session (committed locally `3b7f000`, `69f9beb`; NOT pushed — push when fully done):**

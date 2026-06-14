@@ -1,71 +1,49 @@
-我们继续 Mechanism A（ADE-native in-situ LDO 抽取）的 DEBUG。这一回合的目标是把 ade 后端
-「跑完 → 读数据 → 出 npz」彻底打通，再收尾两个 GUI bug。先读：
+Mechanism A（ADE-native in-situ LDO 抽取）— 下一回合 brief。先读：
+  - 记忆 ade-backend-1610-1707-fix、binpsf-binary-format、ldo-phase4-production-reality、
+    simkit-mechanism-a-reference
+  - HANDOFF.md 顶部 UPDATE (2026-06-14c)
+  - 代码：cadence/binpsf.py、cadence/insitu/{adestate,run,cli,augment}.py、gui/ldo_modeler.py
 
-  - 记忆 ade-backend-1610-1707-fix（这一回合的核心，含实时坐实的根因 + 桥 + 坑）
-  - 记忆 ldo-phase4-production-reality、simkit-mechanism-a-reference
-  - HANDOFF.md 顶部 UPDATE (2026-06-14b)
-  - 代码：cadence/insitu/adestate.py（1610/1707 修复）、run.py（已接线）、probe_ade.py（只读诊断）
+==================== 已完成（已 commit，未 push）====================
 
-==================== 上一回合已完成（已验证、已 commit，未 push）====================
+【1610/1707】设计师 ADE 状态继承（adestate.py，经 axlGetToolSession→asiGetSession 桥）已坐实修通。
+【ade 数据读取】binpsf.py 二进制 PSF 读取器已做好并实测：psf.read_psf 按字节自动分派 ascii/binary。
+  AC（51点×34迹）和 noise（141点，含 per-instance STRUCT 迹，标量 out 精确）都用真实 spectre
+  -format psfascii 交叉验证通过（AC 残差 3.9e-6 = psfascii 6位有效数字截断，二进制反而是全精度）。
+  importmp 的 Zout/noise 推导在真实二进制 PSF 上验证通过。test_binpsf.py + cadence/testdata/binpsf 夹具。
+【GUI #4】run_ade 加了 progress(frac,msg)+cancel()；Tab0 进度条+Cancel；超时不再对未 idle 的 run
+  做破坏性 insituRename（否则 ASSEMBLER-2423），干净中止。
+【GUI #1】Tab0 Edit…/New… 内置 manifest JSON 编辑器（Validate 用同一套 manifest.validate + 测量矩阵预览，
+  Save/Save As/模板新建）。
+都跑通：test_binpsf(AC+noise)、spectre_cli gate vs gold 0.00e+00 无回归、离屏 GUI selftest 绿。
+commits：01d8478 / 1fbf108 / 180287a / 06a0e38（+ 上一回合 3b7f000/69f9beb/dc7ec27）。
 
-【#2 #3 修好了】ASSEMBLER-1610 / 1707，在实时会话 fnxSession0 上坐实并修通：
-  - 根因：flo/VDD/VDD1P0 是设计师 test "Test"（cell Test_PMU，view=config）上的局部变量，
-    我们的裸 test insitu_extract（cell Test_PMU_extract，view=schematic）上空着 → 1610；
-    ac/noise 分析对象存在但没配置没使能 → 1707。
-  - 修法（cadence/insitu/adestate.py，已接进 run.py 的 run_ade）：经 axlGetToolSession ->
-    asiGetSession 桥，asiGetDesignVarList(设计师) -> asiAddDesignVarList(我们) 继承真实 OP
-    (flo=5G, VDD=3, VDD1P0=1.05)；asiSetAnalysisFieldVal + asiEnableAnalysis 配好并打开
-    ac/noise（per-group 用 asiEnableAnalysis/asiDisableAnalysis 只开当前组要的）。
-  - groups() 已把 noise 按 v_out 拆开（一个 noise 分析只能测一个 oprobe）。
-  - 铁证：axlRunAllTests 1.0s 返回、不弹框、spectre 0 errors、AC 扫 10Hz->500MHz；netlist 里
-    Iext_pll/Vprobe_*/供电 mag/继承的 flo=5G VDD=3 VDD1P0=1.05 全对。
-  - commits（本地，未 push）：3b7f000（核心修复）、69f9beb（gate 对 ade 改为 informational）。
+==================== 本回合要干的 ====================
 
-【确认】ade run 在这台实验机上能本地跑完（0 errors）。PSF 落在：
-  ~/simulation/sim_yusheng/Test_PMU/maestro/results/maestro/<history>/<point>/insitu_extract/psf/ac.ac
-  （我手测那次是 Interactive.8/1/.../ac.ac，真实文件还在，可离线用）
+[4]（周一，必须用实时会话）config-view 保真度——最后一个真问题。
+   现状：augment.py 的 insituCopyTB(tb_lib, tb_cell, ext_cell, tb_lib, "schematic") 只复制 TB 的
+   schematic 视图，extract test 跑 ext_cell/schematic。但设计师的 "Test" 用 Test_PMU/config，
+   config 可能给 DUT/子块绑定了 extracted/寄生 视图。
+   风险：真 PMU 若 config 绑了寄生视图，schematic 副本会丢掉 RC 寄生 → 抽出的 Zout/PSRR/noise
+   是无寄生的 schematic 级，跟设计师 config 看到的不一致。stand-in 全 schematic 所以现在看不出来。
+   先做：用实时会话查 Test_PMU/config 到底绑了什么视图（hiViewConfig / 看 config 的 view list；
+   走 virtuoso-skill 协议查 SKILL 签名）。若绑了 layout/extracted 视图，则把 extract test 建成一个
+   CONFIG，顶层换成我们 augment 后的 ext schematic，底下继承设计师的 view-binding 规则。
+   坑：skillbridge 会被 Virtuoso 模态框冻住整条通道，遇冻关弹框或重启 Cadence；config-view 激活过
+   旧/坏会话也会冻——只在当前会话上操作。
 
-==================== 本回合要干的（按优先级）====================
+[5]（小，非阻塞）定向 save：现在 save=allpub（binpsf 能正常读，只是多存数据）。
+   axlAddOutputSignal（adexl p.243）做定向保存集是优化项。
 
-[1] 二进制 PSF 读取器（最后一块，最重要）
-    问题：ade Maestro 写的是 BINARY PSF；cadence/psf.py 只会读 ASCII（spectre_cli 用
-    -format psfascii）。所以 ade 数据出来了但 importmp 读不进去（UnicodeDecodeError）。
-    试过且无效：asiSetSimOptionVal 'rawfmt / asiSetEnvOptionVal 'rawFmt 等都被拒（None）。
-    方案（推荐 A）：写一个独立的 BINPSF 读取器（保持 npz firewall 不依赖实时会话；集群周一
-    出的也是二进制）。验证法：把 ade 生成的 input.scs 用 spectre -64 -format psfascii 再跑一遍
-    （复用 cadence/spectre_run.py 思路）得到 ASCII 参照，断言「二进制读取器(ade的ac.ac) ==
-    ASCII读取器(同一netlist的ascii)」。真实 ac.ac 头 16 字节：
-    00 00 02 00 00 00 00 15 00 00 02 f4 00 00 00 21 ...（big-endian、分段 HEADER/TYPE/SWEEP/
-    TRACE/VALUE/TOC，可参考 libpsf 格式）。读出来要喂进 cadence/insitu/importmp.py 的 read 路径。
+之后：真 PMU bring-up（换 manifest → 用新的 GUI 编辑器改/新建 → Build&Run → 出 npz → fit）。
 
-[2] #4 GUI 卡死 / 无进度 / 不能取消 / 不能重跑
-    现状：run_ade 的 poll 循环每组等到 [0,0] 最长 600s，GUI 的 _ExtractWorker 只在最末尾发
-    done/failed，中途无进度；ade run 若慢/不完成就「假死」。要：run_ade 加进度回调 + 取消检查；
-    GUI worker 流式显示「第 N/8 组 running…」、加 Cancel、加重跑、合理超时。
-    注意：1610/1707 修好后模态框不再弹，所以「卡死」主要是 poll 无反馈 + 无取消。
-
-[3] #1 manifest 在 GUI 里没法编辑/新建
-    manifest 是手写 JSON（cadence/insitu/manifests/pmu_top.json），manifest.propose() 是
-    NotImplementedError 桩，GUI Tab 0 只有 Browse+Load（只读）。要给一个 JSON 编辑面板
-    （校验+保存）或把 propose() 做出来（从会话探测引脚起草）。周一换真 PMU 用得上。
-
-[4]（周一前）config-view 保真度
-    设计师 "Test" 用 Test_PMU/config，我们的 extract 用 schematic。stand-in 全 schematic 无差；
-    真 PMU 若 config 绑了 extracted/寄生视图，schematic 副本会丢精度。确认 + 必要时让 extract
-    继承 config 绑定（不是只复制裸 schematic）。
-
-[5]（小）定向 save：现在 netlist 是 save=allpub（能读但浪费）。axlAddOutputSignal（adexl p.243）
-    没实装；用 manifest 的 save 集做定向保存是优化项，非阻塞。
-
-==================== 硬约束 / 坑（务必记住）====================
-
+==================== 硬约束 / 坑 ====================
 - SKILL 走 virtuoso-skill 协议：grep ~/.claude/skills/virtuoso-skill/assets/function_index.tsv
   → 读 PDF（/home/yusheng/cadence_work/Test/workarea/SKILL_file/...）→ 带出处，绝不凭记忆写签名。
-- skillbridge 会被 Virtuoso 模态框冻住整个通道（连 plus(2,3) 都超时）；杀客户端不能取消已在
-  Virtuoso 里跑的调用。遇冻：关掉所有弹框，或重启 Cadence + 重开 ADE-XL。桥 axlGetToolSession->
-  asiGetSession 在「当前会话的 schematic-view test」上是安全的（之前冻是旧坏会话/config-view 激活）。
-- 不改设计师的脊柱：只动我们的副本 insitu_extract / Test_PMU_extract。
-- 保 npz firewall：PSF→npz 要独立、不依赖实时会话。
-- skillbridge 传 SKILL 符号用 from skillbridge import Symbol（Symbol('ac') -> 'ac）。
-- 实时会话事实：session=fnxSession0，sdb=1001；设计师 test 名 "Test"（manifest 里
-  dut.ade_src_test 已写）；analysis 字段名 spectre ac=start/stop/dec，noise 多 oprobe/iprobe。
+- skillbridge 模态框冻通道；杀客户端不能取消已在 Virtuoso 里跑的调用；遇冻关弹框或重启 Cadence。
+- 不改设计师脊柱：只动副本 insitu_extract / Test_PMU_extract。保 npz firewall。
+- skillbridge 符号用 from skillbridge import Symbol（Symbol('ac')->'ac）。
+- 实时会话事实：session=fnxSession0，sdb=1001；设计师 test 名 "Test"（manifest dut.ade_src_test 已写）；
+  设计师 OP flo=5G/VDD=3/VDD1P0=1.05；spectre ac 字段 start/stop/dec，noise 多 oprobe/iprobe。
+- 验证二进制 PSF 读取：把同一 input.scs 用 spectre -64 -format psfascii 再跑出 ascii 参照对比；
+  二进制-vs-二进制是逐位一致；psfascii 只有 ~6 位有效数字。
