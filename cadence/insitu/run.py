@@ -149,11 +149,18 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
     progress = progress or _noop_progress
     cancel = cancel or (lambda: False)
     d = m["dut"]
+    extract_view = d.get("extract_view", "schematic")
     if build_first:
         from . import augment
         augment.build(m, ws=ws, verbose=False)
     ws["load"](str(SKILL_DIR / "insitu_run.il"))
-    ws["insituEnsureTest"](session, test, d["tb_lib"], d["extract_cell"], "spectre")
+    if extract_view == "config":
+        # config-view fidelity: mirror the designer's config (viewlist/stoplist/per-cell
+        # view bindings -> preserves extracted/parasitic views on the REAL PMU) onto the
+        # extract cell, with the top repointed to our augmented schematic. Built here (after
+        # the schematic exists, so the config's top cellview resolves). Idempotent.
+        ws["insituBuildConfig"](d["tb_lib"], d["tb_cell"], d["extract_cell"], "schematic")
+    ws["insituEnsureTest"](session, test, d["tb_lib"], d["extract_cell"], "spectre", extract_view)
     # backfill the designer's ADE state on the bare test: inherit OP design vars (fixes
     # ASSEMBLER-1610) + configure/enable the ac & noise analyses (fixes ASSEMBLER-1707).
     # Both analyses are configured here; the loop enables only the one each group needs.

@@ -32,18 +32,39 @@
 
 
 ;; --- find-or-create the extraction test, pointed at <lib>/<cell>/schematic ---
-(defun insituEnsureTest (sess testName libName cellName @optional (sim "spectre"))
+(defun insituEnsureTest (sess testName libName cellName @optional (sim "spectre") (view "schematic"))
   ;; Ref: axlPutTest adexl p.133 ; axlSetTestToolArgs adexl p.286/287 (the documented
-  ;; from-scratch ADE-XL test creation flow).
+  ;; from-scratch ADE-XL test creation flow). `view` = "schematic" (default) or "config"
+  ;; (config-view fidelity: inherits the designer's view-bindings incl. extracted/parasitic).
   (let (sdb th)
     (setq sdb (insituSdb sess))
     (setq th (axlPutTest sdb testName "ADE"))
     (unless th (error "insituEnsureTest: axlPutTest %s failed" testName))
     (axlSetTestToolArgs th (list (list "lib" libName)
                                  (list "cell" cellName)
-                                 (list "view" "schematic")
+                                 (list "view" view)
                                  (list "sim" sim)))
     th))
+
+
+;; --- build <extCell>/config mirroring <srcCell>/config, top -> <extCell>/<extView> -------
+(defun insituBuildConfig (libName srcCell extCell @optional (extView "schematic"))
+  ;; Mirror the designer's config (viewlist/stoplist/per-cell bindings -> preserves
+  ;; extracted/parasitic view binding on the REAL PMU) onto the extract cell, with the top
+  ;; hierarchy repointed to our augmented schematic. Idempotent (hdbSaveACopy overwrites).
+  ;; Ref: hdbOpen skdf p.671 ; hdbSaveACopy p.667 ; hdbSetTopCellViewName p.690 ;
+  ;; hdbSave p.669 ; hdbClose p.670.
+  (let (src cfg)
+    (setq src (hdbOpen libName srcCell "config" "r"))
+    (unless src (error "insituBuildConfig: cannot open %s/%s/config" libName srcCell))
+    (hdbSaveACopy src libName extCell "config")
+    (hdbClose src)
+    (setq cfg (hdbOpen libName extCell "config" "a"))
+    (unless cfg (error "insituBuildConfig: cannot reopen %s/%s/config" libName extCell))
+    (hdbSetTopCellViewName cfg libName extCell extView)
+    (hdbSave cfg)
+    (hdbClose cfg)
+    t))
 
 
 ;; --- enable ONLY our extraction test -----------------------------------------
