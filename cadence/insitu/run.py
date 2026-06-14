@@ -20,7 +20,7 @@ need only ~7 runs.
 """
 import pathlib
 
-from . import CADENCE, SKILL_DIR, manifest as _manifest
+from . import CADENCE, SKILL_DIR, manifest as _manifest, adestate as _adestate
 
 WORK_CLI = CADENCE / "work_pmu"          # extract_pmu.py's PSF lands here
 # the CLI fixture (extract_pmu.py) names its sink probes Vb500/Vb1u; the manifest names
@@ -29,18 +29,26 @@ _CLI_PROBE_ALIASES = {"i500n": "Vb500:p", "i1u": "Vb1u:p"}
 
 
 def groups(m):
-    """Group the measurement matrix by (analysis, one-hot stimulus) -> the minimal set of
-    runs. Each group is read by all its member measurements."""
+    """Group the measurement matrix into the minimal set of runs. AC measurements merge by
+    (analysis, one-hot stimulus) -- AC superposition lets one run feed every saved port. A
+    spectre NOISE analysis measures ONE oprobe, so noise NEVER merges across outputs: each
+    v_out is its own group (key includes the output net), carrying that output's oprobe."""
     out = {}
     for pt in _manifest.measurements(m):
-        key = (pt["analysis"], tuple(sorted(tuple(h) for h in pt["hot"])))
-        g = out.setdefault(key, dict(analysis=pt["analysis"], hot=pt["hot"],
+        if pt["analysis"] == "noise":
+            onet = pt["reads"][0][1]
+            key, oprobe = ("noise", ("oprobe", onet)), onet
+        else:
+            key, oprobe = (pt["analysis"], tuple(sorted(tuple(h) for h in pt["hot"]))), None
+        g = out.setdefault(key, dict(analysis=pt["analysis"], hot=pt["hot"], oprobe=oprobe,
                                      tag=_group_tag(pt), members=[]))
         g["members"].append(pt)
     return list(out.values())
 
 
 def _group_tag(pt):
+    if pt["analysis"] == "noise":
+        return "g_" + pt["tag"]                 # one group per noise output (n_pll -> g_n_pll)
     if not pt["hot"]:
         return f"g_{pt['analysis']}"
     return "g_" + "_".join(f"{k}_{v}" for k, v in pt["hot"])
@@ -112,6 +120,11 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
         augment.build(m, ws=ws, verbose=False)
     ws["load"](str(SKILL_DIR / "insitu_run.il"))
     ws["insituEnsureTest"](session, test, d["tb_lib"], d["extract_cell"], "spectre")
+    # backfill the designer's ADE state on the bare test: inherit OP design vars (fixes
+    # ASSEMBLER-1610) + configure/enable the ac & noise analyses (fixes ASSEMBLER-1707).
+    # Both analyses are configured here; the loop enables only the one each group needs.
+    _adestate.inherit_state(ws, m, session, test, verbose=False)
+    _, noise_fields = _adestate.parse_analysis(m["analysis"].get("noise", "noise"))
     # snapshot the designer's test-enable state and RESTORE it afterwards -- enabling only
     # our extraction test must not silently leave their ADE reconfigured.
     snap = ws["insituSnapshotEnabled"](session)
@@ -120,6 +133,11 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
         ws["insituEnableOnly"](session, test)
         allvars = list(augment_design_vars(m))
         for g in groups(m):
+            # enable ONLY this group's analysis (ac groups must not drag noise, which needs
+            # an oprobe); for a noise group, point the single oprobe at THIS output's net.
+            _adestate.enable_only_analysis(ws, session, test, g["analysis"])
+            if g["analysis"] == "noise" and g.get("oprobe"):
+                _adestate.set_noise_oprobe(ws, session, test, g["oprobe"], noise_fields)
             hot = {_manifest.acm_var(k, v): "1" for k, v in g["hot"]}
             for var in allvars:                               # one-hot: this group's vars=1
                 ws["insituPutVar"](session, var, hot.get(var, "0"))

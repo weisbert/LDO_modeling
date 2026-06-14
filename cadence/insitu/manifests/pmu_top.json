@@ -7,7 +7,8 @@
     "tb_lib": "sim_yusheng",
     "tb_cell": "Test_PMU",
     "tb_inst": "I26",
-    "extract_cell": "Test_PMU_extract"
+    "extract_cell": "Test_PMU_extract",
+    "ade_src_test": "Test"
   },
   "ground": "gnd!",
   "supplies": {
