@@ -29,7 +29,7 @@ from skillbridge import Symbol
 # on the designer's test: asiGetAnalysisFieldVal returns '' for a valid-but-empty field and
 # nil for a non-field). We only push manifest tokens whose key is one of these.
 _ANALYSIS_KEYS = ("start", "stop", "dec", "lin", "log", "step", "center", "span", "freq",
-                  "oprobe", "iprobe", "sweeptype", "noisetype")
+                  "oprobe", "iprobe", "p", "n", "sweeptype", "noisetype")
 
 
 def _ts(ws, sess, test):
@@ -97,11 +97,17 @@ def enable_only_analysis(ws, sess, test, ana_name, siblings=("ac", "noise")):
     return on
 
 
-def set_noise_oprobe(ws, sess, test, onet, fields=None):
-    """A spectre noise analysis measures ONE output -> set its oprobe to `onet` (and re-apply
-    the sweep), then enable it. Used per-output by the run loop (one noise run per v_out)."""
+def set_noise_output(ws, sess, test, onet, ground="gnd!", fields=None):
+    """A spectre noise analysis measures ONE output. Set the VOLTAGE node-pair output
+    (p=onet, n=ground) and CLEAR oprobe -- matching the gold's `noise (onet 0) ...`. Setting
+    oprobe to a NET name makes spectre fail (SFE-1997: `oprobe` expects a COMPONENT instance,
+    not a net); the node-pair form is the correct way to measure output-voltage noise at a
+    net. Re-applies the sweep and enables. Used per-output by the run loop (one noise run per
+    v_out). The sev fields p/n/oprobe were confirmed live on the designer's noise analysis."""
     f = dict(fields or {})
-    f["oprobe"] = onet
+    f["p"] = onet
+    f["n"] = ground
+    f["oprobe"] = ""                 # clear the probe form so spectre emits `noise (p n)`
     return config_analysis(ws, sess, test, "noise", f, enable=True)
 
 
@@ -137,9 +143,12 @@ def inherit_state(ws, m, sess, dst_test, verbose=False):
         if not line:
             continue
         name, fields = parse_analysis(line)
-        if kind == "noise" and "oprobe" not in fields and m["v_out"]:
-            # placeholder; the run loop overrides per-output (set_noise_oprobe)
-            fields["oprobe"] = next(iter(m["v_out"].values()))["net"]
+        if kind == "noise" and m["v_out"]:
+            # placeholder output; the run loop overrides per-output (set_noise_output). Use
+            # the VOLTAGE node-pair form (p/n), NOT oprobe -- oprobe=<net> is invalid (SFE-1997).
+            fields.setdefault("p", next(iter(m["v_out"].values()))["net"])
+            fields.setdefault("n", m.get("ground", "gnd!"))
+            fields["oprobe"] = ""
         config_analysis(ws, sess, dst_test, name, fields, enable=True)
         out["analyses"][name] = fields
     if verbose:

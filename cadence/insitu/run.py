@@ -112,6 +112,13 @@ def _noop_progress(frac, msg):                                # default: no-op p
     pass
 
 
+# axlGetRunStatus returns (completed, total) points -- NOT an idle code. After submit it
+# resets completed->0 within ~1-2s; _SETTLE bounds how long we wait for that reset before
+# trusting a (N,N) reading as the NEW run's completion (guards the previous run's resting
+# (N,N)). Observed reset latency ~1.5s; 5s is a safe margin.
+_SETTLE = 5.0
+
+
 def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
             poll=None, timeout=600, build_first=True, progress=None, cancel=None):
     """Drive the augmented extraction through Maestro: per group set the acm one-hot,
@@ -163,23 +170,39 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
             # an oprobe); for a noise group, point the single oprobe at THIS output's net.
             _adestate.enable_only_analysis(ws, session, test, g["analysis"])
             if g["analysis"] == "noise" and g.get("oprobe"):
-                _adestate.set_noise_oprobe(ws, session, test, g["oprobe"], noise_fields)
+                _adestate.set_noise_output(ws, session, test, g["oprobe"],
+                                           m.get("ground", "gnd!"), noise_fields)
             hot = {_manifest.acm_var(k, v): "1" for k, v in g["hot"]}
             for var in allvars:                               # one-hot: this group's vars=1
                 ws["insituPutVar"](session, var, hot.get(var, "0"))
+            # Poll the run's OWN history, not the session aggregate. axlGetRunStatus returns
+            # (completed,total) points -- DONE when completed>=total (it RESTS at (N,N), never
+            # (0,0); the original `== [0,0]` test waited forever). The aggregate form double-
+            # counts across histories and, after many renames, errors with "setup database
+            # entry for handle 0" -- so we detect the NEW history this submit creates (name
+            # != the pre-submit current history) and query THAT history's status. _SETTLE
+            # guards a half-initialised read for a sub-poll-interval run.
+            h_prev = ws["insituCurHist"](session)
             ws["insituSubmit"](session)
-            deadline, started = timeout, False
-            while deadline > 0:                               # poll: confirm start, then idle
+            t_submit = time.time()
+            deadline, hcur, started = timeout, None, False
+            while deadline > 0:                               # poll until completed==total
                 if cancel():                                  # Cancel honoured between ticks
                     raise CancelledError(f"cancelled during {g['tag']}")
-                st = ws["insituStatus"](session)
-                if st and list(st) != [0, 0]:
-                    started = True
-                if st and list(st) == [0, 0] and started:
+                name = ws["insituCurHist"](session)
+                if name and name != h_prev:
+                    hcur = name                               # this submit's own history
+                comp, total = 0, 0
+                if hcur:
+                    comp, total = (list(ws["insituHistStatus"](session, hcur) or []) + [0, 0])[:2]
+                    if total > 0 and comp < total:
+                        started = True                        # observed THIS run in progress
+                settled = (time.time() - t_submit) >= _SETTLE
+                if hcur and total > 0 and comp >= total and (started or settled):
                     break
                 el = timeout - deadline
                 progress(base, f"group {i+1}/{n}: {g['tag']} — "
-                         f"{'running' if started else 'starting'}… {el}s")
+                         f"{'running' if (hcur and started) else 'starting'} {comp}/{total}… {el}s")
                 time.sleep(2); deadline -= 2
             if deadline <= 0:
                 # a hung / over-long run never reached idle. Do NOT insituRename it
@@ -191,9 +214,15 @@ def run_ade(m, session="fnxSession0", test="insitu_extract", ws=None,
                     f"group {i+1}/{n} '{g['tag']}' did not finish within {timeout}s "
                     f"(still running or hung). Raise timeout= or check the ADE/cluster job; "
                     f"the designer's ADE state has been restored.")
-            hname = ws["insituRename"](session, g["tag"])
+            # Anchor on the run's OWN (auto) history name. We deliberately do NOT rename to
+            # g[tag] here: on a re-run the tag collides with a prior history and the rename
+            # pops an ASSEMBLER-2409 MODAL that wedges the skillbridge channel (and on a
+            # degraded session even an errset-wrapped rename escalates to that modal). The PSF
+            # resolver works off the real history name regardless; readable Maestro names can
+            # be restored later via delete-then-rename on a clean session.
+            hname = hcur
             histories[g["tag"]] = hname
-            pdir = _resolve_psf_dir(ws, session, d, hname, g["tag"])
+            pdir = _resolve_psf_dir(ws, session, hname, g["tag"], g["analysis"])
             for pt in g["members"]:
                 if pdir is not None:
                     psf_map[pt["tag"]] = pdir
@@ -211,39 +240,32 @@ def augment_design_vars(m):
     return augment.design_vars(m)
 
 
-def _has_psf(d):
-    """True iff `d` (or a child) actually holds an .ac/.noise PSF -- guards against a
-    resolver returning a stale or empty run dir."""
-    p = pathlib.Path(d)
-    if not p.exists():
-        return False
-    for ext in (".ac", ".noise"):
-        if any(p.rglob(f"*{ext}")):
-            return True
-    return False
+def _resolve_psf_dir(ws, session, hname, tag, analysis):
+    """Locate the PSF dir for a finished ADE-XL run. Anchors on the session's results
+    location (axlGetResultsLocation, adexl p.111) -- the documented absolute results root
+    (.../maestro/results/maestro). The run lands at <root>/<hname>/<pt>/<test>/psf/<x>.<ext>;
+    we rglob under the renamed history (then the raw tag as a fallback) for THIS group's
+    analysis extension and return the dir that holds the PSF, or None.
 
-
-def _resolve_psf_dir(ws, session, d, hname, tag):
-    """Best-effort: locate the PSF tree for a finished run. Tries the ADE analog run dir
-    (asiGetAnalogRunDir) and the session's results area, accepting either psf/ (ALPS) or
-    netlist/ (Spectre). Only returns a dir that ACTUALLY contains PSF (non-empty), so a
-    stale/previous run dir is not silently accepted. Returns a pathlib.Path or None."""
-    cands = []
+    The old impl called asiGetAnalogRunDir() with no args (it needs one) -> always errored
+    -> cands empty -> searched only the cadence/ source tree -> never found the PSF. NB:
+    axlGetResultsLocation may return a RELATIVE path if adexl.results.saveDir is overridden
+    (e.g. on the cluster); here it is absolute. Resolve relatives against cwd best-effort."""
+    ext = ".noise" if analysis == "noise" else ".ac"
     try:
-        rd = ws["asiGetAnalogRunDir"]()
-        if rd:
-            cands.append(pathlib.Path(str(rd)))
+        loc = ws["axlGetResultsLocation"](ws["axlGetMainSetupDB"](session))
     except Exception:                                          # noqa: BLE001
-        pass
-    # the renamed history is the most specific anchor -> prefer it over the bare tag
-    for base in cands + [CADENCE]:
-        for sub in (f"**/{hname}/**/psf", f"**/{hname}/**/netlist", f"**/{tag}/**/psf"):
-            for hit in (base.glob(sub) if base.exists() else []):
-                if _has_psf(hit.parent):
-                    return hit.parent
-    for c in cands:
-        if _has_psf(c):
-            return c
+        loc = None
+    if not loc:
+        return None
+    root = pathlib.Path(str(loc))
+    for anchor in (hname, tag):                                # renamed history first
+        base = root / str(anchor)
+        if not base.exists():
+            continue
+        hits = sorted(base.rglob(f"*{ext}"))
+        if hits:
+            return hits[0].parent                              # the psf/ dir holding the PSF
     return None
 
 
@@ -260,6 +282,7 @@ def run(m, backend="spectre_cli", **kw):
     if backend == "ade":
         return run_ade(m, session=kw.get("session", "fnxSession0"),
                        build_first=kw.get("build_first", True),
+                       timeout=kw.get("timeout", 600),
                        progress=progress, cancel=kw.get("cancel"))
     raise ValueError(f"unknown backend {backend!r} (spectre_cli | ade)")
 

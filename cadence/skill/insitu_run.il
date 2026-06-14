@@ -95,14 +95,37 @@
 
 (defun insituStatus (sess)
   ;; Pure read; safe during the async tail. Ref: axlGetRunStatus adexl p.386.
-  ;; Returns [code sub] (idle = (0 0)) or nil.
+  ;; Returns (completed total) points -- DONE when completed>=total (RESTS at (N,N),
+  ;; NOT (0,0)). nil if no run has registered yet. NB: this SESSION-AGGREGATE form can be
+  ;; poisoned ("Cannot find a setup database entry for handle 0") after many renames, and
+  ;; sums points across ALL histories -- prefer the per-history insituHistStatus below.
   (car (errset (axlGetRunStatus sess) nil)))
 
+
+;; --- per-history run status (robust) -----------------------------------------
+;; The session-aggregate axlGetRunStatus(sess) errors once a stale history handle exists
+;; (rename-heavy runs) and double-counts across histories. Query the run's OWN history:
+(defun insituCurHist (sess)
+  ;; Current history NAME (string) or nil. Ref: axlGetCurrentHistory adexl p.417 ;
+  ;; axlGetHistoryName adexl p.427.
+  (let (h)
+    (setq h (car (errset (axlGetCurrentHistory sess) nil)))
+    (if h (car (errset (axlGetHistoryName h) nil)) nil)))
+
+(defun insituHistStatus (sess hist)
+  ;; (completed total) for ONE history -- DONE when completed>=total. Ref: axlGetRunStatus
+  ;; adexl p.386/387 (?historyName arg).
+  (if hist (car (errset (axlGetRunStatus sess ?historyName hist) nil)) nil))
+
 (defun insituRename (sess histName)
-  ;; DESTRUCTIVE -- only after idle (else ASSEMBLER-2423). Ref: axlGetCurrentHistory
-  ;; p.417 ; axlSetHistoryName p.435.
+  ;; BEST-EFFORT rename of the current (idle) history to histName for readable Maestro
+  ;; names. Only call after idle (a non-idle rename -> ASSEMBLER-2423). A re-run reuses the
+  ;; same tag, so histName may already exist -> axlSetHistoryName errors; that is NOT fatal
+  ;; (the PSF is under the actual history dir), so we swallow it and KEEP the current name.
+  ;; ALWAYS returns the history's actual resulting name. Ref: axlGetCurrentHistory p.417 ;
+  ;; axlSetHistoryName p.435 ; axlGetHistoryName p.427.
   (let (h)
     (setq h (car (errset (axlGetCurrentHistory sess) nil)))
     (unless h (error "insituRename: axlGetCurrentHistory nil"))
-    (axlSetHistoryName h histName)
-    (car (errset (axlGetHistoryName h) nil))))
+    (errset (axlSetHistoryName h histName) nil)        ; swallow name-collision / 2423
+    (car (errset (axlGetHistoryName h) nil))))          ; actual name (renamed or original)
