@@ -389,6 +389,139 @@ if _HAVE_QT:
         ("Bias xfer",   "ibp",        "corner",  False),
     ]
 
+    # A fresh, structurally-valid single-LDO skeleton for 'New…' -- the designer re-tags the
+    # pins for their DUT. The editor's help panel explains each role; Validate shows the
+    # derived measurement matrix before Save.
+    _MANIFEST_TEMPLATE = """{
+  "name": "my_ldo",
+  "dut": {
+    "lib": "my_lib",
+    "cell": "my_dut_cell",
+    "tb_lib": "my_lib",
+    "tb_cell": "my_testbench",
+    "tb_inst": "I0",
+    "extract_cell": "my_testbench_extract"
+  },
+  "ground": "gnd!",
+  "supplies": {
+    "1p0": {"net": "VDD1P0", "dc": 1.05}
+  },
+  "v_out": {
+    "out": {"net": "VOUT"}
+  },
+  "i_out": {},
+  "bias": {},
+  "leave_alone": ["EN"],
+  "current_psrr_supplies": ["1p0"],
+  "analysis": {
+    "ac": "ac start=10 stop=500M dec=20",
+    "noise": "noise start=10 stop=100M dec=20"
+  }
+}
+"""
+
+    _MANIFEST_ROLE_HELP = (
+        "<b>Pin-role manifest</b> — tag each DUT-boundary pin, the tool does the rest.<br>"
+        "&nbsp;• <b>dut</b>: lib/cell of the DUT + its testbench; <i>extract_cell</i> = the "
+        "copy we append stimuli to (TB_extract).<br>"
+        "&nbsp;• <b>supplies</b> <code>{name:{net,dc}}</code> — rails to PSRR (dc = the OP value).<br>"
+        "&nbsp;• <b>v_out</b> <code>{name:{net}}</code> — voltage outputs (Zout/noise/coupling).<br>"
+        "&nbsp;• <b>i_out</b> <code>{name:{net,dc}}</code> — current sinks (admittance / current-PSRR).<br>"
+        "&nbsp;• <b>leave_alone</b> — pins to drive with their OP value and not stimulate "
+        "(enables, digital ctrl bus, …).<br>"
+        "&nbsp;• <b>current_psrr_supplies</b> — subset of supplies to current-PSRR. "
+        "<b>Validate</b> previews the measurement matrix; <b>Save</b> reloads it on Tab 0.")
+
+    class _ManifestEditorDialog(QtWidgets.QDialog):
+        """In-GUI manifest JSON editor: edit/validate/save a pin-role manifest without
+        leaving the tool (the #1 'I can't find where to change the manifest' gap). Validate
+        parses the JSON and runs the same manifest.validate the pipeline uses, then previews
+        the derived measurement matrix. Save writes the editor text verbatim (preserving the
+        designer's formatting)."""
+
+        def __init__(self, parent, text, path):
+            super().__init__(parent)
+            self.path = pathlib.Path(path) if path else None
+            self.saved_path = None
+            self.setWindowTitle(f"Manifest editor — {self.path.name if self.path else 'new (unsaved)'}")
+            self.resize(720, 640)
+            lay = QVBoxLayout(self)
+            help_ = QLabel(_MANIFEST_ROLE_HELP); help_.setWordWrap(True)
+            help_.setStyleSheet("background:#eef5ff; padding:8px; border:1px solid #cdddee;")
+            lay.addWidget(help_)
+            self.ed = QTextEdit(); self.ed.setPlainText(text)
+            self.ed.setStyleSheet("font-family:monospace; font-size:12px;")
+            self.ed.setLineWrapMode(QTextEdit.NoWrap)
+            lay.addWidget(self.ed, 1)
+            self.status = QLabel("edit, then Validate"); self.status.setWordWrap(True)
+            self.status.setStyleSheet("font-family:monospace; font-size:11px;")
+            lay.addWidget(self.status)
+            brow = QHBoxLayout()
+            b_val = QPushButton("Validate"); b_val.clicked.connect(self._validate)
+            b_save = QPushButton("Save"); b_save.clicked.connect(self._save)
+            b_saveas = QPushButton("Save As…"); b_saveas.clicked.connect(self._save_as)
+            b_cancel = QPushButton("Cancel"); b_cancel.clicked.connect(self.reject)
+            brow.addWidget(b_val); brow.addStretch(1)
+            brow.addWidget(b_save); brow.addWidget(b_saveas); brow.addWidget(b_cancel)
+            lay.addLayout(brow)
+
+        def _check(self):
+            """Parse + validate the editor text. Returns (ok, message). On ok, message is the
+            human summary incl. the derived measurement matrix; else an actionable error."""
+            import json
+            from insitu import manifest as M
+            try:
+                m = json.loads(self.ed.toPlainText())
+            except json.JSONDecodeError as e:
+                return False, f"JSON error: {e}"
+            try:
+                m = M._fill_defaults(m)
+                M.validate(m)
+                return True, M.summary(m)
+            except M.ManifestError as e:
+                return False, f"manifest error: {e}"
+
+        def _validate(self):
+            ok, msg = self._check()
+            self.status.setStyleSheet("font-family:monospace; font-size:11px; "
+                                      "color:%s;" % ("#157f3b" if ok else "#b00020"))
+            self.status.setText(("VALID ✓\n" if ok else "INVALID ✗\n") + msg)
+            return ok
+
+        def _write(self, path):
+            ok = self._validate()
+            if not ok:
+                QMessageBox.warning(self, "Manifest", "Fix the validation error before saving.")
+                return False
+            try:
+                pathlib.Path(path).write_text(self.ed.toPlainText())
+            except OSError as e:
+                QMessageBox.critical(self, "Manifest", f"write failed: {e}")
+                return False
+            self.saved_path = pathlib.Path(path)
+            return True
+
+        def _save(self):
+            if self.path is None:
+                return self._save_as()
+            if self._write(self.path):
+                self.accept()
+
+        def _save_as(self):
+            from insitu import MANIFEST_DIR
+            start = str(self.path or (MANIFEST_DIR / "my_ldo.json"))
+            fn, _ = QFileDialog.getSaveFileName(self, "Save manifest as", start, "JSON (*.json)")
+            if not fn:
+                return False
+            if not fn.endswith(".json"):
+                fn += ".json"
+            if self._write(fn):
+                self.path = pathlib.Path(fn)
+                self.setWindowTitle(f"Manifest editor — {self.path.name}")
+                self.accept()
+                return True
+            return False
+
     class MainWindow(QMainWindow):
         def __init__(self, core=None):
             super().__init__()
@@ -430,7 +563,13 @@ if _HAVE_QT:
             row = QHBoxLayout(); row.addWidget(self.x_manifest)
             b_browse = QPushButton("Browse…"); b_browse.clicked.connect(self._x_browse)
             b_load = QPushButton("Load"); b_load.clicked.connect(self._x_load)
-            row.addWidget(b_browse); row.addWidget(b_load)
+            b_edit = QPushButton("Edit…"); b_edit.clicked.connect(self._x_edit)
+            b_edit.setToolTip("Open the manifest JSON in an editor: re-tag pins when you "
+                              "switch LDOs, Validate, then Save (reloads here).")
+            b_new = QPushButton("New…"); b_new.clicked.connect(self._x_new)
+            b_new.setToolTip("Start a fresh manifest from a commented template.")
+            for b in (b_browse, b_load, b_edit, b_new):
+                row.addWidget(b)
             rw = QWidget(); rw.setLayout(row); form.addRow("Manifest *", rw)
             self.x_backend = QComboBox(); self.x_backend.addItems(["spectre_cli", "ade"])
             self.x_backend.setToolTip("spectre_cli: offline dev fixture. ade: live Maestro run "
@@ -493,6 +632,39 @@ if _HAVE_QT:
                 self.statusBar().showMessage("Manifest loaded — 'Build & Run' to extract.")
             except Exception as e:
                 QMessageBox.critical(self, "Manifest", f"{type(e).__name__}: {e}")
+
+        def _resolve_manifest_path(self):
+            """Best-effort resolve the Manifest field (a path or a bare name) to a JSON file
+            on disk -- so Edit opens the right file. Returns a pathlib.Path or None."""
+            from insitu import MANIFEST_DIR
+            txt = self.x_manifest.text().strip()
+            if not txt:
+                return None
+            p = pathlib.Path(txt)
+            if p.exists():
+                return p
+            cand = MANIFEST_DIR / (p.name if p.suffix == ".json" else f"{p.name}.json")
+            return cand if cand.exists() else None
+
+        def _x_edit(self):
+            """Open the current manifest JSON in the editor (re-tag pins for a new LDO)."""
+            path = self._resolve_manifest_path()
+            if path is None:
+                QMessageBox.information(self, "Edit manifest",
+                                        "No manifest file resolved from the field. Use 'New…' "
+                                        "for a fresh template, or Browse… to pick a JSON.")
+                return
+            self._open_manifest_editor(path.read_text(), path)
+
+        def _x_new(self):
+            """Open the editor on a fresh, commented template (no path until Save As)."""
+            self._open_manifest_editor(_MANIFEST_TEMPLATE, None)
+
+        def _open_manifest_editor(self, text, path):
+            dlg = _ManifestEditorDialog(self, text, path)
+            if dlg.exec_() and dlg.saved_path:           # Save / Save As succeeded
+                self.x_manifest.setText(str(dlg.saved_path))
+                self._x_load()                            # reload + refresh the summary/plan
 
         def _x_run(self):
             self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
@@ -1258,6 +1430,28 @@ def _selftest_extract():
             pass
 
 
+def _selftest_manifest_editor(win, tmp):
+    """Headless smoke of the in-GUI manifest editor (#1): template validates, a broken edit
+    is caught, and a valid edit Saves to disk + reloads through ExtractCore. Qt offscreen."""
+    dlg = _ManifestEditorDialog(win, _MANIFEST_TEMPLATE, None)
+    ok, msg = dlg._check()
+    assert ok, f"template should validate, got: {msg}"
+    assert "measurement points" in msg, "validate preview missing the measurement matrix"
+    dlg.ed.setPlainText('{ "name": "x", oops }')                 # malformed JSON
+    bad_ok, _ = dlg._check()
+    assert not bad_ok, "broken JSON must fail validation"
+    dlg.ed.setPlainText('{"name":"x","dut":{"lib":"l"}}')         # valid JSON, invalid manifest
+    bad2_ok, _ = dlg._check()
+    assert not bad2_ok, "manifest missing dut.cell/v_out must fail validation"
+    # a valid edit -> write -> reload through the real loader
+    out = pathlib.Path(tmp) / "edited_manifest.json"
+    dlg.ed.setPlainText(_MANIFEST_TEMPLATE)
+    assert dlg._write(out) and dlg.saved_path == out and out.exists(), "save failed"
+    ExtractCore().load_manifest(str(out))                         # reloadable end-to-end
+    out.unlink()
+    print("  qt: manifest editor OK (template valid, bad JSON/manifest caught, save+reload)")
+
+
 def _selftest(require_qt=False):
     """Headless verification: round-trip a reference through import_cadence -> fit -> predict ->
     emit (the full pipeline), then -- if PyQt5 is importable -- build the window offscreen and
@@ -1351,14 +1545,16 @@ def _selftest(require_qt=False):
         import PyQt5.QtWidgets as _QW
         _orig = (_QW.QMessageBox.information, _QW.QMessageBox.warning, _QW.QMessageBox.critical,
                  _QW.QFileDialog.getExistingDirectory, _QW.QFileDialog.getOpenFileName,
-                 _QW.QFileDialog.getSaveFileName)
+                 _QW.QFileDialog.getSaveFileName, _QW.QDialog.exec_)
         _QW.QMessageBox.information = staticmethod(lambda *a, **k: None)
         _QW.QMessageBox.warning = staticmethod(lambda *a, **k: None)
         _QW.QMessageBox.critical = staticmethod(lambda *a, **k: None)
         _QW.QFileDialog.getExistingDirectory = staticmethod(lambda *a, **k: str(tmp))
         _QW.QFileDialog.getOpenFileName = staticmethod(lambda *a, **k: (str(next(iter(files.values()))), ""))
         _QW.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: ("", ""))
+        _QW.QDialog.exec_ = lambda self: 0   # any modal (manifest editor) returns Rejected, no block
         try:
+            _selftest_manifest_editor(win, tmp)   # the in-GUI manifest editor (#1): validate+save
             win._show_guidance()             # the Measurement-guidance button (was the MEAS_HINTS crash)
             win._import_folder()             # folder-import (must match the synth CSVs in tmp/)
             assert win._collect_files(), "folder-import matched no files into the grid"
@@ -1379,7 +1575,7 @@ def _selftest(require_qt=False):
         finally:
             (_QW.QMessageBox.information, _QW.QMessageBox.warning, _QW.QMessageBox.critical,
              _QW.QFileDialog.getExistingDirectory, _QW.QFileDialog.getOpenFileName,
-             _QW.QFileDialog.getSaveFileName) = _orig
+             _QW.QFileDialog.getSaveFileName, _QW.QDialog.exec_) = _orig
         try:                                  # the Save-text-report click writes results/score/report_*.txt
             import report as _rpt
             _r = _rpt.SCOREDIR / "report__gui_selftest.txt"
