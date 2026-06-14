@@ -1,3 +1,35 @@
+# UPDATE (2026-06-14b) — ade backend 1610/1707 FIXED + proven live; next = binary-PSF read + GUI
+
+**Done this session (committed locally `3b7f000`, `69f9beb`; NOT pushed — push when fully done):**
+- **ASSEMBLER-1610 / 1707 root-caused + fixed LIVE on `fnxSession0`.** Cause: `flo/VDD/VDD1P0`
+  are the designer test `Test`'s *per-test* vars (empty on our bare `insitu_extract`); the
+  `ac/noise` analyses existed but were disabled+unconfigured. Fix = new
+  `cadence/insitu/adestate.py` (wired into `run.py:run_ade`): via the `axlGetToolSession →
+  asiGetSession` bridge, inherit the designer's OP (`asiGetDesignVarList`→`asiAddDesignVarList`,
+  gives `flo=5G,VDD=3,VDD1P0=1.05`) and configure+enable the analyses
+  (`asiSetAnalysisFieldVal`+`asiEnableAnalysis`). `groups()` now splits noise per `v_out`.
+  **Proof:** `axlRunAllTests` returned 0 in 1.0 s, no modal, `spectre completes with 0 errors`,
+  AC swept 10 Hz→500 MHz; the netlist shows our injectors/probes/supply-mag + the inherited OP.
+- **ade run completes locally** (0 errors). PSF lands at
+  `~/simulation/sim_yusheng/Test_PMU/maestro/results/maestro/<hist>/<pt>/insitu_extract/psf/ac.ac`.
+- `cli.py`: gate-vs-gold is now hard-fail only for `spectre_cli`, informational for `ade`.
+- New read-only doctor `cadence/insitu/probe_ade.py`.
+
+**Remaining (see `MECHANISM_A_DEBUG_PROMPT.txt` for the full next-session brief):**
+1. **Binary-PSF reader** — ade writes BINPSF, `cadence/psf.py` is ASCII-only → `importmp` can't
+   read it. (`rawfmt`/env-option ASCII coaxing all rejected.) Build a standalone BINPSF reader;
+   validate by re-running the ade `input.scs` with `spectre -format psfascii` and comparing.
+2. **#4 GUI** stuck/no-progress/no-cancel (run_ade poll has no feedback; worker emits only at end).
+3. **#1 manifest editing** in the GUI (`propose()` is a stub; Tab 0 is load-only).
+4. Before Monday: config-view fidelity (extract uses schematic; designer uses `Test_PMU/config`).
+
+**Gotcha that cost a Cadence restart:** a Virtuoso modal dialog wedges the WHOLE skillbridge
+channel (even `plus(2,3)` times out); killing the client does NOT abort the in-Virtuoso call.
+Recovery = close the dialog or restart Cadence. The bridge is safe on current-session
+schematic-view tests.
+
+---
+
 # UPDATE (2026-06-14) — Mechanism A BUILT + pushed; NEXT SESSION = DEBUG
 
 **State:** Mechanism A (ADE-native in-situ multi-port LDO extraction) is built on `main` and
