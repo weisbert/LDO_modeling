@@ -14,17 +14,29 @@ I(o,VSS) <+ pi_dc*(V(AVDD,VSS) - vdc_AVDD);         // current-PSRR (magnitude o
 No DC bias current, no I-V (sat/triode/compliance), no noise, no temperature, magnitude-only PSRR.
 The expert review (this session) found 11 gaps (G1–G11); the user wants ALL of them built.
 
+## CONFIRMED build inputs (2026-06-15) — the 3 former open items, now CLOSED
+- **Temperatures: −40 / 55 / 125 °C** (the 55 °C center matches the typical-corner nominal — NOT the
+  earlier −40/27/125 placeholder). `Idc(T)`/noise(T) = low-order poly; PTAT = linear-in-absolute-T.
+- **Typical corner label = `tt_55c`** (round-1 typical). Corner still `pull_from_session` with this as
+  the GUI fallback; foundry corner-family names only needed in round-2 `.lib`.
+- **G10 = compliance-clamp ONLY, no enable port.** Confirmed against the repo: the PMU's only enables
+  are block-level `BIAS_EN/PLL_EN/VCO_EN` (`extract_pmu.py:43-44`, `pmu_top_symbol.il:33-35`), already
+  in `leave_alone` (`pmu_top.json:28`) and held by the TB; the 3 current outputs have NO per-output EN,
+  and those block enables are NOT on the locked model symbol (AVDD1P0 left / 6 outs right / VSS bottom).
+- **G9 coupling stays verify-first on the box** (structural prior: all 3 biases are `*_VCO` off a shared
+  `vref_bias`/`IBIAS` ref → expect coupling, but confirm before paying n²).
+
 ## Locked decisions (2026-06-15, "都按推荐来")
-1. **Corners (G6):** TYPICAL-first — get the whole pipeline green at the typical corner, but design
-   `emit` to be **corner-parameterized / able to emit a `.lib` corner family**; fill the full corner
-   set (tt/ss/ff/sf/fs) in a SECOND round. Do NOT loop all corners in round 1.
-2. **Temperature (G2/G3):** **3 temperatures** (per the PDK; default −40 / 27 / 125 °C). Emit
-   `Idc(T)` and noise(T) as **low-order polynomials**; for the PTAT pin a linear-in-absolute-T law.
+1. **Corners (G6):** TYPICAL-first — get the whole pipeline green at the typical corner (`tt_55c`), but
+   design `emit` to be **corner-parameterized / able to emit a `.lib` corner family**; fill the full
+   corner set (tt/ss/ff/sf/fs) in a SECOND round. Do NOT loop all corners in round 1.
+2. **Temperature (G2/G3):** **3 temperatures −40 / 55 / 125 °C** (CONFIRMED). Emit `Idc(T)` and
+   noise(T) as **low-order polynomials**; for the PTAT pin a linear-in-absolute-T law.
 3. **Coupling (G9):** **VERIFY-FIRST** — one early step injects on one sink / the shared bias and
    checks whether the other sinks move. Build the n² cross-admittance ONLY for confirmed coupling
    (don't pay n² extraction blindly on a shared-bias assumption).
-4. **Enable / startup (G10):** add an `enable` port + soft-start IF the TB exposes EN pins for these
-   biases; ELSE compliance clamp only. Conditional on the real TB — resolve at build start.
+4. **Enable / startup (G10):** **compliance-clamp ONLY — no enable port** (CONFIRMED; see above). Do
+   not add EN to the model symbol; the TB holds the block enables at the real OP.
 5. **G1 compliance dc:** upgrade `i_out.dc` from optional+warning to **REQUIRED (or auto-read from the
    OP)**. Today an unset dc defaults to 0.0 V (per review: manifest.validate), so the probe clamps the
    pin to 0 V — the I-V zero point is wrong. Fix the default-to-0 trap.
@@ -76,10 +88,11 @@ this session's review caught a per-group-sweep bug AND a stale-fit bug that "tes
 shipped. Box-validation: the new DC/temp/noise/corner analyses run on the company box; offline tests
 use stand-in fixtures (extend `pmu_standin`).
 
-## Resolve at build start (open inputs)
-- The exact PDK **temperature points + corner names** (ask the user / read the PDK).
-- Whether the TB exposes **EN pins** for these biases (decides G10).
-- The **G9 coupling verify** result (decides whether n² cross-admittance is built).
+## Resolve at build start (open inputs) — ALL CLOSED 2026-06-15
+- ~~PDK temperature points + corner names~~ → **−40 / 55 / 125 °C, typical `tt_55c`** (above).
+- ~~TB EN pins (G10)~~ → **compliance-clamp only, no enable port** (above).
+- **G9 coupling verify** — the ONE thing still resolved during the build (Phase-1 step on the box),
+  not a pre-build input. Structural prior = coupled (shared `vref_bias`/`IBIAS`); confirm before n².
 
 ## Anchors (from the expert review — verify before editing)
 - emit: `harness/emit_pmu_model.py:175–205` (`_current_block`)
