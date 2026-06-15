@@ -19,6 +19,24 @@ of truth) + memory **`alps-donau-cli-flow`**. Key carried facts:
 - Company host shell = **csh** (backticks, `|&`, `set`). Run dir layout: `<projectDir>/<lib>/<cell>/
   maestro/results/maestro/<TestSet>.<n>/<corner#>/<Test>/{netlist/input.scs, psf}`.
 
+## Code status — what exists vs what to build (⚠️ the CLI path is GREENFIELD)
+**There is NO code yet for the self-driven `dsub`+`alps` CLI path** — this session validated it by
+hand (csh). All `alps`/`cluster`/`dsub` strings in the codebase are *comments*, not logic.
+- **Reusable as-is:** `cadence/binpsf.py`, `cadence/insitu/importmp.py`, `cadence/import_cadence.py`
+  (PSF→npz, engine/path-agnostic — already try `psf/`[ALPS] & `netlist/`[Spectre]); `harness/fit_model.py`
+  + scoring (downstream, pure Python); `cadence/insitu/{manifest,augment,adestate}.py` (TB capture/augment logic).
+- **Does NOT cover us:** Mechanism A (`cadence/insitu/run.py`) drives **ADE-XL via skillbridge** and
+  **inherits the session’s Job Setup** — i.e. *ADE* assembles `dsub … alps …`, we neither build nor
+  control that command. The local `spectre_run.py`/`bench_spectre.py` golden is local-only, no cluster.
+- **To BUILD (new):**
+  1. A **Donau/ALPS CLI driver** (e.g. `cadence/cluster/` or `cadence/alps_cli.py`): assemble the
+     validated `dsub … <wrapper>/bin/alps … -x all -I …` command; submit (blocking `-I`, or async +
+     poll `djob`/`.simDone`); hand the produced PSF dir to `binpsf`. Engine-parameterized {alps,spectre} (§8).
+  2. A **storage / workarea convention**: where netlists + psf live and how the result PSF dir is
+     resolved (this session borrowed ADE’s run dir and pointed at it by hand).
+  3. Wire (1)+(2) into the existing PSF→npz→fit downstream.
+  This IS the coding part of the task below.
+
 ## The plan (MVP = one corner, recommended path)
 Build on what’s proven: let **ADE netlist** the corner (it also pre-compiles the VA into
 `sharedData`), then **we CLI-run + downstream**.
