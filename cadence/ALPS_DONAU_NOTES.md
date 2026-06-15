@@ -192,6 +192,24 @@ project `Hi1108V100_Pilot_C1Xplus`, workarea `/data/RFIC3/Hi1108V100_Pilot_C1Xpl
 `dsub` blocks by default or Cadence wraps it. For OUR own CLI golden, submit blocking with `-I`
 (dies with script) or `-Kco` (survives), one task, `-R "cpu=8;mem=8000"`, and run `alps -mt 8`.
 
+### 2a‴. Queues & resource classes (✅ user-provided 2026-06-15)
+**Queues (`-q`)** — pick by sim weight; switch per simulation type:
+| queue | prio | max RAM | max duration | use |
+|---|---|---|---|---|
+| **short** | 75 | 32 G | **3 h** | ✅ our LDO (lightweight) — highest prio, schedules fast |
+| normal | 30 | 32 G | 24 h | medium runs |
+| middle | – | 64 G | 7 days | longer/bigger |
+| long | 35 | 128 G | 1 month | long runs |
+| bigmem | 25 | 512 G | 1 month | memory-heavy |
+| hugemem | – | 200 G+ | 1 month | extreme memory |
+
+**Accounts / resource classes (`-A ug_rfic.<class>`)** — server pools:
+`HIS-RF-SG` (unix group / top pool) · **`rfSClass`** (standard — what our LDO uses,
+`-A ug_rfic.rfSClass`) · `rfHClass` (heavy) · `momHClass` (inductor/EM — admin normally blocks).
+
+→ **For the LDO**: `-q short -A ug_rfic.rfSClass -R "cpu=8;mem=8000"` is the right tuple
+(8 G ≪ short’s 32 G cap; runtime ≪ 3 h). Bump `-q`/`-A` only if a heavier analysis needs it.
+
 ### 2b. How Cadence “Command” distribution wires it (🔶 standard ADE behavior)
 ADE/Maestro **prepends** the Command string to each per-point simulation invocation:
 ```
