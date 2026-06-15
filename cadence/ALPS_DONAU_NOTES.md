@@ -290,6 +290,55 @@ dsub -A ug_rfic.rfSClass -q short -R "cpu=8;mem=8000" -I \
   resolve to the alps selector. (To match production byte-for-byte instead, replicate ADE’s
   `-I …/spectre -I …/alps` — ALPS last-wins picks `/alps` anyway.) Never psfxl; keep `-format ps`.
 
+## 9. Self-drive validation log (2026-06-15)
+**Stage 1 (faithful re-run: hand-assembled `dsub`+`alps` on ADE’s `input.scs`, fresh `-o`):**
+- ✅ **Submit half works**: our hand-built command was accepted (`-x all -EP -T -I` all valid),
+  `dsub` returned `JOBID 37238961 / Submit job successfully`, then **streamed** `PENDING →
+  RUNNING` (node `sinct20-hs`). ⇒ **`dsub -I` blocks the session and streams job state/stdout.**
+- ❌ **Blocker — node lib env**: `alps: error while loading shared libraries: libsvadv.so:
+  cannot open shared object file`. The raw `alps` binary can’t find its own libs on the compute
+  node — **ALPS lib dir not on the node’s `LD_LIBRARY_PATH`**. ADE’s run worked because the
+  Virtuoso session env carried it; our dsub job env did not. `-x all` was insufficient (submit
+  shell likely lacks the ALPS lib path, or `alps` is normally set up via a wrapper/profile/module).
+- → **Closes part of open #2**: env propagation to nodes **IS required** for the CLI path.
+- ✅ **Root cause (diagnosed)**: `which alps` = `/software/empyrean/alps/2026.03.hf1/**bin/alps**`
+  is a **bash WRAPPER script** (8.8 KB) that sets `LD_LIBRARY_PATH` then exec’s the raw binary at
+  `…/tools/alps/platform/linux26-x86_64/**bin/alps**` (= our `$ALPS`, = ADE’s `Exe=`). We called
+  the **raw binary** directly → no lib env → fails. The interactive shell’s `LD_LIBRARY_PATH` does
+  **NOT** contain the ALPS lib (all 7 ALPS libs `ldd → not found`); the wrapper supplies it.
+  Libs live in `…/tools/alps/platform/linux26-x86_64/lib/`. Install root has official
+  **`setup.csh`/`setup.bash`**.
+- ✅ **Fix**: invoke the **wrapper** (`…/bin/alps`, absolute) instead of the raw binary — it
+  self-configures the lib env. Keep `dsub -x all` to also carry the **Empyrean license** env from
+  the submit shell. (ADE instead called the raw binary but with the full Virtuoso env preset.)
+  For our own wrapper/scripts: either call `…/bin/alps`, or `source …/setup.csh` first.
+
+**Stage 1 — ✅ PASSED (2026-06-15, JOBID 37238970, node sinct20-hs):** our hand-assembled
+`dsub … <wrapper>/bin/alps input.scs -format ps -o $OUT -I <pdk>/alps -ahdllibdir … -mt 8` ran to
+completion on the cluster and produced results **byte-size-identical to the ADE run** (`pss.td0.td`
+= 33042492 = ADE’s `pss.td.pss`; `dcOpInfo.info`/`modelParameter.info`/`element.info` sizes all
+match) ⇒ we reproduced the simulation **without Maestro**. Findings:
+- **Native output naming (no `-ade`)**: `pss.fd0.fd` (freq), `pss.td0.td` (time), `op0.op` (OP),
+  and log/warn/tcl named `<outdir-basename>.*` (e.g. `psf_selfdrive.log/.warn/.op0`). With `-ade`
+  the names are ADE-style (`pss.fd.pss`, `dcOp.dc`) + a `.simDone` sentinel. **Choice for our
+  pipeline**: add `-ade` back (ADE-style names `ac.ac`/`noise.noise` + `.simDone`, matches our
+  local binpsf expectations) — OR keep native and teach the reader the native names. *(For ac/noise
+  the native names are likely `*.ac0.ac` / `*.noise0.noise`; confirm when we run our extraction.)*
+- **Completion detection**: `.simDone` only with `-ade`; else poll Donau job state (`djob`) or the
+  `logFile` tail. `dsub -I` already blocks the session until the job ends.
+- **Licensing = FlexLM `LM_LICENSE_FILE`** (`<port>@<host>`); `-x all` propagates it submit→node
+  (proven: the sim checked out a license and ran). `setup.csh` (template, placeholders) also sets
+  `ALPS_ROOT`/`ALPS_HOME`/`ALPSCD_HOME` + prepends `…/bin` to PATH.
+- ✅ **PSF confirmed classic** (header bytes): `pss.fd0.fd` & `op0.op` both start
+  `…PSFversion…1.1…BINPSF…` → `binpsf.py` reads them unchanged. `logFile` ends with `END` and lists
+  `"PSS Analysis 'pss': freq = (0 Hz -> 400 MHz)"` → clean completion.
+- 💡 **`logFile` = analysis→file index** (ASCII PSF): each entry maps an analysis to its output
+  file + format, e.g. `"pss.fd0-fd" "analysisInst" ("fd.pss" "pss.fd0.fd" "PSF" …)`. Even under
+  native naming, read `logFile` to map analyses→PSF files (no `-ade` needed for discovery).
+- ⇒ **🏁 Self-drive of ALPS+Donau is PROVEN end-to-end** (hand-assembled `dsub`+`alps`→cluster→
+  classic PSF, byte-identical to ADE). The CLI golden path is viable. Remaining for the real
+  extraction: naming choice (`-ade` vs native), then run our ac/noise and feed `binpsf.py`.
+
 ## 8. Requirement — keep BOTH engines (ALPS *and* Spectre)
 **User requirement (2026-06-15):** mostly ALPS, but **retain the Spectre pipeline** — ALPS can
 have bugs and they occasionally switch back to Spectre. So any CLI wrapper we build must be
