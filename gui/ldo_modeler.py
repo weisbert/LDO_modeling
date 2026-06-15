@@ -226,13 +226,129 @@ class ExtractCore:
         self.report = None           # multi-port fit report text (current ports separate)
         self.result = None           # fit_multiport result dict
         self.port_refs = {}          # output -> per-output single-port npz path (for Import)
+        self._gui = None             # the GUI form dict the manifest was built from (workarea keys)
+        self._fit_manifest = None    # the manifest object self.result was fit from (desync guard)
+
+    def _invalidate_run(self):
+        """Drop ALL run-derived state when the manifest is repointed -- a fit / per-output refs /
+        report from a PREVIOUS manifest must never be reused under a NEW manifest's identity
+        (the same 'invalidate any prior fit' discipline ModelerCore uses on a ref change). This
+        is what makes build_model_cell's guard reject a stale (non-None, wrong) result."""
+        self.result = None
+        self.report = None
+        self.npz_path = None
+        self.gate = None
+        self.port_refs = {}
+        self._fit_manifest = None
 
     def load_manifest(self, name_or_path):
         """Load + validate a pin-role manifest. Returns the human summary."""
         from insitu import manifest as M
         self.manifest = M.load(name_or_path)
         self.manifest_path = self.manifest.get("_path")
+        self._gui = None             # a directly-loaded manifest -> derive workarea keys from it
+        self._invalidate_run()       # the new manifest has no run yet -- drop any prior fit/refs
         return M.summary(self.manifest)
+
+    # ---- deliverable 1: pin FORM -> resolved manifest --------------------------------
+    def build_manifest_from_gui(self, gui, *, session=None, netmap=None, work_root=None,
+                                corner=None):
+        """Turn the Extract-tab PIN FORM (symbol pin names + scalars) into a validated
+        pin-role manifest, written into the WORKAREA and loaded as the current manifest.
+
+        This is the front-half of the acceptance interface: the designer types pins, we
+        resolve them to TB nets (B resolver over a live skillbridge session, unless a
+        netmap is injected) and build the manifest (C). Returns (path, summary, warnings).
+        `warnings` are build_manifest's m['_warnings'] (e.g. i_out compliance vdc not
+        supplied) -- surfaced so the GUI can prompt. Raises ResolveUnavailable when net
+        resolution needs a live session and none is available (offline, no netmap)."""
+        import json
+        from insitu import build_manifest as BM, manifest as M, pmu_corner as PC
+        from insitu.resolve import resolve_nets
+        pins = [gui["supply"]["pin"], *(gui.get("v_outs") or []),
+                *(gui.get("i_outs") or []), *(gui.get("biases") or {}).keys()]
+        if netmap is None:
+            netmap = resolve_nets(gui["tb_lib"], gui["tb_cell"],
+                                  gui.get("tb_view", "schematic"),
+                                  gui.get("dut_inst") or gui.get("tb_inst", ""),
+                                  pins, session=session)
+        m = BM.build_manifest(gui, netmap)            # validated; carries _warnings + 'pin' fields
+        warns = list(m.get("_warnings", []))
+        corner = corner or gui.get("corner") or "nom"
+        base, _dirs = PC.corner_dir(work_root, gui, corner)   # WORK_ROOT/ldo_modeling/<lib>__<cell>/<corner>
+        path = base / f"{gui['tb_cell']}_{corner}.manifest.json"
+        path.write_text(json.dumps(m, indent=2) + "\n")
+        self.manifest = M.load(str(path))
+        self.manifest_path = str(path)
+        self._gui = dict(gui)
+        self._invalidate_run()       # a freshly-built manifest has no run yet -- drop any prior fit
+        return path, M.summary(self.manifest), warns
+
+    # ---- deliverable 3: the ONE combined model cell (veriloga + symbol + compile) -----
+    def _wa_gui(self):
+        """The minimal {tb_lib,tb_cell} the workarea path needs -- the form dict if the
+        manifest came from build_manifest_from_gui, else derived from the loaded manifest."""
+        if self._gui:
+            return self._gui
+        d = self.manifest["dut"]
+        return {"tb_lib": d["tb_lib"], "tb_cell": d["tb_cell"]}
+
+    def _corner(self):
+        """The corner label for the workarea: the form's corner, else the manifest's."""
+        if self._gui and self._gui.get("corner"):
+            return self._gui["corner"]
+        if self.manifest.get("corner"):
+            return self.manifest["corner"]
+        fb = self.manifest.get("corners", {}).get("fallback", ["nom"])
+        return str(fb[0]) if fb else "nom"
+
+    def _model_ports(self):
+        """(supply_pin, ground) for the combined model symbol: the single supply input
+        (LEFT) and VSS (BOTTOM). Derived from the manifest -- the supply's preserved 'pin'
+        name (build_manifest keeps it), else its role key; ground = the manifest ground."""
+        sup = next(iter(self.manifest["supplies"].values())) if self.manifest.get("supplies") else {}
+        supply_pin = sup.get("pin") or (next(iter(self.manifest["supplies"]))
+                                        if self.manifest.get("supplies") else "AVDD1P0")
+        return supply_pin, (self.manifest.get("ground") or "VSS")
+
+    def build_model_cell(self, model_lib, model_cell, model_path, *, session=None,
+                         dry_run=False, work_root=None, progress=None):
+        """Emit the ONE combined PMU Verilog-A (1 supply LEFT / N v-rails + M i-biases RIGHT /
+        VSS BOTTOM) from the multi-port fit and -- with a live session -- import + compile it +
+        build the symbol cell in Cadence at the user's lib/cell/path (Component D, step_emit +
+        step_cell). No live session / dry_run -> writes the .va + returns the SKILL plan only
+        (the artifact is still produced; the cell build happens on the company box). Requires a
+        completed run OF THE CURRENT MANIFEST (self.result fit from self.manifest) -- a manifest
+        swap since the run is refused, so a stale fit can never be emitted under a new manifest's
+        supply/ground/ports. Returns dict(va, built, plan, pinspec, error). A LIVE build failure
+        (bridge down mid-call) does NOT lose the .va: built=False + error is returned, not raised."""
+        if self.result is None or self._fit_manifest is not self.manifest:
+            raise RuntimeError("run an extraction against the CURRENT manifest first (Build & "
+                               "Run) -- the loaded data changed since the last run, so the model "
+                               "cell would mix a stale fit with the new manifest's ports/supply")
+        from insitu import pmu_corner as PC
+        supply_pin, ground = self._model_ports()
+        _base, dirs = PC.corner_dir(work_root, self._wa_gui(), self._corner())
+        va_path = pathlib.Path(dirs["model"]) / f"{model_cell}.va"
+        p = PC.step_emit(self.result, cell_name=model_cell, va_path=va_path,   # always: write .va
+                         supply=supply_pin, ground=ground, progress=progress)
+
+        def _cell(sess, dry):
+            return PC.step_cell(self.result, p, model_lib=model_lib, model_cell=model_cell,
+                                model_path=model_path, supply=supply_pin, ground=ground,
+                                session=sess, dry_run=dry, progress=progress)
+
+        if session is not None and not dry_run:
+            try:
+                live = _cell(session, False)
+                return dict(va=str(p), built=True, plan=live["plan"],
+                            pinspec=live["pinspec"], error=None)
+            except Exception as e:                       # noqa: BLE001  bridge down mid-build
+                dry = _cell(None, True)                  # recover plan/pinspec for the report
+                return dict(va=str(p), built=False, plan=dry["plan"], pinspec=dry["pinspec"],
+                            error=f"{type(e).__name__}: {e}")
+        dry = _cell(None, True)
+        return dict(va=str(p), built=False, plan=dry["plan"], pinspec=dry["pinspec"], error=None)
 
     def plan(self):
         """The augment plan (session-free preview of what 'Build & Run' will do)."""
@@ -256,6 +372,7 @@ class ExtractCore:
         self.gate = cli.gate_vs_gold(npz, tol=tol)
         import fit_multiport as FMP
         self.result = FMP.fit_multiport(path, self.manifest)
+        self._fit_manifest = self.manifest          # the result belongs to THIS manifest (desync guard)
         self.report = FMP.report(self.result)
         self.port_refs = FMP.export_single_port_refs(path, self.manifest)
         return dict(npz_path=path, gate=self.gate, report=self.report, ports=self.port_refs)
@@ -546,21 +663,79 @@ if _HAVE_QT:
         def _tab_extract(self):
             w = QWidget(); outer = QVBoxLayout(w)
             help_ = QLabel(
-                "<b>In-situ extraction (Mechanism A).</b> Point at a <b>pin-role manifest</b> "
-                "(the designer tags each DUT pin: supply / v_out / i_out / leave-alone). "
-                "<b>Build &amp; Run</b> copies the designer's testbench → <i>_extract</i>, appends "
-                "AC stimuli/probes at the tagged nets, runs the analyses, and assembles the "
-                "multi-port npz — which then feeds <b>2 Import → 3 Fit → 4 Compare</b> per output.<br>"
-                "Backend <b>spectre_cli</b> runs offline (dev fixture, reproduces the trusted gold); "
-                "<b>ade</b> drives the real Maestro run (rides Job Setup → cluster at the company).")
+                "<b>In-situ PMU LDO modeling — one corner, end to end.</b> Fill the form with your "
+                "PMU's <b>symbol pin names</b> (the tool resolves them to TB nets and builds the "
+                "pin-role manifest). <b>Build &amp; Run</b> sweeps the per-measurement cluster jobs, "
+                "reads the PSF, and fits every output. <b>Create model cell</b> then writes the "
+                "combined Verilog-A + symbol (AVDD1P0 left · outputs right · VSS bottom) and "
+                "compiles it.<br>Engine <b>ade</b> = the live Maestro run (rides Job Setup → cluster); "
+                "<b>spectre_cli</b> = the offline dev fixture; <b>cluster</b> = pure-CLI dsub+alps "
+                "(Path B, pending its box-validated netlister).")
             help_.setWordWrap(True)
             help_.setStyleSheet("background:#eef5ff; padding:9px; border:1px solid #cdddee;")
             outer.addWidget(help_)
 
+            # ---- pin FORM (deliverable 1): symbol pins -> resolved manifest --------------
+            gb = QGroupBox("1 · Describe your PMU (symbol pin names)")
+            gf = QFormLayout(gb)
+            self.xf_tblib = QLineEdit(); self.xf_tbcell = QLineEdit()
+            self.xf_tbview = QLineEdit("schematic"); self.xf_inst = QLineEdit("I0")
+            self.xf_inst.setToolTip("The DUT instance name inside the testbench (e.g. I0).")
+            tbrow = QHBoxLayout()
+            for lab, ed in (("lib", self.xf_tblib), ("cell", self.xf_tbcell),
+                            ("view", self.xf_tbview), ("DUT inst", self.xf_inst)):
+                tbrow.addWidget(QLabel(lab)); tbrow.addWidget(ed)
+            tbw = QWidget(); tbw.setLayout(tbrow); gf.addRow("Testbench *", tbw)
+            self.xf_dutlib = QLineEdit(); self.xf_dutcell = QLineEdit()
+            self.xf_dutlib.setToolTip("DUT library (defaults to the testbench lib if blank).")
+            dutrow = QHBoxLayout()
+            for lab, ed in (("lib", self.xf_dutlib), ("cell", self.xf_dutcell)):
+                dutrow.addWidget(QLabel(lab)); dutrow.addWidget(ed)
+            dutw = QWidget(); dutw.setLayout(dutrow); gf.addRow("DUT *", dutw)
+            self.xf_supply = QLineEdit("AVDD1P0"); self.xf_supplydc = QLineEdit("1.0")
+            self.xf_supply.setToolTip("The single supply INPUT pin (PSRR is referenced to it).")
+            self.xf_supplydc.setToolTip("The supply's DC operating voltage (e.g. 1.0).")
+            srow = QHBoxLayout()
+            srow.addWidget(QLabel("pin")); srow.addWidget(self.xf_supply)
+            srow.addWidget(QLabel("dc [V]")); srow.addWidget(self.xf_supplydc)
+            sw = QWidget(); sw.setLayout(srow); gf.addRow("Supply (input) *", sw)
+            self.xf_vouts = QLineEdit("VDD0P8_DIG, VDD0P8_PLL, VDD0P8_VCO")
+            self.xf_vouts.setToolTip("Voltage OUTPUT pins, comma-separated (Zout / PSRR / noise).")
+            gf.addRow("Voltage outputs", self.xf_vouts)
+            self.xf_iouts = QLineEdit("IBP_POLY_1P8U_VCO, IBP_POLY_500N_VCO_Fit, "
+                                      "IBP_PTAT_TUNE_1P5U_VCO")
+            self.xf_iouts.setToolTip("Current OUTPUT pins, comma-separated (admittance / cur-PSRR).")
+            gf.addRow("Current outputs", self.xf_iouts)
+            self.xf_vdc = QLineEdit()
+            self.xf_vdc.setPlaceholderText("optional: IBP_POLY_500N_VCO_Fit=0.9, IBP_POLY_1P8U_VCO=0.85")
+            self.xf_vdc.setToolTip("Per current-output COMPLIANCE voltage (the probe forces this dc "
+                                   "at the pin — it replaces the node driver). Omit → 0 V clamp + a "
+                                   "warning. Voltage outputs need NO bias here: their Zout probe is "
+                                   "AC-only (dc=0), so the TB's own load biases the rail (true in-situ).")
+            gf.addRow("I-out compliance vdc", self.xf_vdc)
+            gnrow = QHBoxLayout()
+            self.xf_ground = QLineEdit("VSS"); self.xf_corner = QLineEdit("tt_25c")
+            gnrow.addWidget(QLabel("ground")); gnrow.addWidget(self.xf_ground)
+            gnrow.addWidget(QLabel("corner")); gnrow.addWidget(self.xf_corner)
+            gnw = QWidget(); gnw.setLayout(gnrow); gf.addRow("Ground / corner", gnw)
+            self.xf_srctest = QLineEdit()
+            self.xf_srctest.setPlaceholderText("optional — auto-discovered from the ADE-XL session")
+            self.xf_srctest.setToolTip("The designer ADE test holding the in-situ OP (its vars are "
+                                       "inherited). Normally auto-found by matching the TB cell; set "
+                                       "this only if that fails (the error will tell you).")
+            gf.addRow("ADE source test", self.xf_srctest)
+            self.xf_build = QPushButton("Resolve pins → Build manifest")
+            self.xf_build.setToolTip("Resolve each symbol pin to its TB net (live skillbridge) and "
+                                     "build the pin-role manifest in the workarea, then enable Run.")
+            self.xf_build.clicked.connect(self._x_build_manifest)
+            gf.addRow(self.xf_build)
+            outer.addWidget(gb)
+
+            # ---- or load a manifest directly (power users) ------------------------------
             form = QFormLayout(); outer.addLayout(form)
             self.x_manifest = QLineEdit("pmu_top")
             self.x_manifest.setToolTip("Manifest name (resolved in cadence/insitu/manifests/) "
-                                       "or a path to a manifest JSON.")
+                                       "or a path to a manifest JSON. The form above writes here.")
             row = QHBoxLayout(); row.addWidget(self.x_manifest)
             b_browse = QPushButton("Browse…"); b_browse.clicked.connect(self._x_browse)
             b_load = QPushButton("Load"); b_load.clicked.connect(self._x_load)
@@ -571,13 +746,17 @@ if _HAVE_QT:
             b_new.setToolTip("Start a fresh manifest from a commented template.")
             for b in (b_browse, b_load, b_edit, b_new):
                 row.addWidget(b)
-            rw = QWidget(); rw.setLayout(row); form.addRow("Manifest *", rw)
-            self.x_backend = QComboBox(); self.x_backend.addItems(["spectre_cli", "ade"])
-            self.x_backend.setToolTip("spectre_cli: offline dev fixture. ade: live Maestro run "
-                                      "(needs the skillbridge session + analyses configured).")
-            form.addRow("Backend", self.x_backend)
+            rw = QWidget(); rw.setLayout(row); form.addRow("…or load a manifest", rw)
+            self.x_backend = QComboBox()
+            self.x_backend.addItem("ade — Mechanism A (live Maestro → cluster)", "ade")
+            self.x_backend.addItem("spectre_cli — offline dev fixture", "spectre_cli")
+            self.x_backend.addItem("cluster — Path B dsub+alps (pending netlister)", "cluster")
+            self.x_backend.setToolTip("ade: live Maestro run (needs the skillbridge session). "
+                                      "spectre_cli: offline dev fixture. cluster: pure-CLI Path B "
+                                      "(backend ready; netlister is a documented box-validation stub).")
+            form.addRow("Engine", self.x_backend)
             self.x_session = QLineEdit("fnxSession0")
-            self.x_session.setToolTip("ADE-XL session name (ade backend only).")
+            self.x_session.setToolTip("ADE-XL session name (ade engine only).")
             form.addRow("Session", self.x_session)
 
             self.x_summary = QTextEdit(); self.x_summary.setReadOnly(True)
@@ -586,7 +765,7 @@ if _HAVE_QT:
             outer.addWidget(self.x_summary)
 
             brow = QHBoxLayout()
-            self.x_run = QPushButton("Build && Run"); self.x_run.clicked.connect(self._x_run)
+            self.x_run = QPushButton("2 · Build && Run"); self.x_run.clicked.connect(self._x_run)
             self.x_run.setEnabled(False)
             brow.addWidget(self.x_run)
             self.x_cancel = QPushButton("Cancel"); self.x_cancel.clicked.connect(self._x_cancel)
@@ -609,13 +788,138 @@ if _HAVE_QT:
             self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
             outer.addWidget(self.x_report, 1)
 
-            srow = QHBoxLayout()
-            srow.addWidget(QLabel("Send output port →"))
-            self.x_port = QComboBox(); srow.addWidget(self.x_port)
+            # ---- model cell (deliverable 3): the ONE combined VA + symbol, compiled -----
+            mgb = QGroupBox("3 · Create the model cell (Verilog-A + symbol, compiled)")
+            mf = QFormLayout(mgb)
+            self.xm_lib = QLineEdit("LDO_model_lab"); self.xm_cell = QLineEdit("PMU_model")
+            self.xm_path = QLineEdit()
+            self.xm_path.setPlaceholderText("on-disk Cadence library path "
+                                            "(e.g. $WORK_ROOT/ldo_modeling/cds/LDO_model_lab)")
+            mrow = QHBoxLayout()
+            for lab, ed in (("lib", self.xm_lib), ("cell", self.xm_cell)):
+                mrow.addWidget(QLabel(lab)); mrow.addWidget(ed)
+            mw = QWidget(); mw.setLayout(mrow); mf.addRow("Model", mw)
+            mf.addRow("Library path", self.xm_path)
+            self.xm_make = QPushButton(
+                "Create model cell  (AVDD1P0 left · outputs right · VSS bottom)")
+            self.xm_make.setToolTip("Emit the combined Verilog-A from the fit, then import + "
+                                    "compile it and build the symbol cell in Cadence (live "
+                                    "skillbridge). No live session → writes the .va + SKILL plan only.")
+            self.xm_make.setEnabled(False)       # enabled only after a run -> a fit exists to emit
+            self.xm_make.clicked.connect(self._x_make_cell)
+            mf.addRow(self.xm_make)
+            outer.addWidget(mgb)
+
+            srow2 = QHBoxLayout()
+            srow2.addWidget(QLabel("Or send one output port →"))
+            self.x_port = QComboBox(); srow2.addWidget(self.x_port)
             b_send = QPushButton("Load into Import → Fit"); b_send.clicked.connect(self._x_send)
-            srow.addWidget(b_send); srow.addStretch(1)
-            outer.addLayout(srow)
+            srow2.addWidget(b_send); srow2.addStretch(1)
+            outer.addLayout(srow2)
             return w
+
+        def _form_gui(self):
+            """Assemble the build_manifest `gui` dict from the pin-form widgets. Comma lists ->
+            pin lists; 'pin=val,...' -> the per-i_out compliance vdc map."""
+            def _csl(s):
+                return [t.strip() for t in s.split(",") if t.strip()]
+            vdc = {}
+            for tok in self.xf_vdc.text().split(","):
+                tok = tok.strip()
+                if "=" in tok:
+                    k, v = tok.split("=", 1)
+                    try:
+                        vdc[k.strip()] = float(v)
+                    except ValueError:
+                        pass
+            try:
+                dc = float(self.xf_supplydc.text() or "1.0")
+            except ValueError:
+                dc = 1.0
+            gui = dict(
+                tb_lib=self.xf_tblib.text().strip(), tb_cell=self.xf_tbcell.text().strip(),
+                tb_view=self.xf_tbview.text().strip() or "schematic",
+                dut_inst=self.xf_inst.text().strip(),
+                dut_lib=self.xf_dutlib.text().strip() or self.xf_tblib.text().strip(),
+                dut_cell=self.xf_dutcell.text().strip(),
+                supply={"pin": self.xf_supply.text().strip(), "dc": dc},
+                v_outs=_csl(self.xf_vouts.text()), i_outs=_csl(self.xf_iouts.text()),
+                ground=self.xf_ground.text().strip() or "VSS",
+                corner=self.xf_corner.text().strip() or "nom")
+            if vdc:
+                gui["vdc"] = vdc
+            if self.xf_srctest.text().strip():
+                gui["ade_src_test"] = self.xf_srctest.text().strip()
+            return gui
+
+        def _x_build_manifest(self):
+            """Resolve the form's symbol pins to TB nets (live skillbridge) and build the
+            pin-role manifest in the workarea, then load it + enable Build & Run."""
+            from insitu.resolve import ResolveUnavailable
+            gui = self._form_gui()
+            try:
+                path, summ, warns = self.extract.build_manifest_from_gui(gui, session=None)
+            except ResolveUnavailable as e:
+                QMessageBox.critical(self, "Resolve pins",
+                    "Net resolution needs a live Virtuoso/skillbridge session (start it in the "
+                    f"CIW on the company box).\n\n{e}\n\nOr load a ready manifest below.")
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Build manifest", f"{type(e).__name__}: {e}")
+                return
+            self.x_manifest.setText(str(path))
+            plan = "\n".join(f"  {a:12s} {d}" for a, d in self.extract.plan())
+            txt = ""
+            if warns:
+                txt += "⚠ WARNINGS:\n" + "\n".join(f"  - {w}" for w in warns) + "\n\n"
+            txt += summ + "\n\naugment plan:\n" + plan
+            self.x_summary.setPlainText(txt)
+            self.x_run.setEnabled(True)
+            self.xm_make.setEnabled(False)       # new manifest -> no fit yet (re-run before cell build)
+            self.statusBar().showMessage(f"Manifest built → {pathlib.Path(path).name}. "
+                                         "'Build & Run' to extract." + (" (see warnings)" if warns else ""))
+
+        def _x_make_cell(self):
+            """Deliverable 3: build the ONE combined model cell (Verilog-A + symbol, compiled)
+            from the multi-port fit, at the user's lib/cell/path. Live skillbridge → full build;
+            no live session → writes the .va + prints the SKILL plan (artifact still produced)."""
+            if self.extract.result is None:
+                QMessageBox.information(self, "Create model cell",
+                    "Run an extraction first (Build & Run) — the model cell is built from the "
+                    "multi-port fit result.")
+                return
+            lib = self.xm_lib.text().strip(); cell = self.xm_cell.text().strip()
+            mpath = self.xm_path.text().strip()
+            if not (lib and cell and mpath):
+                QMessageBox.information(self, "Create model cell",
+                    "Fill model lib, cell, and the on-disk library path.")
+                return
+            from insitu.resolve import ResolveUnavailable, open_session
+            ws, dry = None, False
+            try:
+                ws = open_session()                  # live bridge for the SKILL build
+            except ResolveUnavailable:
+                dry = True                           # no live Virtuoso -> emit .va + plan only
+            try:
+                out = self.extract.build_model_cell(lib, cell, mpath, session=ws, dry_run=dry)
+            except Exception as e:                       # usage error (stale-fit guard) -> raised
+                QMessageBox.critical(self, "Create model cell", f"{type(e).__name__}: {e}")
+                return
+            va = out["va"]
+            if out["built"]:
+                msg = (f"Built model cell {lib}/{cell}.\n\nVerilog-A: {va}\nSymbol: input left · "
+                       "outputs right · VSS bottom · compiled.")
+            elif out.get("error"):                       # .va written, but the LIVE build failed
+                msg = (f"Wrote the combined Verilog-A:\n{va}\n\nBut the live cell build did NOT "
+                       f"complete: {out['error']}\n\nThe .va is valid — re-run on a healthy CIW "
+                       "skillbridge session to import + compile + build the symbol.")
+            else:                                        # no live session -> .va + SKILL plan only
+                plan = "\n".join(f"  {fn} {args}" for fn, args in out["plan"])
+                msg = (f"No live Virtuoso session — wrote the combined Verilog-A only:\n{va}\n\n"
+                       "On the company box (live skillbridge) this also imports, compiles, and "
+                       f"builds the symbol cell. SKILL plan:\n{plan}")
+            self.x_report.append("\n[model cell] " + msg)
+            QMessageBox.information(self, "Create model cell", msg)
 
         def _x_browse(self):
             fn, _ = QFileDialog.getOpenFileName(self, "Pick a manifest JSON",
@@ -630,6 +934,7 @@ if _HAVE_QT:
                 plan = "\n".join(f"  {a:12s} {d}" for a, d in self.extract.plan())
                 self.x_summary.setPlainText(summ + "\n\naugment plan:\n" + plan)
                 self.x_run.setEnabled(True)
+                self.xm_make.setEnabled(False)   # new manifest -> no fit yet (re-run before cell build)
                 self.statusBar().showMessage("Manifest loaded — 'Build & Run' to extract.")
             except Exception as e:
                 QMessageBox.critical(self, "Manifest", f"{type(e).__name__}: {e}")
@@ -668,11 +973,19 @@ if _HAVE_QT:
                 self._x_load()                            # reload + refresh the summary/plan
 
         def _x_run(self):
+            backend = self.x_backend.currentData()
+            if backend == "cluster":
+                QMessageBox.information(self, "Engine: cluster (Path B)",
+                    "Path B (pure-CLI dsub+alps, run_pmu_corner) is wired in the backend, but its "
+                    "per-group netlister (insituNetlistTest, ADE netlist-only) is a documented stub "
+                    "pending box validation (see PMU_CORNER_RUNBOOK §8). Use the 'ade' engine for a "
+                    "working end-to-end run today.")
+                return
             self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
             self.x_gate.setText("running…")
             self.x_prog.setValue(0); self.x_progmsg.setText("starting…")
             self.statusBar().showMessage("Extracting (augment → run → PSF → npz → fit)…")
-            self._xw = _ExtractWorker(self.extract, self.x_backend.currentText(),
+            self._xw = _ExtractWorker(self.extract, backend,
                                       self.x_session.text().strip(),
                                       regenerate=False)
             self._xw.done.connect(self._x_done)
@@ -713,9 +1026,10 @@ if _HAVE_QT:
                                 f"({detail}) — npz {pathlib.Path(out['npz_path']).name}")
             self.x_report.setPlainText(out["report"])
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
+            self.xm_make.setEnabled(True)        # a fit of the current manifest exists -> cell build OK
             self.x_progmsg.setText("done")
-            self.statusBar().showMessage(f"Extraction done — gate {tag}. "
-                                         "Pick an output port and 'Load into Import → Fit'.")
+            self.statusBar().showMessage(f"Extraction done — gate {tag}. 'Create model cell', "
+                                         "or pick an output port for 'Load into Import → Fit'.")
 
         def _x_failed(self, msg):
             self._x_idle()
@@ -1404,10 +1718,41 @@ def _selftest_transid(A, loads, nom, tmp):
     return True
 
 
-def _selftest_extract():
+def _selftest_pinform(tmp):
+    """Headless smoke of the Extract-tab PIN FORM (deliverable 1), Qt-free: the GUI form dict
+    + an INJECTED netmap (no skillbridge) -> ExtractCore.build_manifest_from_gui writes + loads
+    a valid manifest in the WORKAREA, surfaces the no-compliance warning naming every i_out pin,
+    preserves the original symbol pins, and derives the model ports (supply LEFT / VSS BOTTOM)."""
+    gui = dict(tb_lib="PMU_TOP_TB", tb_cell="pmu_tb", tb_view="schematic", dut_inst="I0",
+               dut_lib="PMU_TOP", dut_cell="pmu_top",
+               supply={"pin": "AVDD1P0", "dc": 1.0},
+               v_outs=["VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO"],
+               i_outs=["IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit", "IBP_PTAT_TUNE_1P5U_VCO"],
+               ground="VSS", corner="tt_25c")        # no vdc -> the no-compliance warning must fire
+    netmap = {p: f"net_{p}" for p in [gui["supply"]["pin"], *gui["v_outs"], *gui["i_outs"]]}
+    xc = ExtractCore()
+    path, summ, warns = xc.build_manifest_from_gui(gui, netmap=netmap, work_root=str(tmp))
+    assert pathlib.Path(path).exists(), "form did not write a manifest"
+    assert "v_out" in summ and "i_out" in summ, "summary missing roles"
+    assert warns and all(any(pin in w for w in warns) for pin in gui["i_outs"]), \
+        "no-compliance warning must name every i_out pin"
+    m = xc.manifest
+    assert list(m["v_out"]) == ["dig", "pll", "vco"], list(m["v_out"])
+    assert m["v_out"]["dig"]["pin"] == "VDD0P8_DIG", "original symbol pin not preserved"
+    sp, gnd = xc._model_ports()
+    assert sp == "AVDD1P0" and gnd == "VSS", (sp, gnd)
+    sp_str = str(path)
+    assert "/ldo_modeling/" in sp_str and "/simulation/" not in sp_str, \
+        f"manifest must live in the workarea, not the designer spine: {sp_str}"
+    print(f"  pinform: gui+netmap -> manifest OK ({len(m['v_out'])}v+{len(m['i_out'])}i ports, "
+          f"{len(warns)} warning; model {sp} left / {gnd} bottom)")
+
+
+def _selftest_extract(tmp):
     """Headless smoke of the in-situ EXTRACTION front-half (ExtractCore, Qt-free): manifest
-    -> spectre_cli run -> multi-port npz -> gate vs gold -> per-output single-port refs.
-    The spectre_cli fixture (cadence/work_pmu PSF) is gitignored regenerable data that needs
+    -> spectre_cli run -> multi-port npz -> gate vs gold -> per-output single-port refs, PLUS
+    the combined model-cell build (deliverable 3) as a DRY plan (no live Cadence). The
+    spectre_cli fixture (cadence/work_pmu PSF) is gitignored regenerable data that needs
     Spectre, so a missing fixture is a SKIP (not a failure) -- keeps --selftest green on a
     box without it while exercising the whole path where present."""
     try:
@@ -1423,9 +1768,22 @@ def _selftest_extract():
     ports = xc.port_list()
     assert "pll" in ports and "vco" in ports, f"missing per-output refs: {ports}"
     assert "VOLTAGE OUTPUTS" in out["report"] and "CURRENT SINKS" in out["report"], "report shape"
+    # deliverable 3 (dry): the combined model cell -- emit the .va + derive the symbol pinspec
+    # (single supply LEFT input, every output RIGHT, ground BOTTOM). No live session -> not built.
+    cellout = xc.build_model_cell("LDO_model_lab", "PMU_model_selftest",
+                                  str(tmp / "cds" / "LDO_model_lab"),
+                                  session=None, dry_run=True, work_root=str(tmp))
+    spec = cellout["pinspec"]
+    assert spec[0][1] == "input" and spec[0][2] == "left", f"supply must be left input: {spec[0]}"
+    assert spec[-1][2] == "bottom", f"ground must be bottom: {spec[-1]}"
+    assert all(s == "right" for _n, _d, s in spec[1:-1]), f"outputs must be right: {spec}"
+    assert pathlib.Path(cellout["va"]).exists(), "combined .va not written"
+    assert not cellout["built"], "dry build must not touch Cadence"
     print(f"  extract: manifest->run->npz->fit OK  gate={'PASS' if passed else 'SKIP'} "
           f"({detail}); per-output refs={ports}")
-    for p in list(xc.port_refs.values()) + [xc.npz_path]:   # clean gitignored regenerables
+    print(f"  modelcell: dry build -> {len(spec)} ports (1 left / {len(spec)-2} right / 1 bottom), "
+          f".va {pathlib.Path(cellout['va']).name}")
+    for p in list(xc.port_refs.values()) + [xc.npz_path, cellout["va"]]:   # clean regenerables
         try:
             pathlib.Path(p).unlink()
         except OSError:
@@ -1522,8 +1880,11 @@ def _selftest(require_qt=False):
     # 1b) Trans-ID import path (Tab 5) -- headless, no simulator
     _selftest_transid(A, loads, nom, tmp)
 
-    # 1c) In-situ ExtractCore (Tab 0, Mechanism A) -- Qt-free, offline spectre_cli fixture
-    _selftest_extract()
+    # 1c) Extract-tab PIN FORM (deliverable 1) -- gui+netmap -> manifest, Qt-free, no skillbridge
+    _selftest_pinform(tmp)
+
+    # 1d) In-situ ExtractCore (Tab 0) + combined model-cell dry build (deliverable 3) -- Qt-free
+    _selftest_extract(tmp)
 
     # 2) Qt layer (offscreen) if available -- build window, REGRESSION-test the import button path
     #    (populate pickers -> apply profile -> collect must survive), render, and screenshot.
@@ -1560,9 +1921,14 @@ def _selftest(require_qt=False):
             win._show_guidance()             # the Measurement-guidance button (was the MEAS_HINTS crash)
             win._import_folder()             # folder-import (must match the synth CSVs in tmp/)
             assert win._collect_files(), "folder-import matched no files into the grid"
+            # skip the LIVE-action buttons by IDENTITY (robust to label text): Build & Run starts
+            # a real ade/skillbridge worker (the engine default), Resolve opens a live bridge,
+            # Create model cell drives SKILL -- none may fire in a headless smoke (they would hang
+            # or mutate Cadence state). The text-prefix skip covers the async Fit / re-apply / emit.
+            _live_btns = {win.x_run, win.xf_build, win.xm_make}
             for b in win.findChildren(_QW.QPushButton):
-                if b.text().startswith(("Fit", "Apply", "Emit", "…")):
-                    continue                 # skip async Fit / re-apply / emit-guard / per-cell pickers
+                if b in _live_btns or b.text().startswith(("Fit", "Apply", "Emit", "…")):
+                    continue                 # skip live runs / async Fit / re-apply / emit-guard / pickers
                 b.click(); app.processEvents()
             # regression: a nominal-only change must re-key the nominal-scope pickers (folder-import bug)
             loads0, nom0 = list(win.core.profile.loads), win.core.profile.nominal

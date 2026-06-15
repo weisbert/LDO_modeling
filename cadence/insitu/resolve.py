@@ -89,6 +89,17 @@ def _open_ws(timeout=8.0):
         ex.shutdown(wait=False)             # never block on a hung connect
 
 
+def open_session(timeout=8.0):
+    """Open a live skillbridge Workspace (fail-fast), or raise ResolveUnavailable.
+
+    Public wrapper of _open_ws for callers that need a live bridge for a NON-resolve SKILL
+    action -- e.g. the GUI's model-cell build (ldoEnsureLib/ldoImportVA/ldoCompileVA/
+    pmuBuildModelCell over skillbridge). Same single-catchable-failure contract as the
+    resolver: a missing/unreachable CIW server collapses to ResolveUnavailable rather than
+    hanging the caller."""
+    return _open_ws(timeout)
+
+
 def load_skill(session):
     """Source cadence/skill/resolve_nets.il into the live session so insResolveNets is
     defined, and return the ws used. `session` may be a live ws (used as-is) or None
@@ -141,5 +152,5 @@ def resolve_nets(tb_lib, tb_cell, tb_view, inst_name, pins, session=None):
     return out
 
 
-__all__ = ["resolve_nets", "load_skill", "ResolveUnavailable", "UNRESOLVED",
-           "RESOLVE_IL"]
+__all__ = ["resolve_nets", "load_skill", "open_session", "ResolveUnavailable",
+           "UNRESOLVED", "RESOLVE_IL"]

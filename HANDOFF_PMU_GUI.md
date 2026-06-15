@@ -1,3 +1,23 @@
+# GUI front-end for one-corner PMU LDO modeling (the acceptance interface)
+
+> **STATUS 2026-06-15 (ultracode): BUILT + offline-validated.** The three gaps below are wired into
+> `gui/ldo_modeler.py` Tab 0 ("0 · Extract"): (1) the **pin input form** (TB/DUT/supply/v-outs/i-outs/
+> per-i_out compliance vdc/ground/corner/+optional ADE src test → `resolve_nets` → `build_manifest`,
+> summary + `_warnings` surfaced); (2) **Build & Run** with pending/running/done progress, engine combo
+> **ade (default)** / spectre_cli / **cluster (flagged pending the netlister stub)**; (3) **Create model
+> cell** → `step_emit` + `step_cell` (combined Verilog-A + symbol, AVDD1P0 left / outputs right / VSS
+> bottom, compiled). Backend helper `resolve.open_session`. Adversarially reviewed (4 dims × per-finding
+> verify): 2 HIGH bugs found + FIXED — (a) stale-fit guard: `_invalidate_run()` on manifest change +
+> a `_fit_manifest` desync guard in `build_model_cell` (a fit from manifest A can never emit under
+> manifest B); (b) the `--selftest` Qt button-loop now skips live-run buttons by IDENTITY (was starting
+> a live ade worker that hung). GUI `--selftest` green (PyQt5 offscreen) + 46 backend tests + 11 resolve
+> tests green. **Remaining: the user repackages for the red zone (`package.py incremental`) + the
+> box-validation items below (live Virtuoso/dsub).** Env confirmed = scenario A (company box has live
+> Virtuoso/skillbridge + dsub), engine default = Path A (ade).
+
+---
+
+## (original task brief, for reference)
 # Next task — the GUI front-end for one-corner PMU LDO modeling (the acceptance interface)
 
 **Why this exists:** the user's acceptance was always *"open the GUI in the red zone, type the
