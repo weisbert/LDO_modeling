@@ -1,3 +1,45 @@
+# UPDATE (2026-06-15) — ade chain COMPLETE end-to-end + config-view fidelity DONE (pushed @ 818b959)
+
+**The whole "ade hang" saga was ONE misread status code — fixed; the full in-situ extraction now runs
+end-to-end on the live ADE path.** Pushed to `origin/target-b-cadence-bringup`: `1b9c592`, `da7077d`, `818b959`.
+
+**Root cause (supersedes every prior theory in 14d below — NOT the copy, NOT a degraded session):**
+`axlGetRunStatus` returns `(completed, total)` POINTS, not an idle code. Our poll waited for `== [0,0]`,
+which never comes (a finished run RESTS at `(N,N)`). Runs were completing in ~3s all along; the poll just
+never recognised it → every "hang / required-cellViews / session-degraded" symptom traces here. Proven:
+Phase-1 drove the designer's own `Test` → done in 3s.
+
+**What now works (all VALIDATED live on `fnxSession0`):**
+- **Full chain: 8 groups, ~26s, 14/14 contract arrays → `pmu_top_ade.npz` → fit report.** z/couple/PSRR/
+  noise/Y/current-PSRR, binpsf reading REAL ADE binary PSF. `gate vs gold` FAIL is INFORMATIONAL (155-pt ADE
+  sweep vs 51-pt CLI gold).
+- **Noise** (was the last gap): the spectre noise output mode is the sev field `outType` ('voltage'|'probe').
+  Default 'probe' emitted `oprobe=<net>` → SFE-1997. Fix = `outType='voltage'` + `p=net,n=gnd!` + clear
+  `oprobe` + `inType='none'` → netlist `noise (VDD0P8_PLL gnd!) noise ...`, spectre 0 errors.
+- **Config-view fidelity (the 14d "[4]" item — DONE):** `insituBuildConfig` mirrors the designer's
+  `Test_PMU/config` (viewlist/stoplist/bindings) onto `Test_PMU_extract/config`, top → our augmented
+  schematic; `dut.extract_view='config'`. Full chain via config = **14 arrays BIT-IDENTICAL** to schematic
+  (max|Δ|=0). On the real PMU this inherits the designer's extracted/parasitic bindings (schematic-only
+  would drop them). The user's "the copy is incomplete" instinct was right — but only the config view was
+  needed, not a full cell copy.
+
+**Robustness fixes baked in:** poll PER-HISTORY (`insituHistStatus`) — the session-AGGREGATE
+`axlGetRunStatus(sess)` poisons after many renames and double-counts; PSF located via `axlGetResultsLocation`
+(old code called `asiGetAnalogRunDir()` with wrong arity → never found PSF); driver no longer renames
+histories (auto Interactive.N) to dodge ASSEMBLER-2409 collision MODALS; fresh-session `axlGetCurrentHistory`
+returns 0 (TRUTHY in SKILL) → guarded in `insituCurHist` + `_cur_hist()`. Offline regression (spectre_cli
+gold gate + binpsf self-test) still PASS — nothing offline touched.
+
+**Session hygiene reminder:** ~6 runs + renames degrades a session (runs 3s→197s, aggregate poisoned, rename
+collisions pop modals); **Session→Reset fully recovers it** (aggregate back to `[0,0]`). The driver no longer
+renames, so collisions can't recur. Memory `ade-backend-1610-1707-fix` has the full play-by-play.
+
+**Now-open (all MINOR / non-blocking, next window):** targeted saves (currently `save=allpub`, binpsf reads
+it fine); readable Maestro history names (delete-then-rename on a clean session); validate GUI Tab-0
+progress/cancel against the now-working backend. The CORE mechanism-A in-situ extraction is COMPLETE.
+
+---
+
 # UPDATE (2026-06-14d) — full-chain LIVE attempt: wired + reaches trigger, but blocked on ADE session-reset
 
 **This session's binpsf/GUI work is committed AND pushed to `origin/target-b-cadence-bringup`** (the 8 commits

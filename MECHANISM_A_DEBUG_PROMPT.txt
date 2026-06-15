@@ -1,59 +1,54 @@
 Mechanism A（ADE-native in-situ LDO 抽取）— 下一回合 brief。先读：
-  - 记忆 ade-backend-1610-1707-fix、binpsf-binary-format、ldo-phase4-production-reality、
-    simkit-mechanism-a-reference
-  - HANDOFF.md 顶部 UPDATE (2026-06-14d) 和 (14c)
-  - 代码：cadence/binpsf.py、cadence/insitu/{adestate,run,cli,augment}.py、gui/ldo_modeler.py
+  - 记忆 ade-backend-1610-1707-fix（含完整 play-by-play）、binpsf-binary-format、
+    simkit-mechanism-a-reference、ldo-phase4-production-reality
+  - HANDOFF.md 顶部 UPDATE (2026-06-15)
+  - 代码：cadence/insitu/{run,adestate,augment,cli}.py、cadence/skill/insitu_run.il、
+    cadence/binpsf.py、cadence/insitu/manifests/pmu_top.json
 
-==================== 已完成并已 push（origin/target-b-cadence-bringup）====================
+==================== 核心已完成并已 push（origin/target-b-cadence-bringup @ 818b959）====================
 
-8 个 commit 已推到 origin/target-b-cadence-bringup（3b7f000/69f9beb/dc7ec27 + 01d8478/1fbf108/
-180287a/06a0e38 + handoff）。分支小插曲：仓库当时其实在 main 上，commit 落在 main，已 ff 到
-target-b 并推送，本地 main 已 reset 回 origin/main（ea8eee6 没动）。
+整条 in-situ 抽取链在实时 ADE 会话上端到端跑通了。本回合（2026-06-14/15）三个 commit：
+  1b9c592  根因修复：ade "卡死" = axlGetRunStatus 读反了（返回 (完成,总数)，不是空闲码；
+           老代码等 ==[0,0] 永远等不到）。改成 完成>=总数、且按【单条 history】查
+           （会话级聚合改名多了会中毒、还重复计数）。PSF 定位锚到 axlGetResultsLocation
+           （老代码 asiGetAnalogRunDir() 参数都传错 → 永远找不到）。不再改 history 名（用
+           自动名 Interactive.N，避开 ASSEMBLER-2409 撞名模态框）。
+  da7077d  噪声修通 + 干净会话 handle-0 坑：噪声输出模式是 sev 字段 outType（'voltage'|'probe'），
+           默认 'probe' 会发 oprobe=<net> → SFE-1997。改 outType='voltage' + p=net,n=gnd! +
+           清 oprobe + inType='none' → 网表 noise (VDD0P8_PLL gnd!) noise，spectre 0 errors。
+           干净会话 axlGetCurrentHistory 返回 0（SKILL 里 0 是真值！）→ insituCurHist + _cur_hist() 都已防。
+  818b959  config 视图保真度：insituBuildConfig 把设计师 Test_PMU/config 镜像到
+           Test_PMU_extract/config（继承 viewlist/stoplist/绑定），顶层换成我们 augment 后的
+           schematic；dut.extract_view='config'。实测 config 跑出的 14 个量与 schematic 逐位一致（Δ=0）。
 
-- 1610/1707：设计师 ADE 状态继承（adestate.py，axlGetToolSession→asiGetSession 桥）已修通。
-- 二进制 PSF 读取（binpsf.py）：AC + noise 都用真实 spectre psfascii 交叉验证过；psf.read_psf
-  按字节自动分派；importmp 的 Zout/noise 推导在真实二进制 PSF 上验证过。test_binpsf.py + 夹具。
-- GUI #4（进度/取消/超时干净中止）、GUI #1（内置 manifest 编辑器）都做好，离屏 selftest 绿。
+实测结果：8 组 ~26s，14/14 contract 数组 → pmu_top_ade.npz → fit 报告（Zout/PSRR/噪声/导纳/电流-PSRR）。
+gate-vs-gold FAIL 是【信息性】的（ADE 155 点扫频 vs CLI 金标 51 点）。离线回归（spectre_cli 金标门 +
+binpsf 自测）全绿，没碰坏离线路径。
 
-==================== 本回合首要：补上"实时一次性全链跑通" ====================
+跑法（干净会话上）：cd cadence && python -m insitu run --backend ade --manifest pmu_top --session fnxSession0
+  （run_ade 默认 build_first=True；extract_view=config 时会先 insituBuildConfig 再绑 config 视图）
 
-[A]（最重要，要现场实时会话）完整 ade 链的一次干净实测。
-   现状：链路在程序里接通、能跑到触发（group 1/8 submitting→轮询），1610/1707 + binpsf 都成立；
-   GUI #4 的超时中止也在实机上验证过（60s 抛 RuntimeError、恢复 ADE 状态、不做破坏性 rename）。
-   但仿真发起后不结束，ADE 报 "required cellViews not open … Reset the ADE session (Session→Reset)
-   or re-invoke ADE"。已排除"运行中重建 cellview"（build_first=False + 先关 cellview 仍报）。
-   根因：上一回合反复探测（多次 augment 重建、反复开关 cellview、一次卡死恢复）把 ADE 会话搞退化了。
+==================== 本回合可做（全是小项 / 都不阻塞）====================
 
-   做法（一定要在干净会话上、只跑一次）：
-   1) 先弄干净会话：在 ADE-L 窗口 Session→Reset，或退出重开 ADE，或重启 Cadence。
-   2) 先做一次轻量探活：cd cadence && python3 -c "from skillbridge import Workspace as W; \
-      print(W.open()['plus'](2,3))"（要秒回 5）。
-   3) 然后只跑一次：cd cadence && python -m insitu run --backend ade --session fnxSession0
-      （或 run.run_ade(m, build_first=True, progress=…, timeout=120) 直接驱动、带进度）。
-   4) 千万别在跑之前反复 augment / 开关 cellview——那正是把会话搞退化的元凶。
-   上一个干净会话证过真跑能成（axlRunAllTests 1s 返回、spectre 0 errors、产出 PSF，binpsf 现在能读）。
-   跑成后：psf_map→importmp→npz→gate(对 ade 仅信息性)→fit，确认整条链一口气通。
+[5] 定向 save：现在 save=allpub（binpsf 能读，工作正常）。axlAddOutputSignal 只存需要的端口 = 优化，
+    省 PSF 体积 / IO。非必须。
+[6] 可读的 Maestro history 名：现在驱动用自动名 Interactive.N（为了躲开 re-run 撞名弹的 ASSEMBLER-2409
+    模态框）。要可读名就先 delete-then-rename（查 axlDeleteHistory / 同名先删再 axlSetHistoryName），
+    一定在干净会话上做、且做成幂等。
+[G] GUI Tab-0 实测：GUI #4 的进度/取消之前只在【坏后端】上验过（还验过超时中止）。现在后端能跑了，
+    用 GUI 跑一次 ade，确认进度条走、Cancel 干净中止、产出 npz。离屏 selftest 仍绿。
 
-[4]（周一，同样要实时会话）config-view 保真度。
-   augment.insituCopyTB(...,"schematic") 只复制 TB schematic；设计师 "Test" 用 Test_PMU/config，
-   config 可能绑了 extracted/寄生 视图 → 真 PMU 会丢寄生。先用实时会话查 Test_PMU/config 绑了什么
-   视图；若绑了 layout/extracted，则把 extract test 建成 CONFIG（顶层换我们 augment 后的 ext
-   schematic，底下继承设计师 view-binding）。stand-in 全 schematic 所以现在看不出来。
-   注意：[A] 和 [4] 都要实时会话，可一并在现场做（先做 [A]，因为它顺带把会话弄干净了）。
-
-[5]（小，非阻塞）定向 save：现在 save=allpub（binpsf 能读）；axlAddOutputSignal 做定向保存是优化项。
-
-==================== 硬约束 / 坑 ====================
-- 不要反复探测/重建实时会话：多次 augment 重建 + 反复开关 cellview 会把 ADE 搞成 "required cellViews
-  not open"。要跑就在干净会话上一次跑完。
-- SKILL 走 virtuoso-skill 协议：grep ~/.claude/skills/virtuoso-skill/assets/function_index.tsv →
-  读 PDF（/home/yusheng/cadence_work/Test/workarea/SKILL_file/...）→ 带出处，绝不凭记忆写签名。
-  （已查过：Session→Reset 对应 sevReset(sev)=skart p.821，但它会把会话重置成默认值、会清掉我们继承的
-  vars/analyses；axlResetActive(hsdb)=adexl p.135。这俩都偏重，优先 GUI 里 Session→Reset 或重开 ADE。）
-- skillbridge 模态框冻通道；杀客户端不能取消已在 Virtuoso 里跑的调用；遇冻关弹框或重启 Cadence。
+==================== 硬约束 / 坑（仍然适用）====================
+- 会话卫生：~6 次 run + 改名会把会话搞退化（run 3s→197s、聚合状态中毒、撞名弹模态框）。
+  Session→Reset 能完全恢复（聚合回到 [0,0]）。要跑就在干净会话上、别反复 augment/开关 cellview。
+- 探活：cd cadence && python3 -c "from skillbridge import Workspace as W; print(W.open()['plus'](2,3))" 要秒回 5。
+- SKILL 走 virtuoso-skill 协议：grep ~/.claude/skills/virtuoso-skill/assets/function_index.tsv → 读 PDF
+  （/home/yusheng/cadence_work/Test/workarea/SKILL_file/...）→ 带出处，绝不凭记忆写签名。
+- skillbridge：模态框冻通道；杀客户端不能取消已在 Virtuoso 里跑的调用；符号用 from skillbridge import Symbol。
+  axl* 的 "Cannot find setup database entry for handle 0" 这类错 errset 抓不住 → Python 侧也要 try/except。
 - 不改设计师脊柱：只动副本 insitu_extract / Test_PMU_extract。保 npz firewall。
-- skillbridge 符号用 from skillbridge import Symbol（Symbol('ac')->'ac）。
-- 实时会话事实：session=fnxSession0，sdb=1001；设计师 test 名 "Test"（manifest dut.ade_src_test 已写）；
-  设计师 OP flo=5G/VDD=3/VDD1P0=1.05；spectre ac 字段 start/stop/dec，noise 多 oprobe/iprobe。
-- 验证二进制 PSF：把同一 input.scs 用 spectre -64 -format psfascii 再跑出 ascii 对比；二进制-vs-二进制
-  逐位一致；psfascii 只 ~6 位有效数字。spectre 环境见 cadence/spectre_run.py（CDSHOME/SPECTRE181/license）。
+- 实时会话事实：session=fnxSession0，sdb=1001；设计师 test="Test"（cell Test_PMU，view config）；
+  我们的 test="insitu_extract"（cell Test_PMU_extract，现在 view=config）。
+  设计师 OP：flo=5G/VDD=3/VDD1P0=1.05。ac 字段 start/stop/dec；noise 用 outType=voltage + p/n。
+- 结果路径：axlGetResultsLocation(sdb) = ~/simulation/sim_yusheng/Test_PMU/maestro/results/maestro；
+  单次 run 落在 <root>/<hist>/1/insitu_extract/psf/{ac.ac,noise.noise}。
