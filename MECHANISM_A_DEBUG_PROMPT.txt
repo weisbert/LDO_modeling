@@ -30,8 +30,17 @@ binpsf 自测）全绿，没碰坏离线路径。
 
 ==================== 本回合可做（全是小项 / 都不阻塞）====================
 
-[5] 定向 save：现在 save=allpub（binpsf 能读，工作正常）。axlAddOutputSignal 只存需要的端口 = 优化，
-    省 PSF 体积 / IO。非必须。
+【2026-06-15 复盘后的建议】三项都读过代码了：唯一真正的"验证缺口"是 [G]（GUI 进度/取消之前只在
+坏后端验过，没在能跑的后端验过）——只读跑一次、风险最低，但要用户在 GUI 上点（启动/看进度条/按
+Cancel/确认产出 npz），无法 headless。[5] 比想象麻烦（见下，杠杆不是 axlAddOutputSignal），stand-in
+上收益看不见。[6] 改名正是当初弹 2409 模态框冻通道的操作、live 风险最高、纯 cosmetic。
+本窗口只确认了状态（git @9d1c541 同步、会话健康 plus→5）+ 给了建议，没改代码、没新 commit（除本文档）。
+
+
+[5] 定向 save：现在代码里【没】设 save —— bare test 继承 ADE 默认 allpub（binpsf 能读、工作正常）。
+    坑：正确的杠杆【不是】axlAddOutputSignal（那是 ADE-XL 输出/测量表，adexl p.243）—— 限制写进
+    PSF 的网络是 ADE-L 的 save-options（sevSaveOptions skart p.836 / netlist 的 save 语句）。
+    stand-in 上 PSF 很小、收益看不见，只有真 PMU 才有意义；要读多份 PDF + live 试错。优化、非必须。
 [6] 可读的 Maestro history 名：现在驱动用自动名 Interactive.N（为了躲开 re-run 撞名弹的 ASSEMBLER-2409
     模态框）。要可读名就先 delete-then-rename（查 axlDeleteHistory / 同名先删再 axlSetHistoryName），
     一定在干净会话上做、且做成幂等。
