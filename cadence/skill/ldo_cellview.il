@@ -41,3 +41,19 @@
     (ddUpdateLibList)
     (printf "ldoImportVA: %s/%s/veriloga ready\n" libName cellName)
     vaDir))
+
+;; Trigger the Verilog-A COMPILE/parse of an imported veriloga cellview: parse the .va
+;; module, surface any compile errors, and update the cellview's CDF/parameter info.
+;; Call AFTER ldoImportVA so the model cell carries its parameters and a clean compile
+;; is confirmed without a full netlist/elaborate run. Returns t.
+;;
+;; SKILL ref (IC6.1.8 PI reference, verified):
+;;   ahdlUpdateViewInfo  skartistref.pdf p.600
+;;     (t_lib [?cell lt_cell] [?view lt_view] [?tool lt_tool]) -- parses the Verilog-A /
+;;     SpectreHDL modules defining the cellviews, issues compile error messages, updates
+;;     the cellview CDF. Omitting ?cell/?view updates every veriloga/ahdl cellview.
+(defun ldoCompileVA (libName cellName @optional (viewName "veriloga") "ttt")
+  (ahdlUpdateViewInfo libName ?cell cellName ?view viewName)   ; Ref: skartistref.pdf p.600
+  (printf "ldoCompileVA: %s/%s/%s parsed (CDF updated; check CIW for compile errors)\n"
+      libName cellName viewName)
+  t)

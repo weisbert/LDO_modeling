@@ -205,7 +205,13 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
     for o in m["v_out"]:
         vdc = vmap.get(o, 0.8)
         volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc)
+        # carry the designer's GUI symbol pin name (set by build_manifest) so the model
+        # cell's PORT is the pin, not our internal role key. Default: the role key itself
+        # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).
+        volt[o]["pin"] = m["v_out"][o].get("pin", o)
     curr = _fit_current_ports(cports, m["current_psrr_supplies"])
+    for r in curr:
+        r["pin"] = m["i_out"].get(r["sink"], {}).get("pin", r["sink"])
     return dict(voltage=volt, current=curr,
                 meta=dict(name=pathlib.Path(npz_path).stem,
                           loads=[str(x) for x in ref["loads"]],

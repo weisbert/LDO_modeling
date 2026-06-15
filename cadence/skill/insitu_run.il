@@ -152,3 +152,42 @@
     (unless h (error "insituRename: axlGetCurrentHistory nil"))
     (errset (axlSetHistoryName h histName) nil)        ; swallow name-collision / 2423
     (car (errset (axlGetHistoryName h) nil))))          ; actual name (renamed or original)
+
+
+;; --- NETLIST-ONLY export of one ADE-XL test (NO run) -- BOX-RESEARCH STUB ---------------
+;; pmu_corner.py's pure-CLI per-group sweep needs to NETLIST the augmented extract test
+;; (with this group's acm one-hot + only this group's analysis enabled) WITHOUT running it,
+;; then hand the produced input.scs + the compiled -ahdllibdir to dsub+alps on the cluster.
+;;
+;; This is the seam that must be wired+validated ON THE BOX before the default
+;; (non-injected) per-group netlister can run. It is NOT exercised by the offline tests
+;; (those inject a fake group_netlister). Per the SKILL discipline we DO NOT invent a
+;; signature for the netlist-only trigger: the index has no clearly-PUBLIC "netlist this
+;; ADE-XL test now, no run" entry point. The two relevant, grounded pieces are:
+;;
+;;   * the per-test ADE-L session bridge (same as adestate.py):
+;;       sev = axlGetToolSession(sess test)   ; adexlSKILLref.pdf p.36
+;;       ts  = asiGetSession(sev)             ; skartistref.pdf p.648
+;;   * asiGetNetlistDir(ts) => t_netlistDir   ; skartistref.pdf p.644 -- RETURNS (and creates
+;;       if absent) the netlist directory for that session. It LOCATES the netlist dir; it
+;;       does NOT itself trigger netlisting.
+;;   * asiNetlist(ts) => g_status / nil       ; skartistref.pdf p.421 -- DOES run the
+;;       netlister (nlCreateFormatter + nlNetlist), BUT the reference EXPLICITLY states:
+;;       "This method is called by the environment, so you should not call it directly from
+;;       the interface." i.e. it is an overridable Analog-class METHOD, not the sanctioned
+;;       public netlist-only API. Calling it directly is unvalidated.
+;;
+;; Because no clearly-public netlist-only trigger is in the index, this is left as a
+;; DOCUMENTED stub that errors with exactly what to wire (and on which box) -- NOT a guess.
+;; FLAGGED in open_issues + PMU_CORNER_RUNBOOK.md §4 (box-validation item).
+(defun insituNetlistTest (sess testName)
+  ;; INTENDED contract: netlist <testName> (no run) and return the netlist dir that holds
+  ;; the produced input.scs. To wire on the box, confirm the sanctioned netlist-only call
+  ;; (try the ADE-XL "Netlist" menu's underlying fn, or sevNetlistFile / asiNetlist via the
+  ;; sev above) THEN return asiGetNetlistDir(ts). Until validated live, fail loudly:
+  (error (strcat "insituNetlistTest: BOX-RESEARCH STUB -- the netlist-only trigger for an "
+                 "ADE-XL test is not yet validated. Wire it on the company box: "
+                 "sev=axlGetToolSession(sess \"" testName "\"); ts=asiGetSession(sev); "
+                 "<netlist-only trigger>; asiGetNetlistDir(ts). asiNetlist(ts) (skart p.421) "
+                 "runs the netlister but is documented as env-called -- confirm before use. "
+                 "Offline runs inject a fake group_netlister and never reach this.")))

@@ -5,6 +5,58 @@ testbench (TB)** lives; we then drive **one corner’s LDO modeling end-to-end t
 (`dsub`+`alps` → PSF → npz → fit → model). First real exercise of the just-validated company
 sim/submit path.
 
+## DECISION (2026-06-15, confirmed with user) — Path B (pure-CLI) FIRST, then Path A
+User chose: **pure CLI `dsub+alps` as the PRIMARY driver; get THIS working, THEN add Path A
+(Mechanism-A Maestro drive).** So for this build:
+- **Drive** = our own assembled `dsub … <wrapper>/bin/alps …` (engine-param {alps,spectre}),
+  submitted async; **poll Donau `djob`/`dstat` → map to pending/running/done and surface it**
+  (= deliverable #1 "GUI sees progress" on the CLI path). Spectre fallback kept (§8).
+- **Maestro-open** (user's "other question") = classic PSF loads via ViVA `Results → Open
+  Results` on the psf dir; it will NOT auto-populate a Maestro test row — that native
+  behavior is Path A (Mechanism A inherits the Donau Job Setup + ALPS checkbox), DEFERRED.
+
+## Runtime inputs the user hands us (from the company GUI)
+- PMU TB `lib/cell/view` **+ which instance is the PMU/DUT** (so we can resolve its pins).
+- 6 OUTPUT symbol-pin names — V: `VDD0P8_DIG`, `VDD0P8_PLL`, `VDD0P8_VCO`; I:
+  `IBP_POLY_1P8U_VCO`, `IBP_POLY_500N_VCO_Fit`, `IBP_PTAT_TUNE_1P5U_VCO`.
+- 1 INPUT symbol-pin name — `AVDD1P0` (**single** supply, 1.0 V).
+- Target MODEL `lib/cell/path` for the emitted veriloga+symbol.
+- ⚠️ These are **SYMBOL pin names** → must be resolved to TB nets first (component 1).
+
+## Components to BUILD (this turn)
+1. **symbol-pin→net resolver** (SKILL via skillbridge): locate the PMU/DUT instance in the TB,
+   walk its instTerms, return `{pinName: netName}` (`inst~>instTerms` / `dbGetInstTermByName`).
+2. **in-situ augment on the REAL TB**: generalize the `cadence/extract_pmu.py:8-17` contract to
+   **3 V-out / 3 I-out / 1 supply (`AVDD1P0`)** applied at the resolved nets, AVDD1P0 AC
+   idealized. Per V-out: `Zout`(1 A AC)+`PSRR`(1 V AC on AVDD1P0, complex)+`noise`. Per I-out:
+   `admittance`(1 V AC on pin)+`current-PSRR`(1 V AC on AVDD1P0). + coupling among the 3 V-outs.
+   Reuse `cadence/insitu/augment.il` + `manifest`.
+   - **DC-bias / operating point (critical — model is linearized at the OP):** small-signal
+     extraction must happen at each port's REAL operating point. **V-out**: LDO self-holds
+     ~0.8 V but the **load CURRENT** must be set externally — the `1A AC` probe is `mag=1 dc=0`
+     (probe only, no bias). No load → **silent fallback to no-load** OP (sim converges, but
+     Zout/PSRR/noise are no-load values + possible no-load peaking artifact). **I-out**: the pin
+     VOLTAGE is undefined without a DC reference — the `vsource mag=1` admittance probe doubles
+     as the DC `compliance` bias (`dc=V_node`). Floating I-out → **DC non-convergence / railed
+     garbage OP** (harder failure than V-out). Strategy: **true in-situ FIRST** (keep the TB's
+     real loads / driven nodes → don't add idc/vdc, OP self-consistent); only if a port is
+     floating, take a user-supplied `I_load`(V-out) / `V_node`(I-out) and add `isource dc=` /
+     `vsource dc=`. **Safety net: run a DC OP first, print per-port `(V_dc, I_dc)`** for the user
+     to sanity-check (V-out `I≈0` = missing load; I-out `V` railed = missing compliance); a
+     floating I-out is REFUSED with a clear message, never dumped as a raw convergence error.
+     Slots already exist in `extract_pmu.py` (`Ipll/Ivco isource dc=`, `Vb500/Vb1u vsource dc=`).
+3. **CLI driver** (`cadence/cluster/` or `cadence/alps_cli.py`): assemble + submit the proven
+   `dsub … <wrapper>/bin/alps input.scs -ade -format ps -o ../psf -I <pdk>/alps -ahdllibdir …
+   -mt 8` (wrapper-not-raw, `-x all`, csh); **poll Donau → pending/running/done**; hand the psf
+   dir to binpsf. Engine-parameterized {alps,spectre} (ALPS_DONAU_NOTES §8).
+4. **storage convention**: `$WORK_ROOT/ldo_modeling/<Lib>__<Cell>/<corner>/{netlist,psf,npz,model}`;
+   do NOT touch the designer's `$WORK_ROOT/simulation/<Lib>/<Cell>/` spine. Netlist by borrowing
+   ADE's run (it pre-compiles the VA into `sharedData/input.ahdlSimDB`).
+5. **downstream** (EXISTS): `binpsf`→`import_cadence`→npz→`fit_model`→`model/*.{lib,va}`.
+6. **model cell emitter**: veriloga + symbol at the user's `lib/cell/path`, **compiled**. Interface
+   = `AVDD1P0` LEFT, 6 outputs RIGHT, `VSS` BOTTOM. Reuse `cadence/skill/pmu_top_symbol.il`
+   (`schCreatePin`+`schViewToView`; ADD a VSS-at-bottom row) + `ldo_cellview.il`/`skill_lib.py`.
+
 ## Where we are (validated this session — all pushed @ 445cf14)
 The **ALPS-CLI-under-Donau path is proven end-to-end** (hand-assembled `dsub`+`alps`, no Maestro,
 → classic PSF byte-identical to ADE). Full intel: **`cadence/ALPS_DONAU_NOTES.md`** (single source
