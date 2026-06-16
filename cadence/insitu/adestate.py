@@ -22,8 +22,12 @@ SKILL refs: axlGetToolSession adexl p.36 ; asiGetSession skart p.648 ; asiGetDes
 p.637 ; asiAddDesignVarList p.616 ; asiGetAnalysis p.384 ; asiSetAnalysisFieldVal p.403 ;
 asiEnableAnalysis p.381 ; asiDisableAnalysis p.376 ; asiIsAnalysisEnabled p.401 ;
 axlGetTests adexl p.282 ; axlGetTestToolArgs p.283 ; axlSaveSetup p.136.
+
+skillbridge is a LIVE-Virtuoso-only dependency (NOT bundled in the offline deploy venv).
+It is imported LAZILY inside the live-ADE functions below -- importing this module offline
+(GUI start, --selftest, fit/emit, manifest build) must never require it, exactly like the
+other insitu modules (run/augment/resolve/probe_ade) that local-import it on demand.
 """
-from skillbridge import Symbol
 
 # sev analysis field names that the spectre ac/noise forms actually expose (discovered live
 # on the designer's test: asiGetAnalysisFieldVal returns '' for a valid-but-empty field and
@@ -70,6 +74,7 @@ def parse_analysis(line):
 def config_analysis(ws, sess, test, ana_name, fields, enable=True):
     """Set an analysis' sweep fields, then enable (or disable) it -> fixes 1707 when enabled.
     fields = {'start':'10', ...}. Returns the analysis object."""
+    from skillbridge import Symbol            # live-only dep; see module docstring
     ts = _ts(ws, sess, test)
     ana = ws["asiGetAnalysis"](ts, Symbol(ana_name))            # skart p.384
     if not ana:
@@ -84,6 +89,7 @@ def enable_only_analysis(ws, sess, test, ana_name, siblings=("ac", "noise")):
     """Enable ana_name, disable the other siblings -- so a one-hot group's run computes only
     what it needs (an ac group must not drag a noise analysis, which would also need an
     oprobe). Returns the set of enabled analyses."""
+    from skillbridge import Symbol            # live-only dep; see module docstring
     ts = _ts(ws, sess, test)
     on = set()
     for s in siblings:
