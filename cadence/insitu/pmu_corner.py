@@ -111,7 +111,7 @@ def step_resolve(gui, *, netmap=None, session=None, progress=None):
     if netmap is not None:
         _progress(progress, "resolve", f"using injected netmap ({len(netmap)} pins)")
         return dict(netmap)
-    pins = [gui["supply"]["pin"], *gui.get("v_outs", []), *gui.get("i_outs", []),
+    pins = [*_bm.supply_pins(gui), *gui.get("v_outs", []), *gui.get("i_outs", []),
             *(gui.get("biases") or {}).keys()]
     from .resolve import resolve_nets
     try:
@@ -458,7 +458,7 @@ def run_pmu_corner(gui, work_root=None, corner=None, engine="alps",
     want = set(steps) if steps is not None else set(STEPS)
     corner = corner or gui.get("corner") or "nom"
     base, dirs = corner_dir(work_root, gui, corner)
-    supply_pin = supply_pin or gui["supply"]["pin"]
+    supply_pin = supply_pin or (_bm.supply_pins(gui) or [""])[0]   # model symbol's LEFT input = first supply
     ground = ground or gui.get("ground") or "VSS"
     model_lib = model_lib or "LDO_model_lab"
     model_cell = model_cell or (gui.get("model_cell") or f"{gui['dut_cell']}_model")

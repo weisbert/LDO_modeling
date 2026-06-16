@@ -122,6 +122,36 @@ def _assign_keys(pins, keyfn, kind):
     return out
 
 
+def supply_pins(gui):
+    """The supply PIN names from a gui dict, accepting either the legacy single
+    gui['supply']={pin,..} or the multi gui['supplies']=[{pin,..},...]. Used by callers that
+    build a netmap pin list or pick the model symbol's input pin."""
+    if gui.get("supplies"):
+        return [s["pin"] for s in gui["supplies"] if s.get("pin")]
+    s = gui.get("supply") or {}
+    return [s["pin"]] if s.get("pin") else []
+
+
+def _cpsrr_keys(gui, s_keys):
+    """Resolve current_psrr_supplies to a list of supply ROLE KEYS. Accepts the GUI giving
+    supply PINS or role keys; default = ALL supplies (matches manifest._fill_defaults, so the
+    builder and the validator agree). Single-supply -> [the one key], unchanged."""
+    want = gui.get("current_psrr_supplies")
+    if not want:
+        return list(s_keys)                                # all supplies
+    pin2key = {pin: k for k, pin in s_keys.items()}
+    out = []
+    for w in want:
+        if w in s_keys:
+            out.append(w)                                  # already a role key
+        elif w in pin2key:
+            out.append(pin2key[w])                         # a supply pin name
+        else:
+            raise BuildError(f"current_psrr_supplies entry {w!r} is not a supply pin or key "
+                             f"(have pins {sorted(pin2key)} / keys {sorted(s_keys)})")
+    return list(dict.fromkeys(out))                        # dedup (pin + its own slug), keep order
+
+
 # ---------------------------------------------------------------------------
 # the builder
 # ---------------------------------------------------------------------------
@@ -158,11 +188,28 @@ def build_manifest(gui, netmap):
         if not gui.get(req):
             raise BuildError(f"gui.{req} is required")
 
-    supply = gui.get("supply") or {}
-    if not supply.get("pin"):
-        raise BuildError("gui.supply.pin is required (the single PMU supply, e.g. AVDD1P0)")
-    if supply.get("dc") is None:
-        raise BuildError("gui.supply.dc is required (a number, e.g. 1.0)")
+    # supplies: accept either the legacy single gui['supply']={pin,dc} OR the multi form
+    # gui['supplies']=[{pin,dc[,tb_src]},...]. Exactly one of the two; normalize to a list.
+    if gui.get("supplies") is not None and gui.get("supply") is not None:
+        raise BuildError("give either gui['supplies'] (list) or gui['supply'] (single), not both")
+    if gui.get("supplies") is not None:
+        supply_list = list(gui["supplies"])
+        if not supply_list:
+            raise BuildError("gui['supplies'] is empty (need at least one {pin,dc})")
+    else:
+        supply_list = [gui["supply"]] if gui.get("supply") else []
+    if not supply_list:
+        raise BuildError("gui needs a supply: gui['supply']={pin,dc} or "
+                         "gui['supplies']=[{pin,dc},...] (e.g. AVDD1P0 @ 1.0)")
+    seen_pins = set()
+    for i, sup in enumerate(supply_list):
+        if not (sup or {}).get("pin"):
+            raise BuildError(f"supplies[{i}].pin is required (e.g. AVDD1P0)")
+        if sup.get("dc") is None:
+            raise BuildError(f"supplies[{i}].dc is required (a number, e.g. 1.0)")
+        if sup["pin"] in seen_pins:
+            raise BuildError(f"duplicate supply pin {sup['pin']!r} in gui['supplies']")
+        seen_pins.add(sup["pin"])
 
     v_pins = list(gui.get("v_outs") or [])
     i_pins = list(gui.get("i_outs") or [])
@@ -192,13 +239,16 @@ def build_manifest(gui, netmap):
     if gui.get("ade_src_test"):
         dut["ade_src_test"] = gui["ade_src_test"]
 
-    # --- supplies (single) ----------------------------------------------
-    s_pin = supply["pin"]
-    s_key = role_key_s(s_pin)
-    s_entry = {"net": _net(netmap, s_pin, "supply"), "dc": supply["dc"], "pin": s_pin}
-    if supply.get("tb_src"):
-        s_entry["tb_src"] = supply["tb_src"]
-    supplies = {s_key: s_entry}
+    # --- supplies (N; dedup role keys exactly like v_out/i_out) ----------
+    s_keys = _assign_keys([s["pin"] for s in supply_list], role_key_s, "supply")
+    pin_to_sup = {s["pin"]: s for s in supply_list}
+    supplies = {}
+    for s_key, s_pin in s_keys.items():
+        sup = pin_to_sup[s_pin]
+        entry = {"net": _net(netmap, s_pin, f"supply.{s_key}"), "dc": sup["dc"], "pin": s_pin}
+        if sup.get("tb_src"):
+            entry["tb_src"] = sup["tb_src"]
+        supplies[s_key] = entry
 
     # --- v_out rails -----------------------------------------------------
     v_keys = _assign_keys(v_pins, role_key_v, "v_out")
@@ -249,8 +299,9 @@ def build_manifest(gui, netmap):
         "leave_alone": list(gui.get("leave_alone") or []),
         "corners": {"pull_from_session": True,
                     "fallback": [gui.get("corner") or "nom"]},
-        # single real supply -> current-PSRR only against it
-        "current_psrr_supplies": [s_key],
+        # current-PSRR reference supplies: explicit GUI subset (pins or keys), else ALL
+        # supplies (matches manifest._fill_defaults). Single-supply -> [the one key].
+        "current_psrr_supplies": _cpsrr_keys(gui, s_keys),
     }
     if gui.get("corner"):
         m["corner"] = gui["corner"]
@@ -264,14 +315,25 @@ def build_manifest(gui, netmap):
     elif gui.get("tnom_c") is not None:
         m["tnom_c"] = float(gui["tnom_c"])
 
+    warnings = []
     # in-situ compliance warning: current outputs whose compliance vdc was not supplied get
     # validate()'s dc=0.0 default below -- record them so the orchestrator can prompt the user
     # for the real node voltage (a 0 V clamp is almost never the true OP for a bias current).
     if no_compliance:
-        m["_warnings"] = [
+        warnings.append(
             "current-output compliance (vdc) not supplied for: " + ", ".join(no_compliance)
             + " -- defaulting dc=0.0 (clamps the pin to 0 V). Supply gui['vdc'][<pin>] = the "
-              "pin's real operating node voltage for a meaningful OP."]
+              "pin's real operating node voltage for a meaningful OP.")
+    # multi-supply: PSRR vs EVERY supply is measured + fitted, but the combined model cell exposes
+    # ONE input port (the first supply) and emits PSRR only vs it. Make that drop LOUD, not silent.
+    if len(supplies) > 1:
+        skeys = list(supplies)
+        warnings.append(
+            f"multiple supplies {skeys}: the model emits PSRR only vs the LEFT-input supply "
+            f"'{skeys[0]}'. PSRR vs {skeys[1:]} is measured + fitted but NOT emitted yet "
+            f"(multi-supply-input model is pending). Drop to one supply if you only need rail #1.")
+    if warnings:
+        m["_warnings"] = warnings
 
     # final guard: must satisfy the consumer's schema (raises ManifestError otherwise).
     # validate() mutates i_out entries (defaults dc) -- run on the dict we return.

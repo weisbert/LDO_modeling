@@ -335,5 +335,125 @@ def test_explicit_tnom_overrides_middle():
     assert m["tnom_c"] == 27.0
 
 
+# ---------------------------------------------------------------------------
+# multi-supply: gui['supplies'] = [{pin,dc}, ...]  (back-compat with single gui['supply'])
+# ---------------------------------------------------------------------------
+def multi_gui(**over):
+    gui = real_gui()
+    gui.pop("supply")
+    gui["supplies"] = [{"pin": "AVDD1P0", "dc": 1.0}, {"pin": "AVDD1P8", "dc": 1.8}]
+    gui.update(over)
+    return gui
+
+
+def multi_netmap(gui):
+    pins = [*(s["pin"] for s in gui["supplies"]), *gui["v_outs"], *gui["i_outs"]]
+    return {p: f"net_{p}" for p in pins}
+
+
+def test_supplies_list_back_compat_single():
+    """supplies=[one] must produce an IDENTICAL supplies/current_psrr block to supply=one."""
+    g1 = real_gui()
+    g2 = real_gui(); g2.pop("supply"); g2["supplies"] = [{"pin": "AVDD1P0", "dc": 1.0}]
+    m1 = B.build_manifest(g1, real_netmap(g1))
+    m2 = B.build_manifest(g2, real_netmap(g1))
+    assert m1["supplies"] == m2["supplies"]
+    assert m1["current_psrr_supplies"] == m2["current_psrr_supplies"] == ["avdd1p0"]
+
+
+def test_two_supplies_keys():
+    g = multi_gui()
+    m = B.build_manifest(g, multi_netmap(g))
+    assert list(m["supplies"]) == ["avdd1p0", "avdd1p8"]
+    assert m["supplies"]["avdd1p8"]["dc"] == 1.8
+    assert m["supplies"]["avdd1p8"]["pin"] == "AVDD1P8"
+    assert M.validate(m) is True
+
+
+def test_current_psrr_default_all_supplies():
+    g = multi_gui()
+    m = B.build_manifest(g, multi_netmap(g))
+    assert m["current_psrr_supplies"] == ["avdd1p0", "avdd1p8"]   # default = ALL
+
+
+def test_two_supplies_matrix_count():
+    g = multi_gui()
+    m = B.build_manifest(g, multi_netmap(g))
+    keys = [x["key"] for x in M.measurements(m)]
+    n_psrr = sum(1 for k in keys if k.startswith("p_"))
+    n_pi = sum(1 for k in keys if k.startswith("pi_"))
+    assert n_psrr == 6, "3 v_out x 2 supplies"
+    assert n_pi == 6, "3 sinks x 2 cpsrr supplies (default all)"
+    # z(3) + couple(6) + noise(3) + psrr(6) + y(3) + pi(6) = 27
+    assert len(M.measurements(m)) == 27
+
+
+def test_current_psrr_subset_override_by_pin():
+    g = multi_gui(current_psrr_supplies=["AVDD1P0"])     # a PIN name -> role key
+    m = B.build_manifest(g, multi_netmap(g))
+    assert m["current_psrr_supplies"] == ["avdd1p0"]
+    n_pi = sum(1 for k in (x["key"] for x in M.measurements(m)) if k.startswith("pi_"))
+    assert n_pi == 3, "current-PSRR only vs the one chosen supply"
+
+
+def test_current_psrr_unknown_supply_rejected():
+    g = multi_gui(current_psrr_supplies=["NOPE"])
+    with pytest.raises(BuildError):
+        B.build_manifest(g, multi_netmap(g))
+
+
+def test_both_supply_forms_rejected():
+    g = real_gui(); g["supplies"] = [{"pin": "AVDD1P0", "dc": 1.0}]   # supply AND supplies
+    with pytest.raises(BuildError):
+        B.build_manifest(g, real_netmap())
+
+
+def test_duplicate_supply_pin_rejected():
+    g = multi_gui()
+    g["supplies"] = [{"pin": "AVDD1P0", "dc": 1.0}, {"pin": "AVDD1P0", "dc": 1.0}]
+    with pytest.raises(BuildError):
+        B.build_manifest(g, multi_netmap(g))
+
+
+def test_per_supply_dc_required():
+    g = multi_gui()
+    g["supplies"][1].pop("dc")
+    with pytest.raises(BuildError):
+        B.build_manifest(g, multi_netmap(g))
+
+
+def test_multi_supply_warns_psrr_only_first():
+    """N>1 supplies: a LOUD _warnings line says PSRR is emitted only vs the first supply
+    (the model exposes one input port) -- not silently dropped."""
+    g = multi_gui(vdc={"IBP_POLY_1P8U_VCO": 0.5, "IBP_POLY_500N_VCO_Fit": 0.4,
+                       "IBP_PTAT_TUNE_1P5U_VCO": 0.45})       # no compliance warning to confuse it
+    m = B.build_manifest(g, multi_netmap(g))
+    w = " ".join(m.get("_warnings", []))
+    assert "avdd1p0" in w and "avdd1p8" in w and "PSRR" in w
+    # single supply -> no such warning
+    g1 = real_gui(vdc={"IBP_POLY_1P8U_VCO": 0.5, "IBP_POLY_500N_VCO_Fit": 0.4,
+                       "IBP_PTAT_TUNE_1P5U_VCO": 0.45})
+    assert "_warnings" not in B.build_manifest(g1, real_netmap(g1))
+
+
+def test_cpsrr_dedup_pin_and_slug():
+    """A pin plus its own slug must collapse to ONE current_psrr supply (no duplicate pi_*)."""
+    g = multi_gui(current_psrr_supplies=["AVDD1P0", "avdd1p0"])
+    m = B.build_manifest(g, multi_netmap(g))
+    assert m["current_psrr_supplies"] == ["avdd1p0"]
+    n_pi = sum(1 for k in (x["key"] for x in M.measurements(m)) if k.startswith("pi_"))
+    assert n_pi == 3, "no duplicate current-PSRR points"
+
+
+def test_supply_role_key_collision_disambiguated():
+    """Two distinct pins that slug to the SAME key get suffixed (avdd1p0 / avdd1p02),
+    never silently merged -- same protection v_out/i_out already have."""
+    g = multi_gui()
+    g["supplies"] = [{"pin": "AVDD1P0", "dc": 1.0}, {"pin": "AVDD1P0#", "dc": 1.0}]
+    nm = multi_netmap(g)
+    m = B.build_manifest(g, nm)
+    assert list(m["supplies"]) == ["avdd1p0", "avdd1p02"]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

@@ -17,6 +17,7 @@ even where PyQt5/display are absent (the red box has PyQt5; this dev venv may no
 import os
 import sys
 import json
+import shlex
 import argparse
 import pathlib
 from dataclasses import dataclass, field
@@ -301,7 +302,7 @@ class ExtractCore:
         import json
         from insitu import build_manifest as BM, manifest as M, pmu_corner as PC
         from insitu.resolve import resolve_nets
-        pins = [gui["supply"]["pin"], *(gui.get("v_outs") or []),
+        pins = [*BM.supply_pins(gui), *(gui.get("v_outs") or []),
                 *(gui.get("i_outs") or []), *(gui.get("biases") or {}).keys()]
         if netmap is None:
             netmap = resolve_nets(gui["tb_lib"], gui["tb_cell"],
@@ -700,17 +701,23 @@ if _HAVE_QT:
 
         # --- form-state persistence (PMU pin form + Profile) ---------------------
         def _config_widgets(self):
-            """Registry config-key -> widget for everything we persist across launches. All
-            QLineEdit (text) except x_backend (QComboBox, by userData) and e_nom (QComboBox,
-            by text). Built after all tabs exist, so every widget is present."""
+            """Registry config-key -> widget for everything we persist across launches.
+            QLineEdit by text; QComboBox by userData; QSpinBox by value. Built after all tabs
+            exist, so every widget is present. (Old keys absent from the registry — e.g. the
+            removed single 'supply'/'supply_dc' — are simply ignored on load: back-compat.)"""
             return {
                 "tb_lib": self.xf_tblib, "tb_cell": self.xf_tbcell, "tb_view": self.xf_tbview,
                 "dut_inst": self.xf_inst, "dut_lib": self.xf_dutlib, "dut_cell": self.xf_dutcell,
-                "supply": self.xf_supply, "supply_dc": self.xf_supplydc,
+                "supplies": self.xf_supplies, "cpsrr": self.xf_cpsrr,
                 "vouts": self.xf_vouts, "iouts": self.xf_iouts, "vdc": self.xf_vdc,
                 "ivsweep": self.xf_ivsweep, "temps": self.xf_temps,
                 "ground": self.xf_ground, "corner": self.xf_corner, "src_test": self.xf_srctest,
                 "manifest": self.x_manifest, "session": self.x_session, "backend": self.x_backend,
+                "mode": self.x_mode, "location": self.x_location,
+                "b_netlist": self.xb_netlist["edit"], "b_pdk": self.xb_pdk["edit"],
+                "b_ahdl": self.xb_ahdl["edit"],
+                "d_account": self.xd_account, "d_queue": self.xd_queue,
+                "d_cpu": self.xd_cpu, "d_mem": self.xd_mem,
                 "p_name": self.e_name, "p_vref": self.e_vref, "p_loads": self.e_loads,
                 "p_nom": self.e_nom, "p_cout": self.e_cout, "p_esr": self.e_esr,
             }
@@ -721,6 +728,8 @@ if _HAVE_QT:
                 if isinstance(wd, QComboBox):
                     d = wd.currentData()
                     out[k] = d if d is not None else wd.currentText()
+                elif isinstance(wd, QtWidgets.QSpinBox):
+                    out[k] = wd.value()
                 else:
                     out[k] = wd.text()
             return out
@@ -742,6 +751,11 @@ if _HAVE_QT:
                         idx = wd.findText(str(v))
                     if idx >= 0:
                         wd.setCurrentIndex(idx)
+                elif isinstance(wd, QtWidgets.QSpinBox):
+                    try:
+                        wd.setValue(int(v))
+                    except (TypeError, ValueError):
+                        pass
                 else:
                     wd.setText("" if v is None else str(v))
             if "p_loads" in data and "p_nom" in data:        # rebuild nominal dropdown from saved loads
@@ -802,6 +816,40 @@ if _HAVE_QT:
             self._save_autosave()                             # remember this session's entries
             super().closeEvent(ev)
 
+        # --- Tab 0 helpers: path pickers + mode/location visibility --------------
+        def _path_row(self, name, dir_only=False):
+            """A QLineEdit + Browse button in one container. Returns {'w':container,'edit':QLineEdit}."""
+            edit = QLineEdit()
+            btn = QPushButton("Browse…")
+            btn.clicked.connect(lambda _=False, e=edit, d=dir_only: self._pick_path(e, d))
+            cont = QWidget(); h = QHBoxLayout(cont); h.setContentsMargins(0, 0, 0, 0)
+            h.addWidget(edit); h.addWidget(btn)
+            return {"w": cont, "edit": edit}
+
+        def _pick_path(self, edit, dir_only):
+            if dir_only:
+                d = QFileDialog.getExistingDirectory(self, "Select directory", str(ROOT))
+            else:
+                d, _ = QFileDialog.getOpenFileName(self, "Select file", str(ROOT))
+            if d:
+                edit.setText(d)
+
+        def _x_mode_changed(self, *a):
+            """Show the Mode-A pin form OR the Mode-B import group; Session only for ADE engine.
+            Guarded: the combo signals fire during _tab_extract construction before the later
+            groups exist."""
+            if not hasattr(self, "x_grp_donau"):
+                return                                        # tab still building
+            mode = self.x_mode.currentData()
+            self.x_grp_pinform.setVisible(mode == "schematic")
+            self.x_grp_modeb.setVisible(mode == "import")
+            self.x_grp_session.setVisible(self.x_backend.currentData() == "ade")
+
+        def _x_location_changed(self, *a):
+            if not hasattr(self, "x_grp_donau"):
+                return                                        # tab still building
+            self.x_grp_donau.setVisible(self.x_location.currentData() == "cluster")
+
         # --- Tab 0: Extract (in-situ, Mechanism A) -------------------------------
         def _tab_extract(self):
             w = QWidget(); outer = QVBoxLayout(w)
@@ -834,8 +882,24 @@ if _HAVE_QT:
             cfgrow.addWidget(note); cfgrow.addStretch(1)
             cfgw = QWidget(); cfgw.setLayout(cfgrow); outer.addWidget(cfgw)
 
-            # ---- pin FORM (deliverable 1): symbol pins -> resolved manifest --------------
-            gb = QGroupBox("1 · Describe your PMU (symbol pin names)")
+            # ---- MODE selector: how the manifest is produced ----------------------------
+            mrow = QHBoxLayout()
+            mrow.addWidget(QLabel("Mode:"))
+            self.x_mode = QComboBox()
+            self.x_mode.addItem("Build from schematic (resolve pins)", "schematic")
+            self.x_mode.addItem("Import netlist + manifest (no skillbridge)", "import")
+            self.x_mode.setToolTip("schematic: fill the pin form below; the tool resolves pins to TB "
+                                   "nets (live skillbridge) and builds the manifest.\n"
+                                   "import: bring a prepared netlist (input.scs) + a manifest + PDK "
+                                   "model dir + ahdllibdir and run it (local/cluster) — no skillbridge. "
+                                   "Use this when the tool can't netlist for you.")
+            self.x_mode.currentIndexChanged.connect(self._x_mode_changed)
+            mrow.addWidget(self.x_mode); mrow.addStretch(1)
+            mw = QWidget(); mw.setLayout(mrow); outer.addWidget(mw)
+
+            # ---- pin FORM (deliverable 1): symbol pins -> resolved manifest (MODE A) -----
+            self.x_grp_pinform = QGroupBox("1 · Describe your PMU (symbol pin names)")
+            gb = self.x_grp_pinform
             gf = QFormLayout(gb)
             self.xf_tblib = QLineEdit(); self.xf_tbcell = QLineEdit()
             self.xf_tbview = QLineEdit("schematic"); self.xf_inst = QLineEdit("I0")
@@ -851,13 +915,17 @@ if _HAVE_QT:
             for lab, ed in (("lib", self.xf_dutlib), ("cell", self.xf_dutcell)):
                 dutrow.addWidget(QLabel(lab)); dutrow.addWidget(ed)
             dutw = QWidget(); dutw.setLayout(dutrow); gf.addRow("DUT *", dutw)
-            self.xf_supply = QLineEdit("AVDD1P0"); self.xf_supplydc = QLineEdit("1.0")
-            self.xf_supply.setToolTip("The single supply INPUT pin (PSRR is referenced to it).")
-            self.xf_supplydc.setToolTip("The supply's DC operating voltage (e.g. 1.0).")
-            srow = QHBoxLayout()
-            srow.addWidget(QLabel("pin")); srow.addWidget(self.xf_supply)
-            srow.addWidget(QLabel("dc [V]")); srow.addWidget(self.xf_supplydc)
-            sw = QWidget(); sw.setLayout(srow); gf.addRow("Supply (input) *", sw)
+            self.xf_supplies = QLineEdit("AVDD1P0@1.0")
+            self.xf_supplies.setToolTip("Supply INPUT pin(s), comma-separated, each 'pin@dc' "
+                                        "(dc = operating voltage). One or many, e.g. "
+                                        "AVDD1P0@1.0, DVDD0P8@0.8. PSRR is measured vs every supply.")
+            gf.addRow("Supplies (pin@dc) *", self.xf_supplies)
+            self.xf_cpsrr = QLineEdit()
+            self.xf_cpsrr.setPlaceholderText("optional: AVDD1P0   (blank → current-PSRR vs ALL supplies)")
+            self.xf_cpsrr.setToolTip("Which supply(ies) the CURRENT-output PSRR (pi_*) is referenced "
+                                     "to — comma-separated pins. Blank → all supplies. Voltage-output "
+                                     "PSRR (p_*) is always measured vs every supply.")
+            gf.addRow("Current-PSRR ref", self.xf_cpsrr)
             self.xf_vouts = QLineEdit("VDD0P8_DIG, VDD0P8_PLL, VDD0P8_VCO")
             self.xf_vouts.setToolTip("Voltage OUTPUT pins, comma-separated (Zout / PSRR / noise).")
             gf.addRow("Voltage outputs", self.xf_vouts)
@@ -921,17 +989,66 @@ if _HAVE_QT:
             for b in (b_browse, b_load, b_edit, b_new):
                 row.addWidget(b)
             rw = QWidget(); rw.setLayout(row); form.addRow("…or load a manifest", rw)
+            # Engine (the simulator) and run-location (where it runs) are now SEPARATE.
             self.x_backend = QComboBox()
-            self.x_backend.addItem("ade — Mechanism A (live Maestro → cluster)", "ade")
-            self.x_backend.addItem("spectre_cli — offline dev fixture", "spectre_cli")
-            self.x_backend.addItem("cluster — Path B dsub+alps (pending netlister)", "cluster")
-            self.x_backend.setToolTip("ade: live Maestro run (needs the skillbridge session). "
-                                      "spectre_cli: offline dev fixture. cluster: pure-CLI Path B "
-                                      "(backend ready; netlister is a documented box-validation stub).")
+            self.x_backend.addItem("ADE — live Maestro (rides Job Setup)", "ade")
+            self.x_backend.addItem("Spectre — local CLI fixture", "spectre_cli")
+            self.x_backend.addItem("ALPS", "alps")
+            self.x_backend.setToolTip("The simulator engine. ADE = live Maestro (needs the skillbridge "
+                                      "session). Spectre = offline local CLI fixture. ALPS = the "
+                                      "company engine (cluster, via the Import + cluster path).")
+            self.x_backend.currentIndexChanged.connect(self._x_mode_changed)
             form.addRow("Engine", self.x_backend)
+            self.x_location = QComboBox()
+            self.x_location.addItem("local", "local")
+            self.x_location.addItem("cluster (Donau dsub)", "cluster")
+            self.x_location.setToolTip("Where the run executes. local = one process here. "
+                                       "cluster = submit per-measurement jobs to Donau (dsub); shows "
+                                       "the cluster settings panel below.")
+            self.x_location.currentIndexChanged.connect(self._x_location_changed)
+            form.addRow("Run on", self.x_location)
             self.x_session = QLineEdit("fnxSession0")
-            self.x_session.setToolTip("ADE-XL session name (ade engine only).")
-            form.addRow("Session", self.x_session)
+            self.x_session.setToolTip("ADE-XL session name (ADE engine only).")
+            self.x_grp_session = QWidget()
+            _sgl = QHBoxLayout(self.x_grp_session); _sgl.setContentsMargins(0, 0, 0, 0)
+            _sgl.addWidget(self.x_session)
+            form.addRow("Session", self.x_grp_session)
+
+            # ---- MODE B: import a prepared netlist + PDK + ahdllib (no skillbridge) ------
+            self.x_grp_modeb = QGroupBox("1b · Import netlist + PDK (Mode B — no skillbridge)")
+            bf = QFormLayout(self.x_grp_modeb)
+            self.xb_netlist = self._path_row("xb_netlist", dir_only=True)
+            bf.addRow("Netlist dir (input.scs) *", self.xb_netlist["w"])
+            self.xb_pdk = self._path_row("xb_pdk", dir_only=True)
+            bf.addRow("PDK model dir *", self.xb_pdk["w"])
+            self.xb_ahdl = self._path_row("xb_ahdl", dir_only=True)
+            bf.addRow("ahdllibdir (compiled VA) *", self.xb_ahdl["w"])
+            _mbhint = QLabel("Mode B reuses the manifest above (Load it). A SINGLE input.scs is "
+                             "dry/plan-only — a real multi-measurement sweep needs one netlist per "
+                             "group (box-coupled, pending).")
+            _mbhint.setWordWrap(True); _mbhint.setStyleSheet("color:#a40; font-size:11px;")
+            bf.addRow(_mbhint)
+            outer.addWidget(self.x_grp_modeb)
+
+            # ---- Donau cluster settings (visible only when Run on = cluster) -------------
+            self.x_grp_donau = QGroupBox("Cluster settings (Donau dsub)")
+            df = QFormLayout(self.x_grp_donau)
+            self.xd_account = QLineEdit("ug_rfic.rfSClass")
+            self.xd_account.setToolTip("Donau resource account / class (-A).")
+            df.addRow("Account / class (-A)", self.xd_account)
+            self.xd_queue = QLineEdit("short")
+            self.xd_queue.setToolTip("Donau work queue (-q), e.g. short (3h cap, 32G).")
+            df.addRow("Queue (-q)", self.xd_queue)
+            crow = QHBoxLayout()
+            self.xd_cpu = QtWidgets.QSpinBox(); self.xd_cpu.setRange(1, 256); self.xd_cpu.setValue(8)
+            self.xd_cpu.setToolTip("Cores per job (cpu= in -R; -mt is matched to it).")
+            self.xd_mem = QtWidgets.QSpinBox(); self.xd_mem.setRange(256, 512000)
+            self.xd_mem.setSingleStep(1000); self.xd_mem.setValue(8000)
+            self.xd_mem.setToolTip("Memory per job in MB (mem= in -R).")
+            crow.addWidget(QLabel("CPU")); crow.addWidget(self.xd_cpu)
+            crow.addWidget(QLabel("MEM [MB]")); crow.addWidget(self.xd_mem); crow.addStretch(1)
+            cw = QWidget(); cw.setLayout(crow); df.addRow("Resources (-R)", cw)
+            outer.addWidget(self.x_grp_donau)
 
             self.x_summary = QTextEdit(); self.x_summary.setReadOnly(True)
             self.x_summary.setMaximumHeight(120)
@@ -990,6 +1107,7 @@ if _HAVE_QT:
             b_send = QPushButton("Load into Import → Fit"); b_send.clicked.connect(self._x_send)
             srow2.addWidget(b_send); srow2.addStretch(1)
             outer.addLayout(srow2)
+            self._x_mode_changed(); self._x_location_changed()   # set initial group visibility
             return w
 
         def _form_gui(self):
@@ -1036,20 +1154,35 @@ if _HAVE_QT:
                         temps.append(float(t))
                     except ValueError:
                         pass
-            try:
-                dc = float(self.xf_supplydc.text() or "1.0")
-            except ValueError:
-                dc = 1.0
+            # supplies: comma list of 'pin@dc' (one or many). A bare 'pin' defaults dc=1.0.
+            supplies = []
+            for tok in self.xf_supplies.text().split(","):
+                tok = tok.strip()
+                if not tok:
+                    continue
+                if "@" in tok:
+                    pin, dctxt = tok.split("@", 1)
+                    try:
+                        sdc = float(dctxt)
+                    except ValueError:
+                        sdc = 1.0
+                else:
+                    pin, sdc = tok, 1.0
+                if pin.strip():
+                    supplies.append({"pin": pin.strip(), "dc": sdc})
             gui = dict(
                 tb_lib=self.xf_tblib.text().strip(), tb_cell=self.xf_tbcell.text().strip(),
                 tb_view=self.xf_tbview.text().strip() or "schematic",
                 dut_inst=self.xf_inst.text().strip(),
                 dut_lib=self.xf_dutlib.text().strip() or self.xf_tblib.text().strip(),
                 dut_cell=self.xf_dutcell.text().strip(),
-                supply={"pin": self.xf_supply.text().strip(), "dc": dc},
+                supplies=supplies,
                 v_outs=_csl(self.xf_vouts.text()), i_outs=_csl(self.xf_iouts.text()),
                 ground=self.xf_ground.text().strip() or "VSS",
                 corner=self.xf_corner.text().strip() or "nom")
+            cpsrr = _csl(self.xf_cpsrr.text())
+            if cpsrr:
+                gui["current_psrr_supplies"] = cpsrr
             if vdc:
                 gui["vdc"] = vdc
             if ivsw:
@@ -1181,14 +1314,23 @@ if _HAVE_QT:
                 self._x_load()                            # reload + refresh the summary/plan
 
         def _x_run(self):
-            backend = self.x_backend.currentData()
-            if backend == "cluster":
-                QMessageBox.information(self, "Engine: cluster (Path B)",
-                    "Path B (pure-CLI dsub+alps, run_pmu_corner) is wired in the backend, but its "
-                    "per-group netlister (insituNetlistTest, ADE netlist-only) is a documented stub "
-                    "pending box validation (see PMU_CORNER_RUNBOOK §8). Use the 'ade' engine for a "
-                    "working end-to-end run today.")
+            mode = self.x_mode.currentData()
+            location = self.x_location.currentData()
+            engine = self.x_backend.currentData()
+            # Mode B (imported netlist) or any cluster run -> the Donau dsub path. The real
+            # submit is box-coupled (needs one netlist per measurement group); here we VALIDATE
+            # the inputs and PREVIEW the exact dsub command(s) -- pure, no execution.
+            if mode == "import" or location == "cluster":
+                self._x_cluster_preview(engine, mode)
                 return
+            # Mode A, local. ALPS is cluster-only -> never silently downgrade it to the fixture.
+            if engine == "alps":
+                QMessageBox.information(self, "Engine: ALPS",
+                    "ALPS runs on the cluster. Set 'Run on' = cluster (import a netlist in Mode B), "
+                    "or pick Engine = Spectre for a local CLI run.")
+                return
+            # the existing in-process worker (ade / spectre_cli).
+            backend = engine if engine in ("ade", "spectre_cli") else "spectre_cli"
             self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
             self.x_gate.setText("running…")
             self.x_prog.setValue(0); self.x_progmsg.setText("starting…")
@@ -1202,6 +1344,56 @@ if _HAVE_QT:
             self._xw.cancelled.connect(self._x_cancelled)
             self._xw.finished.connect(self._xw.deleteLater)   # reap the finished QThread
             self._xw.start()
+
+        def _x_cluster_preview(self, engine, mode):
+            """Mode-B / cluster: validate inputs and PREVIEW the exact Donau dsub command(s) for
+            every measurement group -- pure (no submit). Hands the user the commands to run/verify
+            on the box. A live submit is the box-coupled remainder (per-group netlists)."""
+            if getattr(self.extract, "manifest", None) is None:
+                QMessageBox.information(self, "Cluster run",
+                                        "Load a manifest first (…or load a manifest below).")
+                return
+            netdir = self.xb_netlist["edit"].text().strip()
+            pdk = self.xb_pdk["edit"].text().strip()
+            ahdl = self.xb_ahdl["edit"].text().strip()
+            if mode == "import" and not (netdir and pdk and ahdl):
+                QMessageBox.information(self, "Import netlist (Mode B)",
+                    "Mode B needs all three: the netlist dir (with input.scs), the PDK model dir, "
+                    "and the ahdllibdir (compiled VA). Fill them in the import group above.")
+                return
+            try:
+                from cluster import donau, alps_cli      # local import: offline-safe, no skillbridge
+                from insitu import run as _run
+                cfg = donau.DonauCfg(
+                    account=self.xd_account.text().strip() or "ug_rfic.rfSClass",
+                    queue=self.xd_queue.text().strip() or "short",
+                    resource=f"cpu={self.xd_cpu.value()};mem={self.xd_mem.value()}")
+                eng = "spectre" if engine == "spectre_cli" else "alps"
+                grps = _run.groups(self.extract.manifest)
+                L = [f"# Donau dsub PREVIEW — {len(grps)} measurement group(s), engine={eng}",
+                     f"#   -A {cfg.account}   -q {cfg.queue}   -R {shlex.quote(cfg.resource)}",
+                     f"#   netlistdir={netdir or '<set in Mode B>'}",
+                     f"#   pdk={pdk or '<set>'}   ahdllibdir={ahdl or '<set>'}", ""]
+                for g in grps:
+                    payload = alps_cli.build_sim_cmd(eng, "input.scs", "../psf",
+                                                     pdk or "<PDK_model_dir>",
+                                                     ahdl or "<ahdllibdir>", mt=cfg.cpu or 8)
+                    cmd = donau.build_dsub_cmd(cfg, payload, netdir or "<netlistdir>")
+                    # shlex.join: the resource 'cpu=N;mem=M' and any path with spaces MUST be
+                    # quoted or the shell splits on ';'/space (drops mem= silently) -- the whole
+                    # point is a copy-pasteable command.
+                    L += [f"## group {g['tag']}  ({g['analysis']})",
+                          shlex.join(str(x) for x in cmd), ""]
+                L += ["# ⚠ A single input.scs cannot serve all groups (each needs a distinct",
+                      "#   one-hot/analysis). A correct multi-measurement sweep needs ONE netlist",
+                      "#   per group — that wiring is box-coupled and pending. This preview is the",
+                      "#   command SHAPE; verify/submit on the box."]
+                self.x_report.setPlainText("\n".join(L))
+                self.x_gate.setText(f"cluster preview — {len(grps)} dsub command(s) above")
+                self.statusBar().showMessage(f"Previewed {len(grps)} Donau dsub command(s) "
+                                             f"(engine={eng}). No job submitted.")
+            except Exception as e:
+                QMessageBox.critical(self, "Cluster preview", f"{type(e).__name__}: {e}")
 
         def _x_progress(self, frac, msg):
             self.x_prog.setValue(max(0, min(100, int(frac * 100))))
@@ -2064,8 +2256,19 @@ def _selftest_pinform(tmp):
     sp_str = str(path)
     assert "/ldo_modeling/" in sp_str and "/simulation/" not in sp_str, \
         f"manifest must live in the workarea, not the designer spine: {sp_str}"
+    # multi-supply variant: gui['supplies']=[...] -> N supplies, current-PSRR defaults to ALL,
+    # first supply stays the model's LEFT input pin (single-supply path above unchanged).
+    mg = dict(gui); mg.pop("supply")
+    mg["supplies"] = [{"pin": "AVDD1P0", "dc": 1.0}, {"pin": "DVDD0P8", "dc": 0.8}]
+    mnm = {p: f"net_{p}" for p in [*(s["pin"] for s in mg["supplies"]),
+                                   *mg["v_outs"], *mg["i_outs"]]}
+    xc2 = ExtractCore()
+    xc2.build_manifest_from_gui(mg, netmap=mnm, work_root=str(tmp))
+    assert list(xc2.manifest["supplies"]) == ["avdd1p0", "dvdd0p8"], xc2.manifest["supplies"]
+    assert xc2.manifest["current_psrr_supplies"] == ["avdd1p0", "dvdd0p8"]
+    assert xc2._model_ports()[0] == "AVDD1P0", "first supply must be the model LEFT input"
     print(f"  pinform: gui+netmap -> manifest OK ({len(m['v_out'])}v+{len(m['i_out'])}i ports, "
-          f"{len(warns)} warning; model {sp} left / {gnd} bottom)")
+          f"{len(warns)} warning; model {sp} left / {gnd} bottom; multi-supply 2 rails OK)")
 
 
 def _selftest_extract(tmp):
@@ -2304,21 +2507,64 @@ def _selftest(require_qt=False):
                   f"({len([p for p in _pins if p])} current ports, selector+corner-gating OK)")
         else:
             print("  qt: current-port overlay skipped (no work_isrc/*.npz characterized)")
+        # Mode A/B + location/Donau visibility (offscreen: use isVisibleTo, not isVisible).
+        win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
+        assert win.x_grp_pinform.isVisibleTo(win) and not win.x_grp_modeb.isVisibleTo(win), \
+            "Mode A must show the pin form, hide the import group"
+        win.x_mode.setCurrentIndex(win.x_mode.findData("import")); app.processEvents()
+        assert win.x_grp_modeb.isVisibleTo(win) and not win.x_grp_pinform.isVisibleTo(win), \
+            "Mode B must show the import group, hide the pin form"
+        win.x_location.setCurrentIndex(win.x_location.findData("local")); app.processEvents()
+        assert not win.x_grp_donau.isVisibleTo(win), "Donau panel hidden when location=local"
+        win.x_location.setCurrentIndex(win.x_location.findData("cluster")); app.processEvents()
+        assert win.x_grp_donau.isVisibleTo(win), "Donau panel shown when location=cluster"
+        # multi-supply form parse: 'pin@dc, pin@dc' -> gui['supplies']
+        win.x_mode.setCurrentIndex(win.x_mode.findData("schematic"))
+        win.xf_supplies.setText("AVDD1P0@1.0, DVDD0P8@0.8"); win.xf_cpsrr.setText("AVDD1P0")
+        win.xf_ivsweep.setText("IBP_X=0:0.01:1.1")       # Cadence start:step:stop -> [vlo,vhi,step]
+        _g = win._form_gui()
+        assert [s["pin"] for s in _g["supplies"]] == ["AVDD1P0", "DVDD0P8"], _g["supplies"]
+        assert _g["supplies"][1]["dc"] == 0.8 and _g["current_psrr_supplies"] == ["AVDD1P0"]
+        assert _g["iv_sweep"]["IBP_X"] == [0.0, 1.1, 0.01], _g["iv_sweep"]
+        win.xf_ivsweep.setText("")
+        # Mode-B cluster dsub PREVIEW (pure, no submit): load a manifest, fill paths, preview.
+        win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
+        win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
+        win.x_backend.setCurrentIndex(win.x_backend.findData("alps"))
+        win.extract.load_manifest("pmu_top")
+        win.xb_netlist["edit"].setText(str(tmp)); win.xb_pdk["edit"].setText(str(tmp))
+        win.xb_ahdl["edit"].setText(str(tmp))
+        win.xd_cpu.setValue(16); win.xd_mem.setValue(16000)
+        win._x_run()                                 # x_run is in _live_btns -> only fires here
+        _rep = win.x_report.toPlainText()
+        # the dsub LINE itself must be shell-safe: resource quoted so ';' doesn't split it
+        assert any(l.startswith("dsub ") and "-R 'cpu=16;mem=16000'" in l
+                   for l in _rep.splitlines()), "cluster preview dsub line is not shell-safe (B1)"
+        win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
+        print("  qt: mode-split (pinform/import/Donau visibility) + multi-supply parse + "
+              "cluster dsub preview OK")
         # form-config persistence: type values -> autosave -> a FRESH window must restore them;
         # named save/load round-trips too. (LDO_CONFIG_DIR points at the temp dir set above.)
         win.xf_dutlib.setText("PMU_TOP"); win.xf_dutcell.setText("pmu_top")
         win.xf_vouts.setText("RAILA, RAILB"); win.xf_iouts.setText("IBIAS_X")
+        win.xf_supplies.setText("AVDD1P0@1.0, DVDD0P8@0.8")
         win.e_vref.setText("1.234"); win.x_session.setText("sess_XYZ")
         win.x_backend.setCurrentIndex(win.x_backend.findData("spectre_cli"))
+        win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
+        win.xb_netlist["edit"].setText("/tmp/net"); win.xd_cpu.setValue(32)
         win._save_autosave()
         win2 = MainWindow(ModelerCore())            # __init__ -> _load_autosave restores entries
         assert win2.xf_dutlib.text() == "PMU_TOP" and win2.xf_dutcell.text() == "pmu_top", \
             "autosave did not restore DUT lib/cell"
         assert win2.xf_vouts.text() == "RAILA, RAILB" and win2.xf_iouts.text() == "IBIAS_X", \
             "autosave did not restore voltage/current outputs"
+        assert win2.xf_supplies.text() == "AVDD1P0@1.0, DVDD0P8@0.8", "autosave did not restore supplies"
         assert win2.e_vref.text() == "1.234" and win2.x_session.text() == "sess_XYZ", \
             "autosave did not restore Profile vref / session"
         assert win2.x_backend.currentData() == "spectre_cli", "autosave did not restore the engine combo"
+        assert win2.x_mode.currentData() == "import", "autosave did not restore the mode"
+        assert win2.xb_netlist["edit"].text() == "/tmp/net", "autosave did not restore Mode-B netlist path"
+        assert win2.xd_cpu.value() == 32, "autosave did not restore the Donau cpu spinbox"
         named = pathlib.Path(tmp) / "cfg" / "named_demo.json"
         named.parent.mkdir(parents=True, exist_ok=True)
         named.write_text(json.dumps(dict(win._collect_config(), dut_cell="ROUNDTRIP")), encoding="utf-8")
