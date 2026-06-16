@@ -147,6 +147,24 @@ def test_no_ade_drops_flag():
     assert "-ade" not in cmd
 
 
+def test_ahdllibdir_optional_omitted():
+    # blank/None ahdllibdir -> NO -ahdllibdir (the sim auto-compiles VA from the netlist's
+    # own ahdl_include); the rest of the command is intact.
+    cmd = alps_cli.build_sim_cmd("alps", "input.scs", "o", "/pdk", None)
+    assert "-ahdllibdir" not in cmd
+    assert "-I" in cmd and "input.scs" in cmd and "-mt" in cmd
+
+
+def test_model_dir_optional_omitted():
+    # blank/None model_dir -> NO -I (the netlist's own include lines are self-contained).
+    cmd = alps_cli.build_sim_cmd("alps", "input.scs", "o", None, None)
+    assert "-I" not in cmd and "-ahdllibdir" not in cmd
+    assert "input.scs" in cmd and cmd[-1] == "-ade"
+    # spectre branch too
+    cmd2 = alps_cli.build_sim_cmd("spectre", "input.scs", "o")
+    assert "-I" not in cmd2 and "-ahdllibdir" not in cmd2 and "+aps" in cmd2
+
+
 # =====================================================================================
 # dsub wrapper golden: -A/-q/-R, -x all, -EP, payload last
 # =====================================================================================

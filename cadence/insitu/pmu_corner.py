@@ -169,18 +169,20 @@ def step_netlist(dirs, *, netlistdir=None, ahdllibdir=None, pdk_model_dir=None, 
     if not netlistdir:
         raise PmuCornerError(
             "step 4 (netlist) MVP needs a pre-built netlist handoff: pass netlistdir= (the "
-            "ADE work dir holding input.scs), ahdllibdir= (the compiled AHDL/VA DB), and "
-            "pdk_model_dir= (the PDK model root). On the company box, netlist the "
-            "<tb>_extract cellview in ADE (it pre-compiles the Verilog-A) and hand us those "
-            "three paths. [future hook: ADE-triggered netlisting from the augmented TB]")
-    if not ahdllibdir or not pdk_model_dir:
-        raise PmuCornerError(
-            "step 4 (netlist): netlistdir given but ahdllibdir= and/or pdk_model_dir= missing "
-            "-- run_corner needs the compiled -ahdllibdir and the PDK model root.")
+            "ADE work dir holding input.scs). On the company box, netlist the <tb>_extract "
+            "cellview in ADE and hand us that path. [future hook: ADE-triggered netlisting "
+            "from the augmented TB]")
+    # ahdllibdir + pdk_model_dir are OPTIONAL: the netlist's own `ahdl_include`/`include` lines
+    # let the simulator auto-compile the VA and resolve models. Provide ahdllibdir only to reuse
+    # a pre-compiled cache; provide pdk_model_dir only if the netlist needs an -I model tree.
+    extras = [x for x in (("ahdllibdir", ahdllibdir), ("pdk_model_dir", pdk_model_dir)) if x[1]]
     _progress(progress, "netlist",
-              f"handoff netlist dir: {netlistdir}  (ahdllibdir + pdk_model_dir provided)")
-    return dict(netlistdir=str(netlistdir), ahdllibdir=str(ahdllibdir),
-                pdk_model_dir=str(pdk_model_dir))
+              f"handoff netlist dir: {netlistdir}"
+              + (f"  (+{', '.join(k for k, _ in extras)})" if extras else
+                 "  (no ahdllibdir/pdk -- simulator resolves VA+models from the netlist)"))
+    return dict(netlistdir=str(netlistdir),
+                ahdllibdir=str(ahdllibdir) if ahdllibdir else None,
+                pdk_model_dir=str(pdk_model_dir) if pdk_model_dir else None)
 
 
 def ade_group_netlist(ws, session, test, m, group, outdir):

@@ -45,7 +45,7 @@ def _alps_exe(alps_wrapper):
     return w + "/bin/alps"
 
 
-def build_sim_cmd(engine, input_scs, out_psf, model_dir, ahdllibdir, mt=8,
+def build_sim_cmd(engine, input_scs, out_psf, model_dir=None, ahdllibdir=None, mt=8,
                   alps_wrapper=ALPS_WRAPPER_DEFAULT, ade=True):
     """Return the engine command as an argv list (the payload Donau's dsub wraps).
 
@@ -53,25 +53,30 @@ def build_sim_cmd(engine, input_scs, out_psf, model_dir, ahdllibdir, mt=8,
     input_scs     the Spectre-syntax netlist (positional first arg, e.g. 'input.scs')
     out_psf       output dir (alps: -o ; spectre: -raw). Relative is fine -- it is resolved
                   against the node cwd (dsub -EP <netlistdir>), matching ADE's `-o ../psf`.
-    model_dir     PDK model ROOT containing the per-engine subtree {alps,spectre}; the
-                  engine's own subtree is appended to -I (§1d). If model_dir already ends in
-                  the engine name it is used as-is (caller passed the leaf tree directly).
-    ahdllibdir    compiled AHDL/VA model DB (-ahdllibdir), e.g. .../input.ahdlSimDB
+    model_dir     OPTIONAL PDK model ROOT containing the per-engine subtree {alps,spectre};
+                  the engine's own subtree is appended to -I (§1d). If model_dir already ends in
+                  the engine name it is used as-is. Omit (None) when the netlist's own `include`
+                  paths are self-contained -> no -I is added.
+    ahdllibdir    OPTIONAL compiled AHDL/VA model DB (-ahdllibdir), e.g. .../input.ahdlSimDB.
+                  Omit (None) and the simulator AUTO-COMPILES the Verilog-A from the netlist's
+                  own `ahdl_include` lines (default cache next to the netlist). Provide it only
+                  to REUSE a pre-compiled cache (skip per-run/per-node recompile). NOT required.
     mt            sim threads; MUST equal Donau cpu=N (§1c)
     alps_wrapper  ALPS install root (-> <root>/bin/alps); ignored for spectre
     ade           ALPS only: add -ade (ADE-style names + .simDone sentinel). Default True.
     """
     if engine not in ("alps", "spectre"):
         raise ValueError(f"unknown engine {engine!r} (expected 'alps' or 'spectre')")
-    model_tree = _engine_model_tree(model_dir, engine)
+    inc = ["-I", _engine_model_tree(model_dir, engine)] if model_dir else []
+    ahdl = ["-ahdllibdir", str(ahdllibdir)] if ahdllibdir else []
     if engine == "alps":
         cmd = [
             _alps_exe(alps_wrapper),
             str(input_scs),                 # positional netlist (§1b)
             "-format", "ps",                # classic PSF (hidden flag; NOT psfxl) (§1b)
             "-o", str(out_psf),             # output dir, relative to node cwd (§1c)
-            "-I", model_tree,               # alps PDK tree ONLY -> unambiguous models (§1d)
-            "-ahdllibdir", str(ahdllibdir),  # compiled AHDL/VA DB (§1c)
+            *inc,                           # alps PDK tree (only if model_dir given) (§1d)
+            *ahdl,                          # compiled AHDL/VA DB (only if provided) (§1c)
             "-mt", str(int(mt)),            # threads == Donau cpu=N (§1c)
         ]
         if ade:
@@ -84,8 +89,8 @@ def build_sim_cmd(engine, input_scs, out_psf, model_dir, ahdllibdir, mt=8,
         str(input_scs),                     # positional netlist
         "-format", "psfascii",              # classic PSF (ascii); NOT psfxl (§8)
         "-raw", str(out_psf),               # spectre output-dir flag is -raw (§8)
-        "-I", model_tree,                   # spectre PDK tree (§8)
-        "-ahdllibdir", str(ahdllibdir),
+        *inc,                               # spectre PDK tree (only if model_dir given) (§8)
+        *ahdl,
         f"+mt={int(mt)}",                   # spectre threads syntax (§8)
         "+aps",                             # APS turbo (§8)
     ]

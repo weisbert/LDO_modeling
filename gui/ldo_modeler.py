@@ -1031,21 +1031,24 @@ if _HAVE_QT:
                 "simulator runs). In Mode A, ADE generates this for you; in Mode B you bring it.")
             bf.addRow("Netlist dir (input.scs) *", self.xb_netlist["w"])
             self.xb_pdk = self._path_row("xb_pdk", dir_only=True)
+            self.xb_pdk["edit"].setPlaceholderText("optional — only if the netlist needs an -I model tree")
             self.xb_pdk["edit"].setToolTip(
-                "The PDK model ROOT (its {alps,spectre} subtree is added to the sim's -I). The "
-                "device models (BSIM, etc.) your netlist references.")
-            bf.addRow("PDK model dir *", self.xb_pdk["w"])
+                "OPTIONAL. The PDK model ROOT (its {alps,spectre} subtree is added to the sim's "
+                "-I). Leave BLANK if the netlist's own `include` lines already point at the models "
+                "(self-contained). Fill it only when the netlist uses a bare include that needs -I.")
+            bf.addRow("PDK model dir (optional)", self.xb_pdk["w"])
             self.xb_ahdl = self._path_row("xb_ahdl", dir_only=True)
+            self.xb_ahdl["edit"].setPlaceholderText("optional — blank ⇒ simulator compiles VA from the netlist")
             self.xb_ahdl["edit"].setToolTip(
-                "ahdllibdir = the PRE-COMPILED Verilog-A library (the ahdlcmi cache, e.g. "
-                "input.ahdlSimDB). If your design has Verilog-A models, Spectre/ALPS must compile "
-                "them to native code before simulating; this dir is that compiled cache, passed as "
-                "-ahdllibdir. Compile once, point every cluster node at it (no recompile per job, no "
-                "compiler needed on the node). ADE manages this in Mode A; in Mode B you supply it.")
-            bf.addRow("ahdllibdir (compiled VA) *", self.xb_ahdl["w"])
-            _mbhint = QLabel("Mode B reuses the manifest above (Load it). A SINGLE input.scs is "
-                             "dry/plan-only — a real multi-measurement sweep needs one netlist per "
-                             "group (box-coupled, pending).")
+                "OPTIONAL. ahdllibdir = a PRE-COMPILED Verilog-A cache (-ahdllibdir). You DON'T "
+                "need it: the netlist's own `ahdl_include` lines let the simulator auto-compile the "
+                "VA itself. Provide a dir only to REUSE a pre-compiled cache (skip per-run/per-node "
+                "recompile on the cluster). Blank ⇒ the simulator compiles from the netlist.")
+            bf.addRow("ahdllibdir (optional)", self.xb_ahdl["w"])
+            _mbhint = QLabel("Only the netlist dir is required — the simulator reads VA + model "
+                             "locations from the netlist's own ahdl_include/include lines. A SINGLE "
+                             "input.scs is dry/plan-only; a real multi-measurement sweep needs one "
+                             "netlist per group (box-coupled, pending).")
             _mbhint.setWordWrap(True); _mbhint.setStyleSheet("color:#a40; font-size:11px;")
             bf.addRow(_mbhint)
             outer.addWidget(self.x_grp_modeb)
@@ -1376,10 +1379,11 @@ if _HAVE_QT:
             netdir = self.xb_netlist["edit"].text().strip()
             pdk = self.xb_pdk["edit"].text().strip()
             ahdl = self.xb_ahdl["edit"].text().strip()
-            if mode == "import" and not (netdir and pdk and ahdl):
+            if mode == "import" and not netdir:
                 QMessageBox.information(self, "Import netlist (Mode B)",
-                    "Mode B needs all three: the netlist dir (with input.scs), the PDK model dir, "
-                    "and the ahdllibdir (compiled VA). Fill them in the import group above.")
+                    "Mode B needs the netlist dir (with input.scs). PDK model dir and ahdllibdir "
+                    "are OPTIONAL — the simulator resolves the models and compiles the Verilog-A "
+                    "from the netlist's own include/ahdl_include lines if you leave them blank.")
                 return
             try:
                 from cluster import donau, alps_cli      # local import: offline-safe, no skillbridge
@@ -1393,11 +1397,13 @@ if _HAVE_QT:
                 L = [f"# Donau dsub PREVIEW — {len(grps)} measurement group(s), engine={eng}",
                      f"#   -A {cfg.account}   -q {cfg.queue}   -R {shlex.quote(cfg.resource)}",
                      f"#   netlistdir={netdir or '<set in Mode B>'}",
-                     f"#   pdk={pdk or '<set>'}   ahdllibdir={ahdl or '<set>'}", ""]
+                     f"#   pdk={pdk or '(none — netlist self-contained)'}   "
+                     f"ahdllibdir={ahdl or '(none — sim auto-compiles VA)'}", ""]
                 for g in grps:
+                    # blank pdk/ahdl -> None -> the -I / -ahdllibdir flags are omitted, and the
+                    # simulator resolves models + compiles VA from the netlist itself.
                     payload = alps_cli.build_sim_cmd(eng, "input.scs", "../psf",
-                                                     pdk or "<PDK_model_dir>",
-                                                     ahdl or "<ahdllibdir>", mt=cfg.cpu or 8)
+                                                     pdk or None, ahdl or None, mt=cfg.cpu or 8)
                     cmd = donau.build_dsub_cmd(cfg, payload, netdir or "<netlistdir>")
                     # shlex.join: the resource 'cpu=N;mem=M' and any path with spaces MUST be
                     # quoted or the shell splits on ';'/space (drops mem= silently) -- the whole
@@ -2560,6 +2566,17 @@ def _selftest(require_qt=False):
         # the dsub LINE itself must be shell-safe: resource quoted so ';' doesn't split it
         assert any(l.startswith("dsub ") and "-R 'cpu=16;mem=16000'" in l
                    for l in _rep.splitlines()), "cluster preview dsub line is not shell-safe (B1)"
+        # ahdllibdir/PDK are OPTIONAL: blank -> the -ahdllibdir / -I flags are omitted (the sim
+        # auto-compiles VA + resolves models from the netlist itself), and the preview still runs.
+        win.xb_ahdl["edit"].setText(""); win.xb_pdk["edit"].setText("")
+        win._x_run()
+        _rep2 = win.x_report.toPlainText()
+        _dl = next(l for l in _rep2.splitlines() if l.startswith("dsub "))
+        # (the dsub command itself uses -I to introduce its payload, so only -ahdllibdir / the
+        # model tree are checked) blank ahdllibdir/PDK -> no -ahdllibdir, no PDK model tree
+        assert "-ahdllibdir" not in _dl, "blank ahdllibdir must drop -ahdllibdir"
+        assert "-format ps -o ../psf -mt" in _dl, "blank PDK must drop the model -I (no tree between -o and -mt)"
+        win.xb_pdk["edit"].setText(str(tmp)); win.xb_ahdl["edit"].setText(str(tmp))
         win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
         print("  qt: mode-split (pinform/import/Donau visibility) + multi-supply parse + "
               "cluster dsub preview OK")
