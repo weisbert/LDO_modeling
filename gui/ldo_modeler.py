@@ -867,17 +867,20 @@ if _HAVE_QT:
             gf.addRow("Current outputs", self.xf_iouts)
             self.xf_vdc = QLineEdit()
             self.xf_vdc.setPlaceholderText("optional: IBP_POLY_500N_VCO_Fit=0.9, IBP_POLY_1P8U_VCO=0.85")
-            self.xf_vdc.setToolTip("Per current-output COMPLIANCE voltage (the probe forces this dc "
-                                   "at the pin — it replaces the node driver). Omit → 0 V clamp + a "
-                                   "warning. Voltage outputs need NO bias here: their Zout probe is "
-                                   "AC-only (dc=0), so the TB's own load biases the rail (true in-situ).")
+            self.xf_vdc.setToolTip("Per current-output COMPLIANCE voltage = the pin's normal "
+                                   "operating bias voltage. A current port FORCES a voltage and "
+                                   "MEASURES current (V/I dual), so the probe holds the pin at this "
+                                   "dc and reads Idc there — it's the operating point Idc/I-V are "
+                                   "defined at (NOT the current value). Omit → 0 V clamp + a warning. "
+                                   "Voltage outputs need NO bias here (their Zout probe is AC-only, "
+                                   "dc=0, so the TB's own load biases the rail — true in-situ).")
             gf.addRow("I-out compliance vdc", self.xf_vdc)
             self.xf_ivsweep = QLineEdit()
-            self.xf_ivsweep.setPlaceholderText("optional: IBP_POLY_1P8U_VCO=0:1.1:0.01, IBP_PTAT_TUNE_1P5U_VCO=auto")
-            self.xf_ivsweep.setToolTip("Per current-output I-V compliance-knee sweep (G5): "
-                                       "'pin=vlo:vhi:step' or 'pin=auto' (0 → supply+margin). "
-                                       "Blank → characterize the single OP only (no knee). "
-                                       "User-defined so the harness serves any project's pins.")
+            self.xf_ivsweep.setPlaceholderText("optional: IBP_POLY_1P8U_VCO=0:0.01:1.1, IBP_PTAT_TUNE_1P5U_VCO=auto")
+            self.xf_ivsweep.setToolTip("Per current-output I-V compliance-knee sweep (G5), "
+                                       "Cadence order: 'pin=start:step:stop' (e.g. 0:0.01:1.1) "
+                                       "or 'pin=auto' (0 → supply+margin). Blank → the single OP "
+                                       "only (no knee). User-defined so the harness serves any project's pins.")
             gf.addRow("I-out I-V sweep", self.xf_ivsweep)
             self.xf_temps = QLineEdit()
             self.xf_temps.setPlaceholderText("optional: -40, 55, 125   (°C; middle = nominal)")
@@ -1003,7 +1006,8 @@ if _HAVE_QT:
                         vdc[k.strip()] = float(v)
                     except ValueError:
                         pass
-            # per-i_out I-V sweep: "pin=vlo:vhi:step" or "pin=auto"
+            # per-i_out I-V sweep: "pin=start:step:stop" (Cadence convention) or "pin=auto".
+            # The manifest stores [vlo, vhi, step]; the USER types start:step:stop, so reorder.
             ivsw = {}
             for tok in self.xf_ivsweep.text().split(","):
                 tok = tok.strip()
@@ -1015,9 +1019,14 @@ if _HAVE_QT:
                     ivsw[k] = "auto"
                 else:
                     try:
-                        ivsw[k] = [float(x) for x in v.split(":")]
+                        nums = [float(x) for x in v.split(":")]
                     except ValueError:
-                        pass
+                        continue
+                    if len(nums) == 3:                       # start:step:stop -> [vlo, vhi, step]
+                        start, step, stop = nums
+                        ivsw[k] = [start, stop, step]
+                    else:
+                        ivsw[k] = nums                       # 2-token / non-standard: keep as typed
             # temperature points (°C)
             temps = []
             for t in self.xf_temps.text().split(","):
