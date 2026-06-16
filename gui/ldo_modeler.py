@@ -973,14 +973,22 @@ if _HAVE_QT:
             gf.addRow(self.xf_build)
             outer.addWidget(gb)
 
-            # ---- or load a manifest directly (power users) ------------------------------
+            # ---- the MANIFEST: the resolved pin-role + measurement contract -------------
+            mhdr = QLabel("<b>Manifest</b> — the pin-role + measurement contract (which nets to "
+                          "probe, what to measure). <b>Mode A</b> builds it from the form above; "
+                          "<b>Mode B</b>: Load/Browse your prepared one here (required).")
+            mhdr.setWordWrap(True); mhdr.setStyleSheet("color:#345; margin-top:6px;")
+            outer.addWidget(mhdr)
             form = QFormLayout(); outer.addLayout(form)
             self.x_manifest = QLineEdit("pmu_top")
-            self.x_manifest.setToolTip("Manifest name (resolved in cadence/insitu/manifests/) "
-                                       "or a path to a manifest JSON. The form above writes here.")
+            self.x_manifest.setToolTip("A manifest name (resolved under cadence/insitu/manifests/, "
+                                       "e.g. pmu_top) OR a path to a manifest JSON. In Mode A the "
+                                       "pin form writes here; in Mode B you point at your own.")
             row = QHBoxLayout(); row.addWidget(self.x_manifest)
             b_browse = QPushButton("Browse…"); b_browse.clicked.connect(self._x_browse)
+            b_browse.setToolTip("Pick a manifest JSON file from disk.")
             b_load = QPushButton("Load"); b_load.clicked.connect(self._x_load)
+            b_load.setToolTip("Load the manifest above (enables Build & Run / the cluster preview).")
             b_edit = QPushButton("Edit…"); b_edit.clicked.connect(self._x_edit)
             b_edit.setToolTip("Open the manifest JSON in an editor: re-tag pins when you "
                               "switch LDOs, Validate, then Save (reloads here).")
@@ -988,7 +996,7 @@ if _HAVE_QT:
             b_new.setToolTip("Start a fresh manifest from a commented template.")
             for b in (b_browse, b_load, b_edit, b_new):
                 row.addWidget(b)
-            rw = QWidget(); rw.setLayout(row); form.addRow("…or load a manifest", rw)
+            rw = QWidget(); rw.setLayout(row); form.addRow("Manifest", rw)
             # Engine (the simulator) and run-location (where it runs) are now SEPARATE.
             self.x_backend = QComboBox()
             self.x_backend.addItem("ADE — live Maestro (rides Job Setup)", "ade")
@@ -1018,10 +1026,22 @@ if _HAVE_QT:
             self.x_grp_modeb = QGroupBox("1b · Import netlist + PDK (Mode B — no skillbridge)")
             bf = QFormLayout(self.x_grp_modeb)
             self.xb_netlist = self._path_row("xb_netlist", dir_only=True)
+            self.xb_netlist["edit"].setToolTip(
+                "The ADE/work dir holding the Spectre-syntax netlist input.scs (the deck the "
+                "simulator runs). In Mode A, ADE generates this for you; in Mode B you bring it.")
             bf.addRow("Netlist dir (input.scs) *", self.xb_netlist["w"])
             self.xb_pdk = self._path_row("xb_pdk", dir_only=True)
+            self.xb_pdk["edit"].setToolTip(
+                "The PDK model ROOT (its {alps,spectre} subtree is added to the sim's -I). The "
+                "device models (BSIM, etc.) your netlist references.")
             bf.addRow("PDK model dir *", self.xb_pdk["w"])
             self.xb_ahdl = self._path_row("xb_ahdl", dir_only=True)
+            self.xb_ahdl["edit"].setToolTip(
+                "ahdllibdir = the PRE-COMPILED Verilog-A library (the ahdlcmi cache, e.g. "
+                "input.ahdlSimDB). If your design has Verilog-A models, Spectre/ALPS must compile "
+                "them to native code before simulating; this dir is that compiled cache, passed as "
+                "-ahdllibdir. Compile once, point every cluster node at it (no recompile per job, no "
+                "compiler needed on the node). ADE manages this in Mode A; in Mode B you supply it.")
             bf.addRow("ahdllibdir (compiled VA) *", self.xb_ahdl["w"])
             _mbhint = QLabel("Mode B reuses the manifest above (Load it). A SINGLE input.scs is "
                              "dry/plan-only — a real multi-measurement sweep needs one netlist per "
