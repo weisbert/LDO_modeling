@@ -190,6 +190,30 @@ class ModelerCore:
                     Sm=fit_model.predict(self.result.P[il], cg["fn"], self.result.nfk,
                                          nfkv=nfkv, nmode=nmode)["noise"])
 
+    # ---- current ports (bias sinks/sources): the V/I-dual overlay -----------------
+    def current_ports(self):
+        """Pin names of the current ports carried by the loaded ref ([] if none / no ref).
+        These are the bias sink/source outputs the Compare tab plots with I-V/Y/PSRR/noise
+        instead of Zout (V/I duality)."""
+        if self.ref is None:
+            return []
+        import current_digest
+        return current_digest.list_iports(self.ref)
+
+    def current_compare(self, pin):
+        """One current port's GT arrays + analytic model curves + fit-vs-GT metrics, for the
+        Compare-tab overlay. Pure-numpy (current_digest.port_view + fit_isrc); no simulator,
+        no voltage FitResult needed -- current ports live in the ref independently."""
+        import current_digest, fit_isrc
+        v = current_digest.port_view(self.ref, pin)
+        p = fit_isrc.fit_isrc(v)
+        return dict(view=v, params=p, metrics=current_digest.diff_metrics(v, p),
+                    iv_model=fit_isrc.predict_iv(p, v["iv_v"]),
+                    y_model=fit_isrc.predict_y(p, v["ac_f"]),
+                    psrr_model=fit_isrc.predict_psrr(p, v["psrr_f"]),
+                    noise_model=fit_isrc.predict_noise(p, v["nz_f"]),
+                    idcT_model=fit_isrc.predict_idcT(p, v["temps"]))
+
     def text_report(self, outdir=None):
         """Analytic text MODEL-vs-GT difference report (report.build_report) for the current
         fit -- the copy-pasteable diagnosis built for an airgapped red zone where you can't
@@ -387,7 +411,7 @@ try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                                  QHBoxLayout, QFormLayout, QGridLayout, QLabel, QLineEdit,
                                  QPushButton, QComboBox, QCheckBox, QFileDialog, QTextEdit,
-                                 QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox)
+                                 QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox, QScrollArea)
     import matplotlib
     matplotlib.use("Qt5Agg")
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -402,7 +426,9 @@ if _HAVE_QT:
 
     class _Canvas(FigureCanvas):
         def __init__(self, nrows=1, ncols=1, figsize=(7, 5)):
-            self.fig = Figure(figsize=figsize, tight_layout=True)
+            # constrained_layout (not tight_layout) re-solves spacing on every resize, so the
+            # panels never overlap/pile up ("积压") when the canvas is squeezed in a stacked tab.
+            self.fig = Figure(figsize=figsize, constrained_layout=True)
             super().__init__(self.fig)
             self.axes = self.fig.subplots(nrows, ncols, squeeze=False)
 
@@ -1204,6 +1230,7 @@ if _HAVE_QT:
             self.e_esr.setText("" if p.esr is None or np.isnan(p.esr) else str(p.esr))
             self._rebuild_import_grid()
             self.cmp_corner.clear(); self.cmp_corner.addItems(p.loads)
+            self._refresh_compare_ports()
 
         # --- Tab 2: Import -------------------------------------------------------
         def _tab_import(self):
@@ -1237,7 +1264,16 @@ if _HAVE_QT:
             b_hint.clicked.connect(self._show_guidance)
             opts.addWidget(b_hint)
             lay.addLayout(opts)
-            self.grid_host = QWidget(); lay.addWidget(self.grid_host)
+            # the file-path grid can be many rows (quantities x corners) -- put it in its OWN
+            # scroll area so a tall grid can never push the preview plot off-screen or squeeze
+            # it to a sliver (the "积压" bug: tall grid + warn box + plot in one non-scrolling
+            # column). The grid scrolls internally; the preview keeps its height below.
+            self.grid_host = QWidget()
+            grid_scroll = QScrollArea(); grid_scroll.setWidgetResizable(True)
+            grid_scroll.setWidget(self.grid_host)
+            grid_scroll.setMaximumHeight(300)
+            grid_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            lay.addWidget(grid_scroll)
             self._rebuild_import_grid()
             row = QHBoxLayout()
             b_imp = QPushButton("Import + preview   →   go to Fit")
@@ -1245,8 +1281,12 @@ if _HAVE_QT:
             row.addWidget(b_imp); row.addStretch(1)
             lay.addLayout(row)
             self.warn_box = QTextEdit(); self.warn_box.setReadOnly(True)
-            self.warn_box.setMaximumHeight(120); lay.addWidget(self.warn_box)
-            self.imp_canvas = _Canvas(1, 3, figsize=(11, 2.8)); lay.addWidget(self.imp_canvas)
+            self.warn_box.setMaximumHeight(110); lay.addWidget(self.warn_box)
+            # preview: firm minimum height so the grid above can't squeeze it; constrained_layout
+            # (in _Canvas) keeps the 3 panels from overlapping when the window is small.
+            self.imp_canvas = _Canvas(1, 3, figsize=(11, 3.0))
+            self.imp_canvas.setMinimumHeight(240)
+            lay.addWidget(self.imp_canvas)
             return w
 
         def _show_guidance(self):
@@ -1362,6 +1402,7 @@ if _HAVE_QT:
                        " — you can fit once these are added.\n") + txt
             self.warn_box.setText(txt)
             self._preview()
+            self._refresh_compare_ports()        # surface any current ports the new ref carries
             self.b_emit.setEnabled(False)        # new data invalidates any prior fit -> must re-Fit
             self.statusBar().showMessage(f"Imported → {path.name}. → go to Fit (Tab 3).")
 
@@ -1455,6 +1496,7 @@ if _HAVE_QT:
                 f"Cout={result.cout*1e12:.1f}pF ESR={result.esr:.3f}ohm "
                 f"noise corners={['%.3g'%x for x in result.nfk]} spurs={len(result.spur_f)}")
             self.statusBar().showMessage("Fit complete.")
+            self._refresh_compare_ports()
             self._refresh_compare()
 
         def _fit_failed(self, msg):
@@ -1495,21 +1537,117 @@ if _HAVE_QT:
         def _tab_compare(self):
             w = QWidget(); lay = QVBoxLayout(w)
             row = QHBoxLayout()
+            # PORT selector: one port at a time (voltage output, or a current bias port) so a
+            # multi-port PMU never piles every quantity onto one figure. Voltage -> Zout/PSRR/
+            # noise (corner-swept); current -> I-V/Y/PSRR/noise/Idc(T) (V/I dual). userData =
+            # None for the voltage output, the pin string for a current port.
+            row.addWidget(QLabel("port:"))
+            self.cmp_port = QComboBox()
+            self.cmp_port.setToolTip("Pick which modeled output to overlay. Current ports show "
+                                     "I-V / admittance / current-PSRR / current-noise / Idc(T) "
+                                     "instead of Zout (current ports measure I, not V).")
+            self.cmp_port.currentIndexChanged.connect(self._on_cmp_port)
+            row.addWidget(self.cmp_port)
+            row.addSpacing(12)
             row.addWidget(QLabel("corner:"))
             self.cmp_corner = QComboBox(); self.cmp_corner.addItems(self.core.profile.loads)
             self.cmp_corner.currentIndexChanged.connect(self._refresh_compare)
             row.addWidget(self.cmp_corner); row.addStretch(1)
             self.cmp_report_btn = QPushButton("Save text report…")
             self.cmp_report_btn.setToolTip("Write the plain-text model-vs-GT difference report "
-                                           "(copy-pasteable diagnosis; no screenshot needed).")
+                                           "(voltage [7] + current [8]; copy-pasteable diagnosis).")
             self.cmp_report_btn.clicked.connect(self._save_text_report)
             row.addWidget(self.cmp_report_btn)
             lay.addLayout(row)
-            self.cmp_canvas = _Canvas(2, 3, figsize=(11, 6)); lay.addWidget(self.cmp_canvas)
+            self.cmp_canvas = _Canvas(2, 3, figsize=(11, 6))
+            self.cmp_canvas.setMinimumHeight(380)
+            lay.addWidget(self.cmp_canvas)
             self.cmp_err = QLabel("Fit a model to see the overlay."); lay.addWidget(self.cmp_err)
+            self._refresh_compare_ports()
             return w
 
+        def _refresh_compare_ports(self):
+            """Repopulate the port selector from the loaded ref (voltage output + any current
+            ports). Called after import / fit / --ref. Preserves the current selection."""
+            if not hasattr(self, "cmp_port"):
+                return
+            keep = self.cmp_port.currentData() if self.cmp_port.count() else None
+            self.cmp_port.blockSignals(True)
+            self.cmp_port.clear()
+            self.cmp_port.addItem("Vout · voltage", None)
+            for pin in self.core.current_ports():
+                self.cmp_port.addItem(f"{pin} · current", pin)
+            idx = self.cmp_port.findData(keep)
+            self.cmp_port.setCurrentIndex(idx if idx >= 0 else 0)
+            self.cmp_port.blockSignals(False)
+            self._sync_corner_enabled()
+
+        def _sync_corner_enabled(self):
+            """The corner picker only applies to the voltage output; grey it out for current
+            ports (their temp axis is the Idc(T) panel, not a load corner)."""
+            if hasattr(self, "cmp_corner"):
+                self.cmp_corner.setEnabled(self.cmp_port.currentData() is None)
+
+        def _on_cmp_port(self):
+            self._sync_corner_enabled()
+            self._refresh_compare()
+
+        def _draw_current_compare(self, pin):
+            """V/I-dual overlay for one current port: I-V knee / |Y| / current-noise /
+            current-PSRR / Idc(T) + a fit-vs-GT metric box. Pure-numpy via core.current_compare."""
+            ax = self.cmp_canvas.axes
+            self.cmp_canvas.clear()
+            try:
+                d = self.core.current_compare(pin)
+            except Exception as e:
+                self.cmp_canvas.draw()
+                self.cmp_err.setText(f"current port {pin}: {e}")
+                return
+            v, p, m = d["view"], d["params"], d["metrics"]
+            ax[0, 0].plot(v["iv_v"], v["iv_i"] * 1e6, label="GT", lw=2)
+            ax[0, 0].plot(v["iv_v"], d["iv_model"] * 1e6, "--", label="model")
+            ax[0, 0].axvline(v["vc"], color="k", ls=":", lw=.8)
+            ax[0, 0].set_title("I-V compliance knee")   # pin/pol shown in the metric box + status line
+            ax[0, 0].set_xlabel("Vo [V]"); ax[0, 0].set_ylabel("I [µA]")
+            ax[0, 1].loglog(v["ac_f"], np.abs(v["ac_y"]), label="GT", lw=2)
+            ax[0, 1].loglog(v["ac_f"], np.abs(d["y_model"]), "--", label="model")
+            ax[0, 1].set_title("|Y| admittance [S]"); ax[0, 1].set_xlabel("Hz")
+            ax[0, 2].loglog(v["nz_f"], v["nz_in"] * 1e15, label="GT", lw=2)
+            ax[0, 2].loglog(v["nz_f"], d["noise_model"] * 1e15, "--", label="model")
+            ax[0, 2].set_title("current noise In [fA/√Hz]"); ax[0, 2].set_xlabel("Hz")
+            ax[1, 0].loglog(v["psrr_f"], np.abs(v["psrr_g"]), label="GT", lw=2)
+            ax[1, 0].loglog(v["psrr_f"], np.abs(d["psrr_model"]), "--", label="model")
+            ax[1, 0].set_title("current-PSRR |dI/dVdd| [S]"); ax[1, 0].set_xlabel("Hz")
+            ax[1, 1].plot(v["temps"], v["idcT"] * 1e6, "o-", label="GT", lw=2)
+            ax[1, 1].plot(v["temps"], d["idcT_model"] * 1e6, "s--", label="model")
+            ax[1, 1].set_title("Idc(T) [µA]"); ax[1, 1].set_xlabel("T [°C]")
+            sign = "OK" if m["sign_ok"] else f"FLIP! ({m['gdd_sign']} vs GT {m['gt_sign']})"
+            ax[1, 2].axis("off")
+            ax[1, 2].text(0.0, 0.98,
+                          f"port {pin}  ({v['pol']})\n\n"
+                          f"Idc       = {m['idc_ua']:.3f} µA\n"
+                          f"I-V  RMS  = {m['ivrms']:.2f} %\n"
+                          f"rout      = {m['rout_M']:.1f} MΩ\n"
+                          f"Cp        = {m['cp_fF']:.1f} fF\n"
+                          f"gdd       = {m['gdd_nS']:+.3f} nS\n"
+                          f"PSRR sign = {sign}\n"
+                          f"PSRR RMS  = {m['prms']:.2f} dB\n"
+                          f"noise RMS = {m['nrms']:.2f} dB\n"
+                          f"PTAT g/m  = {m['ptat_g']:.3f} / {m['ptat_m']:.3f}",
+                          fontsize=9, family="monospace", va="top")
+            for a in (ax[0, 0], ax[0, 1], ax[0, 2], ax[1, 0], ax[1, 1]):
+                a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+            self.cmp_canvas.draw()
+            sf = "sign OK" if m["sign_ok"] else "SIGN FLIP"
+            self.cmp_err.setText(f"current port {pin} ({v['pol']}):  IVrms={m['ivrms']:.2f}%  "
+                                 f"PSRR {sf}  Prms={m['prms']:.2f}dB  noiseRMS={m['nrms']:.2f}dB  "
+                                 f"PTAT GT/model={m['ptat_g']:.3f}/{m['ptat_m']:.3f}")
+
         def _refresh_compare(self):
+            pin = self.cmp_port.currentData() if hasattr(self, "cmp_port") else None
+            if pin is not None:                       # a current port -> V/I-dual overlay
+                self._draw_current_compare(pin)
+                return
             if self.core.result is None:
                 return
             il = self.cmp_corner.currentText() or self.core.result.loads[0]
@@ -1998,6 +2136,30 @@ def _selftest(require_qt=False):
         shot.parent.mkdir(parents=True, exist_ok=True)
         ok_shot = bool(win.grab().save(str(shot)))
         win.cmp_canvas.fig.savefig(ROOT / "work" / "gui_selftest_out" / "gui_overlay.png", dpi=110)
+        # current-port overlay (Tab 4, V/I-dual): embed offline current GT into the ref, refresh
+        # the port selector, render + screenshot one current port. Skips cleanly if the offline
+        # GT library (work_isrc) hasn't been characterized; exercises+asserts the path when present.
+        import glob as _glob
+        _srcs = sorted(_glob.glob(str(ROOT / "work_isrc" / "*.npz")))
+        if _srcs and isinstance(win.core.ref, dict):
+            import current_digest as _cd
+            _pmos = next((s for s in _srcs if "pmos" in s), _srcs[-1])
+            for _pin, _f in (("IBP_DEMO_SINK", _srcs[0]), ("IBP_DEMO_SRC", _pmos)):
+                _cd.embed_port(win.core.ref, _pin,
+                               {k: v for k, v in np.load(_f, allow_pickle=True).items()})
+            win._refresh_compare_ports()
+            _pins = [win.cmp_port.itemData(i) for i in range(win.cmp_port.count())]
+            assert "IBP_DEMO_SINK" in _pins, "current port missing from the Compare port selector"
+            win.cmp_port.setCurrentIndex(win.cmp_port.findData("IBP_DEMO_SINK"))
+            app.processEvents()
+            assert not win.cmp_corner.isEnabled(), "corner picker should grey out for a current port"
+            win.cmp_canvas.fig.savefig(ROOT / "work" / "gui_selftest_out" / "gui_overlay_current.png", dpi=110)
+            win.cmp_port.setCurrentIndex(0)          # back to voltage (must not raise)
+            app.processEvents()
+            print(f"  qt: current-port overlay rendered + screenshotted "
+                  f"({len([p for p in _pins if p])} current ports, selector+corner-gating OK)")
+        else:
+            print("  qt: current-port overlay skipped (no work_isrc/*.npz characterized)")
         print(f"  qt: MainWindow built offscreen; import-button regression OK ({len(collected)} files "
               f"survive apply); compare rendered (PyQt5 {QtCore.PYQT_VERSION_STR}, Qt "
               f"{QtCore.QT_VERSION_STR}); screenshot {'saved' if ok_shot else 'FAILED'}")
