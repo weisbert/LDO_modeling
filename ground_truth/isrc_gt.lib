@@ -1,0 +1,103 @@
+* ============================================================
+* MOS current-source GROUND-TRUTH library  (transistor-level)
+*
+* The OBJECT we model is MOS-transistor-level (real current mirrors, run in
+* SPICE); the DELIVERABLE model is behavioral -- exactly the LDO pattern
+* (ground_truth/ldo_gt.cir is device-level, the fitted model is behavioral).
+*
+* Each subckt:  ports (vdd out), global 0 = gnd.
+*   SINK   : NMOS output pulls current FROM `out` to gnd  (+I into the pin).
+*   SOURCE : PMOS output pushes current FROM vdd into `out`.
+* The testbench forces `out` to a compliance voltage and reads the delivered
+* current -> Idc / I-V knee / Y(s) / dIout/dVdd (PSRR) / current-noise / Idc(T).
+* Requires models nlv / plv at top level.  Device geometries are LITERALS
+* (BSIM3 op convergence; cf. the ldo_v1 note); only bias knobs are {params}.
+*
+* >= 8 DELIBERATELY DIVERSE archetypes so a behavioral fit cannot overfit a
+* single topology/operating point -- they span polarity, output impedance,
+* compliance knee, current-noise, temperature law (PTAT vs CTAT), and PSRR
+* sign.  This mirrors the LDO variants[] generalization set.
+* ============================================================
+
+* ---- V1: simple NMOS mirror SINK, ideal Iref, ~1.8uA -----------------------
+*   low-ish rout (single ro), early knee, near-IDEAL PSRR (Iref supply-indep).
+*   archetype for IBP_POLY_1P8U_VCO.
+.subckt isrc_v1_nmos_simple vdd out iref=1.8u
+Iref vdd nd DC {iref}
+m1   nd  nd 0 0 nlv W=2u L=1u
+mout out nd 0 0 nlv W=2u L=1u
+.ends isrc_v1_nmos_simple
+
+* ---- V2: cascode NMOS SINK, ideal Iref, ~1.0uA -----------------------------
+*   very high rout (gm*ro*ro), HIGHER compliance (~2*Vov), near-ideal PSRR.
+.subckt isrc_v2_nmos_cascode vdd out iref=1.0u
+Iref vdd nc DC {iref}
+mcd  nc nc nd 0 nlv W=2u L=1u        ; top diode  -> vcas=nc (~2Vgs)
+m1   nd nd 0  0 nlv W=2u L=1u        ; bottom diode -> vbias=nd
+mout od nd 0  0 nlv W=2u L=1u        ; output bottom device
+mcas out nc od 0 nlv W=2u L=1u       ; cascode device (gate=nc)
+.ends isrc_v2_nmos_cascode
+
+* ---- V3: long-channel simple NMOS SINK, ideal Iref, ~0.8uA -----------------
+*   L=4u -> high rout AND low compliance, LOW current-noise (big gate area).
+*   distinct (rout, knee, noise) point from V1 at the same simple topology.
+.subckt isrc_v3_nmos_long vdd out iref=0.8u
+Iref vdd nd DC {iref}
+m1   nd  nd 0 0 nlv W=8u L=4u
+mout out nd 0 0 nlv W=8u L=4u
+.ends isrc_v3_nmos_long
+
+* ---- V4: simple PMOS mirror SOURCE, ideal Iref, ~1.0uA ---------------------
+*   OPPOSITE polarity (sources into `out` from vdd); knee at HIGH out (out->vdd);
+*   PMOS device -> different noise/temp; PSRR set by output ro to vdd.
+.subckt isrc_v4_pmos_simple vdd out iref=1.0u
+Iref np 0 DC {iref}
+mp1 np  np  vdd vdd plv W=4u L=1u
+mout out np vdd vdd plv W=4u L=1u
+.ends isrc_v4_pmos_simple
+
+* ---- V5: cascode PMOS SOURCE, ideal Iref, ~2.0uA ---------------------------
+*   high-rout source; knee near out->vdd-2*Vov; PMOS cascode.
+.subckt isrc_v5_pmos_cascode vdd out iref=2.0u
+Iref npc 0 DC {iref}
+mpb  npb npb vdd vdd plv W=4u L=1u    ; bottom diode -> vbias=npb=vdd-Vgs
+mpc  npc npc npb vdd plv W=4u L=1u    ; stacked diode -> vcas=npc=vdd-2Vgs
+mout oc  npb vdd vdd plv W=4u L=1u    ; output top device (mirror of mpb)
+mcas out npc oc  vdd plv W=4u L=1u    ; cascode device (gate=npc)
+.ends isrc_v5_pmos_cascode
+
+* ---- V6: PTAT constant-gm (beta-multiplier) reference, NMOS SINK, ~1.5uA ----
+*   self-biased; sized toward weak inversion so dVgs ~ n*kT/q*ln(K) -> I ~ PTAT.
+*   archetype for IBP_PTAT_TUNE_1P5U_VCO (linear-in-absolute-T).
+.subckt isrc_v6_ptat vdd out rs=600k wout=150u
+* self-biased constant-gm core: PMOS mirror (gates=n2) forces I(n1)=I(n2);
+* NMOS gates common=n1; M2 is K=8x wide with SOURCE-degeneration Rs ->
+*   I*Rs = Vgs(M1)-Vgs(M2) = dVgs ~ n*(kT/q)*ln(K)  => I ~ PTAT.
+mp1 n1 n2 vdd vdd plv W=8u L=2u
+mp2 n2 n2 vdd vdd plv W=8u L=2u
+mn1 n1 n1 0  0  nlv W=10u L=2u
+mn2 n2 n1 ns 0  nlv W=80u L=2u
+Rs  ns 0 {rs}
+* startup: weak leak so the all-off (I=0) state is not the solver's solution
+Rstart vdd n1 500meg
+* output mirror off the NMOS gate node n1
+mout out n1 0 0 nlv W={wout} L=2u
+.ends isrc_v6_ptat
+
+* ---- V7: resistor-biased NMOS SINK (no ideal Iref), ~1.2uA -----------------
+*   Iref=(vdd-Vgs)/Rref -> STRONG dIout/dVdd (POOR, positive-sign PSRR);
+*   CTAT-leaning tempco.  The PSRR-sign / supply-pushing outlier (G4/G8).
+.subckt isrc_v7_nmos_rbias vdd out rref=520k
+Rref vdd nd {rref}
+m1   nd  nd 0 0 nlv W=3u L=1u
+mout out nd 0 0 nlv W=3u L=1u
+.ends isrc_v7_nmos_rbias
+
+* ---- V8: Wilson NMOS SINK, ideal Iref, ~0.6uA ------------------------------
+*   feedback-boosted rout (3-transistor Wilson); distinct PSRR/noise signature.
+.subckt isrc_v8_wilson vdd out iref=0.6u
+Iref vdd nin DC {iref}
+mw1 nin nd  0   0 nlv W=2u L=1u       ; input device, drain=nin
+mw2 nd  nd  0   0 nlv W=2u L=1u       ; diode reference, sets nd
+mw3 out nin nd  0 nlv W=2u L=1u       ; output device (Wilson cascode)
+.ends isrc_v8_wilson
