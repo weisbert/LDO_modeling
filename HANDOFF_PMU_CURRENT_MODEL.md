@@ -39,6 +39,19 @@ Whole pipeline built + validated twice (ngspice + Spectre). Commits on `target-b
    `temps`, `tnom_c` flow GUI form (`gui/ldo_modeler.py` xf_ivsweep/xf_temps) → `build_manifest`
    → manifest → emit. Plus `supply_dc`. **No project-specific constant left in the harness.**
 
+6. **Current ports in the air-gap REPORT (paste-to-reproduce)** — `report.py` now emits a **`[8]
+   CURRENT PORTS`** section when the ref carries current ports: per-port behavioral-fit-vs-device-GT
+   scorecard (Idc, IVrms%, rout, Cp, signed gdd + sign-match flag, current-PSRR/noise RMS, PTAT) +
+   plain-language diagnosis + a **machine-readable `[8d] CURRENT GT DIGEST`** (I-V / Idc(T) / Y(s) /
+   current-PSRR / current-noise). `digest_import.py` parses `[8]` back into a **fit_isrc-ready
+   `results/ref/<name>__<pin>.npz` per port** (+ folds them into the main ref). New module
+   `harness/current_digest.py` (ref↔per-port namespace `iport_<pin>__*`, the model-vs-GT metrics, the
+   digest emit/parse); `fit_isrc.py` gained `predict_*` (pure-numpy analytic twin of `fit_model.predict`)
+   and now accepts a dict view. **So a copied report reproduces a CURRENT discrepancy locally** — the
+   same way `[7]` does for voltage. Test `harness/test_report_current.py` (round-trip: GT→report→paste
+   →fit_isrc within tol; PSRR sign + PTAT preserved). HONEST scope (in the report): the scorecard is the
+   ANALYTIC fit-vs-GT; emitted-netlist/probe-sign fidelity still needs `isrc_spectre.py --sc`.
+
 Tooling: **ngspice built from source** at `~/.local/bin` (EPEL el8 lacks it — see
 `[[ngspice-built-from-source]]`); local **Spectre 18.1** via `cadence/spectre_run.py`.
 
@@ -50,7 +63,10 @@ Tooling: **ngspice built from source** at `~/.local/bin` (EPEL el8 lacks it — 
    new manifest fields: `i_out.iv_sweep` (DC sweep the probe → I-V knee), `temps` (temp loop →
    Idc(T)/PTAT/noise(T)), producing the npz `fit_multiport` reads.
 3. **Thread** manifest `supply_dc` + `tnom_c` into `fit_result.meta` so `emit_pmu_va` bakes them.
-4. Then **G9** coupling (verify-first), **G6** corner-family `.lib` (round-2), **G11** report columns.
+4. Then **G9** coupling (verify-first), **G6** corner-family `.lib` (round-2). **G11 report columns are
+   DONE for the analytic channel** (`[8]` above); on the box, make the real extraction populate the
+   `iport_<pin>__*` ref keys (via `current_digest.embed_port`, schema = `fit_isrc`) so the report's
+   `[8]` shows REAL ports, not just offline GT.
 The offline `emit_isrc` (ngspice) + `cadence/isrc_spectre.py --sc` (Spectre) are the REFERENCES the
 on-box run must reproduce.
 

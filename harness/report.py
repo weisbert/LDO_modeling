@@ -11,8 +11,12 @@ numpy/scipy; runs wherever the fit runs.
     python report.py --variant myldo --nominal 121u --vref 1.05
 
 Writes results/score/report_<name>.txt and prints it. Covers Zout / PSRR / output-noise
-(the analytic blocks). Transient & discrete-spur fidelity need the ngspice scorer
-(score.py); this report says so rather than pretending to cover them.
+(the analytic voltage blocks) and -- when the ref carries current ports -- a [8] CURRENT
+PORTS section (bias sink/source: Idc, I-V knee, Idc(T)/PTAT, admittance, current-PSRR,
+current-noise) with its own machine-readable GT digest (see current_digest.py; rebuilt by
+digest_import.py). Transient & discrete-spur fidelity need the ngspice scorer (score.py);
+emitted current-netlist fidelity needs cadence/isrc_spectre.py --sc; this report says so
+rather than pretending to cover them.
 """
 import argparse
 import json
@@ -350,6 +354,16 @@ def build_report(ref, result, name, refpath="", with_sim_note=True):
         pr(f"  # dcblock {key}  (columns: {desc})")
         for i in idx:
             pr(f"  {d[i, 0]:.6e}, {d[i, 1]:.6e}")
+
+    # ---- [8] CURRENT PORTS: behavioral current model vs device GT + machine-readable
+    #      GT digest. The CURRENT twin of [7] -- the air-gap channel for the bias
+    #      sink/source ports (digest_import rebuilds them, fit_isrc reproduces locally).
+    #      Emits nothing when the ref carries no current ports (pure voltage report).
+    try:
+        import current_digest
+        L += current_digest.current_section_lines(ref)
+    except Exception as e:                       # never let a current-port glitch kill the report
+        pr(f"\n[8] CURRENT PORTS: skipped ({type(e).__name__}: {e})")
     pr("=" * 84)
     return "\n".join(L)
 

@@ -95,7 +95,9 @@ def _fit_temp(temps, idcT):
 
 
 def fit_isrc(npz_path):
-    d = np.load(npz_path, allow_pickle=True)
+    # accept a path OR an already-loaded mapping (npz/dict view) -- report.py and the
+    # air-gap digest_import feed a per-port dict view without round-tripping to disk.
+    d = npz_path if hasattr(npz_path, "keys") else np.load(npz_path, allow_pickle=True)
     pol = str(d["pol"])
     vc = float(d["vc"])
     Vo = np.asarray(d["iv_v"], float)
@@ -108,6 +110,43 @@ def fit_isrc(npz_path):
     cp = float(d["cp"])
     return dict(name=str(d["name"]), pol=pol, vc=vc, cp=cp,
                 **iv, **ps, **nz, **tp)
+
+
+# --------------------------------------------------------------------------- predict
+# Pure-numpy ANALYTIC model curves (the exact transfer fns the fitter anchors) -- the
+# current-port twin of fit_model.predict. report.py diffs these vs the GT arrays, no
+# simulator. (Emitted-netlist / VA fidelity incl. the probe-sign needs crossval_isrc /
+# isrc_spectre.py --sc; this analytic predictor cannot see an emit-side sign bug.)
+def predict_iv(p, Vo):
+    """DC I-V at TNOM: (Idc + g0*(Vo-vc)) * compliance-knee."""
+    Vo = np.asarray(Vo, float)
+    return (p["idc"] + p["g0"] * (Vo - p["vc"])) * gate(Vo, p["vknee"], p["knee_p"], p["pol"])
+
+
+def predict_idcT(p, T_C):
+    """Idc temperature law (PTAT/CTAT slope), T in degC."""
+    return p["idc55"] + p["didt"] * (np.asarray(T_C, float) - TNOM)
+
+
+def predict_y(p, f):
+    """Output admittance Y(s) = g0 + s*Cp (magnitude is what report diffs)."""
+    w = 2 * np.pi * np.asarray(f, float)
+    return p["g0"] + 1j * w * p["cp"]
+
+
+def predict_psrr(p, f):
+    """current-PSRR dIpin/dVdd: signed gdd, +1-pole if it rolls in band."""
+    f = np.asarray(f, float)
+    wp = p.get("psrr_pole_w")
+    if wp:
+        return p["gdd"] / (1.0 + 1j * (2 * np.pi * f) / wp)
+    return np.full(f.shape, complex(p["gdd"]))
+
+
+def predict_noise(p, f):
+    """output current-noise density In(f) = sqrt(iw^2 + kf/f)."""
+    f = np.asarray(f, float)
+    return np.sqrt(p["in_white"] ** 2 + p["in_kf"] / f)
 
 
 def _fmt(p):

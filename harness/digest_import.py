@@ -1,12 +1,16 @@
-"""Rebuild a fit-ready reference npz from a pasted [7] GT DIGEST block.
+"""Rebuild a fit-ready reference npz from a pasted [7]/[8] GT DIGEST block.
 
 The air-gap return channel: the red-zone report's section [7] carries log-resampled
-GT curves as text. This parser turns that paste back into results/ref/<name>.npz so
-the real part can be fitted/iterated LOCALLY (no npz crosses the gap).
+VOLTAGE GT curves as text, and section [8] CURRENT GT DIGEST carries the CURRENT-port
+(bias sink/source) curves. This parser turns the paste back into results/ref/<name>.npz
+(+ one fit_isrc-ready results/ref/<name>__<pin>.npz per current port) so the real part
+can be fitted/iterated LOCALLY (no npz crosses the gap).
 
-Digest columns: f[Hz], |Z|[ohm], Zph[deg], PSRRatt[dB], Hph[deg], Sv[V/rtHz]
+[7] columns: f[Hz], |Z|[ohm], Zph[deg], PSRRatt[dB], Hph[deg], Sv[V/rtHz]
 ('-' = quantity not swept at that frequency). dc_loadreg is synthesized from the
 per-corner LF Re(Zout) (good enough for fitting; the digest has no DC sweeps).
+[8] carries per port: I-V (compliance knee), Idc(T)/PTAT, admittance Y(s), current-PSRR,
+current-noise -- the exact schema fit_isrc consumes (see current_digest.py).
 
 Usage:
     python harness/digest_import.py results/ref/myldo_digest.txt [--name myldo_digest]
@@ -32,6 +36,9 @@ def parse_digest(text):
     cur = curdc = None
     for raw in text.splitlines():
         line = raw.strip()
+        if line.startswith("[8]") or line.startswith("# iport"):
+            cur = curdc = None              # entering the current-port section: stop [7] collection
+            continue
         m = re.match(r"#\s*corner\s+(\S+)", line)
         if m:
             cur, curdc = m.group(1), None
@@ -172,21 +179,53 @@ def build_ref(corners, name, vref=1.05, dcblocks=None):
     return out, loads, synth
 
 
+def _import_current(text, name):
+    """Parse the [8] CURRENT GT DIGEST (if any) and write one fit_isrc-ready npz per
+    port to results/ref/<name>__<pin>.npz. Returns {pin: src-dict} (empty if none)."""
+    try:
+        import current_digest
+        cports = current_digest.parse_current_digest(text)
+    except Exception as e:                       # never block the voltage import
+        print(f"  (current-port parse skipped: {type(e).__name__}: {e})")
+        return {}
+    REFDIR.mkdir(parents=True, exist_ok=True)
+    for pin, src in cports.items():
+        pout = REFDIR / f"{name}__{current_digest._san(pin)}.npz"
+        src = dict(src, name=f"{name}__{current_digest._san(pin)}")
+        np.savez(pout, **src)                     # fit_isrc(pout) reproduces the port locally
+        print(f"  current port '{pin}' -> {pout}  (fit_isrc-ready)")
+    return cports
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("digest", help="text file containing the pasted [7] GT DIGEST block")
+    ap.add_argument("digest", help="text file with the pasted report: [7] GT DIGEST "
+                                    "(voltage) and/or [8] CURRENT GT DIGEST (bias ports)")
     ap.add_argument("--name", default=None, help="output ref name (default: file stem)")
     ap.add_argument("--vref", type=float, default=1.05)
     a = ap.parse_args()
     p = pathlib.Path(a.digest)
-    corners, dcblocks = parse_digest(p.read_text(encoding="utf-8"))
-    if not corners:
-        sys.exit("no '# corner' blocks parsed -- is this a [7] GT DIGEST paste?")
+    text = p.read_text(encoding="utf-8")
+    corners, dcblocks = parse_digest(text)
     name = a.name or p.stem
+    cports = _import_current(text, name)            # [8] CURRENT GT DIGEST (may be empty)
+    if not corners:
+        if cports:
+            print(f"no '# corner' (voltage) blocks -- current-only paste: "
+                  f"ports={list(cports)} written to results/ref/{name}__*.npz")
+            return
+        sys.exit("no '# corner' or '# iport' blocks parsed -- is this a GT DIGEST paste?")
     out, loads, synth_dc = build_ref(corners, name, vref=a.vref, dcblocks=dcblocks)
+    if cports:                                      # fold current ports into the same ref npz
+        ref = {k: v for k, v in np.load(out, allow_pickle=True).items()}
+        import current_digest
+        for pin, src in cports.items():
+            current_digest.embed_port(ref, pin, src)
+        np.savez(out, **ref)
     print(f"wrote {out}   corners={loads} "
           f"({', '.join(str(len(corners[il])) + 'pts' for il in loads)})"
-          + (f"   dcblocks={sorted(dcblocks)}" if dcblocks else ""))
+          + (f"   dcblocks={sorted(dcblocks)}" if dcblocks else "")
+          + (f"   iports={list(cports)}" if cports else ""))
     checks = check_sufficiency(corners, synth_dc=synth_dc)
     nwarn = sum(1 for lv, _ in checks if lv == "WARN")
     print(f"\nDIGEST SUFFICIENCY ({nwarn} warning(s)):")
