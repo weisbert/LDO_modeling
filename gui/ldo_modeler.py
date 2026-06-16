@@ -16,6 +16,7 @@ even where PyQt5/display are absent (the red box has PyQt5; this dev venv may no
 """
 import os
 import sys
+import json
 import argparse
 import pathlib
 from dataclasses import dataclass, field
@@ -23,6 +24,17 @@ from dataclasses import dataclass, field
 import numpy as np
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+# Persisted GUI form state (the PMU pin form + Profile). Kept in the user's HOME -- NOT under
+# the deploy app/ dir, which `deploy/update.sh` wipes (rm -rf app) on every incremental update;
+# HOME survives redeploys, exactly like the persistent results/ and model/ stores. Resolved at
+# call time so LDO_CONFIG_DIR can redirect it (the --selftest uses a temp dir, not real HOME).
+def _config_dir():
+    return pathlib.Path(os.environ.get("LDO_CONFIG_DIR", pathlib.Path.home() / ".ldo_modeler"))
+
+
+def _autosave_json():
+    return _config_dir() / "gui_state.json"
 for _p in (ROOT / "harness", ROOT / "cadence"):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
@@ -684,6 +696,111 @@ if _HAVE_QT:
             self.tabs.addTab(self._tab_transid(), "5 · Trans-ID")
             self.statusBar().showMessage(
                 "In-situ extraction → Tab 0. Or hand-imported data → Tab 1 Profile.")
+            self._load_autosave()           # restore last session's form entries (if any)
+
+        # --- form-state persistence (PMU pin form + Profile) ---------------------
+        def _config_widgets(self):
+            """Registry config-key -> widget for everything we persist across launches. All
+            QLineEdit (text) except x_backend (QComboBox, by userData) and e_nom (QComboBox,
+            by text). Built after all tabs exist, so every widget is present."""
+            return {
+                "tb_lib": self.xf_tblib, "tb_cell": self.xf_tbcell, "tb_view": self.xf_tbview,
+                "dut_inst": self.xf_inst, "dut_lib": self.xf_dutlib, "dut_cell": self.xf_dutcell,
+                "supply": self.xf_supply, "supply_dc": self.xf_supplydc,
+                "vouts": self.xf_vouts, "iouts": self.xf_iouts, "vdc": self.xf_vdc,
+                "ivsweep": self.xf_ivsweep, "temps": self.xf_temps,
+                "ground": self.xf_ground, "corner": self.xf_corner, "src_test": self.xf_srctest,
+                "manifest": self.x_manifest, "session": self.x_session, "backend": self.x_backend,
+                "p_name": self.e_name, "p_vref": self.e_vref, "p_loads": self.e_loads,
+                "p_nom": self.e_nom, "p_cout": self.e_cout, "p_esr": self.e_esr,
+            }
+
+        def _collect_config(self):
+            out = {}
+            for k, wd in self._config_widgets().items():
+                if isinstance(wd, QComboBox):
+                    d = wd.currentData()
+                    out[k] = d if d is not None else wd.currentText()
+                else:
+                    out[k] = wd.text()
+            return out
+
+        def _apply_config(self, data):
+            """Restore saved values into the widgets. Only touches widgets a key exists for, so
+            an older/partial config never clears newer fields. e_nom's item list is rebuilt from
+            the saved load list so the nominal can be re-selected. No profile re-validation here
+            (no startup dialog): the user clicks Apply/Resolve as usual once restored."""
+            for k, wd in self._config_widgets().items():
+                if k not in data:
+                    continue
+                v = data[k]
+                if wd is self.e_nom:
+                    continue                                  # handled after e_loads below
+                if isinstance(wd, QComboBox):
+                    idx = wd.findData(v)
+                    if idx < 0:
+                        idx = wd.findText(str(v))
+                    if idx >= 0:
+                        wd.setCurrentIndex(idx)
+                else:
+                    wd.setText("" if v is None else str(v))
+            if "p_loads" in data and "p_nom" in data:        # rebuild nominal dropdown from saved loads
+                loads = [s.strip() for s in str(data["p_loads"]).split(",") if s.strip()]
+                if loads:
+                    self.e_nom.blockSignals(True)
+                    self.e_nom.clear(); self.e_nom.addItems(loads)
+                    if str(data["p_nom"]) in loads:
+                        self.e_nom.setCurrentText(str(data["p_nom"]))
+                    self.e_nom.blockSignals(False)
+
+        def _save_autosave(self):
+            try:
+                aj = _autosave_json()
+                aj.parent.mkdir(parents=True, exist_ok=True)
+                aj.write_text(json.dumps(self._collect_config(), indent=2), encoding="utf-8")
+            except OSError:
+                pass                                          # never let a read-only HOME block exit
+
+        def _load_autosave(self):
+            try:
+                aj = _autosave_json()
+                if aj.exists():
+                    self._apply_config(json.loads(aj.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass                                          # corrupt/old state must not block launch
+
+        def _save_config_as(self):
+            cfgdir = _config_dir()
+            cfgdir.mkdir(parents=True, exist_ok=True)
+            fn, _ = QFileDialog.getSaveFileName(self, "Save form config",
+                                                str(cfgdir / "my_pmu_config.json"),
+                                                "JSON (*.json)")
+            if not fn:
+                return
+            if not fn.endswith(".json"):
+                fn += ".json"
+            try:
+                pathlib.Path(fn).write_text(json.dumps(self._collect_config(), indent=2),
+                                            encoding="utf-8")
+                self.statusBar().showMessage(f"Saved form config → {fn}")
+            except OSError as e:
+                QMessageBox.warning(self, "Save config", f"{type(e).__name__}: {e}")
+
+        def _load_config_dialog(self):
+            cfgdir = _config_dir()
+            start = str(cfgdir if cfgdir.exists() else ROOT)
+            fn, _ = QFileDialog.getOpenFileName(self, "Load form config", start, "JSON (*.json)")
+            if not fn:
+                return
+            try:
+                self._apply_config(json.loads(pathlib.Path(fn).read_text(encoding="utf-8")))
+                self.statusBar().showMessage(f"Loaded form config ← {fn}")
+            except (OSError, ValueError) as e:
+                QMessageBox.warning(self, "Load config", f"{type(e).__name__}: {e}")
+
+        def closeEvent(self, ev):
+            self._save_autosave()                             # remember this session's entries
+            super().closeEvent(ev)
 
         # --- Tab 0: Extract (in-situ, Mechanism A) -------------------------------
         def _tab_extract(self):
@@ -700,6 +817,22 @@ if _HAVE_QT:
             help_.setWordWrap(True)
             help_.setStyleSheet("background:#eef5ff; padding:9px; border:1px solid #cdddee;")
             outer.addWidget(help_)
+
+            # ---- form config: persist what you type across launches ---------------------
+            cfgrow = QHBoxLayout()
+            cfgrow.addWidget(QLabel("Form config:"))
+            b_cfg_save = QPushButton("Save config…")
+            b_cfg_save.setToolTip("Save every field on this tab + the Profile tab to a JSON you "
+                                  "can reload (e.g. one per project).")
+            b_cfg_save.clicked.connect(self._save_config_as)
+            b_cfg_load = QPushButton("Load config…")
+            b_cfg_load.setToolTip("Reload a saved form config into the fields.")
+            b_cfg_load.clicked.connect(self._load_config_dialog)
+            cfgrow.addWidget(b_cfg_save); cfgrow.addWidget(b_cfg_load)
+            note = QLabel("· your entries auto-restore on next launch")
+            note.setStyleSheet("color:#567;")
+            cfgrow.addWidget(note); cfgrow.addStretch(1)
+            cfgw = QWidget(); cfgw.setLayout(cfgrow); outer.addWidget(cfgw)
 
             # ---- pin FORM (deliverable 1): symbol pins -> resolved manifest --------------
             gb = QGroupBox("1 · Describe your PMU (symbol pin names)")
@@ -2068,6 +2201,8 @@ def _selftest(require_qt=False):
     #    (populate pickers -> apply profile -> collect must survive), render, and screenshot.
     if _HAVE_QT:
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        # redirect form-config persistence to a temp dir so the selftest never writes real HOME
+        os.environ["LDO_CONFIG_DIR"] = str(pathlib.Path(tmp) / "cfg")
         app = QApplication.instance() or QApplication(sys.argv[:1])
         win = MainWindow(core)
         win.resize(1180, 820)
@@ -2160,6 +2295,27 @@ def _selftest(require_qt=False):
                   f"({len([p for p in _pins if p])} current ports, selector+corner-gating OK)")
         else:
             print("  qt: current-port overlay skipped (no work_isrc/*.npz characterized)")
+        # form-config persistence: type values -> autosave -> a FRESH window must restore them;
+        # named save/load round-trips too. (LDO_CONFIG_DIR points at the temp dir set above.)
+        win.xf_dutlib.setText("PMU_TOP"); win.xf_dutcell.setText("pmu_top")
+        win.xf_vouts.setText("RAILA, RAILB"); win.xf_iouts.setText("IBIAS_X")
+        win.e_vref.setText("1.234"); win.x_session.setText("sess_XYZ")
+        win.x_backend.setCurrentIndex(win.x_backend.findData("spectre_cli"))
+        win._save_autosave()
+        win2 = MainWindow(ModelerCore())            # __init__ -> _load_autosave restores entries
+        assert win2.xf_dutlib.text() == "PMU_TOP" and win2.xf_dutcell.text() == "pmu_top", \
+            "autosave did not restore DUT lib/cell"
+        assert win2.xf_vouts.text() == "RAILA, RAILB" and win2.xf_iouts.text() == "IBIAS_X", \
+            "autosave did not restore voltage/current outputs"
+        assert win2.e_vref.text() == "1.234" and win2.x_session.text() == "sess_XYZ", \
+            "autosave did not restore Profile vref / session"
+        assert win2.x_backend.currentData() == "spectre_cli", "autosave did not restore the engine combo"
+        named = pathlib.Path(tmp) / "cfg" / "named_demo.json"
+        named.parent.mkdir(parents=True, exist_ok=True)
+        named.write_text(json.dumps(dict(win._collect_config(), dut_cell="ROUNDTRIP")), encoding="utf-8")
+        win2._apply_config(json.loads(named.read_text()))
+        assert win2.xf_dutcell.text() == "ROUNDTRIP", "named config load did not apply"
+        print("  qt: form-config persistence OK (autosave restore + named save/load round-trip)")
         print(f"  qt: MainWindow built offscreen; import-button regression OK ({len(collected)} files "
               f"survive apply); compare rendered (PyQt5 {QtCore.PYQT_VERSION_STR}, Qt "
               f"{QtCore.QT_VERSION_STR}); screenshot {'saved' if ok_shot else 'FAILED'}")
