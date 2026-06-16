@@ -38,7 +38,10 @@ Public API (pinned cross-component interface):
     corner,                                 # process-corner label (informational)
     biases   = {pin: dc, ...}   (optional)  # held bias ports
     iload    = {pin: A,  ...}   (optional)  # per-v_out load current override
-    vdc      = {pin: V,  ...}   (optional)  # per-i_out forced dc override
+    vdc      = {pin: V,  ...}   (optional)  # per-i_out forced dc (compliance OP) override
+    iv_sweep = {pin: [vlo,vhi,step] | "auto"}  (optional)  # per-i_out I-V knee sweep (G5)
+    temps    = [degC, ...]      (optional)  # temperature points for Idc(T)/PTAT/noise(T)
+    tnom_c   = degC             (optional)  # nominal/model-bake temp (default = middle of temps)
     name, tb_inst, extract_cell, extract_view, ade_src_test, analysis (all optional)
 
 `netmap` : {pin -> net} from the B resolver (resolve_nets). Every pin referenced by the
@@ -169,6 +172,7 @@ def build_manifest(gui, netmap):
     bias_in = gui.get("biases") or {}
     iload_in = gui.get("iload") or {}
     vdc_in = gui.get("vdc") or {}
+    iv_in = gui.get("iv_sweep") or {}            # per i_out I-V knee sweep: [vlo,vhi,step] | "auto"
 
     # --- DUT block -------------------------------------------------------
     tb_cell = gui["tb_cell"]
@@ -222,6 +226,10 @@ def build_manifest(gui, netmap):
             entry["dc"] = vdc_in[pin]
         else:
             no_compliance.append(f"{key}({pin})")
+        # I-V compliance-knee sweep (G5): per-pin [vlo, vhi, step] or "auto" (0 -> supply+margin).
+        # User-defined so the same harness serves any project's pins/rails without a code edit.
+        if pin in iv_in and iv_in[pin] is not None:
+            entry["iv_sweep"] = iv_in[pin]
         i_out[key] = entry
 
     # --- held bias ports (optional) -------------------------------------
@@ -248,6 +256,13 @@ def build_manifest(gui, netmap):
         m["corner"] = gui["corner"]
     if gui.get("analysis"):
         m["analysis"] = dict(gui["analysis"])
+    # temperature points (degC) for Idc(T)/PTAT/noise(T) -- user-defined per project / PDK;
+    # the nominal (model-bake) temperature is the middle point (or m['tnom_c'] if given).
+    if gui.get("temps"):
+        m["temps"] = [float(t) for t in gui["temps"]]
+        m["tnom_c"] = float(gui.get("tnom_c", m["temps"][len(m["temps"]) // 2]))
+    elif gui.get("tnom_c") is not None:
+        m["tnom_c"] = float(gui["tnom_c"])
 
     # in-situ compliance warning: current outputs whose compliance vdc was not supplied get
     # validate()'s dc=0.0 default below -- record them so the orchestrator can prompt the user

@@ -172,15 +172,16 @@ def _voltage_block(o, vfit, supply, ground):
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
-def current_crow_from_isrc_fit(p, pin=None):
+def current_crow_from_isrc_fit(p, pin=None, tnom_c=55.0):
     """harness/fit_isrc.fit_isrc(...) param dict -> a `crow` that _current_block emits
     as the LARGE-SIGNAL VA form. Connects the offline-validated behavioral current model
     (8/8 vs the MOS-GT, harness/crossval_isrc.py) to this Cadence VA emit; the in-situ
-    fit_multiport will produce the same fields on the box."""
+    fit_multiport will produce the same fields on the box. `tnom_c` = the nominal temp the
+    Idc/didt fit is referenced to (the manifest's tnom_c / middle of its temps)."""
     return dict(sink=p["name"], pin=pin or p["name"], pol=p["pol"],
                 idc55=p["idc55"], didt=p["didt"], g0=p["g0"], vc=p["vc"],
                 gdd=p["gdd"], vknee=p["vknee"], knee_p=p["knee_p"], Cp=p["cp"],
-                in_white=p["in_white"], in_kf=p["in_kf"])
+                in_white=p["in_white"], in_kf=p["in_kf"], tnom_c=tnom_c)
 
 
 def _current_block(o, crow, supply, ground):
@@ -211,6 +212,7 @@ def _current_block_largesignal(o, crow, supply, ground):
     gdd_eff = -gdd if pol == "sink" else gdd
     inw2 = float(crow.get("in_white", 0.0)) ** 2
     kf = float(crow.get("in_kf", 0.0))
+    tref_k = float(crow.get("tnom_c", 55.0)) + 273.15    # $temperature is KELVIN; user-set nominal
     rvars = [f"{pre}_idc55", f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
              f"{pre}_vk", f"{pre}_kp", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"]
     asg = (f"{pre}_idc55 = {idc55:.6e};  {pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
@@ -224,7 +226,7 @@ def _current_block_largesignal(o, crow, supply, ground):
         karg = f"sqrt((vdc_{supply}-V({o},{ground}))*(vdc_{supply}-V({o},{ground})) + 1e-12)"
         drive = f"I({supply}, {o})"
     body = f"""    // ====== current bias {o} ({pol}: Idc(T)+I-V knee+g0+Cp+signed PSRR+noise) ======
-    {drive} <+ ({pre}_idc55 + {pre}_didt*($temperature - 328.15)
+    {drive} <+ ({pre}_idc55 + {pre}_didt*($temperature - {tref_k:g})
                   + {pre}_g0*(V({o},{ground}) - {pre}_vc)
                   + {pre}_gdd*(V({supply},{ground}) - vdc_{supply}))
                  * tanh(pow({karg}/{pre}_vk, {pre}_kp));
@@ -318,7 +320,7 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
 
 # --------------------------------------------------------------------- emit
 def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
-                supply_dc=None):
+                supply_dc=None, tnom_c=None):
     """Emit ONE combined Verilog-A module `cell_name` for the whole PMU: input `supply`
     (LEFT), every voltage rail + current bias from fit_result (RIGHT), `ground` (BOTTOM).
 
@@ -352,6 +354,16 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
     meta = fit_result.get("meta", {})
     if supply_dc is None:
         supply_dc = float(meta.get("supply_dc", 1.0))
+    # nominal temp the Idc(T) fit is referenced to. Precedence: explicit kwarg OVERRIDES
+    # every crow; else fit meta FILLS crows that lack it (the box path -- fit_multiport
+    # doesn't set it yet); else each crow keeps its own (the bridge sets it from the fit);
+    # else _current_block_largesignal defaults to 55 C.
+    if tnom_c is not None:
+        for r in crows:
+            r["tnom_c"] = float(tnom_c)
+    elif meta.get("tnom_c") is not None:
+        for r in crows:
+            r.setdefault("tnom_c", float(meta["tnom_c"]))
 
     # pass the PIN name (port) as the block's `o` -- it is used as BOTH the port reference
     # and the internal node namespace prefix; pin names are unique + valid VA identifiers.

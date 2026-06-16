@@ -713,6 +713,18 @@ if _HAVE_QT:
                                    "warning. Voltage outputs need NO bias here: their Zout probe is "
                                    "AC-only (dc=0), so the TB's own load biases the rail (true in-situ).")
             gf.addRow("I-out compliance vdc", self.xf_vdc)
+            self.xf_ivsweep = QLineEdit()
+            self.xf_ivsweep.setPlaceholderText("optional: IBP_POLY_1P8U_VCO=0:1.1:0.01, IBP_PTAT_TUNE_1P5U_VCO=auto")
+            self.xf_ivsweep.setToolTip("Per current-output I-V compliance-knee sweep (G5): "
+                                       "'pin=vlo:vhi:step' or 'pin=auto' (0 → supply+margin). "
+                                       "Blank → characterize the single OP only (no knee). "
+                                       "User-defined so the harness serves any project's pins.")
+            gf.addRow("I-out I-V sweep", self.xf_ivsweep)
+            self.xf_temps = QLineEdit()
+            self.xf_temps.setPlaceholderText("optional: -40, 55, 125   (°C; middle = nominal)")
+            self.xf_temps.setToolTip("Temperature points for Idc(T)/PTAT/noise(T). Blank → nominal "
+                                     "only. The middle point is the model-bake nominal temp.")
+            gf.addRow("Temperatures [°C]", self.xf_temps)
             gnrow = QHBoxLayout()
             self.xf_ground = QLineEdit("VSS"); self.xf_corner = QLineEdit("tt_25c")
             gnrow.addWidget(QLabel("ground")); gnrow.addWidget(self.xf_ground)
@@ -832,6 +844,30 @@ if _HAVE_QT:
                         vdc[k.strip()] = float(v)
                     except ValueError:
                         pass
+            # per-i_out I-V sweep: "pin=vlo:vhi:step" or "pin=auto"
+            ivsw = {}
+            for tok in self.xf_ivsweep.text().split(","):
+                tok = tok.strip()
+                if "=" not in tok:
+                    continue
+                k, v = tok.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if v.lower() == "auto":
+                    ivsw[k] = "auto"
+                else:
+                    try:
+                        ivsw[k] = [float(x) for x in v.split(":")]
+                    except ValueError:
+                        pass
+            # temperature points (°C)
+            temps = []
+            for t in self.xf_temps.text().split(","):
+                t = t.strip()
+                if t:
+                    try:
+                        temps.append(float(t))
+                    except ValueError:
+                        pass
             try:
                 dc = float(self.xf_supplydc.text() or "1.0")
             except ValueError:
@@ -848,6 +884,10 @@ if _HAVE_QT:
                 corner=self.xf_corner.text().strip() or "nom")
             if vdc:
                 gui["vdc"] = vdc
+            if ivsw:
+                gui["iv_sweep"] = ivsw
+            if temps:
+                gui["temps"] = temps
             if self.xf_srctest.text().strip():
                 gui["ade_src_test"] = self.xf_srctest.text().strip()
             return gui

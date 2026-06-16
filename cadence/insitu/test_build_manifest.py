@@ -301,5 +301,39 @@ def test_golden_matches_builder_output():
     assert built["current_psrr_supplies"] == golden["current_psrr_supplies"]
 
 
+def test_user_defined_iv_sweep_and_temps():
+    """The reusable knobs: per-i_out I-V knee sweep + temperature points flow into the
+    manifest (and the nominal-temp default = middle of temps). Cross-project reuse."""
+    nm = {p: f"net_{p}" for p in ["AVDD1P0", "VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO",
+                                  "IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",
+                                  "IBP_PTAT_TUNE_1P5U_VCO"]}
+    gui = real_gui(
+        vdc={"IBP_POLY_1P8U_VCO": 0.5, "IBP_POLY_500N_VCO_Fit": 0.5,
+             "IBP_PTAT_TUNE_1P5U_VCO": 0.5},
+        iv_sweep={"IBP_POLY_1P8U_VCO": [0.0, 1.1, 0.01],
+                  "IBP_PTAT_TUNE_1P5U_VCO": "auto"},
+        temps=[-40, 55, 125],
+    )
+    m = B.build_manifest(gui, nm)
+    assert m["temps"] == [-40.0, 55.0, 125.0]
+    assert m["tnom_c"] == 55.0                          # middle point = nominal
+    i1p8 = next(c for c in m["i_out"].values() if c["pin"] == "IBP_POLY_1P8U_VCO")
+    iptat = next(c for c in m["i_out"].values() if c["pin"] == "IBP_PTAT_TUNE_1P5U_VCO")
+    assert i1p8["iv_sweep"] == [0.0, 1.1, 0.01]
+    assert iptat["iv_sweep"] == "auto"
+    # i_out without an iv_sweep entry carries none (single-OP); manifest still valid
+    i500 = next(c for c in m["i_out"].values() if c["pin"] == "IBP_POLY_500N_VCO_Fit")
+    assert "iv_sweep" not in i500
+    M.validate(m)
+
+
+def test_explicit_tnom_overrides_middle():
+    nm = {p: f"net_{p}" for p in ["AVDD1P0", "VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO",
+                                  "IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",
+                                  "IBP_PTAT_TUNE_1P5U_VCO"]}
+    m = B.build_manifest(real_gui(temps=[-40, 27, 125], tnom_c=27), nm)
+    assert m["tnom_c"] == 27.0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))
