@@ -14,27 +14,51 @@ I(o,VSS) <+ pi_dc*(V(AVDD,VSS) - vdc_AVDD);         // current-PSRR (magnitude o
 No DC bias current, no I-V (sat/triode/compliance), no noise, no temperature, magnitude-only PSRR.
 The expert review (this session) found 11 gaps (G1–G11); the user wants ALL of them built.
 
-## PROGRESS 2026-06-16 (offline, ngspice — no Cadence box needed)
+## PROGRESS 2026-06-16 — current model BUILT + validated offline AND on local Spectre (4 commits, all PUSHED)
 User reframed: **object = MOS-transistor-level, deliverable = behavioral** (the LDO pattern).
-Built + validated the whole offline pipeline:
-- **GT object set** `ground_truth/isrc_gt.lib` — **8 diverse transistor-level current sources**
-  (anti-overfit; user asked ≥6). Char'd terminal behavior → `work_isrc/*.npz`
-  (`harness/isrc_char.py`, `isrc_variants.py`).
-- **Behavioral fit** `harness/fit_isrc.py` (anchored OP + 2-point gate) → **emit** `harness/emit_isrc.py`
-  (ngspice B-source) → **cross-val** `harness/crossval_isrc.py`: **ONE template reproduces ALL 8**
-  (Idc ≤0.36%, IV ≤4.9% RMS, rout ≤6.6%, PSRR sign all ok, PTAT ≤0.001). This already satisfies
-  **G1/G2(PTAT)/G3/G4(sign)/G5/G7/G8** and the **G11** GT-vs-model DC + sign check (in the crossval).
-- **Cadence VA emit DONE** — `emit_pmu_model.py::_current_block_largesignal` now emits the validated
-  form: `I=(Idc(T)+g0*(Vo-vc)+gdd*(Vsup-vdc))*tanh((knee_arg/Vk)^p) + Cp*ddt + white/flicker noise`
-  ($temperature in Kelvin; sink drives o→gnd, source drives sup→o; legacy AC-only path kept for
-  back-compat). Bridge `current_crow_from_isrc_fit`. Tests `test_emit_pmu_current.py` +
-  `test_isrc.py`/`test_fit_isrc.py` green; offline VA-math mirror reproduces GT.
+Whole pipeline built + validated twice (ngspice + Spectre). Commits on `target-b-cadence-bringup`:
+`df2eb3f` (GT+fit), `6fc3f83` (VA emit), `ca9fbbb` (Spectre flow+bugfix), `0127a28` (user knobs).
 
-**REMAINING (box-coupled / round-2):** wire **fit_multiport** to PRODUCE the large-signal fields
-(idc55/didt/vknee/knee_p/gdd-sign/noise) from on-box **Phase-1 DC+temp+coupling extraction** (it only
-has AC small-signal today); then **G9** cross-admittance (verify-first), **G6** corner family in the
-.lib (typical-first → round-2), **G11** the same columns in the fit_multiport report. The offline
-ngspice twin (`emit_isrc`) is the reference the on-box Spectre VA run must match.
+1. **GT object set** `ground_truth/isrc_gt.lib` — **8 diverse transistor-level current sources**
+   (anti-overfit; user asked ≥6): simple/cascode/long/Wilson NMOS sinks, simple/cascode PMOS sources,
+   PTAT β-multiplier, resistor-biased. Char'd → `work_isrc/*.npz` (`harness/isrc_char.py`,
+   `isrc_variants.py`, registry+real-pin→archetype map).
+2. **Behavioral fit** `harness/fit_isrc.py` (anchored OP + 2-point gate, no optimizer) → **emit**
+   `harness/emit_isrc.py` (ngspice B-source) → **cross-val** `harness/crossval_isrc.py`: **1 template
+   reproduces ALL 8** (Idc ≤0.36%, IV ≤4.9% RMS, rout ≤6.6%, PSRR sign ok, PTAT ≤0.001).
+   Satisfies **G1/G2(PTAT)/G3/G4(sign)/G5/G7/G8** + **G11** (GT-vs-model DC+sign in crossval).
+3. **Cadence VA emit** `emit_pmu_model.py::_current_block_largesignal`:
+   `I=(Idc(T)+g0*(Vo-vc)+gdd*(Vsup-vdc))*tanh((knee_arg/Vk)^p) + Cp*ddt + white/flicker noise`
+   ($temperature KELVIN; sink drives o→gnd, source sup→o; legacy AC-only path kept). Bridge
+   `current_crow_from_isrc_fit`. `supply_dc`/`tnom_c` are kwargs (read fit meta).
+4. **WHOLE FLOW ON LOCAL SPECTRE 18.1** `cadence/isrc_spectre.py --sc`: GT ported to Spectre spice
+   (BSIM3 level 8→49, `{p}`→bare) → char IN Spectre → fit → emit VA → **ahdlcmi −64 compile + sim** →
+   vs GT same probe. **8/8 self-consistent.** Caught a REAL bug: `emit_pmu_va` hardcoded
+   `supply_dc=1.0` vs GT 1.05 → fixed (kwarg/meta). Env in `cadence/spectre_run.py`.
+5. **User-definable knobs (cross-project reuse)** — `iv_sweep` (per-i_out I-V knee sweep, G5),
+   `temps`, `tnom_c` flow GUI form (`gui/ldo_modeler.py` xf_ivsweep/xf_temps) → `build_manifest`
+   → manifest → emit. Plus `supply_dc`. **No project-specific constant left in the harness.**
+
+Tooling: **ngspice built from source** at `~/.local/bin` (EPEL el8 lacks it — see
+`[[ngspice-built-from-source]]`); local **Spectre 18.1** via `cadence/spectre_run.py`.
+
+**REMAINING (box-coupled — the real PMU):**
+1. **Wire `fit_multiport` to PRODUCE the large-signal fields** (idc55/didt/vknee/knee_p/gdd-signed/
+   in_white/in_kf/pol/vc/cp) — today it only emits AC small-signal. The field schema is fixed by
+   `fit_isrc`/`current_crow_from_isrc_fit`; match it.
+2. **Phase-1 extraction** (`augment`/`manifest.measurements`/`run.groups`/`importmp`) must CONSUME the
+   new manifest fields: `i_out.iv_sweep` (DC sweep the probe → I-V knee), `temps` (temp loop →
+   Idc(T)/PTAT/noise(T)), producing the npz `fit_multiport` reads.
+3. **Thread** manifest `supply_dc` + `tnom_c` into `fit_result.meta` so `emit_pmu_va` bakes them.
+4. Then **G9** coupling (verify-first), **G6** corner-family `.lib` (round-2), **G11** report columns.
+The offline `emit_isrc` (ngspice) + `cadence/isrc_spectre.py --sc` (Spectre) are the REFERENCES the
+on-box run must reproduce.
+
+**GOTCHAS (learned, don't rediscover):** ngspice/VA gate `(V/vk)^p` blows the OP Jacobian at Vo=0 when
+p<1 → **sqrt-floor the base**. Sink PSRR sign: probe reads `i(vout)=−I_pin` → **gdd_eff=−gdd (sink),
++gdd (source)**; source drives `I(supply,o)`, sink `I(o,gnd)`. VA `$temperature` is **Kelvin**
+(328.15=55 °C). BSIM3 **ngspice level=8 → Spectre level=49**, strip `{param}` braces. **supply_dc MUST
+equal the characterization supply** (the bug that cost v4/v5/v7 until fixed).
 
 ## CONFIRMED build inputs (2026-06-15) — the 3 former open items, now CLOSED
 - **Temperatures: −40 / 55 / 125 °C** (the 55 °C center matches the typical-corner nominal — NOT the
