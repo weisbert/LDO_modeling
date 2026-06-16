@@ -843,6 +843,12 @@ if _HAVE_QT:
             mode = self.x_mode.currentData()
             self.x_grp_pinform.setVisible(mode == "schematic")
             self.x_grp_modeb.setVisible(mode == "import")
+            # ADE is the LIVE-skillbridge engine -> invalid in Mode B (no skillbridge): grey it
+            # out and switch off it. Session (ADE-only) then never shows in Mode B.
+            ade_i = self.x_backend.findData("ade")
+            self.x_backend.model().item(ade_i).setEnabled(mode != "import")
+            if mode == "import" and self.x_backend.currentData() == "ade":
+                self.x_backend.setCurrentIndex(self.x_backend.findData("alps"))
             self.x_grp_session.setVisible(self.x_backend.currentData() == "ade")
 
         def _x_location_changed(self, *a):
@@ -1297,6 +1303,11 @@ if _HAVE_QT:
                 summ = self.extract.load_manifest(self.x_manifest.text().strip())
                 plan = "\n".join(f"  {a:12s} {d}" for a, d in self.extract.plan())
                 self.x_summary.setPlainText(summ + "\n\naugment plan:\n" + plan)
+                # auto-fill the model-cell name from the manifest's DUT (don't re-ask what the
+                # manifest already implies) -- only when the user hasn't typed a custom one.
+                dcell = (self.extract.manifest.get("dut") or {}).get("cell")
+                if dcell and self.xm_cell.text().strip() in ("", "PMU_model"):
+                    self.xm_cell.setText(f"{dcell}_model")
                 self.x_run.setEnabled(True)
                 self.xm_make.setEnabled(False)   # new manifest -> no fit yet (re-run before cell build)
                 self.statusBar().showMessage("Manifest loaded — 'Build & Run' to extract.")
@@ -1369,11 +1380,12 @@ if _HAVE_QT:
             self._xw.start()
 
         def _x_cluster_preview(self, engine, mode):
-            """Mode-B / cluster: validate inputs and PREVIEW the exact Donau dsub command(s) for
-            every measurement group -- pure (no submit). Hands the user the commands to run/verify
-            on the box. A live submit is the box-coupled remainder (per-group netlists)."""
+            """Mode-B / cluster: validate inputs and PREVIEW the exact run command(s) per
+            measurement group -- pure (no execution). local -> the bare engine command;
+            cluster -> the Donau dsub-wrapped command. A live submit is the box-coupled remainder
+            (per-group netlists)."""
             if getattr(self.extract, "manifest", None) is None:
-                QMessageBox.information(self, "Cluster run",
+                QMessageBox.information(self, "Run preview",
                                         "Load a manifest first (…or load a manifest below).")
                 return
             netdir = self.xb_netlist["edit"].text().strip()
@@ -1388,38 +1400,41 @@ if _HAVE_QT:
             try:
                 from cluster import donau, alps_cli      # local import: offline-safe, no skillbridge
                 from insitu import run as _run
+                on_cluster = self.x_location.currentData() == "cluster"
                 cfg = donau.DonauCfg(
                     account=self.xd_account.text().strip() or "ug_rfic.rfSClass",
                     queue=self.xd_queue.text().strip() or "short",
                     resource=f"cpu={self.xd_cpu.value()};mem={self.xd_mem.value()}")
                 eng = "spectre" if engine == "spectre_cli" else "alps"
                 grps = _run.groups(self.extract.manifest)
-                L = [f"# Donau dsub PREVIEW — {len(grps)} measurement group(s), engine={eng}",
-                     f"#   -A {cfg.account}   -q {cfg.queue}   -R {shlex.quote(cfg.resource)}",
-                     f"#   netlistdir={netdir or '<set in Mode B>'}",
-                     f"#   pdk={pdk or '(none — netlist self-contained)'}   "
-                     f"ahdllibdir={ahdl or '(none — sim auto-compiles VA)'}", ""]
+                where = "Donau dsub (cluster)" if on_cluster else "local"
+                L = [f"# {where} run PREVIEW — {len(grps)} measurement group(s), engine={eng}"]
+                if on_cluster:
+                    L.append(f"#   -A {cfg.account}   -q {cfg.queue}   -R {shlex.quote(cfg.resource)}")
+                L += [f"#   netlistdir={netdir or '<set in Mode B>'}",
+                      f"#   pdk={pdk or '(none — netlist self-contained)'}   "
+                      f"ahdllibdir={ahdl or '(none — sim auto-compiles VA)'}", ""]
                 for g in grps:
                     # blank pdk/ahdl -> None -> the -I / -ahdllibdir flags are omitted, and the
                     # simulator resolves models + compiles VA from the netlist itself.
                     payload = alps_cli.build_sim_cmd(eng, "input.scs", "../psf",
                                                      pdk or None, ahdl or None, mt=cfg.cpu or 8)
-                    cmd = donau.build_dsub_cmd(cfg, payload, netdir or "<netlistdir>")
-                    # shlex.join: the resource 'cpu=N;mem=M' and any path with spaces MUST be
-                    # quoted or the shell splits on ';'/space (drops mem= silently) -- the whole
-                    # point is a copy-pasteable command.
+                    # shlex.join: resource 'cpu=N;mem=M' and spaced paths MUST be quoted or the
+                    # shell splits them -- the whole point is a copy-pasteable command.
+                    cmd = (donau.build_dsub_cmd(cfg, payload, netdir or "<netlistdir>")
+                           if on_cluster else payload)
                     L += [f"## group {g['tag']}  ({g['analysis']})",
                           shlex.join(str(x) for x in cmd), ""]
                 L += ["# ⚠ A single input.scs cannot serve all groups (each needs a distinct",
                       "#   one-hot/analysis). A correct multi-measurement sweep needs ONE netlist",
                       "#   per group — that wiring is box-coupled and pending. This preview is the",
-                      "#   command SHAPE; verify/submit on the box."]
+                      "#   command SHAPE; verify/run on the box."]
                 self.x_report.setPlainText("\n".join(L))
-                self.x_gate.setText(f"cluster preview — {len(grps)} dsub command(s) above")
-                self.statusBar().showMessage(f"Previewed {len(grps)} Donau dsub command(s) "
-                                             f"(engine={eng}). No job submitted.")
+                self.x_gate.setText(f"{where} preview — {len(grps)} command(s) above")
+                self.statusBar().showMessage(f"Previewed {len(grps)} {where} command(s) "
+                                             f"(engine={eng}). Nothing executed.")
             except Exception as e:
-                QMessageBox.critical(self, "Cluster preview", f"{type(e).__name__}: {e}")
+                QMessageBox.critical(self, "Run preview", f"{type(e).__name__}: {e}")
 
         def _x_progress(self, frac, msg):
             self.x_prog.setValue(max(0, min(100, int(frac * 100))))
@@ -2540,6 +2555,9 @@ def _selftest(require_qt=False):
         win.x_mode.setCurrentIndex(win.x_mode.findData("import")); app.processEvents()
         assert win.x_grp_modeb.isVisibleTo(win) and not win.x_grp_pinform.isVisibleTo(win), \
             "Mode B must show the import group, hide the pin form"
+        assert not win.x_backend.model().item(win.x_backend.findData("ade")).isEnabled(), \
+            "ADE engine must be disabled in Mode B (no skillbridge)"
+        assert win.x_backend.currentData() != "ade", "Mode B must switch off the ADE engine"
         win.x_location.setCurrentIndex(win.x_location.findData("local")); app.processEvents()
         assert not win.x_grp_donau.isVisibleTo(win), "Donau panel hidden when location=local"
         win.x_location.setCurrentIndex(win.x_location.findData("cluster")); app.processEvents()
@@ -2577,9 +2595,17 @@ def _selftest(require_qt=False):
         assert "-ahdllibdir" not in _dl, "blank ahdllibdir must drop -ahdllibdir"
         assert "-format ps -o ../psf -mt" in _dl, "blank PDK must drop the model -I (no tree between -o and -mt)"
         win.xb_pdk["edit"].setText(str(tmp)); win.xb_ahdl["edit"].setText(str(tmp))
+        # local (not cluster): the preview must be the BARE engine command, not dsub-wrapped.
+        win.x_location.setCurrentIndex(win.x_location.findData("local"))
+        win._x_run()
+        _repL = win.x_report.toPlainText()
+        assert not any(l.startswith("dsub ") for l in _repL.splitlines()), \
+            "Mode-B local preview must be a bare command, not dsub"
+        assert "input.scs" in _repL, "local preview missing the engine command"
+        win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
         win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
-        print("  qt: mode-split (pinform/import/Donau visibility) + multi-supply parse + "
-              "cluster dsub preview OK")
+        print("  qt: mode-split (pinform/import/Donau visibility) + ADE-off-in-B + multi-supply "
+              "parse + cluster dsub + local-bare run preview OK")
         # form-config persistence: type values -> autosave -> a FRESH window must restore them;
         # named save/load round-trips too. (LDO_CONFIG_DIR points at the temp dir set above.)
         win.xf_dutlib.setText("PMU_TOP"); win.xf_dutcell.setText("pmu_top")
