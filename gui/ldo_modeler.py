@@ -856,6 +856,41 @@ if _HAVE_QT:
                 return                                        # tab still building
             self.x_grp_donau.setVisible(self.x_location.currentData() == "cluster")
 
+        # --- skillbridge (live Virtuoso) connection indicator --------------------
+        def _set_sb(self, state, msg):
+            """state: 'ok' (green) / 'no' (red) / 'idle' (grey)."""
+            dot = {"ok": "●", "no": "○", "idle": "◌"}[state]
+            col = {"ok": "#157f3b", "no": "#b00020", "idle": "#777"}[state]
+            self.x_sb_status.setText(f"skillbridge: {dot} {msg}")
+            self.x_sb_status.setStyleSheet(f"color:{col}; font-weight:bold;")
+
+        def _sb_initial(self):
+            """Cheap startup check: just whether skillbridge is importable (no connection attempt,
+            so launch never blocks). The full connection test is the Check button."""
+            try:
+                import skillbridge  # noqa: F401
+                self._set_sb("idle", "installed — click Check to test the connection")
+            except Exception:
+                self._set_sb("no", "not installed (offline venv — Mode B / offline modeling is fine)")
+
+        def _check_skillbridge(self):
+            """Probe the live skillbridge server (bounded). Updates the indicator. Never raises."""
+            self._set_sb("idle", "checking…")
+            QApplication.processEvents()
+            try:
+                from insitu.resolve import open_session, ResolveUnavailable
+            except Exception:
+                self._set_sb("no", "not installed (offline venv)")
+                return
+            try:
+                open_session(timeout=3.0)            # opens a bounded Workspace or raises
+                self._set_sb("ok", "connected (live Virtuoso)")
+                self.statusBar().showMessage("skillbridge connected — Mode A / ADE / Create cell available.")
+            except ResolveUnavailable as e:
+                self._set_sb("no", str(e).splitlines()[0][:90])
+            except Exception as e:
+                self._set_sb("no", f"{type(e).__name__}: {str(e)[:70]}")
+
         # --- Tab 0: Extract (in-situ, Mechanism A) -------------------------------
         def _tab_extract(self):
             w = QWidget(); outer = QVBoxLayout(w)
@@ -901,6 +936,16 @@ if _HAVE_QT:
                                    "Use this when the tool can't netlist for you.")
             self.x_mode.currentIndexChanged.connect(self._x_mode_changed)
             mrow.addWidget(self.x_mode); mrow.addStretch(1)
+            # skillbridge (live Virtuoso) connection indicator -- tells you up front whether the
+            # live paths (Mode A resolve, ADE run, Create model cell) can work.
+            self.x_sb_status = QLabel(); self.x_sb_status.setToolTip(
+                "Whether a live Virtuoso skillbridge server is reachable. Needed for Mode A "
+                "(resolve pins), the ADE engine, and Create model cell. Mode B / offline modeling "
+                "do NOT need it. Click Check after starting the CIW skillbridge server.")
+            self.x_sb_check = QPushButton("Check")
+            self.x_sb_check.setToolTip("Test the skillbridge connection now (opens a bounded probe).")
+            self.x_sb_check.clicked.connect(self._check_skillbridge)
+            mrow.addWidget(self.x_sb_status); mrow.addWidget(self.x_sb_check)
             mw = QWidget(); mw.setLayout(mrow); outer.addWidget(mw)
 
             # ---- pin FORM (deliverable 1): symbol pins -> resolved manifest (MODE A) -----
@@ -1137,6 +1182,7 @@ if _HAVE_QT:
             srow2.addWidget(b_send); srow2.addStretch(1)
             outer.addLayout(srow2)
             self._x_mode_changed(); self._x_location_changed()   # set initial group visibility
+            self._sb_initial()                                   # skillbridge indicator (import-only)
             return w
 
         def _form_gui(self):
@@ -2491,7 +2537,7 @@ def _selftest(require_qt=False):
             # a real ade/skillbridge worker (the engine default), Resolve opens a live bridge,
             # Create model cell drives SKILL -- none may fire in a headless smoke (they would hang
             # or mutate Cadence state). The text-prefix skip covers the async Fit / re-apply / emit.
-            _live_btns = {win.x_run, win.xf_build, win.xm_make}
+            _live_btns = {win.x_run, win.xf_build, win.xm_make, win.x_sb_check}
             for b in win.findChildren(_QW.QPushButton):
                 if b in _live_btns or b.text().startswith(("Fit", "Apply", "Emit", "…")):
                     continue                 # skip live runs / async Fit / re-apply / emit-guard / pickers
@@ -2604,8 +2650,13 @@ def _selftest(require_qt=False):
         assert "input.scs" in _repL, "local preview missing the engine command"
         win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
         win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
+        # skillbridge indicator: startup sets it (import-only, never blocks); _set_sb renders states
+        assert "skillbridge:" in win.x_sb_status.text(), "skillbridge indicator not initialized"
+        win._set_sb("ok", "x"); assert "●" in win.x_sb_status.text()
+        win._set_sb("no", "y"); assert "○" in win.x_sb_status.text()
+        win._sb_initial()
         print("  qt: mode-split (pinform/import/Donau visibility) + ADE-off-in-B + multi-supply "
-              "parse + cluster dsub + local-bare run preview OK")
+              "parse + cluster dsub + local-bare preview + skillbridge indicator OK")
         # form-config persistence: type values -> autosave -> a FRESH window must restore them;
         # named save/load round-trips too. (LDO_CONFIG_DIR points at the temp dir set above.)
         win.xf_dutlib.setText("PMU_TOP"); win.xf_dutcell.setText("pmu_top")
