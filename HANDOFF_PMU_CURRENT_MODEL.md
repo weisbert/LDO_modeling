@@ -1,5 +1,17 @@
 # HANDOFF — PMU current-output behavioral model: full build (G1–G11)
 
+> **GUI PROGRESS 2026-06-16 (turns 7–10, all on `main`, HEAD `976c73a`):** the in-situ Tab-0 GUI got a
+> big round of work ON TOP of the current-model engine. Done + green (GUI `--selftest` + 106 cadence
+> tests): current-port overlay on the Compare tab + import-tab layout fix (`55dc4d5`); red-zone deploy
+> crash fixed (lazy skillbridge in `adestate.py`, `43bf39d`); form-config persistence in `~/.ldo_modeler/`
+> (`dfe7f00`); **Tab-0 MODE split** schematic/import + multi-supply (`gui['supplies']`) + engine/location
+> split + Donau cluster panel + cluster `dsub` PREVIEW (`45cf3e4`, built via ultracode scout→implement→
+> adversarial-review); ahdllibdir + PDK now OPTIONAL — sim self-resolves from the netlist (`2651286`);
+> Mode-B input trim (ADE off, local/cluster meaningful, model-cell auto-name, `2bd74a1`); skillbridge
+> connection indicator (`976c73a`). **Box-coupled GUI remainders:** per-group netlists for a REAL Mode-B
+> cluster sweep (one input.scs = preview/plan-only); N-supply-input model cell (emit PSRR vs ALL supplies
+> — today only the first, LOUD-warned). The engine-side NEXT list below is unchanged.
+
 **Created 2026-06-15 (planning session). Build in a FRESH ultracode session — see
 `[[working-mode-ultracode-execution]]`.** The user decided to model EVERYTHING an independent
 behavioral-modeling expert flagged about the PMU **current** outputs (bias sources/sinks).
