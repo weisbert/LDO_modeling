@@ -172,12 +172,73 @@ def _voltage_block(o, vfit, supply, ground):
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
+def current_crow_from_isrc_fit(p, pin=None):
+    """harness/fit_isrc.fit_isrc(...) param dict -> a `crow` that _current_block emits
+    as the LARGE-SIGNAL VA form. Connects the offline-validated behavioral current model
+    (8/8 vs the MOS-GT, harness/crossval_isrc.py) to this Cadence VA emit; the in-situ
+    fit_multiport will produce the same fields on the box."""
+    return dict(sink=p["name"], pin=pin or p["name"], pol=p["pol"],
+                idc55=p["idc55"], didt=p["didt"], g0=p["g0"], vc=p["vc"],
+                gdd=p["gdd"], vknee=p["vknee"], knee_p=p["knee_p"], Cp=p["cp"],
+                in_white=p["in_white"], in_kf=p["in_kf"])
+
+
 def _current_block(o, crow, supply, ground):
-    """Render the Verilog-A for ONE current bias output. Behavioral current source with
-    the fitted admittance Y(s)=g0+sCp and a current-PSRR injection pi*(vin-vin_dc).
-    crow is a fit_multiport.current row: {sink,il,g0,Cp,yrms,ydc,pi:{s:{rms,dc}}}.
-    NOTE: pi_dc is a MAGNITUDE (fit_multiport reports |PI(0)|), so the current-PSRR sign
-    and phase are not modeled here -- consistent with the single-OP scope of the rails."""
+    """Render the Verilog-A for ONE current bias output. Dispatches:
+      * LARGE-SIGNAL form (Idc(T) + I-V compliance knee + g0 + Cp + SIGNED current-PSRR
+        + white/flicker noise) when the fit carries `idc55` -- the offline-validated
+        behavioral current model (harness/emit_isrc.py, 8/8 vs MOS-GT);
+      * else the LEGACY AC-only form (admittance Y=g0+sCp + |PI(0)| magnitude PSRR),
+        kept for backward compatibility with single-OP small-signal fits."""
+    if "idc55" in crow:
+        return _current_block_largesignal(o, crow, supply, ground)
+    return _current_block_legacy(o, crow, supply, ground)
+
+
+def _current_block_largesignal(o, crow, supply, ground):
+    """I_pin = ( Idc(T) + g0*(Vo-vc) + gdd*(Vsup-vdc) ) * tanh( (knee_arg/Vk)^p )
+              + Cp*ddt(Vo) + white_noise + flicker_noise.
+    SINK draws at {o}->ground; SOURCE injects supply->{o}. $temperature is KELVIN, so the
+    Idc nominal at 55 C uses 328.15 K. gdd sign is folded for the drive-node convention
+    (sink probe reads -I_pin), exactly as validated in harness/emit_isrc.py. The knee base
+    is sqrt-floored so the OP Jacobian of (arg/Vk)^p stays finite at Vo=0 when p<1."""
+    pre = o
+    pol = crow.get("pol", "sink")
+    idc55 = float(crow["idc55"]); didt = float(crow.get("didt", 0.0))
+    g0 = float(crow.get("g0", 0.0)); vc = float(crow.get("vc", 0.0))
+    vk = float(crow.get("vknee", 0.1)); kp = float(crow.get("knee_p", 1.0))
+    cp = float(crow.get("Cp", 0.0)); gdd = float(crow.get("gdd", 0.0))
+    gdd_eff = -gdd if pol == "sink" else gdd
+    inw2 = float(crow.get("in_white", 0.0)) ** 2
+    kf = float(crow.get("in_kf", 0.0))
+    rvars = [f"{pre}_idc55", f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
+             f"{pre}_vk", f"{pre}_kp", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"]
+    asg = (f"{pre}_idc55 = {idc55:.6e};  {pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
+           f"{pre}_vc = {vc:.6g};  {pre}_gdd = {gdd_eff:.6e};  {pre}_vk = {vk:.6g};  "
+           f"{pre}_kp = {kp:.6g};  {pre}_Cp = {cp:.6e};  {pre}_inw2 = {inw2:.6e};  "
+           f"{pre}_kf = {kf:.6e};")
+    if pol == "sink":
+        karg = f"sqrt(V({o},{ground})*V({o},{ground}) + 1e-12)"
+        drive = f"I({o}, {ground})"
+    else:
+        karg = f"sqrt((vdc_{supply}-V({o},{ground}))*(vdc_{supply}-V({o},{ground})) + 1e-12)"
+        drive = f"I({supply}, {o})"
+    body = f"""    // ====== current bias {o} ({pol}: Idc(T)+I-V knee+g0+Cp+signed PSRR+noise) ======
+    {drive} <+ ({pre}_idc55 + {pre}_didt*($temperature - 328.15)
+                  + {pre}_g0*(V({o},{ground}) - {pre}_vc)
+                  + {pre}_gdd*(V({supply},{ground}) - vdc_{supply}))
+                 * tanh(pow({karg}/{pre}_vk, {pre}_kp));
+    I({o}, {ground}) <+ {pre}_Cp*ddt(V({o}, {ground}));   // output cap (Y imag part)
+    I({o}, {ground}) <+ white_noise({pre}_inw2, "{pre}_wht");
+    I({o}, {ground}) <+ flicker_noise({pre}_kf, 1.0, "{pre}_flk");
+"""
+    return dict(rvars=rvars, asg=asg, body=body)
+
+
+def _current_block_legacy(o, crow, supply, ground):
+    """Legacy AC-only behavioral current source: fitted admittance Y(s)=g0+sCp and a
+    current-PSRR injection pi*(vin-vin_dc). crow: {sink,il,g0,Cp,yrms,ydc,pi:{s:{rms,dc}}}.
+    pi_dc is a MAGNITUDE (|PI(0)|), so current-PSRR sign/phase are not modeled."""
     pre = o
     g0 = float(crow.get("g0", 0.0))
     Cp = float(crow.get("Cp", 0.0))

@@ -14,6 +14,28 @@ I(o,VSS) <+ pi_dc*(V(AVDD,VSS) - vdc_AVDD);         // current-PSRR (magnitude o
 No DC bias current, no I-V (sat/triode/compliance), no noise, no temperature, magnitude-only PSRR.
 The expert review (this session) found 11 gaps (G1–G11); the user wants ALL of them built.
 
+## PROGRESS 2026-06-16 (offline, ngspice — no Cadence box needed)
+User reframed: **object = MOS-transistor-level, deliverable = behavioral** (the LDO pattern).
+Built + validated the whole offline pipeline:
+- **GT object set** `ground_truth/isrc_gt.lib` — **8 diverse transistor-level current sources**
+  (anti-overfit; user asked ≥6). Char'd terminal behavior → `work_isrc/*.npz`
+  (`harness/isrc_char.py`, `isrc_variants.py`).
+- **Behavioral fit** `harness/fit_isrc.py` (anchored OP + 2-point gate) → **emit** `harness/emit_isrc.py`
+  (ngspice B-source) → **cross-val** `harness/crossval_isrc.py`: **ONE template reproduces ALL 8**
+  (Idc ≤0.36%, IV ≤4.9% RMS, rout ≤6.6%, PSRR sign all ok, PTAT ≤0.001). This already satisfies
+  **G1/G2(PTAT)/G3/G4(sign)/G5/G7/G8** and the **G11** GT-vs-model DC + sign check (in the crossval).
+- **Cadence VA emit DONE** — `emit_pmu_model.py::_current_block_largesignal` now emits the validated
+  form: `I=(Idc(T)+g0*(Vo-vc)+gdd*(Vsup-vdc))*tanh((knee_arg/Vk)^p) + Cp*ddt + white/flicker noise`
+  ($temperature in Kelvin; sink drives o→gnd, source drives sup→o; legacy AC-only path kept for
+  back-compat). Bridge `current_crow_from_isrc_fit`. Tests `test_emit_pmu_current.py` +
+  `test_isrc.py`/`test_fit_isrc.py` green; offline VA-math mirror reproduces GT.
+
+**REMAINING (box-coupled / round-2):** wire **fit_multiport** to PRODUCE the large-signal fields
+(idc55/didt/vknee/knee_p/gdd-sign/noise) from on-box **Phase-1 DC+temp+coupling extraction** (it only
+has AC small-signal today); then **G9** cross-admittance (verify-first), **G6** corner family in the
+.lib (typical-first → round-2), **G11** the same columns in the fit_multiport report. The offline
+ngspice twin (`emit_isrc`) is the reference the on-box Spectre VA run must match.
+
 ## CONFIRMED build inputs (2026-06-15) — the 3 former open items, now CLOSED
 - **Temperatures: −40 / 55 / 125 °C** (the 55 °C center matches the typical-corner nominal — NOT the
   earlier −40/27/125 placeholder). `Idc(T)`/noise(T) = low-order poly; PTAT = linear-in-absolute-T.
