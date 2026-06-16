@@ -28,7 +28,7 @@ def _emit(tmp_path, arch_pins):
              for pin, a in arch_pins.items()]
     out = tmp_path / "PMU_isrc.va"
     emit_pmu_va(dict(voltage={}, current=crows, meta={}), "PMU_isrc", str(out),
-                supply="AVDD1P0", ground="VSS")
+                supply="AVDD1P0", ground="VSS", supply_dc=VDC)   # match the char supply
     return out.read_text(), list(arch_pins.keys())
 
 

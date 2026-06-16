@@ -95,6 +95,26 @@ EPEL el8 does not package ngspice; it was **built from source** (GitHub mirror,
 `AC_PREREQ` lowered to 2.69, linked with `-lstdc++`) to `~/.local/bin/ngspice`
 (v46), which is on PATH so `harness/ng.py` picks it up automatically.
 
+## Validated on the LOCAL Spectre CLI (2026-06-16) — whole flow, self-consistent
+`cadence/isrc_spectre.py --sc` runs the entire pipeline through **Spectre 18.1**: GT ported
+to Spectre spice (BSIM3 level 8→49, `{p}`→bare) → characterized **in Spectre** → fit → emit
+Verilog-A → **compiled (ahdlcmi −64) + simulated in Spectre** → compared to the GT on the same
+probe. **8/8** (Idc ≤0.36%, IV ≤4.95% RMS, PSRR sign+magnitude all match, PTAT err 0.001):
+```
+variant          pol     Idc err  IV rms   GT dId/dVdd   MD dId/dVdd  sign  PTAT  PASS
+v1_nmos_simple   sink      0.00%   3.76%        0.00n        0.00n     ok     -    yes
+v4_pmos_simple   source    0.02%   2.30%       55.62n       55.62n     ok     -    yes
+v6_ptat          sink      0.36%   3.73%     -145.46n     -145.46n     ok   0.001  yes
+v7_nmos_rbias    sink      0.07%   4.95%    -1802.00n    -1801.68n     ok     -    yes   (8/8)
+```
+**The Spectre run caught a real VA-emit bug invisible offline:** `emit_pmu_va` hardcoded
+`supply_dc=1.0` while the GT runs at 1.05 V — the SOURCE knee `(vdc-Vo)` shifted 50 mV (17.75%
+IV error on v4/v5) and the PSRR `gdd*(Vsup-vdc)` term got a DC offset (6.8% Idc on v7). Fixed:
+`supply_dc` is now a kwarg / read from fit meta; the bench passes the real 1.05 V. The offline
+ngspice `emit_isrc` used 1.05 directly so it never saw this — **why the on-simulator run matters.**
+First runs cross-sim (fit-to-ngspice vs Spectre-GT) → 5/8, the 3 misses being BSIM3 card
+differences (level 8 vs 49) for PMOS/resistor-bias; the `--sc` self-consistent path closes them.
+
 ## Next step
 Carry the validated behavioral form into the Cadence Verilog-A emit
 (`harness/emit_pmu_model.py::_current_block`) — same math (Idc(T)+I-V knee+g0+Cp+

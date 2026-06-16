@@ -317,7 +317,8 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
 
 
 # --------------------------------------------------------------------- emit
-def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS"):
+def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
+                supply_dc=None):
     """Emit ONE combined Verilog-A module `cell_name` for the whole PMU: input `supply`
     (LEFT), every voltage rail + current bias from fit_result (RIGHT), `ground` (BOTTOM).
 
@@ -344,11 +345,13 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS"):
             seen.add(s)
     i_outs = [r.get("pin", r["sink"]) for r in crows]
 
-    # supply DC reference: read from any output's primary supply fit context if present;
-    # default to the conventional AVDD1P0 = 1.0 V (the contract's single 1.0 V supply).
-    supply_dc = 1.0
+    # supply DC reference baked as vdc_<supply>. MUST match the supply used during
+    # characterization: the SOURCE compliance knee (vdc - Vo) and the PSRR term
+    # (Vsup - vdc) both pin to it -- a wrong vdc shifts the source knee and adds a
+    # gdd*delta DC offset. Priority: explicit kwarg > fit meta > contract default 1.0 V.
     meta = fit_result.get("meta", {})
-    # (fit_multiport meta does not carry supply dc; the GUI profile sets the literal)
+    if supply_dc is None:
+        supply_dc = float(meta.get("supply_dc", 1.0))
 
     # pass the PIN name (port) as the block's `o` -- it is used as BOTH the port reference
     # and the internal node namespace prefix; pin names are unique + valid VA identifiers.
