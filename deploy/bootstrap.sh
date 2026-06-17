@@ -78,6 +78,8 @@ echo "{\"installed_utc\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"requirements_hash\
 cp "$PREFIX/app/deploy/run_gui" "$PREFIX/run_gui"
 cp "$PREFIX/app/deploy/update"  "$PREFIX/update"
 cp "$PREFIX/app/deploy/apply"   "$PREFIX/apply"     # unified one-command updater (full|incremental)
+# defensive: strip any CRLF so the deployed launchers run even if the bundle was packaged on Windows
+sed -i 's/\r$//' "$PREFIX/run_gui" "$PREFIX/update" "$PREFIX/apply"
 chmod +x "$PREFIX/run_gui" "$PREFIX/update" "$PREFIX/apply"
 
 echo ""

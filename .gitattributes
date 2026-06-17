@@ -3,6 +3,9 @@
 *.sh text eol=lf
 # Requirements files are consumed by pip on the Linux red box — force LF too.
 requirements*.txt text eol=lf
-# Extensionless bash launchers shipped to the Linux red box — force LF (CRLF breaks the shebang).
+# Extensionless bash launchers shipped to the Linux red box — force LF (CRLF breaks the shebang
+# AND `set -euo pipefail` -> "invalid option name"). `*.sh` does NOT match these (no extension),
+# so every extensionless launcher MUST be listed explicitly.
 deploy/run_gui text eol=lf
 deploy/update text eol=lf
+deploy/apply text eol=lf

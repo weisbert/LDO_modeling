@@ -34,6 +34,9 @@ rm -rf "$HERE/.bundle_apply"; mkdir -p "$HERE/.bundle_apply"
 tar xzf "$TAR" -C "$HERE/.bundle_apply"
 B="$HERE/.bundle_apply"
 [ -f "$B/MANIFEST.json" ] || { echo "ERROR: $TAR has no MANIFEST.json (corrupt bundle?)"; exit 1; }
+# defensive: a Windows-packaged bundle may carry CRLF -> the installers it runs would die on
+# `set -euo pipefail\r` ("invalid option name"). Normalize the scripts we are about to bash.
+for s in "$B/bootstrap.sh" "$B/update.sh"; do [ -f "$s" ] && sed -i 's/\r$//' "$s"; done
 
 # --- dispatch on the mode recorded by package.py ---
 MODE="$(grep -o '"mode"[^,]*' "$B/MANIFEST.json" | head -1 | sed 's/.*: *"//; s/"//')"
