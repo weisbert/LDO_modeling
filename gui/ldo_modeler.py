@@ -420,7 +420,7 @@ class ExtractCore:
 
 # =============================================================================== Qt UI
 try:
-    from PyQt5 import QtCore, QtWidgets
+    from PyQt5 import QtCore, QtGui, QtWidgets
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                                  QHBoxLayout, QFormLayout, QGridLayout, QLabel, QLineEdit,
                                  QPushButton, QComboBox, QCheckBox, QFileDialog, QTextEdit,
@@ -589,27 +589,100 @@ if _HAVE_QT:
         "&nbsp;• <b>current_psrr_supplies</b> — subset of supplies to current-PSRR. "
         "<b>Validate</b> previews the measurement matrix; <b>Save</b> reloads it on Tab 0.")
 
+    class _FindReplaceBar(QWidget):
+        """A small Ctrl+F / Ctrl+H find/replace bar over a QTextEdit (the Raw-JSON view).
+        Plain-substring search (no regex) — enough for a designer hunting a net/role name."""
+
+        def __init__(self, parent, edit):
+            super().__init__(parent)
+            self.edit = edit
+            h = QHBoxLayout(self); h.setContentsMargins(0, 2, 0, 2)
+            self.find = QLineEdit(); self.find.setPlaceholderText("Find… (Ctrl+F)")
+            self.repl = QLineEdit(); self.repl.setPlaceholderText("Replace with… (Ctrl+H)")
+            b_next = QPushButton("Next"); b_prev = QPushButton("Prev")
+            b_rep = QPushButton("Replace"); b_all = QPushButton("Replace all")
+            b_close = QPushButton("✕"); b_close.setMaximumWidth(28)
+            b_next.clicked.connect(lambda: self._find(True))
+            b_prev.clicked.connect(lambda: self._find(False))
+            b_rep.clicked.connect(self._replace)
+            b_all.clicked.connect(self._replace_all)
+            b_close.clicked.connect(self.hide)
+            self.find.returnPressed.connect(lambda: self._find(True))
+            for wd in (QLabel("Find"), self.find, b_next, b_prev,
+                       QLabel("Repl"), self.repl, b_rep, b_all, b_close):
+                h.addWidget(wd)
+            self.setVisible(False)
+
+        def open_find(self):
+            self.setVisible(True); self.find.setFocus(); self.find.selectAll()
+
+        def open_replace(self):
+            self.setVisible(True); self.repl.setFocus()
+
+        def _find(self, forward=True):
+            from PyQt5.QtGui import QTextDocument
+            needle = self.find.text()
+            if not needle:
+                return False
+            flags = QTextDocument.FindFlags()
+            if not forward:
+                flags |= QTextDocument.FindBackward
+            if not self.edit.find(needle, flags):
+                # wrap around: move the cursor to the doc start/end and retry once
+                cur = self.edit.textCursor()
+                cur.movePosition(cur.End if not forward else cur.Start)
+                self.edit.setTextCursor(cur)
+                return self.edit.find(needle, flags)
+            return True
+
+        def _replace(self):
+            cur = self.edit.textCursor()
+            if cur.hasSelection() and cur.selectedText() == self.find.text():
+                cur.insertText(self.repl.text())
+            self._find(True)
+
+        def _replace_all(self):
+            needle = self.find.text()
+            if not needle:
+                return
+            txt = self.edit.toPlainText()
+            self.edit.setPlainText(txt.replace(needle, self.repl.text()))
+
     class _ManifestEditorDialog(QtWidgets.QDialog):
-        """In-GUI manifest JSON editor: edit/validate/save a pin-role manifest without
-        leaving the tool (the #1 'I can't find where to change the manifest' gap). Validate
-        parses the JSON and runs the same manifest.validate the pipeline uses, then previews
-        the derived measurement matrix. Save writes the editor text verbatim (preserving the
-        designer's formatting)."""
+        """In-GUI manifest editor: edit/validate/save a pin-role manifest without leaving the
+        tool. Two sub-tabs:
+          • Form     — fill-in-the-blanks (REQUIRED always visible + an ADVANCED group, collapsed).
+                       Supplies/v_out/i_out are tables. A TYPED OVERLAY on the parsed dict, so
+                       unknown/unmodeled keys survive the round-trip untouched.
+          • Raw JSON — the original QTextEdit (escape hatch + power view), with Ctrl+F / Ctrl+H.
+        Validate / Save / Save As reuse manifest._fill_defaults + .validate + .summary (thin-shell)."""
 
         def __init__(self, parent, text, path):
             super().__init__(parent)
             self.path = pathlib.Path(path) if path else None
             self.saved_path = None
             self.setWindowTitle(f"Manifest editor — {self.path.name if self.path else 'new (unsaved)'}")
-            self.resize(720, 640)
+            self.resize(760, 720)
+            # STASH: parse the incoming text once; the form is an overlay on THIS dict, so every
+            # key the form does not model survives intact. Bad JSON -> empty stash, raw text kept.
+            try:
+                self._stash = json.loads(text)
+                if not isinstance(self._stash, dict):
+                    self._stash = {}
+            except (json.JSONDecodeError, TypeError):
+                self._stash = {}
+
             lay = QVBoxLayout(self)
             help_ = QLabel(_MANIFEST_ROLE_HELP); help_.setWordWrap(True)
             help_.setStyleSheet("background:#eef5ff; padding:8px; border:1px solid #cdddee;")
             lay.addWidget(help_)
-            self.ed = QTextEdit(); self.ed.setPlainText(text)
-            self.ed.setStyleSheet("font-family:monospace; font-size:12px;")
-            self.ed.setLineWrapMode(QTextEdit.NoWrap)
-            lay.addWidget(self.ed, 1)
+
+            self.subtabs = QTabWidget()
+            self.subtabs.addTab(self._build_form_tab(), "Form")
+            self.subtabs.addTab(self._build_raw_tab(text), "Raw JSON")
+            self.subtabs.currentChanged.connect(self._on_subtab_changed)
+            lay.addWidget(self.subtabs, 1)
+
             self.status = QLabel("edit, then Validate"); self.status.setWordWrap(True)
             self.status.setStyleSheet("font-family:monospace; font-size:11px;")
             lay.addWidget(self.status)
@@ -622,15 +695,406 @@ if _HAVE_QT:
             brow.addWidget(b_save); brow.addWidget(b_saveas); brow.addWidget(b_cancel)
             lay.addLayout(brow)
 
-        def _check(self):
-            """Parse + validate the editor text. Returns (ok, message). On ok, message is the
-            human summary incl. the derived measurement matrix; else an actionable error."""
-            import json
-            from insitu import manifest as M
+            # populate the form widgets from the stashed dict (or template defaults)
+            self._dict_to_form(self._stash)
+
+        # ---- Raw-JSON sub-tab (the original editor + find/replace) -----------------
+        def _build_raw_tab(self, text):
+            w = QWidget(); v = QVBoxLayout(w); v.setContentsMargins(0, 0, 0, 0)
+            self.ed = QTextEdit(); self.ed.setPlainText(text)
+            self.ed.setStyleSheet("font-family:monospace; font-size:12px;")
+            self.ed.setLineWrapMode(QTextEdit.NoWrap)
+            self.findbar = _FindReplaceBar(self, self.ed)
+            v.addWidget(self.findbar)
+            v.addWidget(self.ed, 1)
+            # Ctrl+F / Ctrl+H find+replace over the raw text (escape hatch power-user view)
+            QtWidgets.QShortcut(QtGui.QKeySequence.Find, self.ed,
+                                activated=self.findbar.open_find)
+            QtWidgets.QShortcut(QtGui.QKeySequence.Replace, self.ed,
+                                activated=self.findbar.open_replace)
+            return w
+
+        # ---- Form sub-tab ----------------------------------------------------------
+        def _build_form_tab(self):
+            outer = QWidget(); ov = QVBoxLayout(outer)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            inner = QWidget(); v = QVBoxLayout(inner)
+
+            # REQUIRED section (always visible) ------------------------------------
+            req = QGroupBox("Required")
+            req.setStyleSheet("QGroupBox{font-weight:bold;}")
+            rf = QFormLayout(req)
+            self.f_name = QLineEdit(); self.f_name.setPlaceholderText("e.g. pmu_top")
+            rf.addRow(self._req_label("Model name"), self.f_name)
+            # DUT first (D4): tb_lib inherits dut_lib when left blank.
+            self.f_dut_lib = QLineEdit(); self.f_dut_lib.setPlaceholderText("e.g. sim_1108_yusheng")
+            self.f_dut_lib.setToolTip("DUT = the LDO/PMU being modeled. Its Cadence library.")
+            rf.addRow(self._req_label("DUT library"), self.f_dut_lib)
+            self.f_dut_cell = QLineEdit(); self.f_dut_cell.setPlaceholderText("e.g. Test_LDO")
+            self.f_dut_cell.setToolTip("DUT cell = your LDO cellview (the design under test).")
+            rf.addRow(self._req_label("DUT cell (your LDO)"), self.f_dut_cell)
+            self.f_tb_lib = QLineEdit()
+            self.f_tb_lib.setPlaceholderText("blank → inherits the DUT library (sim_1108_yusheng)")
+            self.f_tb_lib.setToolTip("Testbench = the schematic that instantiates the DUT + the "
+                                     "sources/probes ADE actually simulates. Blank → uses the DUT "
+                                     "library.")
+            rf.addRow(self._req_label("Testbench library"), self.f_tb_lib)
+            self.f_tb_cell = QLineEdit(); self.f_tb_cell.setPlaceholderText("e.g. Test_LDO_TB")
+            self.f_tb_cell.setToolTip("Testbench cell — the harness cellview wrapping the DUT.")
+            rf.addRow(self._req_label("Testbench cell"), self.f_tb_cell)
+            self.f_ground = QLineEdit(); self.f_ground.setPlaceholderText("e.g. gnd! (or VSS)")
+            rf.addRow(self._req_label("Ground net"), self.f_ground)
+
+            # supplies table (REQUIRED: >=1, each net + dc)
+            rf.addRow(QLabel("<b>Supplies *</b> &nbsp;<span style='color:#678;font-weight:normal'>"
+                             "(rails to PSRR — each needs a net + dc)</span>"))
+            self.t_supplies = self._make_table(["key", "net", "dc"],
+                                               ["AVDD1P0", "VDD1P0", "1.0"])
+            rf.addRow(self._table_block(self.t_supplies))
+
+            # outputs note: at least one v_out OR i_out
+            rf.addRow(QLabel("<b>Voltage outputs</b> &nbsp;<span style='color:#678;font-weight:"
+                             "normal'>(≥1 v_out OR i_out required)</span>"))
+            self.t_vout = self._make_table(["key", "net"], ["vco", "VDD0P8_VCO"])
+            rf.addRow(self._table_block(self.t_vout))
+            v.addWidget(req)
+
+            # ADVANCED section (collapsed by default — D2) --------------------------
+            adv = QGroupBox("Advanced (optional)")
+            adv.setCheckable(True); adv.setChecked(False)
+            adv.toggled.connect(lambda on, g=adv: self._toggle_group(g, on))
+            self.adv_group = adv
+            af = QFormLayout(adv)
+            self.f_extract = QLineEdit()
+            self.f_extract.setToolTip("The TB copy stimuli are appended to. Auto = <tb_cell>_extract.")
+            af.addRow("extract_cell", self.f_extract)
+            self.f_tb_view = QLineEdit(); self.f_tb_view.setPlaceholderText("e.g. schematic")
+            af.addRow("tb_view", self.f_tb_view)
+            self.f_dut_inst = QLineEdit(); self.f_dut_inst.setPlaceholderText("e.g. PMU_TOP")
+            self.f_dut_inst.setToolTip("DUT instance name inside the testbench.")
+            af.addRow("DUT instance (tb_inst)", self.f_dut_inst)
+            self.f_src_test = QLineEdit()
+            self.f_src_test.setPlaceholderText("optional — auto-discovered from the ADE-XL session")
+            af.addRow("ade_src_test", self.f_src_test)
+            self.f_cpsrr = QLineEdit()
+            self.f_cpsrr.setPlaceholderText("comma keys, e.g. AVDD1P0   (blank → all supplies)")
+            self.f_cpsrr.setToolTip("Supply ROLE KEYS the current-output PSRR is referenced to.")
+            af.addRow("current_psrr_supplies", self.f_cpsrr)
+            self.f_leave = QLineEdit()
+            self.f_leave.setPlaceholderText("comma, e.g. EN, PLL_CTRL<3:0>")
+            self.f_leave.setToolTip("Pins held at their OP value, not stimulated (enables, ctrl bus).")
+            af.addRow("leave_alone", self.f_leave)
+            # i_out table (advanced: a current output is optional + has compliance dc / iv_sweep)
+            af.addRow(QLabel("<b>Current outputs (i_out)</b> &nbsp;<span style='color:#678;"
+                             "font-weight:normal'>(net + compliance dc + optional I-V sweep)</span>"))
+            self.t_iout = self._make_table(["key", "net", "compliance dc", "iv_sweep"],
+                                           ["i500n", "IBP_500N", "0.9", "0:0.01:1.1"])
+            af.addRow(self._table_block(self.t_iout))
+            # bias table (advanced)
+            af.addRow(QLabel("<b>Bias ports (held)</b> &nbsp;<span style='color:#678;"
+                             "font-weight:normal'>(net + dc)</span>"))
+            self.t_bias = self._make_table(["key", "net", "dc"], ["vbg", "VBG", "0.6"])
+            af.addRow(self._table_block(self.t_bias))
+            # corners
+            self.f_pull = QCheckBox("pull corners from the ADE session")
+            self.f_pull.setChecked(True)
+            af.addRow("corners.pull_from_session", self.f_pull)
+            self.f_fallback = QLineEdit("nom")
+            self.f_fallback.setPlaceholderText("comma, e.g. nom, ff_125c")
+            af.addRow("corners.fallback", self.f_fallback)
+            # analysis lines
+            self.f_ac = QLineEdit()
+            self.f_ac.setPlaceholderText("ac start=10 stop=500M dec=20")
+            af.addRow("analysis.ac", self.f_ac)
+            self.f_noise = QLineEdit()
+            self.f_noise.setPlaceholderText("noise start=10 stop=100M dec=20")
+            af.addRow("analysis.noise", self.f_noise)
+            v.addWidget(adv)
+            self._toggle_group(adv, False)   # honor the collapsed initial state
+
+            v.addStretch(1)
+            scroll.setWidget(inner)
+            ov.addWidget(scroll, 1)
+            return outer
+
+        @staticmethod
+        def _req_label(text):
+            return QLabel(f"{text} <span style='color:#b00020'>*</span>")
+
+        @staticmethod
+        def _toggle_group(group, on):
+            """Collapse/expand a checkable QGroupBox by hiding its child widgets (PyQt5 has no
+            native collapse)."""
+            for ch in group.findChildren(QWidget):
+                ch.setVisible(on)
+
+        def _make_table(self, cols, example):
+            t = QTableWidget(0, len(cols))
+            t.setHorizontalHeaderLabels(cols)
+            t.horizontalHeader().setStretchLastSection(True)
+            t.setMaximumHeight(150)
+            t.setToolTip("example row → " + " / ".join(f"{c}={e}" for c, e in zip(cols, example)))
+            t._example = example
+            return t
+
+        def _table_block(self, table):
+            """A table + Add/Remove buttons in one container widget (for QFormLayout.addRow)."""
+            cont = QWidget(); v = QVBoxLayout(cont); v.setContentsMargins(0, 0, 0, 0)
+            v.addWidget(table)
+            h = QHBoxLayout()
+            b_add = QPushButton("+ row")
+            b_add.clicked.connect(lambda _=False, t=table: self._table_add_row(t))
+            b_del = QPushButton("− row")
+            b_del.clicked.connect(lambda _=False, t=table: self._table_del_row(t))
+            h.addWidget(b_add); h.addWidget(b_del); h.addStretch(1)
+            v.addLayout(h)
+            return cont
+
+        @staticmethod
+        def _table_add_row(t, values=None):
+            r = t.rowCount(); t.insertRow(r)
+            for c in range(t.columnCount()):
+                val = "" if values is None else (values[c] if c < len(values) else "")
+                it = QTableWidgetItem(str(val))
+                if values is None:                       # placeholder hint on a fresh row
+                    ex = getattr(t, "_example", [])
+                    if c < len(ex):
+                        it.setToolTip(f"e.g. {ex[c]}")
+                t.setItem(r, c, it)
+            return r
+
+        @staticmethod
+        def _table_del_row(t):
+            r = t.currentRow()
+            if r < 0:
+                r = t.rowCount() - 1
+            if r >= 0:
+                t.removeRow(r)
+
+        @staticmethod
+        def _table_rows(t):
+            rows = []
+            for r in range(t.rowCount()):
+                cells = []
+                for c in range(t.columnCount()):
+                    it = t.item(r, c)
+                    cells.append(it.text().strip() if it else "")
+                rows.append(cells)
+            return rows
+
+        # ---- form <-> dict (the typed OVERLAY, D6) ---------------------------------
+        def _dict_to_form(self, m):
+            """Populate the Form widgets from a parsed manifest dict. Tables are rebuilt from
+            the dict's role maps; unknown keys are NOT shown (they live on in self._stash)."""
+            d = m.get("dut") or {}
+            self.f_name.setText(str(m.get("name", "")))
+            self.f_dut_lib.setText(str(d.get("lib", "")))
+            self.f_dut_cell.setText(str(d.get("cell", "")))
+            self.f_tb_lib.setText(str(d.get("tb_lib", "")))
+            self.f_tb_cell.setText(str(d.get("tb_cell", "")))
+            self.f_ground.setText(str(m.get("ground", "")))
+            self.f_extract.setText(str(d.get("extract_cell", "")))
+            self.f_tb_view.setText(str(d.get("tb_view", "")))
+            self.f_dut_inst.setText(str(d.get("tb_inst", "")))
+            self.f_src_test.setText(str(d.get("ade_src_test", "")))
+            self.f_extract.setPlaceholderText(
+                (d.get("tb_cell", "") or "TB") + "_extract  (auto)")
+            self.f_cpsrr.setText(", ".join(m.get("current_psrr_supplies", []) or []))
+            self.f_leave.setText(", ".join(m.get("leave_alone", []) or []))
+            cor = m.get("corners") or {}
+            self.f_pull.setChecked(bool(cor.get("pull_from_session", True)))
+            self.f_fallback.setText(", ".join(cor.get("fallback", []) or []))
+            an = m.get("analysis") or {}
+            self.f_ac.setText(str(an.get("ac", "")))
+            self.f_noise.setText(str(an.get("noise", "")))
+
+            def fill(t, mp, cols):
+                t.setRowCount(0)
+                for k, ent in (mp or {}).items():
+                    ent = ent or {}
+                    row = [k]
+                    for col in cols[1:]:
+                        if col == "iv_sweep":
+                            iv = ent.get("iv_sweep")
+                            row.append(self._iv_to_text(iv))
+                        else:
+                            v = ent.get(col, "")
+                            row.append("" if v is None else str(v))
+                    self._table_add_row(t, row)
+            fill(self.t_supplies, m.get("supplies"), ["key", "net", "dc"])
+            fill(self.t_vout, m.get("v_out"), ["key", "net"])
+            fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "iv_sweep"])
+            fill(self.t_bias, m.get("bias"), ["key", "net", "dc"])
+
+        @staticmethod
+        def _iv_to_text(iv):
+            if iv is None:
+                return ""
+            if isinstance(iv, str):
+                return iv
+            if isinstance(iv, (list, tuple)) and len(iv) == 3:   # [vlo,vhi,step] -> start:step:stop
+                return f"{iv[0]}:{iv[2]}:{iv[1]}"
+            return ", ".join(str(x) for x in iv)
+
+        @staticmethod
+        def _iv_from_text(s):
+            s = s.strip()
+            if not s:
+                return None
+            if s.lower() == "auto":
+                return "auto"
+            try:
+                nums = [float(x) for x in s.split(":")]
+            except ValueError:
+                return s
+            if len(nums) == 3:                                   # start:step:stop -> [vlo,vhi,step]
+                start, step, stop = nums
+                return [start, stop, step]
+            return nums
+
+        @staticmethod
+        def _num(s):
+            """Parse a numeric cell to int/float when it looks numeric, else keep the string."""
+            try:
+                f = float(s)
+                return int(f) if f.is_integer() and "." not in s and "e" not in s.lower() else f
+            except ValueError:
+                return s
+
+        def _form_to_dict(self):
+            """Build the merged manifest dict: deep-copy the STASH (preserving unknown/unmodeled
+            keys), then overwrite ONLY the keys the form models (D6 — lossless overlay)."""
+            import copy
+            m = copy.deepcopy(self._stash) if isinstance(self._stash, dict) else {}
+            m["name"] = self.f_name.text().strip()
+            # DUT block: overlay the modeled dut keys, preserve any others (extract_view, etc.)
+            d = dict(m.get("dut") or {})
+            d["lib"] = self.f_dut_lib.text().strip()
+            d["cell"] = self.f_dut_cell.text().strip()
+            # D4: tb_lib inherits the DUT library when left blank (type DUT first)
+            d["tb_lib"] = self.f_tb_lib.text().strip() or self.f_dut_lib.text().strip()
+            d["tb_cell"] = self.f_tb_cell.text().strip()
+            for src, key in ((self.f_extract, "extract_cell"), (self.f_tb_view, "tb_view"),
+                             (self.f_dut_inst, "tb_inst"), (self.f_src_test, "ade_src_test")):
+                val = src.text().strip()
+                if val:
+                    d[key] = val
+                else:
+                    d.pop(key, None)
+            m["dut"] = d
+            # ground: only set when non-empty; blank -> drop it so _fill_defaults restores 'gnd!'
+            # (a present-but-empty value would ship as '' and defeat the setdefault). Mirrors how
+            # analysis / current_psrr_supplies below conditionally set-or-pop.
+            ground = self.f_ground.text().strip()
+            if ground:
+                m["ground"] = ground
+            else:
+                m.pop("ground", None)
+
+            # role tables overlay onto the STASHED per-entry dicts, so unmodeled per-entry keys
+            # (e.g. supplies.<k>.tb_src, i_out.<k>.probe_src, a 'pin' traceability tag) survive (D6).
+            stash_roles = m if isinstance(m, dict) else {}
+
+            def collect(t, role, has_dc=False, is_iout=False):
+                prev = stash_roles.get(role) or {}
+                out = {}
+                for cells in self._table_rows(t):
+                    key = cells[0]
+                    net = cells[1] if len(cells) > 1 else ""
+                    if not key:
+                        continue
+                    ent = dict(prev.get(key) or {})      # preserve this entry's unmodeled keys
+                    ent["net"] = net
+                    if is_iout:
+                        if len(cells) > 2 and cells[2] != "":
+                            ent["dc"] = self._num(cells[2])
+                        else:
+                            ent.pop("dc", None)
+                        if len(cells) > 3 and cells[3].strip():
+                            iv = self._iv_from_text(cells[3])
+                            if iv is not None:
+                                ent["iv_sweep"] = iv
+                        else:
+                            ent.pop("iv_sweep", None)
+                    elif has_dc:
+                        if len(cells) > 2 and cells[2] != "":
+                            ent["dc"] = self._num(cells[2])
+                        else:
+                            ent.pop("dc", None)
+                    out[key] = ent
+                return out
+            m["supplies"] = collect(self.t_supplies, "supplies", has_dc=True)
+            m["v_out"] = collect(self.t_vout, "v_out")
+            m["i_out"] = collect(self.t_iout, "i_out", is_iout=True)
+            m["bias"] = collect(self.t_bias, "bias", has_dc=True)
+
+            cpsrr = [t for t in (x.strip() for x in self.f_cpsrr.text().split(",")) if t]
+            if cpsrr:
+                m["current_psrr_supplies"] = cpsrr
+            else:
+                m.pop("current_psrr_supplies", None)
+            leave = [t for t in (x.strip() for x in self.f_leave.text().split(",")) if t]
+            m["leave_alone"] = leave
+            fb = [t for t in (x.strip() for x in self.f_fallback.text().split(",")) if t]
+            cor = dict(m.get("corners") or {})
+            cor["pull_from_session"] = bool(self.f_pull.isChecked())
+            cor["fallback"] = fb or ["nom"]
+            m["corners"] = cor
+            an = dict(m.get("analysis") or {})
+            if self.f_ac.text().strip():
+                an["ac"] = self.f_ac.text().strip()
+            if self.f_noise.text().strip():
+                an["noise"] = self.f_noise.text().strip()
+            if an:
+                m["analysis"] = an
+            return m
+
+        # ---- Form <-> Raw sync (merge-overlay both ways) ---------------------------
+        def _on_subtab_changed(self, idx):
+            """Form (0) -> Raw (1): regenerate the JSON text from the merged dict. Raw (1) -> Form
+            (0): re-parse the raw text into the stash + repopulate the form (warn on bad JSON,
+            keep the raw text). Both directions preserve unknown keys."""
+            if idx == 1:                                    # leaving Form -> entering Raw
+                self._sync_form_to_raw()
+            else:                                           # leaving Raw -> entering Form
+                self._sync_raw_to_form()
+
+        def _sync_form_to_raw(self):
+            self._stash = self._form_to_dict()              # re-stash so unknown keys persist
+            self.ed.setPlainText(json.dumps(self._stash, indent=2) + "\n")
+
+        def _sync_raw_to_form(self):
             try:
                 m = json.loads(self.ed.toPlainText())
-            except json.JSONDecodeError as e:
-                return False, f"JSON error: {e}"
+                if not isinstance(m, dict):
+                    raise ValueError("top-level JSON must be an object")
+            except (json.JSONDecodeError, ValueError) as e:
+                QMessageBox.warning(self, "Raw JSON",
+                    f"Raw JSON is not parseable; keeping the text, form not updated.\n\n{e}")
+                self.subtabs.blockSignals(True)
+                self.subtabs.setCurrentIndex(1)             # stay on Raw so the user can fix it
+                self.subtabs.blockSignals(False)
+                return
+            self._stash = m                                 # unknown keys live here
+            self._dict_to_form(m)
+
+        def _current_dict(self):
+            """The merged manifest dict reflecting whichever sub-tab is active."""
+            if self.subtabs.currentIndex() == 0:            # Form active -> overlay the stash
+                return self._form_to_dict()
+            try:                                            # Raw active -> parse the text
+                m = json.loads(self.ed.toPlainText())
+                return m if isinstance(m, dict) else None
+            except json.JSONDecodeError:
+                return None
+
+        def _check(self):
+            """Parse + validate the CURRENT editor state. Returns (ok, message). On ok, message
+            is the human summary incl. the derived measurement matrix; else an actionable error."""
+            from insitu import manifest as M
+            m = self._current_dict()
+            if m is None:
+                return False, "JSON error: the Raw JSON does not parse"
             try:
                 m = M._fill_defaults(m)
                 M.validate(m)
@@ -645,13 +1109,25 @@ if _HAVE_QT:
             self.status.setText(("VALID ✓\n" if ok else "INVALID ✗\n") + msg)
             return ok
 
+        def _merged_text(self):
+            """The JSON text to write: the merged dict (preserves unknown keys). If Raw is active
+            and parses, use its verbatim text (keeps the designer's formatting); else regenerate."""
+            if self.subtabs.currentIndex() == 1:
+                try:
+                    json.loads(self.ed.toPlainText())
+                    return self.ed.toPlainText()             # keep hand formatting
+                except json.JSONDecodeError:
+                    pass
+            m = self._current_dict()
+            return json.dumps(m, indent=2) + "\n"
+
         def _write(self, path):
             ok = self._validate()
             if not ok:
                 QMessageBox.warning(self, "Manifest", "Fix the validation error before saving.")
                 return False
             try:
-                pathlib.Path(path).write_text(self.ed.toPlainText())
+                pathlib.Path(path).write_text(self._merged_text())
             except OSError as e:
                 QMessageBox.critical(self, "Manifest", f"write failed: {e}")
                 return False
@@ -834,6 +1310,40 @@ if _HAVE_QT:
             if d:
                 edit.setText(d)
 
+        @staticmethod
+        def _pdk_default_for(engine):
+            """The engine-aware default PDK model path from $MODEL_ROOT (item #2 / D7).
+
+            The consumer (cluster/alps_cli.build_sim_cmd → _engine_model_tree) treats model_dir as
+            a DIRECTORY ROOT and appends the engine name to form the `-I` include TREE — it does NOT
+            consume a toplevel.scs FILE. So we default to the per-engine DIRECTORY $MODEL_ROOT/<eng>
+            (spectre_cli → /spectre, alps → /alps). ADE = live Maestro (no Mode-B import) → no default.
+            Returns "" when MODEL_ROOT is unset or the engine takes no default (never crashes)."""
+            root = os.environ.get("MODEL_ROOT")
+            if not root:
+                return ""
+            sub = {"spectre_cli": "spectre", "alps": "alps"}.get(engine)
+            if not sub:                                  # 'ade' (live) -> no Mode-B import default
+                return ""
+            return f"{root.rstrip('/')}/{sub}"
+
+        def _x_pdk_default(self):
+            """Refresh the xb_pdk placeholder (soft default) for the current engine. Auto-FILL the
+            field with the engine default when the user has not hand-edited it — i.e. it is empty
+            OR still holds the value we last auto-applied (so switching engines REFRESHES the stale
+            default instead of leaving the wrong path, #1). A genuine user edit (current text differs
+            from the stashed auto-value) is left untouched. Always update the placeholder. Safe if
+            MODEL_ROOT is unset (default resolves to '' -> placeholder falls back to the generic hint)."""
+            if not hasattr(self, "xb_pdk"):
+                return
+            dflt = self._pdk_default_for(self.x_backend.currentData())
+            ed = self.xb_pdk["edit"]
+            ed.setPlaceholderText(dflt or "optional — only if the netlist needs an -I model tree")
+            cur = ed.text().strip()
+            if dflt and (not cur or cur == getattr(self, "_xb_pdk_auto", None)):
+                ed.setText(dflt)
+                self._xb_pdk_auto = dflt
+
         def _x_mode_changed(self, *a):
             """Show the Mode-A pin form OR the Mode-B import group; Session only for ADE engine.
             Guarded: the combo signals fire during _tab_extract construction before the later
@@ -850,6 +1360,7 @@ if _HAVE_QT:
             if mode == "import" and self.x_backend.currentData() == "ade":
                 self.x_backend.setCurrentIndex(self.x_backend.findData("alps"))
             self.x_grp_session.setVisible(self.x_backend.currentData() == "ade")
+            self._x_pdk_default()       # engine-aware $MODEL_ROOT default for the PDK field (D7)
 
         def _x_location_changed(self, *a):
             if not hasattr(self, "x_grp_donau"):
@@ -954,18 +1465,30 @@ if _HAVE_QT:
             gf = QFormLayout(gb)
             self.xf_tblib = QLineEdit(); self.xf_tbcell = QLineEdit()
             self.xf_tbview = QLineEdit("schematic"); self.xf_inst = QLineEdit("I0")
-            self.xf_inst.setToolTip("The DUT instance name inside the testbench (e.g. I0).")
+            self.xf_inst.setToolTip("DUT instance name inside the testbench (e.g. PMU_TOP / I0).")
+            # DUT FIRST (type the design under test), then the testbench that wraps it. The
+            # testbench library inherits the DUT library when left blank (tb_lib <- dut_lib).
+            self.xf_dutlib = QLineEdit(); self.xf_dutcell = QLineEdit()
+            self.xf_dutlib.setToolTip("DUT = the LDO/PMU being modeled. Its Cadence library "
+                                      "(e.g. sim_1108_yusheng).")
+            self.xf_dutcell.setToolTip("DUT cell = your LDO cellview (the design under test, e.g. Test_LDO).")
+            dutrow = QHBoxLayout()
+            for lab, ed, tip in (("DUT library", self.xf_dutlib, "sim_1108_yusheng"),
+                                 ("DUT cell", self.xf_dutcell, "Test_LDO"),
+                                 ("DUT inst", self.xf_inst, "PMU_TOP")):
+                ed.setPlaceholderText(f"e.g. {tip}")
+                dutrow.addWidget(QLabel(lab)); dutrow.addWidget(ed)
+            dutw = QWidget(); dutw.setLayout(dutrow); gf.addRow("DUT (your LDO) *", dutw)
+            self.xf_tblib.setToolTip("Testbench = the schematic that instantiates the DUT + the "
+                                     "sources/probes ADE simulates. Blank → inherits the DUT library.")
+            self.xf_tbcell.setToolTip("Testbench cell — the harness cellview wrapping the DUT.")
+            self.xf_tblib.setPlaceholderText("blank → DUT library")
+            self.xf_tbcell.setPlaceholderText("e.g. Test_LDO_TB")
             tbrow = QHBoxLayout()
-            for lab, ed in (("lib", self.xf_tblib), ("cell", self.xf_tbcell),
-                            ("view", self.xf_tbview), ("DUT inst", self.xf_inst)):
+            for lab, ed in (("Testbench library", self.xf_tblib), ("Testbench cell", self.xf_tbcell),
+                            ("view", self.xf_tbview)):
                 tbrow.addWidget(QLabel(lab)); tbrow.addWidget(ed)
             tbw = QWidget(); tbw.setLayout(tbrow); gf.addRow("Testbench *", tbw)
-            self.xf_dutlib = QLineEdit(); self.xf_dutcell = QLineEdit()
-            self.xf_dutlib.setToolTip("DUT library (defaults to the testbench lib if blank).")
-            dutrow = QHBoxLayout()
-            for lab, ed in (("lib", self.xf_dutlib), ("cell", self.xf_dutcell)):
-                dutrow.addWidget(QLabel(lab)); dutrow.addWidget(ed)
-            dutw = QWidget(); dutw.setLayout(dutrow); gf.addRow("DUT *", dutw)
             self.xf_supplies = QLineEdit("AVDD1P0@1.0")
             self.xf_supplies.setToolTip("Supply INPUT pin(s), comma-separated, each 'pin@dc' "
                                         "(dc = operating voltage). One or many, e.g. "
@@ -1082,11 +1605,14 @@ if _HAVE_QT:
                 "simulator runs). In Mode A, ADE generates this for you; in Mode B you bring it.")
             bf.addRow("Netlist dir (input.scs) *", self.xb_netlist["w"])
             self.xb_pdk = self._path_row("xb_pdk", dir_only=True)
-            self.xb_pdk["edit"].setPlaceholderText("optional — only if the netlist needs an -I model tree")
             self.xb_pdk["edit"].setToolTip(
                 "OPTIONAL. The PDK model ROOT (its {alps,spectre} subtree is added to the sim's "
                 "-I). Leave BLANK if the netlist's own `include` lines already point at the models "
-                "(self-contained). Fill it only when the netlist uses a bare include that needs -I.")
+                "(self-contained). Fill it only when the netlist uses a bare include that needs -I.\n"
+                "Default: when $MODEL_ROOT is set and this is blank, the engine picks the subtree "
+                "($MODEL_ROOT/spectre for Spectre, $MODEL_ROOT/alps for ALPS). Overridable.")
+            self.xb_pdk["edit"].setPlaceholderText(self._pdk_default_for(self.x_backend.currentData())
+                                                   or "optional — only if the netlist needs an -I model tree")
             bf.addRow("PDK model dir (optional)", self.xb_pdk["w"])
             self.xb_ahdl = self._path_row("xb_ahdl", dir_only=True)
             self.xb_ahdl["edit"].setPlaceholderText("optional — blank ⇒ simulator compiles VA from the netlist")
@@ -1245,11 +1771,15 @@ if _HAVE_QT:
                     pin, sdc = tok, 1.0
                 if pin.strip():
                     supplies.append({"pin": pin.strip(), "dc": sdc})
+            # D4: type the DUT first; the TESTBENCH library inherits the DUT library when blank
+            # (tb_lib <- dut_lib). This is the deliberate flip of the old dut_lib<-tb_lib default.
+            dut_lib = self.xf_dutlib.text().strip()
             gui = dict(
-                tb_lib=self.xf_tblib.text().strip(), tb_cell=self.xf_tbcell.text().strip(),
+                tb_lib=self.xf_tblib.text().strip() or dut_lib,
+                tb_cell=self.xf_tbcell.text().strip(),
                 tb_view=self.xf_tbview.text().strip() or "schematic",
                 dut_inst=self.xf_inst.text().strip(),
-                dut_lib=self.xf_dutlib.text().strip() or self.xf_tblib.text().strip(),
+                dut_lib=dut_lib,
                 dut_cell=self.xf_dutcell.text().strip(),
                 supplies=supplies,
                 v_outs=_csl(self.xf_vouts.text()), i_outs=_csl(self.xf_iouts.text()),
@@ -1389,6 +1919,7 @@ if _HAVE_QT:
 
         def _open_manifest_editor(self, text, path):
             dlg = _ManifestEditorDialog(self, text, path)
+            dlg.subtabs.setCurrentIndex(0)               # land on the structured Form tab
             if dlg.exec_() and dlg.saved_path:           # Save / Save As succeeded
                 self.x_manifest.setText(str(dlg.saved_path))
                 self._x_load()                            # reload + refresh the summary/plan
@@ -2401,25 +2932,77 @@ def _selftest_extract(tmp):
 
 
 def _selftest_manifest_editor(win, tmp):
-    """Headless smoke of the in-GUI manifest editor (#1): template validates, a broken edit
-    is caught, and a valid edit Saves to disk + reloads through ExtractCore. Qt offscreen."""
+    """Headless smoke of the in-GUI manifest editor (#1): the structured Form + Raw-JSON sub-tabs.
+    Asserts: template validates, a broken/invalid edit is caught (Raw tab), a valid edit Saves +
+    reloads through ExtractCore, the Form models the REQUIRED fields, Form->Raw regenerates valid
+    JSON, an UNKNOWN top-level key + an unmodeled nested key SURVIVE the Raw->Form->save round-trip
+    (lossless overlay, D6), and find/replace works. Qt offscreen."""
+    RAW = 1
+    # 1) template validates on the Form tab (default), with the measurement matrix preview
     dlg = _ManifestEditorDialog(win, _MANIFEST_TEMPLATE, None)
+    assert dlg.subtabs.currentIndex() == 0, "dialog should open on the Form tab"
     ok, msg = dlg._check()
     assert ok, f"template should validate, got: {msg}"
     assert "measurement points" in msg, "validate preview missing the measurement matrix"
+    # 2) bad / invalid manifest is caught on the Raw tab
+    dlg.subtabs.setCurrentIndex(RAW)
     dlg.ed.setPlainText('{ "name": "x", oops }')                 # malformed JSON
-    bad_ok, _ = dlg._check()
-    assert not bad_ok, "broken JSON must fail validation"
+    assert not dlg._check()[0], "broken JSON must fail validation"
     dlg.ed.setPlainText('{"name":"x","dut":{"lib":"l"}}')         # valid JSON, invalid manifest
-    bad2_ok, _ = dlg._check()
-    assert not bad2_ok, "manifest missing dut.cell/v_out must fail validation"
-    # a valid edit -> write -> reload through the real loader
+    assert not dlg._check()[0], "manifest missing dut.cell/v_out must fail validation"
+    # 3) a valid edit -> write -> reload through the real loader (Raw tab text path)
     out = pathlib.Path(tmp) / "edited_manifest.json"
     dlg.ed.setPlainText(_MANIFEST_TEMPLATE)
     assert dlg._write(out) and dlg.saved_path == out and out.exists(), "save failed"
     ExtractCore().load_manifest(str(out))                         # reloadable end-to-end
     out.unlink()
-    print("  qt: manifest editor OK (template valid, bad JSON/manifest caught, save+reload)")
+
+    # 4) FORM round-trip: fill the REQUIRED fields programmatically, then Form->Raw must
+    #    regenerate JSON that parses + validates. tb_lib left blank -> inherits dut_lib (D4).
+    dlg2 = _ManifestEditorDialog(win, "{}", None)
+    dlg2.f_name.setText("pmu_top")
+    dlg2.f_dut_lib.setText("sim_1108_yusheng"); dlg2.f_dut_cell.setText("Test_LDO")
+    dlg2.f_tb_lib.setText("")                                     # blank -> inherit dut_lib
+    dlg2.f_tb_cell.setText("Test_LDO_TB"); dlg2.f_ground.setText("gnd!")
+    _ManifestEditorDialog._table_add_row(dlg2.t_supplies, ["AVDD1P0", "VDD1P0", "1.0"])
+    _ManifestEditorDialog._table_add_row(dlg2.t_vout, ["vco", "VDD0P8_VCO"])
+    dlg2.subtabs.setCurrentIndex(RAW)                            # Form->Raw regenerates the JSON
+    raw = json.loads(dlg2.ed.toPlainText())
+    assert raw["dut"]["tb_lib"] == "sim_1108_yusheng", "tb_lib must inherit dut_lib when blank (D4)"
+    assert raw["supplies"]["AVDD1P0"]["dc"] == 1.0 and raw["v_out"]["vco"]["net"] == "VDD0P8_VCO"
+    ok2, _ = dlg2._check()
+    assert ok2, "Form-built manifest must validate after Form->Raw"
+
+    # 5) LOSSLESS overlay: inject an UNKNOWN top-level key + an unmodeled NESTED key into Raw,
+    #    switch Raw->Form (re-parse) and back to Raw (regenerate via the stash), then save ->
+    #    both unknown keys MUST survive (D6).
+    raw["_designer_note"] = "keep me"                            # unknown top-level key
+    raw["dut"]["_secret_view"] = "layout"                       # unmodeled NESTED key under dut
+    raw["supplies"]["AVDD1P0"]["tb_src"] = "V_AVDD"             # unmodeled nested key under a supply
+    dlg2.ed.setPlainText(json.dumps(raw, indent=2))
+    dlg2.subtabs.setCurrentIndex(0)                             # Raw->Form re-parses into the stash
+    assert dlg2.f_name.text() == "pmu_top", "Raw->Form did not repopulate the form"
+    dlg2.subtabs.setCurrentIndex(RAW)                          # Form->Raw regenerates from the stash
+    merged = json.loads(dlg2.ed.toPlainText())
+    assert merged.get("_designer_note") == "keep me", "unknown top-level key lost in round-trip"
+    assert merged["dut"].get("_secret_view") == "layout", "unmodeled nested dut key lost"
+    assert merged["supplies"]["AVDD1P0"].get("tb_src") == "V_AVDD", "unmodeled supply key lost"
+    out2 = pathlib.Path(tmp) / "roundtrip_manifest.json"
+    assert dlg2._write(out2), "round-trip save failed"
+    on_disk = json.loads(out2.read_text())
+    assert on_disk.get("_designer_note") == "keep me" and \
+        on_disk["dut"].get("_secret_view") == "layout", "unknown keys did not reach disk"
+    ExtractCore().load_manifest(str(out2))                       # the merged file still loads
+    out2.unlink()
+
+    # 6) find/replace bar (Ctrl+F / Ctrl+H) over the Raw text
+    dlg2.findbar.find.setText("VDD0P8_VCO"); dlg2.findbar.repl.setText("VDD0P8_RENAMED")
+    dlg2.findbar._replace_all()
+    assert "VDD0P8_RENAMED" in dlg2.ed.toPlainText() and "VDD0P8_VCO" not in dlg2.ed.toPlainText(), \
+        "find/replace-all did not rewrite the Raw text"
+
+    print("  qt: manifest editor OK (Form+Raw tabs, bad JSON/manifest caught, save+reload, "
+          "tb_lib<-dut_lib, lossless unknown-key round-trip, find/replace)")
 
 
 def _selftest(require_qt=False):
@@ -2657,6 +3240,38 @@ def _selftest(require_qt=False):
         win._sb_initial()
         print("  qt: mode-split (pinform/import/Donau visibility) + ADE-off-in-B + multi-supply "
               "parse + cluster dsub + local-bare preview + skillbridge indicator OK")
+        # engine-aware $MODEL_ROOT PDK default (#2) + the stale-on-engine-switch fix (#1).
+        # Restore os.environ in a finally so we don't leak MODEL_ROOT into the rest of the test.
+        _mr_saved = os.environ.get("MODEL_ROOT")
+        try:
+            os.environ.pop("MODEL_ROOT", None)            # unset -> no default for any engine
+            assert MainWindow._pdk_default_for("spectre_cli") == "", "unset MODEL_ROOT must give no default"
+            assert MainWindow._pdk_default_for("ade") == "", "ADE engine never takes a default"
+            os.environ["MODEL_ROOT"] = str(tmp)           # set -> per-engine DIRECTORY subtree
+            assert MainWindow._pdk_default_for("spectre_cli").endswith("/spectre"), "spectre default subtree"
+            assert MainWindow._pdk_default_for("alps").endswith("/alps"), "alps default subtree"
+            assert MainWindow._pdk_default_for("ade") == "", "ADE (live) takes no Mode-B default even when set"
+            # engine-switch refresh + stale fix: in Mode B, the xb_pdk field must TRACK the engine
+            win.x_mode.setCurrentIndex(win.x_mode.findData("import")); app.processEvents()
+            win.xb_pdk["edit"].clear(); win._xb_pdk_auto = None      # start clean (no prior auto value)
+            win.x_backend.setCurrentIndex(win.x_backend.findData("spectre_cli")); app.processEvents()
+            assert win.xb_pdk["edit"].text().endswith("/spectre"), "PDK field did not auto-fill the spectre default"
+            win.x_backend.setCurrentIndex(win.x_backend.findData("alps")); app.processEvents()
+            assert win.xb_pdk["edit"].text().endswith("/alps"), \
+                "engine switch left a STALE PDK default (#1) — must refresh to alps"
+            # a genuine user edit must NOT be clobbered by a later engine switch
+            win.xb_pdk["edit"].setText("/my/custom/models")
+            win.x_backend.setCurrentIndex(win.x_backend.findData("spectre_cli")); app.processEvents()
+            assert win.xb_pdk["edit"].text() == "/my/custom/models", "user-edited PDK path was clobbered on engine switch"
+            win.xb_pdk["edit"].clear(); win._xb_pdk_auto = None
+            win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
+            print("  qt: PDK $MODEL_ROOT default (per-engine subtree, ADE none) + engine-switch refresh "
+                  "+ no-clobber of user edits OK (#1/#2)")
+        finally:
+            if _mr_saved is None:
+                os.environ.pop("MODEL_ROOT", None)
+            else:
+                os.environ["MODEL_ROOT"] = _mr_saved
         # form-config persistence: type values -> autosave -> a FRESH window must restore them;
         # named save/load round-trips too. (LDO_CONFIG_DIR points at the temp dir set above.)
         win.xf_dutlib.setText("PMU_TOP"); win.xf_dutcell.setText("pmu_top")
