@@ -10,3 +10,10 @@ matplotlib==3.9.4
 PyQt5==5.15.10
 PyQt5-Qt5==5.15.2      # KEY: 5.15.2 is manylinux2014; 5.15.11+ may need glibc 2.28
 PyQt5-sip==12.15.0
+
+# skillbridge: the LIVE-Virtuoso bridge (Mode A pin-resolve / ADE engine / create-cell). Pure
+# Python, py3-none-any, no glibc concern. It does NOTHING offline -- every import of it in the
+# app is function-local, so bundling it never affects the analytic-only path. PIN to the version
+# matching the CIW SKILL server (1.8.0 here); a client/server version skew breaks the handshake.
+# To actually connect you still start the server in CIW (pyStartServer) -> GUI 'Check' -> green.
+skillbridge==1.8.0
