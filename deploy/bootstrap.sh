@@ -75,12 +75,17 @@ echo "{\"installed_utc\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"requirements_hash\
 
 # install the launchers from the single source of truth (deploy/run_gui + deploy/update, shipped
 # into app/deploy/) so the repo file and the deployed file never drift.
-cp "$PREFIX/app/deploy/run_gui" "$PREFIX/run_gui"
-cp "$PREFIX/app/deploy/update"  "$PREFIX/update"
-cp "$PREFIX/app/deploy/apply"   "$PREFIX/apply"     # unified one-command updater (full|incremental)
-# defensive: strip any CRLF so the deployed launchers run even if the bundle was packaged on Windows
-sed -i 's/\r$//' "$PREFIX/run_gui" "$PREFIX/update" "$PREFIX/apply"
-chmod +x "$PREFIX/run_gui" "$PREFIX/update" "$PREFIX/apply"
+# Install the root launchers ATOMICALLY (write a temp, then mv/rename into place). A plain
+# in-place `cp` truncates+rewrites the very file that may be RUNNING right now (apply calls
+# bootstrap, which reinstalls apply) -> the running bash resumes at a stale byte offset and dies
+# with "syntax error". rename() swaps the inode, so the running script's open fd stays valid.
+# (sed strips any CRLF too, in case the bundle was packaged on Windows.)
+for L in run_gui update apply; do          # apply = unified one-command updater (full|incremental)
+    src="$PREFIX/app/deploy/$L"; [ -f "$src" ] || continue
+    tmp="$PREFIX/.$L.tmp.$$"
+    cp "$src" "$tmp"; sed -i 's/\r$//' "$tmp"; chmod +x "$tmp"
+    mv -f "$tmp" "$PREFIX/$L"
+done
 
 echo ""
 echo "OK. Launch the GUI with:"

@@ -35,10 +35,16 @@ cp -r "$HERE/app" "$PREFIX/"
 mkdir -p "$PREFIX/results" "$PREFIX/model"
 ln -sfn "$PREFIX/results" "$PREFIX/app/results"
 ln -sfn "$PREFIX/model"   "$PREFIX/app/model"
-# keep the root launchers fresh + present (they must live at the install root, next to .venv)
+# keep the root launchers fresh + present (they must live at the install root, next to .venv).
+# Install ATOMICALLY (temp + mv): a bare in-place cp would truncate+rewrite the very launcher that
+# may be RUNNING (update/apply reinstall themselves) -> running bash resumes at a stale offset ->
+# "syntax error". rename() swaps the inode so the running script's open fd stays valid. sed strips
+# any CRLF from a Windows-packaged launcher.
 for L in run_gui update apply; do
-    [ -f "$PREFIX/app/deploy/$L" ] && { cp "$PREFIX/app/deploy/$L" "$PREFIX/$L"; \
-        sed -i 's/\r$//' "$PREFIX/$L"; chmod +x "$PREFIX/$L"; }   # strip CRLF from Windows-packaged launchers
+    src="$PREFIX/app/deploy/$L"; [ -f "$src" ] || continue
+    tmp="$PREFIX/.$L.tmp.$$"
+    cp "$src" "$tmp"; sed -i 's/\r$//' "$tmp"; chmod +x "$tmp"
+    mv -f "$tmp" "$PREFIX/$L"
 done
 
 echo "[2/2] re-running smoke test ..."
