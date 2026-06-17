@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# One-command in-place updater for the LDO modeler install -- handles FULL *and* INCREMENTAL.
+# Drop a bundle tarball into THIS folder (the install root, where .venv/ app/ results/ live), run:
+#     ./apply                              # auto-picks the newest ldo_modeler_*.tar.gz here
+#     ./apply ldo_modeler_full.tar.gz      # or name one explicitly
+# It checksums, extracts to a temp dir, reads the bundle's MANIFEST "mode", and runs the right
+# installer against THIS install IN PLACE:
+#     full         -> bootstrap.sh  (rebuild .venv + wheels; results/ model/ kept)
+#     incremental  -> update.sh     (swap app/ only; .venv/wheels untouched, req-hash guarded)
+# Install root = wherever this script lives. No /tmp, no second argument needed.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"; cd "$HERE"
+
+# --- pick the bundle: explicit arg, else the newest ldo_modeler_*.tar.gz in the install root ---
+TAR="${1:-}"
+[ -n "$TAR" ] || TAR="$(ls -1t "$HERE"/ldo_modeler_*.tar.gz 2>/dev/null | head -1 || true)"
+[ -n "$TAR" ] && [ -f "$TAR" ] || {
+    echo "ERROR: no bundle found. Upload ldo_modeler_full.tar.gz or _incremental.tar.gz into"
+    echo "       $HERE   (or pass one as an argument)."; exit 1; }
+TAR="$(basename "$TAR")"
+echo "== apply: $TAR  ->  $HERE =="
+
+# --- integrity (if the .sha256 sidecar was uploaded too; tolerate CRLF from Windows) ---
+if [ -f "$TAR.sha256" ]; then
+    echo "[1/4] sha256 check ..."; sed 's/\r$//' "$TAR.sha256" | sha256sum -c
+else
+    echo "[1/4] (no $TAR.sha256 sidecar -- skipping integrity check)"
+fi
+
+# --- extract to a clean staging dir under the install root (tar is FLAT: app/ *.sh MANIFEST.json) ---
+trap 'rm -rf "$HERE/.bundle_apply"' EXIT
+echo "[2/4] extracting ..."
+rm -rf "$HERE/.bundle_apply"; mkdir -p "$HERE/.bundle_apply"
+tar xzf "$TAR" -C "$HERE/.bundle_apply"
+B="$HERE/.bundle_apply"
+[ -f "$B/MANIFEST.json" ] || { echo "ERROR: $TAR has no MANIFEST.json (corrupt bundle?)"; exit 1; }
+
+# --- dispatch on the mode recorded by package.py ---
+MODE="$(grep -o '"mode"[^,]*' "$B/MANIFEST.json" | head -1 | sed 's/.*: *"//; s/"//')"
+BLD="$(grep -o '"git_sha"[^,]*' "$B/MANIFEST.json" | head -1 | sed 's/.*: *"//; s/"//')"
+echo "[3/4] bundle mode=$MODE  build=${BLD:0:9}"
+case "$MODE" in
+  full)
+    [ -f "$B/bootstrap.sh" ] || { echo "ERROR: full bundle missing bootstrap.sh"; exit 1; }
+    echo "[4/4] FULL: rebuild .venv + wheels (results/ model/ kept) ..."
+    bash "$B/bootstrap.sh" "$HERE" ;;
+  incremental)
+    [ -f "$B/update.sh" ] || { echo "ERROR: incremental bundle missing update.sh"; exit 1; }
+    echo "[4/4] INCREMENTAL: refresh app/ only (.venv untouched) ..."
+    bash "$B/update.sh" "$HERE" ;;
+  *)
+    echo "ERROR: unknown/empty bundle mode '$MODE' in MANIFEST.json"; exit 1 ;;
+esac
+
+echo "== done: $HERE updated ($MODE ${BLD:0:9}) =="

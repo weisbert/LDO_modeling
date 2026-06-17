@@ -35,8 +35,10 @@ PYEOF
 
 mkdir -p "$PREFIX" "$PREFIX/results" "$PREFIX/model"
 echo "[2/5] copying app/ + wheels/ + lock + installers ..."
-cp -r "$HERE/app"            "$PREFIX/"
-cp -r "$HERE/wheels"         "$PREFIX/"
+# rm-then-cp so bootstrap is SAFE TO RE-RUN in place (a bare `cp -r app $PREFIX/` onto an existing
+# install nests as $PREFIX/app/app). results/ model/ are NEVER removed -> user outputs survive.
+rm -rf "$PREFIX/app"    && cp -r "$HERE/app"    "$PREFIX/"
+rm -rf "$PREFIX/wheels" && cp -r "$HERE/wheels" "$PREFIX/"
 cp    "$HERE/requirements.lock" "$PREFIX/"
 cp    "$HERE/update.sh"      "$PREFIX/" 2>/dev/null || true
 cp    "$HERE/MANIFEST.json"  "$PREFIX/MANIFEST.deployed.json"
@@ -75,7 +77,8 @@ echo "{\"installed_utc\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"requirements_hash\
 # into app/deploy/) so the repo file and the deployed file never drift.
 cp "$PREFIX/app/deploy/run_gui" "$PREFIX/run_gui"
 cp "$PREFIX/app/deploy/update"  "$PREFIX/update"
-chmod +x "$PREFIX/run_gui" "$PREFIX/update"
+cp "$PREFIX/app/deploy/apply"   "$PREFIX/apply"     # unified one-command updater (full|incremental)
+chmod +x "$PREFIX/run_gui" "$PREFIX/update" "$PREFIX/apply"
 
 echo ""
 echo "OK. Launch the GUI with:"
