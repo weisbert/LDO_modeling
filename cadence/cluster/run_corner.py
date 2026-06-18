@@ -149,32 +149,16 @@ def _relpath(target, start):
 
 
 # --------------------------------------------------------------------------- CLI
-# A thin command-line front-end so one corner can be SMOKE-TESTED on the box without the
-# GUI or skillbridge:  python -m cluster.run_corner --netlistdir <d> --out <d> --pdk $MODEL_ROOT
-# This is the documented "one-corner CLI driver" the module header promises. It does NOT
-# generate the per-group one-hot netlists (that is the multi-measurement sweep, still box-
-# coupled) -- it runs the netlist you point it at, end to end, to prove the Donau+ALPS path.
-def _build_argparser():
-    import argparse
-    ap = argparse.ArgumentParser(
-        prog="python -m cluster",
-        description="Run ONE corner via the pure-CLI Donau+ALPS path: submit -> poll -> verify "
-                    "the PSF landed -> print the PSF dir. Smoke test of the cluster pipeline; "
-                    "no skillbridge / ADE needed.")
-    ap.add_argument("--netlistdir", required=True,
-                    help="dir holding input.scs (read as the node cwd via dsub -EP).")
-    ap.add_argument("--out", dest="out_psf_dir", required=True,
-                    help="where the PSF lands. Point at a SCRATCH dir in your workarea -- NOT the "
-                         "maestro results tree (we never write the designer/maestro spine).")
-    ap.add_argument("--pdk", dest="pdk_model_dir", default=None,
-                    help="PDK model ROOT *directory* (the engine subtree {alps,spectre} is "
-                         "appended). e.g. $MODEL_ROOT  ->  -I $MODEL_ROOT/alps. Omit if the "
-                         "netlist's own include lines are self-contained.")
-    ap.add_argument("--ahdllibdir", default=None,
-                    help="compiled AHDL/VA model DB (-ahdllibdir). Omit -> the sim auto-compiles "
-                         "the Verilog-A from the netlist's ahdl_include lines.")
-    ap.add_argument("--engine", default="alps", choices=("alps", "spectre"))
-    ap.add_argument("--input-scs", default=INPUT_SCS, help=f"netlist filename (default {INPUT_SCS}).")
+# Two subcommands, both pure-CLI Donau+ALPS, no skillbridge / ADE:
+#   run-corner  (default)  ONE prepared netlist -> submit/poll/verify -> the PSF dir. The
+#               documented one-corner SMOKE TEST of the cluster pipeline. It does NOT generate
+#               per-group one-hot netlists; it runs the netlist you point it at, end to end.
+#   run-sweep              MANIFEST-DRIVEN per-group sweep: one Donau job per measurement GROUP
+#               (run.groups(m)), each netlisting one acm one-hot from ONE base input.scs via the
+#               OFFLINE group netlister (cluster.netlist_augment) -- no Virtuoso. Reuses the full
+#               9-step orchestrator (insitu.pmu_corner.run_pmu_corner, manifest=); lands the npz.
+def _add_donau_args(ap):
+    """The shared Donau submit-tuple + poll knobs (both subcommands)."""
     ap.add_argument("--account", default="ug_rfic.rfSClass", help="Donau -A account.")
     ap.add_argument("--queue", default="short", help="Donau -q queue.")
     ap.add_argument("--cpu", type=int, default=8, help="Donau cpu= (== alps -mt).")
@@ -182,14 +166,83 @@ def _build_argparser():
     ap.add_argument("--poll-interval", type=float, default=5.0)
     ap.add_argument("--poll-timeout", type=float, default=10800.0)
     ap.add_argument("--dry-run", action="store_true",
-                    help="assemble + print the exact dsub command, submit NOTHING.")
+                    help="assemble + print the dsub command(s), submit NOTHING.")
+
+
+def _build_argparser():
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="python -m cluster",
+        description="Pure-CLI Donau+ALPS corner driver (no skillbridge / ADE needed). Two "
+                    "subcommands: 'run-corner' (one prepared netlist, the smoke test) and "
+                    "'run-sweep' (the manifest-driven per-group sweep via the offline netlister).")
+    sub = ap.add_subparsers(dest="cmd")
+
+    # --- run-corner: the existing one-corner smoke (kept reachable; also the DEFAULT) -------
+    rcp = sub.add_parser("run-corner",
+                         help="run ONE prepared netlist dir: submit -> poll -> verify -> PSF dir")
+    rcp.add_argument("--netlistdir", required=True,
+                     help="dir holding input.scs (read as the node cwd via dsub -EP).")
+    rcp.add_argument("--out", dest="out_psf_dir", required=True,
+                     help="where the PSF lands. Point at a SCRATCH dir in your workarea -- NOT the "
+                          "maestro results tree (we never write the designer/maestro spine).")
+    rcp.add_argument("--pdk", dest="pdk_model_dir", default=None,
+                     help="PDK model ROOT *directory* (the engine subtree {alps,spectre} is "
+                          "appended). e.g. $MODEL_ROOT  ->  -I $MODEL_ROOT/alps. Omit if the "
+                          "netlist's own include lines are self-contained.")
+    rcp.add_argument("--ahdllibdir", default=None,
+                     help="compiled AHDL/VA model DB (-ahdllibdir). Omit -> the sim auto-compiles "
+                          "the Verilog-A from the netlist's ahdl_include lines.")
+    rcp.add_argument("--engine", default="alps", choices=("alps", "spectre"))
+    rcp.add_argument("--input-scs", default=INPUT_SCS, help=f"netlist filename (default {INPUT_SCS}).")
+    _add_donau_args(rcp)
+
+    # --- run-sweep: the manifest-driven offline per-group sweep -----------------------------
+    swp = sub.add_parser("run-sweep",
+                         help="manifest-driven per-group sweep via the OFFLINE netlister (no Virtuoso)")
+    swp.add_argument("--manifest", required=True,
+                     help="manifest path or bare name (resolved via insitu.manifest.load). Its "
+                          "nets MUST be resolved (no '<net:...>' placeholders).")
+    swp.add_argument("--base-netlist", required=True,
+                     help="dir holding the base maestro input.scs (the designer's .tran TB); the "
+                          "offline netlister rewrites it into one ac/noise netlist per group.")
+    swp.add_argument("--pdk", dest="pdk_model_dir", default=None,
+                     help="PDK model ROOT *directory* ($MODEL_ROOT); the engine subtree {alps,"
+                          "spectre} is appended to -I.")
+    swp.add_argument("--ahdllibdir", default=None,
+                     help="compiled AHDL/VA model DB (-ahdllibdir). Omit -> the sim auto-compiles.")
+    swp.add_argument("--engine", default="alps", choices=("alps", "spectre"))
+    swp.add_argument("--work-root", default=None,
+                     help="$WORK_ROOT (else env WORK_ROOT / ~/ldo_workarea); the per-group netlists "
+                          "+ PSF + npz land under <work-root>/ldo_modeling/<Lib>__<Cell>/<corner>.")
+    swp.add_argument("--corner", default=None, help="process-corner label (else the manifest's).")
+    _add_donau_args(swp)
     return ap
+
+
+_SUBCOMMANDS = ("run-corner", "run-sweep")
 
 
 def main(argv=None):
     import sys
+    raw = list(argv) if argv is not None else sys.argv[1:]
+    # default subcommand: run-corner. Inject it when the first non-help arg is NOT a known
+    # subcommand, so the existing `python -m cluster --netlistdir ...` smoke keeps working
+    # unchanged (argparse subparsers need the subcommand token to lead).
+    if raw and raw[0] not in _SUBCOMMANDS and raw[0] not in ("-h", "--help"):
+        raw = ["run-corner", *raw]
+    args = _build_argparser().parse_args(raw)
+    if getattr(args, "cmd", None) is None:                 # bare `python -m cluster`
+        _build_argparser().parse_args(["-h"])
+        return 2
+    if args.cmd == "run-sweep":
+        return _main_sweep(args)
+    return _main_run_corner(args)
+
+
+def _main_run_corner(args):
+    import sys
     import shlex
-    args = _build_argparser().parse_args(argv)
     cfg = DonauCfg(account=args.account, queue=args.queue,
                    resource=f"cpu={args.cpu};mem={args.mem}")
     common = dict(engine=args.engine, donau=cfg, input_scs=args.input_scs)
@@ -210,6 +263,63 @@ def main(argv=None):
         print(f"FAILED: {e}", file=sys.stderr)
         return 1
     print(f"OK -- PSF dir: {psf}")
+    return 0
+
+
+def _main_sweep(args):
+    """The run-sweep subcommand: load the manifest, build the OFFLINE group netlister over the
+    base input.scs, and drive the FULL 9-step orchestrator (manifest-driven). On --dry-run print
+    the per-group dsub commands; on a real run land the npz. Reuses pmu_corner.run_pmu_corner --
+    no second orchestrator."""
+    import sys
+    import shlex
+    # imports are function-local so the cluster package never hard-depends on insitu at load
+    # time (insitu.pmu_corner imports cluster -> a module-level import here would be circular).
+    sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))   # .../cadence
+    from insitu import manifest as _manifest
+    from insitu import pmu_corner as _pc
+    from . import netlist_augment as _na
+
+    m = _manifest.load(args.manifest)
+    corner = args.corner or m.get("corner") or (m.get("corners", {}).get("fallback") or ["nom"])[0]
+    cfg = DonauCfg(account=args.account, queue=args.queue,
+                   resource=f"cpu={args.cpu};mem={args.mem}")
+
+    # the per-group netlists land under the workarea corner dir's netlist/ subtree (NOT the
+    # designer spine). corner_dir uses a minimal gui synthesized from the manifest.
+    gui = _pc._gui_from_manifest(m)
+    base, dirs = _pc.corner_dir(args.work_root, gui, corner)
+    out_base = dirs["netlist"]
+
+    runner = None if args.dry_run else _donau.SubprocessRunner()
+
+    def _on_status(state, raw):
+        print(f"  [donau] {state}", flush=True)
+
+    try:
+        # building the offline factory validates resolved nets + the supply source up front;
+        # surface its NetlistAugmentError cleanly rather than as a traceback.
+        gnl = _na.make_offline_group_netlister(args.base_netlist, m, out_base)
+        res = _pc.run_pmu_corner(
+            manifest=m, work_root=args.work_root, corner=corner, engine=args.engine,
+            netlistdir=args.base_netlist, ahdllibdir=args.ahdllibdir,
+            pdk_model_dir=args.pdk_model_dir, group_netlister=gnl, donau=cfg,
+            runner=runner, on_status=_on_status, dry_run=args.dry_run,
+            poll_interval=args.poll_interval, poll_timeout=args.poll_timeout)
+    except (RunCornerError, _na.NetlistAugmentError, _manifest.ManifestError) as e:
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 1
+
+    cmds = res.get("dsub_cmds") or []
+    if args.dry_run:
+        print(f"\n=== run-sweep DRY: {len(cmds)} Donau job(s) (one per measurement GROUP) ===")
+        for c in cmds:
+            print(shlex.join(str(x) for x in c))
+        return 0
+    print(f"\n=== run-sweep: {len(cmds)} group(s) ran ===")
+    print(f"  psf_dir : {res.get('psf_dir')}")
+    print(f"  npz     : {res.get('npz')}")
+    print(f"  va      : {res.get('va')}")
     return 0
 
 

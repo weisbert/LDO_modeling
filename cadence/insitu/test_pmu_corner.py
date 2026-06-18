@@ -20,6 +20,7 @@ Nothing papers over the box steps:
 
 Run:  python -m pytest cadence/insitu/test_pmu_corner.py -q
 """
+import json
 import pathlib
 import re
 import sys
@@ -35,12 +36,14 @@ from insitu import manifest as M                                           # noq
 from insitu import run as RUN                                              # noqa: E402
 from insitu import importmp as IMP                                         # noqa: E402
 from cluster.donau import RunResult                                        # noqa: E402
+from cluster import netlist_augment as NA                                  # noqa: E402
 
 import fit_multiport as FIT                                                # noqa: E402
 import emit_pmu_model as EMIT                                              # noqa: E402
 
 ROOT = HERE.parents[1]                          # .../LDO_modeling (HERE=.../cadence/insitu)
 STANDIN_MANIFEST = HERE / "manifests" / "pmu_top.json"
+WUR_MANIFEST = HERE / "manifests" / "wur_pmu_top.json"
 
 
 # ----------------------------------------------------------------- the REAL PMU GUI
@@ -389,6 +392,152 @@ def test_corner_dir_layout_and_work_root(tmp_path, monkeypatch):
 
     monkeypatch.setenv("WORK_ROOT", str(tmp_path / "envroot"))
     assert PC.resolve_work_root() == tmp_path / "envroot"
+
+
+# =====================================================================================
+# (F) OFFLINE SWEEP: run_pmu_corner(manifest=) + the REAL offline group netlister
+#     (cluster.netlist_augment) -- NO Virtuoso, NO dsub. The manifest-driven path reuses
+#     all 9 steps (no second orchestrator) and rewrites ONE base input.scs into the 8
+#     per-group one-hot ac/noise netlists.
+# =====================================================================================
+def _resolved_wur_manifest():
+    """A RESOLVED copy of the shipped wur_pmu_top manifest ('<net:X>' -> 'X'), loaded +
+    validated -- the offline-sweep input (the real red-zone roles: 1 supply + 2 v_out + 3
+    i_out -> 14 measurement points -> 8 groups)."""
+    raw = re.sub(r"<net:([^>]+)>", r"\1", WUR_MANIFEST.read_text())
+    return M.load(_write_json(json.loads(raw)))
+
+
+_OFFLINE_TMP = []
+
+
+def _write_json(obj):
+    import tempfile
+    f = tempfile.NamedTemporaryFile("w", suffix=".json", delete=False)
+    json.dump(obj, f)
+    f.close()
+    _OFFLINE_TMP.append(f.name)
+    return f.name
+
+
+def _wur_base_dir(tmp_path):
+    """A synthetic base .tran TB matching the resolved wur nets: the DUT instance, a supply
+    vsource on AVDD1P0 (no tb_src -> auto-detect), an output load, and a .tran to be stripped."""
+    d = tmp_path / "base"
+    d.mkdir()
+    (d / "input.scs").write_text(
+        "simulator lang=spectre\n"
+        'include "models.scs"\n'
+        "Xdut (AVDD1P0 VDD0P8_PLL VDD0P8_VCO IBP_POLY_500N_LPF IBP_POLY_3P6U_VCO "
+        "IBP_PTAT_TUNE_1P5U_VCO VSS) WuR_PMU_TOP\n"
+        "V_AVDD (AVDD1P0 0) vsource dc=0.98\n"
+        "Iload_pll (VDD0P8_PLL 0) isource dc=500u\n"
+        "tt tran stop=1u\n")
+    return d
+
+
+def test_offline_sweep_dry_run_eight_groups(tmp_path):
+    """run_pmu_corner(manifest=) + the REAL offline netlister, dry_run: exactly 8 per-group
+    dsub commands assembled, NOTHING executed; the per-group one-hot netlists were written
+    under the workarea; resolve/manifest steps SKIPPED (manifest-driven)."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    assert len(grps) == 8
+
+    # the per-group netlists land under the workarea corner dir (NOT the designer spine)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+
+    class Boom:
+        def __call__(self, *a, **k):
+            raise AssertionError("runner must NOT be called on a dry_run sweep")
+
+    res = PC.run_pmu_corner(
+        manifest=m, work_root=str(tmp_path), corner=corner, engine="alps",
+        netlistdir=str(base), ahdllibdir=None, pdk_model_dir=str(tmp_path / "pdk"),
+        group_netlister=gnl, runner=Boom(), dry_run=True, sleep=lambda *_: None)
+
+    # exactly one assembled dsub per measurement GROUP, returned without executing -----------
+    assert res["dsub_cmds"] and len(res["dsub_cmds"]) == 8
+    for cmd, g in zip(res["dsub_cmds"], grps):
+        s = " ".join(str(x) for x in cmd)
+        assert cmd[0] == "dsub"
+        assert "/software/empyrean/alps/2026.03.hf1/bin/alps" in s and "-ade" in s
+        # -EP points at THIS group's offline-written netlist dir (a real per-group one-hot)
+        assert "-EP " + str(dirs["netlist"] / g["tag"]) in s
+        assert (dirs["netlist"] / g["tag"] / "input.scs").is_file()
+    # injected real factory -> each group has its OWN one-hot netlist (a real sweep, not shape)
+    assert res["per_group_netlist"] is True
+    # the manifest-driven path SKIPS resolve+manifest; the run still happened (dry) ----------
+    assert "resolve" not in res["steps_run"] and "manifest" not in res["steps_run"]
+    assert "run" in res["steps_run"]
+    # a workarea copy of the manifest was persisted for traceability
+    assert res["manifest"] and pathlib.Path(res["manifest"]).exists()
+    assert not res["psf_map"]                            # nothing ran -> no PSF map
+
+
+def test_offline_sweep_real_runner_psf_map_by_all_14_tags(tmp_path):
+    """Non-dry offline sweep with a FAKE runner that pre-seeds each group's stub PSF + .simDone:
+    psf_map is keyed by ALL 14 measurement tags (each tag -> its group's PSF dir)."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+
+    # pre-fill each group's psf subdir so run_corner's _verify_psf passes with the fake runner
+    for g in grps:
+        gd = dirs["psf"] / g["tag"]
+        gd.mkdir(parents=True, exist_ok=True)
+        ext = "noise.noise" if g["analysis"] == "noise" else "ac.ac"
+        (gd / ext).write_bytes(b"PSFversion")
+        (gd / ".simDone").write_bytes(b"")
+
+    runner = FakeRunner()
+    seen = []
+    res = PC.run_pmu_corner(
+        manifest=m, work_root=str(tmp_path), corner=corner, engine="alps",
+        netlistdir=str(base), ahdllibdir=None, pdk_model_dir=str(tmp_path / "pdk"),
+        group_netlister=gnl, runner=runner, on_status=lambda st, raw: seen.append(st),
+        sleep=lambda *_: None,
+        # run-only: the read/fit/emit side needs a real PSF (covered elsewhere); the npz fixture
+        # for wur's 2+3 topology needs a box run, so we stop after the SWEEP.
+        steps=["augment", "netlist", "run"])
+
+    # one dsub per group; the Donau transitions surfaced per group --------------------------
+    assert len(runner.cmds("dsub")) == 8
+    assert seen == ["pending", "running", "done"] * 8
+
+    # psf_map keyed BY MEASUREMENT TAG, covering ALL 14 measurement points -------------------
+    meas_tags = {pt["tag"] for pt in M.measurements(m)}
+    assert len(meas_tags) == 14
+    assert set(res["psf_map"]) == meas_tags
+    # every member of a group maps to THAT group's PSF dir
+    for g in grps:
+        gdir = str(pathlib.Path(res["psf_dir"]) / g["tag"])
+        for pt in g["members"]:
+            assert res["psf_map"][pt["tag"]] == gdir, (pt["tag"], g["tag"])
+
+    # every artifact under the workarea, never the designer spine ----------------------------
+    workarea = tmp_path / "ldo_modeling"
+    for gtag, gdir in res["psf_map"].items():
+        assert str(gdir).startswith(str(workarea)) and "/simulation/" not in str(gdir)
+
+
+def test_offline_sweep_guard_trips_on_unresolved_manifest(tmp_path):
+    """The shipped wur manifest carries '<net:...>' placeholders; building the offline factory
+    over it must refuse with an actionable error (resolve nets first)."""
+    m = M.load(str(WUR_MANIFEST))                       # placeholders intact
+    base = _wur_base_dir(tmp_path)
+    with pytest.raises(NA.NetlistAugmentError) as ei:
+        NA.make_offline_group_netlister(base, m, tmp_path / "out")
+    assert "resolve" in str(ei.value).lower()
 
 
 if __name__ == "__main__":

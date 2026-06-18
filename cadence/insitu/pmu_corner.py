@@ -407,19 +407,44 @@ def step_cell(fit_result, va_path, *, model_lib, model_cell, model_path,
 
 
 # =========================================================================== orchestrator
-def run_pmu_corner(gui, work_root=None, corner=None, engine="alps",
+def _gui_from_manifest(m):
+    """Synthesize the MINIMAL gui fields run_pmu_corner still needs from a loaded manifest
+    (the manifest-driven offline-sweep path). corner_dir needs tb_lib/tb_cell; the supply/
+    ground/model defaults are read off the manifest too. We do NOT reconstruct the full GUI
+    schema -- only the keys the orchestrator reads when manifest= is given (resolve + manifest
+    steps are skipped, so build_manifest's gui keys are never consumed)."""
+    d = m["dut"]
+    sups = m.get("supplies") or {}
+    first_sup = next(iter(sups.values()), {}) if sups else {}
+    return {
+        "tb_lib": d["tb_lib"], "tb_cell": d["tb_cell"],
+        "dut_lib": d.get("lib", ""), "dut_cell": d.get("cell", ""),
+        "ground": m.get("ground"),
+        # supply_pins() reads gui['supply']={pin,..}; carry the first supply's pin
+        "supply": {"pin": first_sup.get("pin", ""), "dc": first_sup.get("dc")},
+        "corner": m.get("corner") or (m.get("corners", {}).get("fallback") or [None])[0],
+        "model_cell": (m.get("dut", {}).get("cell") or "model"),
+    }
+
+
+def run_pmu_corner(gui=None, work_root=None, corner=None, engine="alps",
                    session=None, netmap=None, netlistdir=None, ahdllibdir=None,
                    pdk_model_dir=None, model_lib=None, model_cell=None, model_path=None,
                    runner=None, on_status=None, dry_run=False, steps=None,
                    donau=None, npz_in=None, fit_manifest=None, supply_pin=None,
-                   ground=None, progress=None, group_netlister=None,
+                   ground=None, progress=None, group_netlister=None, manifest=None,
                    extract_test="insitu_extract", session_name="fnxSession0",
                    poll_interval=5.0, poll_timeout=10800.0, sleep=None):
     """Run ONE process corner of in-situ PMU LDO modeling end-to-end (the 9-step flow).
 
     gui            the designer's GUI inputs (build_manifest schema: tb_lib/tb_cell/tb_view,
                    dut_inst/dut_lib/dut_cell, supply={pin,dc}, v_outs=[pin], i_outs=[pin],
-                   ground, corner, optional biases/iload/vdc).
+                   ground, corner, optional biases/iload/vdc). OPTIONAL when manifest= is given.
+    manifest       a loaded manifest dict to drive the run VERBATIM (the manifest-driven
+                   offline-sweep path -- the run-sweep CLI). When given we use it as m, SKIP
+                   the 'resolve' and 'manifest' steps (we already have m + resolved nets), and
+                   synthesize the minimal gui fields the remaining steps need from it. The
+                   gui-driven path (manifest=None) is 100% unchanged.
     work_root      writable $WORK_ROOT (else env WORK_ROOT, else ~/ldo_workarea).
     corner         process-corner label (else gui['corner'], else 'nom').
     engine         'alps' (default) | 'spectre'.
@@ -458,12 +483,24 @@ def run_pmu_corner(gui, work_root=None, corner=None, engine="alps",
     model cell) + the fit report + the BY-TAG psf_map + per-group dsub commands (dsub_cmd is
     the first group's; dsub_cmds is the full list) -- ALWAYS, even in dry_run."""
     want = set(steps) if steps is not None else set(STEPS)
+    # manifest-driven offline-sweep path: drive the run VERBATIM from a loaded manifest.
+    # We already have m + RESOLVED nets, so steps 'resolve' and 'manifest' are skipped, and
+    # the minimal gui fields the remaining steps read are synthesized from the manifest. The
+    # gui-driven path (manifest=None) is untouched.
+    manifest_driven = manifest is not None
+    if manifest_driven:
+        if gui is None:
+            gui = _gui_from_manifest(manifest)
+        want -= {"resolve", "manifest"}
+    elif gui is None:
+        raise PmuCornerError("run_pmu_corner needs either gui= (the GUI-driven path) or "
+                             "manifest= (the manifest-driven offline-sweep path)")
     corner = corner or gui.get("corner") or "nom"
     base, dirs = corner_dir(work_root, gui, corner)
     supply_pin = supply_pin or (_bm.supply_pins(gui) or [""])[0]   # model symbol's LEFT input = first supply
     ground = ground or gui.get("ground") or "VSS"
     model_lib = model_lib or "LDO_model_lab"
-    model_cell = model_cell or (gui.get("model_cell") or f"{gui['dut_cell']}_model")
+    model_cell = model_cell or (gui.get("model_cell") or f"{gui.get('dut_cell', 'model')}_model")
     model_path = model_path or gui.get("model_path") or str(base / "model" / "cds" / model_lib)
 
     res = {
@@ -483,12 +520,21 @@ def run_pmu_corner(gui, work_root=None, corner=None, engine="alps",
     if "resolve" in want:
         netmap = step_resolve(gui, netmap=netmap, session=session, progress=progress)
         _ran("resolve")
-    if netmap is None:
+    # the manifest-driven path already carries resolved nets (m verbatim) -> no netmap needed
+    if netmap is None and not manifest_driven:
         raise PmuCornerError("no netmap: include 'resolve' in steps= or pass netmap=")
 
     # 2) manifest ---------------------------------------------------------------
     man_path = dirs["netlist"].parent / f"{gui['tb_cell']}_{corner}.manifest.json"
-    if "manifest" in want:
+    if manifest_driven:
+        # the manifest is the source of truth -- use it verbatim, persist a copy in the
+        # workarea for traceability, and surface its warnings (no build_manifest re-derive).
+        m = manifest
+        man_path.parent.mkdir(parents=True, exist_ok=True)
+        man_path.write_text(json.dumps(m, indent=2) + "\n")
+        res["manifest"] = str(man_path)
+        res["warnings"] = list(m.get("_warnings", []))
+    elif "manifest" in want:
         m, man_path = step_manifest(gui, netmap, out_path=man_path, progress=progress)
         res["manifest"] = str(man_path)
         res["warnings"] = list(m.get("_warnings", []))
