@@ -1,5 +1,38 @@
 # HANDOFF — complete the pure-CLI Donau+ALPS workflow (Path B, full sweep)
 
+> **✅ GUI-WIRED 2026-06-18 (commit `052cf5b`, main).** The full sweep now RUNS from the GUI
+> (no CLI). Extract tab: Run-on=cluster + **Build & Run** → `_ClusterSweepWorker` (QThread) →
+> `ExtractCore.run_cluster_sweep` (offline factory → `step_run` real Donau → `step_import` →
+> multi-port fit; sets `self.result` so **Create model cell** works after). LIVE status = a
+> **per-group table** (#, group, analysis, state with colour: pending→running→done/failed) +
+> progress bar; a **"Preview only (dry-run)"** checkbox lists the per-group dsub commands without
+> submitting. `pmu_corner.step_run` gained structured `group_status(i,n,group,state)` + a
+> cooperative `cancel` (between groups). 130 backend tests + GUI `--selftest` PASS.
+>
+> **DATA LANDS AT** (`pmu_corner.corner_dir`): `$WORK_ROOT/ldo_modeling/<tb_lib>__<tb_cell>/
+> <corner>/{netlist/<g>/input.scs, psf/<g>/, npz/<name>_<corner>.npz, model/<cell>.va}`.
+> `$WORK_ROOT` = env `WORK_ROOT` else `~/ldo_workarea`. NEVER the designer spine
+> `$WORK_ROOT/simulation/<Lib>/<Cell>/`.
+>
+> **NEXT = BOX VALIDATION (designer-driven, the only thing untested off-box) + deploy:**
+> (a) deploy: `package.ps1 -Mode incremental` → red zone `bash apply` (ships 297cb1f + 052cf5b;
+>     no dep change — code-only);
+> (b) in the GUI: get a RESOLVED manifest (Mode A resolves pins→manifest, or load a resolved one
+>     — wur_pmu_top.json ships `<net:...>` placeholders the guard refuses); Mode B → point
+>     **Netlist dir** at the maestro base `input.scs` (Create Netlist, no run); PDK=$MODEL_ROOT;
+>     engine=ALPS; Run-on=cluster; **untick Preview** → Build & Run;
+> (c) watch the 8-group status table walk pending→running→done; confirm the npz lands + the fit
+>     report renders + **Create model cell** lights up;
+> (d) box-only unknowns to watch: real ALPS PSF for the wur **2 v_out + 3 i_out** topology read
+>     back by `importmp`; analysis-strip / supply auto-detect on the REAL maestro netlist (other
+>     maestro idioms beyond the handled `\` continuations); supply `tb_src` if auto-detect is
+>     ambiguous (set `supplies.avdd1p0.tb_src`).
+>
+> **OPTIONAL GUI NICETY (offered, not yet built):** an "Open results dir / show full npz path"
+> button on the Extract tab (today only the npz FILENAME is shown in the status bar). Small.
+>
+> ---
+>
 > **✅ BUILT 2026-06-18 (commit `297cb1f`, main).** The gap below is CLOSED. The offline
 > (no-ADE) per-group netlister is `cadence/cluster/netlist_augment.py`
 > (`make_offline_group_netlister`); `run_pmu_corner` gained a `manifest=` injection; the
