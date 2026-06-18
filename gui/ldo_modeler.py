@@ -414,6 +414,60 @@ class ExtractCore:
         self.port_refs = FMP.export_single_port_refs(path, self.manifest)
         return dict(npz_path=path, gate=self.gate, report=self.report, ports=self.port_refs)
 
+    def run_cluster_sweep(self, *, netlistdir, pdk_model_dir=None, ahdllibdir=None,
+                          engine="alps", donau=None, runner=None, work_root=None,
+                          dry_run=False, group_status=None, log=None, cancel=None):
+        """Run a FULL Donau+ALPS measurement sweep from the loaded manifest, pure-CLI (no ADE /
+        no skillbridge): build each measurement GROUP's one-hot netlist OFFLINE from the
+        designer's base input.scs, submit one dsub+alps job per group, collect the per-group PSF,
+        read it into the by-tag npz, and multi-port fit. Sets self.npz_path/result/report exactly
+        like run(), so 'Create model cell' works afterwards (the desync guard still holds).
+
+        netlistdir     the designer's BASE netlist dir (holding input.scs -- a maestro .tran TB).
+        pdk_model_dir  PDK model ROOT directory ($MODEL_ROOT); -I <dir>/<engine> is appended. Optional.
+        ahdllibdir     pre-compiled AHDL/VA DB (optional -- else the sim compiles VA from the netlist).
+        engine         'alps' (Donau+ALPS) | 'spectre'.
+        donau          cluster.donau.DonauCfg (account/queue/cpu/mem); defaults to the validated tuple.
+        runner         injected cluster command executor (a fake in tests; real subprocess on the box).
+        dry_run        assemble the per-group dsub commands WITHOUT submitting (returns them).
+        group_status   callback(i, n, group, state) -- drives the GUI per-group status table.
+        log            callback(msg) -- streamed progress lines.
+        cancel         callback() -> bool -- checked between groups (cooperative Cancel).
+
+        Returns dict(dry_run, dsub_cmds, n_groups[, npz_path, gate, report, ports, psf_map])."""
+        if self.manifest is None:
+            raise RuntimeError("load a manifest first")
+        from insitu import pmu_corner as PC
+        from cluster.netlist_augment import make_offline_group_netlister
+        from cluster.donau import DonauCfg
+        m = self.manifest
+        gui, corner = self._wa_gui(), self._corner()
+        _base, dirs = PC.corner_dir(work_root, gui, corner)
+        _log = (lambda _s, msg: log(msg)) if log else None
+        # offline per-group netlister over the designer's base input.scs. The resolved-net GUARD +
+        # the supply-source auto-detect fire HERE, before any submit, so a bad manifest (placeholder
+        # nets / no locatable supply source) fails loudly up front, not mid-sweep.
+        factory = make_offline_group_netlister(netlistdir, m, dirs["netlist"])
+        netinfo = PC.step_netlist(dirs, netlistdir=netlistdir, ahdllibdir=ahdllibdir,
+                                  pdk_model_dir=pdk_model_dir, progress=_log)
+        runres = PC.step_run(netinfo, dirs["psf"], m, engine=engine, donau=donau or DonauCfg(),
+                             runner=runner, dry_run=dry_run, group_netlister=factory,
+                             group_status=group_status, cancel=cancel, progress=_log)
+        if dry_run:
+            return dict(dry_run=True, dsub_cmds=runres["dsub_cmds"],
+                        n_groups=len(runres["dsub_cmds"]))
+        npz = PC.step_import(m, runres["psf_map"], npz_dir=dirs["npz"], load=corner, progress=_log)
+        self.npz_path = str(npz)
+        import fit_multiport as FMP
+        self.result = FMP.fit_multiport(str(npz), m)
+        self._fit_manifest = m                        # the fit belongs to THIS manifest (desync guard)
+        self.report = FMP.report(self.result)
+        self.port_refs = FMP.export_single_port_refs(str(npz), m)
+        self.gate = (None, "", "Donau+ALPS sweep (no gold reference)")
+        return dict(dry_run=False, npz_path=str(npz), gate=self.gate, report=self.report,
+                    ports=self.port_refs, psf_map=runres["psf_map"],
+                    dsub_cmds=runres["dsub_cmds"], n_groups=len(runres["dsub_cmds"]))
+
     def port_list(self):
         return list(self.port_refs)
 
@@ -494,6 +548,51 @@ if _HAVE_QT:
                                        regenerate=self.regenerate,
                                        progress=lambda f, m: self.progressed.emit(f, m),
                                        cancel=lambda: self._cancel)
+                self.done.emit(out)
+            except CancelledError:
+                self.cancelled.emit()
+            except Exception as e:
+                import traceback
+                self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    class _ClusterSweepWorker(QtCore.QThread):
+        """Run the FULL Donau+ALPS measurement sweep (offline per-group netlist -> dsub+alps ->
+        per-group PSF -> by-tag npz -> multi-port fit) off the UI thread. A real submit blocks
+        on the cluster queue, so it MUST be threaded; per-group state is streamed to the GUI
+        status table via group_state, and a cooperative Cancel stops between groups."""
+        done = QtCore.pyqtSignal(object)
+        failed = QtCore.pyqtSignal(str)
+        progressed = QtCore.pyqtSignal(float, str)        # frac in [0,1], message
+        group_state = QtCore.pyqtSignal(int, int, str, str, str)   # i, n, tag, analysis, state
+        cancelled = QtCore.pyqtSignal()
+
+        def __init__(self, extract, *, netlistdir, pdk, ahdl, engine, donau_cfg, dry_run):
+            super().__init__()
+            self.extract = extract
+            self.netlistdir, self.pdk, self.ahdl = netlistdir, pdk, ahdl
+            self.engine, self.donau_cfg, self.dry_run = engine, donau_cfg, dry_run
+            self._cancel = False
+
+        def cancel(self):
+            """Request cancellation (UI thread). step_run checks it BETWEEN groups and raises
+            CancelledError -- a submitted job already on the queue is left to finish."""
+            self._cancel = True
+
+        def _gs(self, i, n, group, state):
+            self.group_state.emit(i, n, group["tag"], group["analysis"], state)
+            # drive the bar off the per-group progress: a group counts ~done when its PSF lands
+            frac = (i + (1.0 if state in ("done", "preview") else 0.35)) / max(n, 1)
+            self.progressed.emit(min(1.0, frac), f"group {i+1}/{n} {group['tag']}: {state}")
+
+        def run(self):
+            from insitu.run import CancelledError
+            try:
+                out = self.extract.run_cluster_sweep(
+                    netlistdir=self.netlistdir, pdk_model_dir=self.pdk or None,
+                    ahdllibdir=self.ahdl or None, engine=self.engine, donau=self.donau_cfg,
+                    dry_run=self.dry_run, group_status=self._gs,
+                    log=lambda m: self.progressed.emit(-1.0, m),
+                    cancel=lambda: self._cancel)
                 self.done.emit(out)
             except CancelledError:
                 self.cancelled.emit()
@@ -1400,7 +1499,12 @@ if _HAVE_QT:
         def _x_location_changed(self, *a):
             if not hasattr(self, "x_grp_donau"):
                 return                                        # tab still building
-            self.x_grp_donau.setVisible(self.x_location.currentData() == "cluster")
+            on_cluster = self.x_location.currentData() == "cluster"
+            self.x_grp_donau.setVisible(on_cluster)
+            if hasattr(self, "x_status_box"):
+                self.x_status_box.setVisible(on_cluster)      # per-group table only for a sweep
+            if hasattr(self, "x_dryrun"):
+                self.x_dryrun.setVisible(on_cluster)          # preview toggle is cluster-only
 
         # --- skillbridge (live Virtuoso) connection indicator --------------------
         def _set_sb(self, state, msg):
@@ -1698,6 +1802,10 @@ if _HAVE_QT:
             self.x_cancel.setEnabled(False); self.x_cancel.setToolTip(
                 "Stop the ade run after the current step (ADE state is restored cleanly).")
             brow.addWidget(self.x_cancel)
+            self.x_dryrun = QCheckBox("Preview only (dry-run)")
+            self.x_dryrun.setToolTip("Cluster runs: assemble + show the per-group dsub commands "
+                                     "WITHOUT submitting. Untick to actually run the sweep on Donau.")
+            brow.addWidget(self.x_dryrun)
             self.x_gate = QLabel("—"); brow.addWidget(self.x_gate, 1)
             outer.addLayout(brow)
             # live progress (per measurement group) -- ade runs stream here so the window
@@ -1709,6 +1817,24 @@ if _HAVE_QT:
             self.x_progmsg = QLabel(""); self.x_progmsg.setStyleSheet("color:#555; font-size:11px;")
             prow.addWidget(self.x_progmsg, 2)
             outer.addLayout(prow)
+
+            # per-GROUP run status (cluster Donau+ALPS sweep): one row per measurement group, live
+            # state pending -> running -> done|failed (or 'preview' for a dry-run). Shown only when
+            # Run-on = cluster (a sweep is N jobs); hidden for local/ade single runs.
+            self.x_status_box = QGroupBox("Per-group run status (Donau+ALPS sweep)")
+            _sbl = QVBoxLayout(self.x_status_box)
+            self.x_status = QTableWidget(0, 4)
+            self.x_status.setHorizontalHeaderLabels(["#", "Group", "Analysis", "State"])
+            self.x_status.verticalHeader().setVisible(False)
+            self.x_status.setEditTriggers(QTableWidget.NoEditTriggers)
+            self.x_status.setSelectionMode(QTableWidget.NoSelection)
+            self.x_status.setMaximumHeight(190)
+            _hh = self.x_status.horizontalHeader()
+            _hh.setStretchLastSection(True)
+            _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
+            _hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+            _sbl.addWidget(self.x_status)
+            outer.addWidget(self.x_status_box)
 
             self.x_report = QTextEdit(); self.x_report.setReadOnly(True)
             self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
@@ -1963,10 +2089,15 @@ if _HAVE_QT:
             mode = self.x_mode.currentData()
             location = self.x_location.currentData()
             engine = self.x_backend.currentData()
-            # Mode B (imported netlist) or any cluster run -> the Donau dsub path. The real
-            # submit is box-coupled (needs one netlist per measurement group); here we VALIDATE
-            # the inputs and PREVIEW the exact dsub command(s) -- pure, no execution.
-            if mode == "import" or location == "cluster":
+            # A cluster run IS the full Donau+ALPS sweep (N per-group jobs): execute it end to end
+            # (offline per-group netlist -> dsub+alps -> PSF -> npz -> fit). With 'Preview only'
+            # ticked it assembles the per-group dsub commands WITHOUT submitting.
+            if location == "cluster":
+                self._x_cluster_run(engine)
+                return
+            # Mode B imported netlist, LOCAL: preview the bare engine command (the supported full
+            # run is the cluster path; local sweep execution is not wired).
+            if mode == "import":
                 self._x_cluster_preview(engine, mode)
                 return
             # Mode A, local. ALPS is cluster-only -> never silently downgrade it to the fixture.
@@ -1990,6 +2121,113 @@ if _HAVE_QT:
             self._xw.cancelled.connect(self._x_cancelled)
             self._xw.finished.connect(self._xw.deleteLater)   # reap the finished QThread
             self._xw.start()
+
+        def _x_cluster_run(self, engine):
+            """Run (or, with 'Preview only', dry-run) the FULL Donau+ALPS sweep from the GUI:
+            build each measurement group's one-hot netlist OFFLINE from the imported base
+            input.scs, submit one dsub+alps job per group, stream each group's live state into
+            the per-group status table, then read PSF -> npz -> multi-port fit. The table makes
+            the sweep's state legible at a glance (the whole point of running it from the GUI)."""
+            if getattr(self.extract, "manifest", None) is None:
+                QMessageBox.information(self, "Cluster run",
+                    "Load a manifest first (Mode A builds one from the pin form, or load one below).")
+                return
+            netdir = self.xb_netlist["edit"].text().strip()
+            if not netdir:
+                QMessageBox.information(self, "Cluster run (Donau+ALPS)",
+                    "A cluster sweep runs an imported BASE netlist. Switch Mode to "
+                    "'Import netlist + manifest (no skillbridge)' and set 'Netlist dir (input.scs)' "
+                    "to the directory holding your base maestro netlist (Create Netlist in "
+                    "ADE/Maestro — no run needed). The tool rewrites it into one one-hot netlist "
+                    "per measurement group.\n\n(Mode A resolves the pins/manifest first; then switch "
+                    "to Mode B to point at the netlist and run.)")
+                return
+            pdk = self.xb_pdk["edit"].text().strip()
+            ahdl = self.xb_ahdl["edit"].text().strip()
+            eng = "spectre" if engine == "spectre_cli" else "alps"
+            dry = self.x_dryrun.isChecked()
+            from cluster import donau
+            cfg = donau.DonauCfg(
+                account=self.xd_account.text().strip() or "ug_rfic.rfSClass",
+                queue=self.xd_queue.text().strip() or "short",
+                resource=f"cpu={self.xd_cpu.value()};mem={self.xd_mem.value()}")
+            # pre-fill the status table from the manifest's measurement groups, so the user sees
+            # the FULL job list immediately (before the first submit) and watches it fill in.
+            try:
+                from insitu import run as _run
+                groups = _run.groups(self.extract.manifest)
+            except Exception as e:                       # noqa: BLE001  malformed manifest
+                QMessageBox.critical(self, "Cluster run", f"{type(e).__name__}: {e}")
+                return
+            self._x_status_init(groups)
+            self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
+            self.x_prog.setValue(0)
+            self.x_gate.setText("preview…" if dry else "running…")
+            self.x_progmsg.setText("assembling per-group netlists…" if dry else "submitting sweep…")
+            self.statusBar().showMessage(
+                f"{'Previewing' if dry else 'Running'} Donau+ALPS sweep — {len(groups)} "
+                f"measurement group(s), engine={eng}…")
+            self._xw = _ClusterSweepWorker(self.extract, netlistdir=netdir, pdk=pdk, ahdl=ahdl,
+                                           engine=eng, donau_cfg=cfg, dry_run=dry)
+            self._xw.group_state.connect(self._x_status_set)
+            self._xw.progressed.connect(self._x_progress)
+            self._xw.done.connect(self._x_cluster_done)
+            self._xw.failed.connect(self._x_failed)
+            self._xw.cancelled.connect(self._x_cancelled)
+            self._xw.finished.connect(self._xw.deleteLater)
+            self._xw.start()
+
+        def _x_status_init(self, groups):
+            """Fill the per-group status table from the manifest's measurement groups (one row
+            per group: #, tag, analysis, state='—'). Called once before a sweep starts."""
+            t = self.x_status
+            t.setRowCount(0)
+            for i, g in enumerate(groups):
+                t.insertRow(i)
+                t.setItem(i, 0, QTableWidgetItem(str(i + 1)))
+                t.setItem(i, 1, QTableWidgetItem(g["tag"]))
+                t.setItem(i, 2, QTableWidgetItem(g["analysis"]))
+                st = QTableWidgetItem("—"); st.setForeground(QtGui.QColor("#777"))
+                t.setItem(i, 3, st)
+
+        _X_STATE_COLOUR = {"pending": "#888", "preview": "#555", "submitting": "#1565c0",
+                           "running": "#b8860b", "done": "#157f3b", "failed": "#b00020"}
+
+        def _x_status_set(self, i, n, tag, analysis, state):
+            """Update one group's row state (live, from the worker's group_state signal)."""
+            if i >= self.x_status.rowCount():            # defensive: table not pre-filled
+                return
+            it = QTableWidgetItem(state)
+            it.setForeground(QtGui.QColor(self._X_STATE_COLOUR.get(state, "#333")))
+            self.x_status.setItem(i, 3, it)
+
+        def _x_cluster_done(self, out):
+            """A Donau+ALPS sweep finished. Dry-run -> show the per-group dsub commands; a real
+            run -> show the multi-port fit report and enable 'Create model cell'."""
+            self._x_idle()
+            self.x_prog.setValue(100)
+            if out.get("dry_run"):
+                cmds = out.get("dsub_cmds") or []
+                L = [f"# Donau+ALPS sweep PREVIEW — {len(cmds)} per-group dsub command(s), "
+                     "nothing submitted", ""]
+                for cmd in cmds:
+                    L.append(shlex.join(str(x) for x in cmd)); L.append("")
+                self.x_report.setPlainText("\n".join(L))
+                self.x_gate.setText(f"preview — {len(cmds)} per-group command(s)")
+                self.x_progmsg.setText("preview")
+                self.statusBar().showMessage(f"Previewed {len(cmds)} per-group dsub command(s) — "
+                                             "untick 'Preview only' to run the sweep.")
+                return
+            npz = pathlib.Path(out["npz_path"]).name
+            nmeas = len(out.get("psf_map") or {})
+            self.x_gate.setText(f"<b><span style='color:#157f3b'>Donau+ALPS sweep DONE</span></b> "
+                                f"— {nmeas} measurement(s), npz {npz}")
+            self.x_report.setPlainText(out["report"])
+            self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
+            self.xm_make.setEnabled(True)                # a fit of the current manifest exists
+            self.x_progmsg.setText("done")
+            self.statusBar().showMessage("Sweep done — fit complete. 'Create model cell', or send a "
+                                         "port to Import → Fit.")
 
         def _x_cluster_preview(self, engine, mode):
             """Mode-B / cluster: validate inputs and PREVIEW the exact run command(s) per
@@ -2037,10 +2275,10 @@ if _HAVE_QT:
                            if on_cluster else payload)
                     L += [f"## group {g['tag']}  ({g['analysis']})",
                           shlex.join(str(x) for x in cmd), ""]
-                L += ["# ⚠ A single input.scs cannot serve all groups (each needs a distinct",
-                      "#   one-hot/analysis). A correct multi-measurement sweep needs ONE netlist",
-                      "#   per group — that wiring is box-coupled and pending. This preview is the",
-                      "#   command SHAPE; verify/run on the box."]
+                L += ["# NOTE: this LOCAL preview shows the bare per-group command SHAPE. The real",
+                      "#   per-group one-hot netlists are built automatically — set Run-on = cluster",
+                      "#   and click Build & Run to execute the full Donau+ALPS sweep (each group",
+                      "#   gets its own one-hot netlist; watch the per-group status table)."]
                 self.x_report.setPlainText("\n".join(L))
                 self.x_gate.setText(f"{where} preview — {len(grps)} command(s) above")
                 self.statusBar().showMessage(f"Previewed {len(grps)} {where} command(s) "
@@ -2049,7 +2287,8 @@ if _HAVE_QT:
                 QMessageBox.critical(self, "Run preview", f"{type(e).__name__}: {e}")
 
         def _x_progress(self, frac, msg):
-            self.x_prog.setValue(max(0, min(100, int(frac * 100))))
+            if frac >= 0:                                # frac<0 == message-only (don't move the bar)
+                self.x_prog.setValue(max(0, min(100, int(frac * 100))))
             self.x_progmsg.setText(msg)
 
         def _x_cancel(self):
@@ -2062,8 +2301,8 @@ if _HAVE_QT:
             self._x_idle()
             self.x_gate.setText("cancelled")
             self.x_progmsg.setText("cancelled")
-            self.statusBar().showMessage("Extraction cancelled — ADE state restored. "
-                                         "Adjust and Build & Run again.")
+            self.statusBar().showMessage("Run cancelled (ade: ADE state restored; cluster: stopped "
+                                         "between groups). Adjust and Build & Run again.")
 
         def _x_idle(self):
             """Return Tab 0 to the runnable state (re-run is just 'Build & Run' again)."""
@@ -2966,6 +3205,80 @@ def _selftest_extract(tmp):
             pass
 
 
+def _selftest_cluster_sweep(win, tmp, app):
+    """The GUI Donau+ALPS SWEEP path (the user-facing goal): the offline per-group netlister +
+    the live per-group status table, exercised via a DRY-RUN (assemble the per-group dsub
+    commands, submit NOTHING -- fully offline, no dsub/alps). Covers BOTH the Qt-free core
+    (ExtractCore.run_cluster_sweep) and the GUI worker/table wiring through the Build & Run button."""
+    import json
+    from insitu import run as _run, pmu_corner as PC
+    # a RESOLVED manifest + a base .tran TB whose nets match it (1 supply + 1 v_out -> 3 groups)
+    base = tmp / "clsweep_base"; base.mkdir(parents=True, exist_ok=True)
+    (base / "input.scs").write_text(
+        "simulator lang=spectre\n"
+        "Xdut (AVDD1P0 VDD0P8_PLL VSS) DUT\n"
+        "V_AVDD (AVDD1P0 0) vsource dc=0.98\n"
+        "Iload (VDD0P8_PLL 0) isource dc=500u\n"
+        "tt tran stop=1u\n")
+    man = {"name": "clsweep_selftest",
+           "dut": {"lib": "L", "cell": "C", "tb_lib": "TBL", "tb_cell": "TBC", "tb_inst": "X"},
+           "ground": "VSS",
+           "supplies": {"avdd": {"net": "AVDD1P0", "dc": 0.98, "pin": "AVDD1P0"}},
+           "v_out": {"pll": {"net": "VDD0P8_PLL", "pin": "VDD0P8_PLL", "iload": 5e-4}},
+           "current_psrr_supplies": ["avdd"]}
+    mpath = tmp / "clsweep.manifest.json"; mpath.write_text(json.dumps(man))
+
+    # --- CORE: a dry-run sweep assembles one per-group dsub command + writes each one-hot netlist
+    xc = ExtractCore(); xc.load_manifest(str(mpath))
+    grps = _run.groups(xc.manifest)
+    ngroups = len(grps)
+    assert ngroups == 3, f"expected 3 groups (z/noise/supply), got {ngroups}"
+    seen = []
+    out = xc.run_cluster_sweep(netlistdir=str(base), pdk_model_dir=str(tmp), engine="alps",
+                               work_root=str(tmp), dry_run=True,
+                               group_status=lambda i, n, g, st: seen.append((g["tag"], st)))
+    assert out["dry_run"] and out["n_groups"] == ngroups and len(out["dsub_cmds"]) == ngroups, out
+    _, dirs = PC.corner_dir(str(tmp), PC._gui_from_manifest(xc.manifest), xc._corner())
+    for g in grps:                                       # each group's offline one-hot netlist exists
+        assert (dirs["netlist"] / g["tag"] / "input.scs").is_file(), g["tag"]
+    assert {t for t, _s in seen} == {g["tag"] for g in grps}, "group_status missed a group"
+
+    # --- GUI WIRING: Build & Run (dry-run) starts the worker, fills the status table, shows cmds.
+    # Scope WORK_ROOT to tmp so the worker (which takes no work_root) writes under tmp, not ~/.
+    import os
+    _old_wr = os.environ.get("WORK_ROOT")
+    os.environ["WORK_ROOT"] = str(tmp)
+    try:
+        win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
+        win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
+        win.x_backend.setCurrentIndex(win.x_backend.findData("alps")); app.processEvents()
+        assert win.x_status_box.isVisibleTo(win), "per-group status table must show when location=cluster"
+        assert win.x_dryrun.isVisibleTo(win), "preview-only toggle must show when location=cluster"
+        win.extract.load_manifest(str(mpath))
+        win.xb_netlist["edit"].setText(str(base)); win.xb_pdk["edit"].setText(str(tmp))
+        win.xb_ahdl["edit"].setText("")                  # blank -> the -ahdllibdir flag is dropped
+        win.xd_cpu.setValue(16); win.xd_mem.setValue(16000)
+        win.x_dryrun.setChecked(True)
+        win._x_run()                                     # cluster -> the dry-run sweep worker
+        assert win._xw.wait(15000), "cluster sweep worker did not finish"
+        app.processEvents()                              # deliver the queued done/group_state signals
+    finally:
+        if _old_wr is None:
+            os.environ.pop("WORK_ROOT", None)
+        else:
+            os.environ["WORK_ROOT"] = _old_wr
+    rep = win.x_report.toPlainText()
+    dsub_lines = [l for l in rep.splitlines() if l.startswith("dsub ")]
+    assert len(dsub_lines) == ngroups, f"expected {ngroups} per-group dsub lines, got {len(dsub_lines)}"
+    assert any("-R 'cpu=16;mem=16000'" in l for l in dsub_lines), "dsub resource not shell-safe (';')"
+    assert all("-ahdllibdir" not in l for l in dsub_lines), "blank ahdllibdir must drop -ahdllibdir"
+    assert win.x_status.rowCount() == ngroups, "status table must have one row per group"
+    states = {win.x_status.item(i, 3).text() for i in range(win.x_status.rowCount())}
+    assert states == {"preview"}, f"dry-run rows should be 'preview', got {states}"
+    win.x_dryrun.setChecked(False)
+    print(f"  cluster: GUI dry-run sweep -> {ngroups} per-group dsub cmds + live status table OK")
+
+
 def _selftest_manifest_editor(win, tmp):
     """Headless smoke of the in-GUI manifest editor (#1): the structured Form + Raw-JSON sub-tabs.
     Asserts: template validates, a broken/invalid edit is caught (Raw tab), a valid edit Saves +
@@ -3237,37 +3550,22 @@ def _selftest(require_qt=False):
         assert _g["supplies"][1]["dc"] == 0.8 and _g["current_psrr_supplies"] == ["AVDD1P0"]
         assert _g["iv_sweep"]["IBP_X"] == [0.0, 1.1, 0.01], _g["iv_sweep"]
         win.xf_ivsweep.setText("")
-        # Mode-B cluster dsub PREVIEW (pure, no submit): load a manifest, fill paths, preview.
+        # Donau+ALPS cluster SWEEP from the GUI (the user-facing goal): offline per-group
+        # netlister + the live per-group status table, via a dry-run (no submit).
+        _selftest_cluster_sweep(win, tmp, app)
+        # Mode-B LOCAL preview: the BARE per-group engine command (no dsub wrap), pure (no submit).
         win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
-        win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
+        win.x_location.setCurrentIndex(win.x_location.findData("local"))
         win.x_backend.setCurrentIndex(win.x_backend.findData("alps"))
         win.extract.load_manifest("pmu_top")
         win.xb_netlist["edit"].setText(str(tmp)); win.xb_pdk["edit"].setText(str(tmp))
-        win.xb_ahdl["edit"].setText(str(tmp))
-        win.xd_cpu.setValue(16); win.xd_mem.setValue(16000)
-        win._x_run()                                 # x_run is in _live_btns -> only fires here
-        _rep = win.x_report.toPlainText()
-        # the dsub LINE itself must be shell-safe: resource quoted so ';' doesn't split it
-        assert any(l.startswith("dsub ") and "-R 'cpu=16;mem=16000'" in l
-                   for l in _rep.splitlines()), "cluster preview dsub line is not shell-safe (B1)"
-        # ahdllibdir/PDK are OPTIONAL: blank -> the -ahdllibdir / -I flags are omitted (the sim
-        # auto-compiles VA + resolves models from the netlist itself), and the preview still runs.
-        win.xb_ahdl["edit"].setText(""); win.xb_pdk["edit"].setText("")
-        win._x_run()
-        _rep2 = win.x_report.toPlainText()
-        _dl = next(l for l in _rep2.splitlines() if l.startswith("dsub "))
-        # (the dsub command itself uses -I to introduce its payload, so only -ahdllibdir / the
-        # model tree are checked) blank ahdllibdir/PDK -> no -ahdllibdir, no PDK model tree
-        assert "-ahdllibdir" not in _dl, "blank ahdllibdir must drop -ahdllibdir"
-        assert "-format ps -o ../psf -mt" in _dl, "blank PDK must drop the model -I (no tree between -o and -mt)"
-        win.xb_pdk["edit"].setText(str(tmp)); win.xb_ahdl["edit"].setText(str(tmp))
-        # local (not cluster): the preview must be the BARE engine command, not dsub-wrapped.
-        win.x_location.setCurrentIndex(win.x_location.findData("local"))
+        win.xb_ahdl["edit"].setText("")
         win._x_run()
         _repL = win.x_report.toPlainText()
         assert not any(l.startswith("dsub ") for l in _repL.splitlines()), \
             "Mode-B local preview must be a bare command, not dsub"
         assert "input.scs" in _repL, "local preview missing the engine command"
+        assert "-ahdllibdir" not in _repL, "blank ahdllibdir must drop -ahdllibdir"
         win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
         win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
         # skillbridge indicator: startup sets it (import-only, never blocks); _set_sb renders states

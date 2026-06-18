@@ -540,5 +540,66 @@ def test_offline_sweep_guard_trips_on_unresolved_manifest(tmp_path):
     assert "resolve" in str(ei.value).lower()
 
 
+def _seed_all_group_psf(dirs, grps):
+    for g in grps:
+        gd = dirs["psf"] / g["tag"]
+        gd.mkdir(parents=True, exist_ok=True)
+        ext = "noise.noise" if g["analysis"] == "noise" else "ac.ac"
+        (gd / ext).write_bytes(b"PSFversion")
+        (gd / ".simDone").write_bytes(b"")
+
+
+def test_step_run_group_status_streams_states(tmp_path):
+    """step_run's group_status callback streams each group's lifecycle (pending -> the Donau
+    states -> done) -- the structured feed the GUI per-group status table renders. Every group
+    is reported, each stream begins 'pending', walks 'running', and ends 'done'."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+    _seed_all_group_psf(dirs, grps)
+    netinfo = PC.step_netlist(dirs, netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"))
+
+    events = []
+    runres = PC.step_run(netinfo, dirs["psf"], m, engine="alps", runner=FakeRunner(),
+                         group_netlister=gnl, sleep=lambda *_: None,
+                         group_status=lambda i, n, g, st: events.append((i, g["tag"], st)))
+
+    assert {t for _i, t, _s in events} == {g["tag"] for g in grps}      # every group reported
+    by_group = {}
+    for _i, t, s in events:
+        by_group.setdefault(t, []).append(s)
+    for t, states in by_group.items():
+        assert states[0] == "pending" and states[-1] == "done", (t, states)
+        assert "running" in states                    # the Donau RUNNING transition surfaced
+    assert runres["ran"] is True
+
+
+def test_step_run_cancel_between_groups(tmp_path):
+    """A cancel() that turns True after the first group stops the sweep with CancelledError
+    BETWEEN groups (a submitted group is never interrupted mid-poll)."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+    _seed_all_group_psf(dirs, grps)
+    netinfo = PC.step_netlist(dirs, netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"))
+
+    runner = FakeRunner()
+    with pytest.raises(RUN.CancelledError):
+        PC.step_run(netinfo, dirs["psf"], m, engine="alps", runner=runner,
+                    group_netlister=gnl, sleep=lambda *_: None,
+                    cancel=lambda: len(runner.cmds("dsub")) >= 1)   # cancel after group 1 submits
+    assert len(runner.cmds("dsub")) == 1               # exactly one group submitted before cancel
+    # the 2nd group's netlist dir was never produced (the sweep stopped before it began)
+    assert not (dirs["netlist"] / grps[1]["tag"]).exists()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

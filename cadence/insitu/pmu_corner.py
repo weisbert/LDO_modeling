@@ -250,6 +250,7 @@ def _live_group_netlister(ws, session_name, test, m, netlist_base):
 
 def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
              on_status=None, dry_run=False, progress=None, group_netlister=None,
+             group_status=None, cancel=None,
              poll_interval=5.0, poll_timeout=10800.0, sleep=None):
     """5) run ONE corner as a PER-GROUP SWEEP via the pure-CLI Donau+ALPS path (Component A).
 
@@ -265,7 +266,14 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
 
     group_netlister(group) -> netlistdir is the seam: the DEFAULT (ade_group_netlist, bound by
     run_pmu_corner with the live ws/session/test) reuses the run_ade wiring to netlist each
-    one-hot on the box; tests inject a fake that writes a stub input.scs per group."""
+    one-hot on the box; tests inject a fake that writes a stub input.scs per group.
+
+    group_status(i, n, group, state) is an optional STRUCTURED per-group status callback (the
+    GUI's per-group table feeds off it): 'pending' -> the Donau states ('pending'/'running'/
+    'done'/'failed' from run_corner's poll) -> 'done' once the PSF lands, or 'preview' on a
+    dry_run. cancel() -> bool is checked BETWEEN groups (a long ALPS job is NOT interrupted
+    mid-poll); when it returns True the sweep raises run.CancelledError so the GUI Cancel reports
+    cleanly rather than wedging the window."""
     cfg = donau or DonauCfg()
     grps = _run.groups(m)
     n = len(grps) or 1
@@ -273,7 +281,12 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
     psf_map, dsub_cmds = {}, []
 
     for i, g in enumerate(grps):
+        if cancel and cancel():                        # cooperative cancel BETWEEN groups
+            raise _run.CancelledError(
+                f"cluster sweep cancelled before group {i+1}/{n} ({g['tag']})")
         tag = g["tag"]
+        if group_status:
+            group_status(i, n, g, "pending")
         group_netdir = group_netlister(g)             # the seam -> this group's netlist dir
         group_psf = psf_root / tag
 
@@ -283,14 +296,18 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
             engine=engine, donau=cfg, dry_run=True)
         dsub_cmds.append(dsub_cmd)
 
-        def _status(state, raw, _i=i, _tag=tag):
+        def _status(state, raw, _i=i, _g=g, _tag=tag):
             _progress(progress, "run", f"group {_i+1}/{n} {_tag}: Donau job {state.upper()}")
+            if group_status:
+                group_status(_i, n, _g, state)
             if on_status:
                 on_status(state, raw)
 
         if dry_run:
             _progress(progress, "run",
                       f"DRY -- group {i+1}/{n} {tag}: assembled dsub command, not executing")
+            if group_status:
+                group_status(i, n, g, "preview")
             continue
 
         _progress(progress, "run", f"group {i+1}/{n} {tag}: submitting")
@@ -299,6 +316,8 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
             engine=engine, donau=cfg, on_status=_status, runner=runner, dry_run=False,
             poll_interval=poll_interval, poll_timeout=poll_timeout, sleep=sleep)
         _progress(progress, "run", f"group {i+1}/{n} {tag}: PSF landed: {out}")
+        if group_status:
+            group_status(i, n, g, "done")
         for pt in g["members"]:                        # map EVERY member tag at this group PSF
             psf_map[pt["tag"]] = str(out)
 
