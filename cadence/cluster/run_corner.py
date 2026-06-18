@@ -146,3 +146,73 @@ def _relpath(target, start):
     if rel.startswith(".." + os.sep + ".."):
         return str(pathlib.Path(target).resolve())
     return rel
+
+
+# --------------------------------------------------------------------------- CLI
+# A thin command-line front-end so one corner can be SMOKE-TESTED on the box without the
+# GUI or skillbridge:  python -m cluster.run_corner --netlistdir <d> --out <d> --pdk $MODEL_ROOT
+# This is the documented "one-corner CLI driver" the module header promises. It does NOT
+# generate the per-group one-hot netlists (that is the multi-measurement sweep, still box-
+# coupled) -- it runs the netlist you point it at, end to end, to prove the Donau+ALPS path.
+def _build_argparser():
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="python -m cluster",
+        description="Run ONE corner via the pure-CLI Donau+ALPS path: submit -> poll -> verify "
+                    "the PSF landed -> print the PSF dir. Smoke test of the cluster pipeline; "
+                    "no skillbridge / ADE needed.")
+    ap.add_argument("--netlistdir", required=True,
+                    help="dir holding input.scs (read as the node cwd via dsub -EP).")
+    ap.add_argument("--out", dest="out_psf_dir", required=True,
+                    help="where the PSF lands. Point at a SCRATCH dir in your workarea -- NOT the "
+                         "maestro results tree (we never write the designer/maestro spine).")
+    ap.add_argument("--pdk", dest="pdk_model_dir", default=None,
+                    help="PDK model ROOT *directory* (the engine subtree {alps,spectre} is "
+                         "appended). e.g. $MODEL_ROOT  ->  -I $MODEL_ROOT/alps. Omit if the "
+                         "netlist's own include lines are self-contained.")
+    ap.add_argument("--ahdllibdir", default=None,
+                    help="compiled AHDL/VA model DB (-ahdllibdir). Omit -> the sim auto-compiles "
+                         "the Verilog-A from the netlist's ahdl_include lines.")
+    ap.add_argument("--engine", default="alps", choices=("alps", "spectre"))
+    ap.add_argument("--input-scs", default=INPUT_SCS, help=f"netlist filename (default {INPUT_SCS}).")
+    ap.add_argument("--account", default="ug_rfic.rfSClass", help="Donau -A account.")
+    ap.add_argument("--queue", default="short", help="Donau -q queue.")
+    ap.add_argument("--cpu", type=int, default=8, help="Donau cpu= (== alps -mt).")
+    ap.add_argument("--mem", type=int, default=8000, help="Donau mem= (MB).")
+    ap.add_argument("--poll-interval", type=float, default=5.0)
+    ap.add_argument("--poll-timeout", type=float, default=10800.0)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="assemble + print the exact dsub command, submit NOTHING.")
+    return ap
+
+
+def main(argv=None):
+    import sys
+    import shlex
+    args = _build_argparser().parse_args(argv)
+    cfg = DonauCfg(account=args.account, queue=args.queue,
+                   resource=f"cpu={args.cpu};mem={args.mem}")
+    common = dict(engine=args.engine, donau=cfg, input_scs=args.input_scs)
+    if args.dry_run:
+        cmd = run_corner(args.netlistdir, args.pdk_model_dir, args.ahdllibdir,
+                         args.out_psf_dir, dry_run=True, **common)
+        print(shlex.join(str(x) for x in cmd))
+        return 0
+
+    def _on_status(state, raw):
+        print(f"[donau] {state}", flush=True)
+
+    try:
+        psf = run_corner(args.netlistdir, args.pdk_model_dir, args.ahdllibdir, args.out_psf_dir,
+                         on_status=_on_status, poll_interval=args.poll_interval,
+                         poll_timeout=args.poll_timeout, **common)
+    except RunCornerError as e:
+        print(f"FAILED: {e}", file=sys.stderr)
+        return 1
+    print(f"OK -- PSF dir: {psf}")
+    return 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
