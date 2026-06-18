@@ -1046,18 +1046,51 @@ if _HAVE_QT:
                 for k, ent in (mp or {}).items():
                     ent = ent or {}
                     row = [k]
+                    unresolved_pin = None        # set if the 'net' cell is a placeholder default
                     for col in cols[1:]:
                         if col == "iv_sweep":
                             iv = ent.get("iv_sweep")
                             row.append(self._iv_to_text(iv))
+                        elif col == "net":
+                            disp, is_ph = self._net_display(ent.get("net"))
+                            row.append(disp)
+                            if is_ph:
+                                unresolved_pin = ent.get("pin") or k
                         else:
                             v = ent.get(col, "")
                             row.append("" if v is None else str(v))
-                    self._table_add_row(t, row)
+                    r = self._table_add_row(t, row)
+                    if unresolved_pin is not None:
+                        self._flag_unresolved_net(t, r, cols.index("net"), unresolved_pin)
             fill(self.t_supplies, m.get("supplies"), ["key", "net", "dc"])
             fill(self.t_vout, m.get("v_out"), ["key", "net"])
             fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "iv_sweep"])
             fill(self.t_bias, m.get("bias"), ["key", "net", "dc"])
+
+        @staticmethod
+        def _net_display(net):
+            """A '<net:PIN>' value is the resolver's UNRESOLVED placeholder, not a real net.
+            Don't show the wrapper to a designer hand-editing the form -- strip it to the bare
+            PIN name (the obvious default; for most testbenches the connecting net == the pin
+            name). Returns (display_text, is_placeholder)."""
+            s = "" if net is None else str(net)
+            if s.startswith("<net:") and s.endswith(">"):
+                return s[len("<net:"):-1], True
+            return s, False
+
+        @staticmethod
+        def _flag_unresolved_net(t, r, c, pin):
+            """Style a net cell that was filled from an unresolved '<net:PIN>' placeholder:
+            amber italic + a tooltip telling the designer it's a default to confirm or edit."""
+            it = t.item(r, c)
+            if it is None:
+                return
+            it.setForeground(QtGui.QColor("#b8860b"))
+            f = it.font(); f.setItalic(True); it.setFont(f)
+            it.setToolTip(
+                f"Unresolved — defaulted to the pin name “{pin}”. Keep it if your "
+                f"testbench net is also “{pin}”; otherwise type the real TB net "
+                f"(or run Mode A in Virtuoso to auto-resolve).")
 
         @staticmethod
         def _iv_to_text(iv):
@@ -3344,6 +3377,25 @@ def _selftest_manifest_editor(win, tmp):
         on_disk["dut"].get("_secret_view") == "layout", "unknown keys did not reach disk"
     ExtractCore().load_manifest(str(out2))                       # the merged file still loads
     out2.unlink()
+
+    # 5b) UNRESOLVED '<net:PIN>' placeholders must NOT leak the wrapper into the Form net cells:
+    #     the designer sees the bare PIN name (a confirmable default), and Form->Raw writes the
+    #     bare net (resolved), never the '<net:...>' marker.
+    ph = json.dumps({
+        "name": "ph", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "supplies": {"avdd1p0": {"net": "<net:AVDD1P0>", "dc": 1.0, "pin": "AVDD1P0"}},
+        "v_out": {"pll": {"net": "<net:VDD0P8_PLL>", "pin": "VDD0P8_PLL"}},
+    })
+    dlg3 = _ManifestEditorDialog(win, ph, None)
+    vcell = dlg3.t_vout.item(0, 1)
+    assert vcell.text() == "VDD0P8_PLL", \
+        f"placeholder net should display the bare pin, got {vcell.text()!r}"
+    assert vcell.font().italic(), "unresolved net cell should be flagged (italic)"
+    assert "<net:" not in dlg3.t_supplies.item(0, 1).text(), "supply placeholder wrapper leaked"
+    dlg3.subtabs.setCurrentIndex(RAW)                            # Form->Raw resolves to the bare net
+    ph_raw = json.loads(dlg3.ed.toPlainText())
+    assert ph_raw["v_out"]["pll"]["net"] == "VDD0P8_PLL", "Form->Raw must write the bare resolved net"
+    assert ph_raw["v_out"]["pll"]["pin"] == "VDD0P8_PLL", "pin tag must survive the placeholder strip"
 
     # 6) find/replace bar (Ctrl+F / Ctrl+H) over the Raw text
     dlg2.findbar.find.setText("VDD0P8_VCO"); dlg2.findbar.repl.setText("VDD0P8_RENAMED")
