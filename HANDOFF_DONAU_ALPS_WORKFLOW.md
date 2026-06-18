@@ -1,5 +1,19 @@
 # HANDOFF — complete the pure-CLI Donau+ALPS workflow (Path B, full sweep)
 
+> **✅ BUILT 2026-06-18 (commit `297cb1f`, main).** The gap below is CLOSED. The offline
+> (no-ADE) per-group netlister is `cadence/cluster/netlist_augment.py`
+> (`make_offline_group_netlister`); `run_pmu_corner` gained a `manifest=` injection; the
+> entrypoint is `python -m cluster run-sweep --manifest <name> --base-netlist <dir> --pdk
+> $MODEL_ROOT --engine alps [--dry-run]`. 128 tests pass offline. Backslash line-continuations
+> (maestro formatting) are handled. **ONLY REMAINING = box validation + deploy:**
+> (1) `package.ps1 -Mode incremental` → red zone `bash apply`;
+> (2) RESOLVE the manifest nets first (wur_pmu_top.json ships `<net:...>` placeholders — the
+>     netlister's guard refuses them; run Mode A in Virtuoso or hand-edit `net` fields);
+> (3) supply PSRR source: `avdd1p0` has no `tb_src` → auto-detect finds the lone vsource on the
+>     net, or set `supplies.avdd1p0.tb_src` if ambiguous;
+> (4) `--dry-run` should print 8 per-group dsub commands; a real run lands the npz → fit gate.
+> The historical brief below is kept for context.
+
 Date: 2026-06-18. Branch `main`. HEAD at handoff: `dd19aab`.
 **Goal of the next session:** make the full measurement sweep run end-to-end on the cluster
 via **pure dsub+ALPS (no ADE / no skillbridge)** — manifest → per-group one-hot netlists →
