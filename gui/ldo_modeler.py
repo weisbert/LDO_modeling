@@ -579,14 +579,12 @@ if _HAVE_QT:
 
     _MANIFEST_ROLE_HELP = (
         "<b>Pin-role manifest</b> — tag each DUT-boundary pin, the tool does the rest.<br>"
-        "&nbsp;• <b>dut</b>: lib/cell of the DUT + its testbench; <i>extract_cell</i> = the "
-        "copy we append stimuli to (TB_extract).<br>"
+        "&nbsp;• <b>DUT</b> = the PMU/LDO you model; <b>Testbench</b> = the cell Maestro simulates "
+        "(instantiates the DUT + sources/probes). <i>extract_cell</i> auto = &lt;tb_cell&gt;_extract.<br>"
         "&nbsp;• <b>supplies</b> <code>{name:{net,dc}}</code> — rails to PSRR (dc = the OP value).<br>"
         "&nbsp;• <b>v_out</b> <code>{name:{net}}</code> — voltage outputs (Zout/noise/coupling).<br>"
         "&nbsp;• <b>i_out</b> <code>{name:{net,dc}}</code> — current sinks (admittance / current-PSRR).<br>"
-        "&nbsp;• <b>leave_alone</b> — pins to drive with their OP value and not stimulate "
-        "(enables, digital ctrl bus, …).<br>"
-        "&nbsp;• <b>current_psrr_supplies</b> — subset of supplies to current-PSRR. "
+        "&nbsp;• Any pin you DON'T list is left exactly as the testbench drives it.<br>"
         "<b>Validate</b> previews the measurement matrix; <b>Save</b> reloads it on Tab 0.")
 
     class _FindReplaceBar(QWidget):
@@ -716,50 +714,101 @@ if _HAVE_QT:
 
         # ---- Form sub-tab ----------------------------------------------------------
         def _build_form_tab(self):
+            # Organized BY TOPIC (not a blunt required/advanced cut): Identity · Supplies ·
+            # Voltage outputs · Current outputs are always visible; only genuinely-rare overrides
+            # live in a collapsed Advanced group. `leave_alone` is NOT surfaced — augment never
+            # consumes it, so any pin you don't list is already left exactly as the TB drives it.
             outer = QWidget(); ov = QVBoxLayout(outer)
             scroll = QScrollArea(); scroll.setWidgetResizable(True)
             inner = QWidget(); v = QVBoxLayout(inner)
 
-            # REQUIRED section (always visible) ------------------------------------
-            req = QGroupBox("Required")
-            req.setStyleSheet("QGroupBox{font-weight:bold;}")
-            rf = QFormLayout(req)
-            self.f_name = QLineEdit(); self.f_name.setPlaceholderText("e.g. pmu_top")
-            rf.addRow(self._req_label("Model name"), self.f_name)
-            # DUT first (D4): tb_lib inherits dut_lib when left blank.
-            self.f_dut_lib = QLineEdit(); self.f_dut_lib.setPlaceholderText("e.g. sim_1108_yusheng")
-            self.f_dut_lib.setToolTip("DUT = the LDO/PMU being modeled. Its Cadence library.")
-            rf.addRow(self._req_label("DUT library"), self.f_dut_lib)
-            self.f_dut_cell = QLineEdit(); self.f_dut_cell.setPlaceholderText("e.g. Test_LDO")
-            self.f_dut_cell.setToolTip("DUT cell = your LDO cellview (the design under test).")
-            rf.addRow(self._req_label("DUT cell (your LDO)"), self.f_dut_cell)
-            self.f_tb_lib = QLineEdit()
-            self.f_tb_lib.setPlaceholderText("blank → inherits the DUT library (sim_1108_yusheng)")
-            self.f_tb_lib.setToolTip("Testbench = the schematic that instantiates the DUT + the "
-                                     "sources/probes ADE actually simulates. Blank → uses the DUT "
-                                     "library.")
-            rf.addRow(self._req_label("Testbench library"), self.f_tb_lib)
-            self.f_tb_cell = QLineEdit(); self.f_tb_cell.setPlaceholderText("e.g. Test_LDO_TB")
-            self.f_tb_cell.setToolTip("Testbench cell — the harness cellview wrapping the DUT.")
-            rf.addRow(self._req_label("Testbench cell"), self.f_tb_cell)
-            self.f_ground = QLineEdit(); self.f_ground.setPlaceholderText("e.g. gnd! (or VSS)")
-            rf.addRow(self._req_label("Ground net"), self.f_ground)
+            # one-line orientation: what DUT vs Testbench mean + the leave-alone policy
+            note = QLabel(
+                "<b>DUT</b> = the PMU/LDO you're modeling. &nbsp;<b>Testbench</b> = the cell "
+                "Maestro actually simulates (it instantiates the DUT + sources/probes).<br>"
+                "Any pin you don't list below is left <b>exactly as the testbench drives it</b> — "
+                "you never have to enumerate the rest.")
+            note.setWordWrap(True)
+            note.setStyleSheet("color:#345; background:#f5f8ff; padding:6px; border:1px solid #dde6f2;")
+            v.addWidget(note)
 
-            # supplies table (REQUIRED: >=1, each net + dc)
-            rf.addRow(QLabel("<b>Supplies *</b> &nbsp;<span style='color:#678;font-weight:normal'>"
-                             "(rails to PSRR — each needs a net + dc)</span>"))
+            # IDENTITY — what & where (always visible) ------------------------------
+            idg = QGroupBox("Identity — what & where")
+            idg.setStyleSheet("QGroupBox{font-weight:bold;}")
+            idf = QFormLayout(idg)
+            self.f_name = QLineEdit(); self.f_name.setPlaceholderText("e.g. wur_pmu_top")
+            self.f_name.setToolTip("A name for this model / manifest (free text).")
+            idf.addRow(self._req_label("Model name"), self.f_name)
+            # DUT first (D4): tb_lib inherits dut_lib when left blank.
+            self.f_dut_lib = QLineEdit(); self.f_dut_lib.setPlaceholderText("e.g. Hi1108_WuR_PMU")
+            self.f_dut_lib.setToolTip("Library that holds your PMU/LDO cell — the DUT itself.")
+            idf.addRow(self._req_label("DUT library"), self.f_dut_lib)
+            self.f_dut_cell = QLineEdit(); self.f_dut_cell.setPlaceholderText("e.g. WuR_PMU_TOP")
+            self.f_dut_cell.setToolTip("The DUT CELL name — your PMU/LDO cellview "
+                                       "(NOT the instance name).")
+            idf.addRow(self._req_label("DUT cell (your PMU/LDO)"), self.f_dut_cell)
+            self.f_dut_inst = QLineEdit(); self.f_dut_inst.setPlaceholderText("e.g. PMU_TOP")
+            self.f_dut_inst.setToolTip("The DUT's INSTANCE name inside the testbench (e.g. PMU_TOP) "
+                                       "— how the DUT is placed in the TB, not the cell name.")
+            idf.addRow("DUT instance (in the TB)", self.f_dut_inst)
+            self.f_tb_lib = QLineEdit()
+            self.f_tb_lib.setPlaceholderText("blank → same as DUT library")
+            self.f_tb_lib.setToolTip("Library that holds the testbench cell. Blank → reuse the "
+                                     "DUT library.")
+            idf.addRow("Testbench library", self.f_tb_lib)
+            self.f_tb_cell = QLineEdit(); self.f_tb_cell.setPlaceholderText("e.g. sim_LDO")
+            self.f_tb_cell.setToolTip("The testbench cell Maestro simulates (wraps the DUT + "
+                                      "sources/probes).")
+            idf.addRow(self._req_label("Testbench cell (Maestro)"), self.f_tb_cell)
+            self.f_ground = QLineEdit(); self.f_ground.setPlaceholderText("e.g. VSS  (blank → gnd!)")
+            self.f_ground.setToolTip("Ground net name. Blank → gnd!.")
+            idf.addRow("Ground net", self.f_ground)
+            v.addWidget(idg)
+
+            # SUPPLIES (always visible) ---------------------------------------------
+            sg = QGroupBox("Supplies — rails to PSRR")
+            sg.setStyleSheet("QGroupBox{font-weight:bold;}")
+            sgl = QVBoxLayout(sg)
+            sgl.addWidget(QLabel("<span style='color:#678'>Each supply needs a net + its DC "
+                                 "operating value.</span>"))
             self.t_supplies = self._make_table(["key", "net", "dc"],
                                                ["AVDD1P0", "VDD1P0", "1.0"])
-            rf.addRow(self._table_block(self.t_supplies))
+            sgl.addWidget(self._table_block(self.t_supplies))
+            v.addWidget(sg)
 
-            # outputs note: at least one v_out OR i_out
-            rf.addRow(QLabel("<b>Voltage outputs</b> &nbsp;<span style='color:#678;font-weight:"
-                             "normal'>(≥1 v_out OR i_out required)</span>"))
+            # VOLTAGE OUTPUTS (always visible) --------------------------------------
+            vg = QGroupBox("Voltage outputs — LDO rails")
+            vg.setStyleSheet("QGroupBox{font-weight:bold;}")
+            vgl = QVBoxLayout(vg)
+            vgl.addWidget(QLabel("<span style='color:#678'>The regulated voltage outputs "
+                                 "(Zout / PSRR / noise). &nbsp;<b>≥1 voltage OR current output "
+                                 "required.</b></span>"))
             self.t_vout = self._make_table(["key", "net"], ["vco", "VDD0P8_VCO"])
-            rf.addRow(self._table_block(self.t_vout))
-            v.addWidget(req)
+            vgl.addWidget(self._table_block(self.t_vout))
+            v.addWidget(vg)
 
-            # ADVANCED section (collapsed by default — D2) --------------------------
+            # CURRENT OUTPUTS (always visible; carries its OWN settings) -------------
+            cg = QGroupBox("Current outputs — bias / current sinks")
+            cg.setStyleSheet("QGroupBox{font-weight:bold;}")
+            cgl = QVBoxLayout(cg)
+            cgl.addWidget(QLabel("<span style='color:#678'>Current-output pins (admittance / "
+                                 "current-PSRR): net + compliance dc + optional I-V sweep "
+                                 "(start:step:stop or 'auto'). Leave empty if your DUT has none."
+                                 "</span>"))
+            self.t_iout = self._make_table(["key", "net", "compliance dc", "iv_sweep"],
+                                           ["i500n", "IBP_500N", "0.9", "0:0.01:1.1"])
+            cgl.addWidget(self._table_block(self.t_iout))
+            cf = QFormLayout()
+            self.f_cpsrr = QLineEdit()
+            self.f_cpsrr.setPlaceholderText("supply keys, e.g. AVDD1P0   (blank → all supplies)")
+            self.f_cpsrr.setToolTip("Current-PSRR reference: which supply rail(s) to measure the "
+                                    "current outputs' PSRR against (how supply ripple leaks into the "
+                                    "output current). Blank → every supply.")
+            cf.addRow("Current-PSRR reference", self.f_cpsrr)
+            cgl.addLayout(cf)
+            v.addWidget(cg)
+
+            # ADVANCED (collapsed) — genuinely rare overrides -----------------------
             adv = QGroupBox("Advanced (optional)")
             adv.setCheckable(True); adv.setChecked(False)
             adv.toggled.connect(lambda on, g=adv: self._toggle_group(g, on))
@@ -770,26 +819,12 @@ if _HAVE_QT:
             af.addRow("extract_cell", self.f_extract)
             self.f_tb_view = QLineEdit(); self.f_tb_view.setPlaceholderText("e.g. schematic")
             af.addRow("tb_view", self.f_tb_view)
-            self.f_dut_inst = QLineEdit(); self.f_dut_inst.setPlaceholderText("e.g. PMU_TOP")
-            self.f_dut_inst.setToolTip("DUT instance name inside the testbench.")
-            af.addRow("DUT instance (tb_inst)", self.f_dut_inst)
             self.f_src_test = QLineEdit()
             self.f_src_test.setPlaceholderText("optional — auto-discovered from the ADE-XL session")
+            self.f_src_test.setToolTip("The Maestro/ADE test whose operating point + design variables "
+                                       "we inherit (so the bias matches your real run). Auto-found by "
+                                       "TB cell name — set only if auto-find fails.")
             af.addRow("ade_src_test", self.f_src_test)
-            self.f_cpsrr = QLineEdit()
-            self.f_cpsrr.setPlaceholderText("comma keys, e.g. AVDD1P0   (blank → all supplies)")
-            self.f_cpsrr.setToolTip("Supply ROLE KEYS the current-output PSRR is referenced to.")
-            af.addRow("current_psrr_supplies", self.f_cpsrr)
-            self.f_leave = QLineEdit()
-            self.f_leave.setPlaceholderText("comma, e.g. EN, PLL_CTRL<3:0>")
-            self.f_leave.setToolTip("Pins held at their OP value, not stimulated (enables, ctrl bus).")
-            af.addRow("leave_alone", self.f_leave)
-            # i_out table (advanced: a current output is optional + has compliance dc / iv_sweep)
-            af.addRow(QLabel("<b>Current outputs (i_out)</b> &nbsp;<span style='color:#678;"
-                             "font-weight:normal'>(net + compliance dc + optional I-V sweep)</span>"))
-            self.t_iout = self._make_table(["key", "net", "compliance dc", "iv_sweep"],
-                                           ["i500n", "IBP_500N", "0.9", "0:0.01:1.1"])
-            af.addRow(self._table_block(self.t_iout))
             # bias table (advanced)
             af.addRow(QLabel("<b>Bias ports (held)</b> &nbsp;<span style='color:#678;"
                              "font-weight:normal'>(net + dc)</span>"))
@@ -900,7 +935,6 @@ if _HAVE_QT:
             self.f_extract.setPlaceholderText(
                 (d.get("tb_cell", "") or "TB") + "_extract  (auto)")
             self.f_cpsrr.setText(", ".join(m.get("current_psrr_supplies", []) or []))
-            self.f_leave.setText(", ".join(m.get("leave_alone", []) or []))
             cor = m.get("corners") or {}
             self.f_pull.setChecked(bool(cor.get("pull_from_session", True)))
             self.f_fallback.setText(", ".join(cor.get("fallback", []) or []))
@@ -1033,8 +1067,9 @@ if _HAVE_QT:
                 m["current_psrr_supplies"] = cpsrr
             else:
                 m.pop("current_psrr_supplies", None)
-            leave = [t for t in (x.strip() for x in self.f_leave.text().split(",")) if t]
-            m["leave_alone"] = leave
+            # leave_alone is intentionally NOT surfaced in the form (augment never consumes it;
+            # undeclared pins already stay TB-original). Don't touch it -> any existing value
+            # rides on the deep-copied stash and survives the round-trip (lossless).
             fb = [t for t in (x.strip() for x in self.f_fallback.text().split(",")) if t]
             cor = dict(m.get("corners") or {})
             cor["pull_from_session"] = bool(self.f_pull.isChecked())
@@ -2960,15 +2995,17 @@ def _selftest_manifest_editor(win, tmp):
     # 4) FORM round-trip: fill the REQUIRED fields programmatically, then Form->Raw must
     #    regenerate JSON that parses + validates. tb_lib left blank -> inherits dut_lib (D4).
     dlg2 = _ManifestEditorDialog(win, "{}", None)
-    dlg2.f_name.setText("pmu_top")
-    dlg2.f_dut_lib.setText("sim_1108_yusheng"); dlg2.f_dut_cell.setText("Test_LDO")
+    dlg2.f_name.setText("wur_pmu_top")
+    dlg2.f_dut_lib.setText("Hi1108_WuR_PMU"); dlg2.f_dut_cell.setText("WuR_PMU_TOP")
+    dlg2.f_dut_inst.setText("PMU_TOP")                           # identity field (moved up from Advanced)
     dlg2.f_tb_lib.setText("")                                     # blank -> inherit dut_lib
-    dlg2.f_tb_cell.setText("Test_LDO_TB"); dlg2.f_ground.setText("gnd!")
+    dlg2.f_tb_cell.setText("sim_LDO"); dlg2.f_ground.setText("VSS")
     _ManifestEditorDialog._table_add_row(dlg2.t_supplies, ["AVDD1P0", "VDD1P0", "1.0"])
     _ManifestEditorDialog._table_add_row(dlg2.t_vout, ["vco", "VDD0P8_VCO"])
     dlg2.subtabs.setCurrentIndex(RAW)                            # Form->Raw regenerates the JSON
     raw = json.loads(dlg2.ed.toPlainText())
-    assert raw["dut"]["tb_lib"] == "sim_1108_yusheng", "tb_lib must inherit dut_lib when blank (D4)"
+    assert raw["dut"]["tb_lib"] == "Hi1108_WuR_PMU", "tb_lib must inherit dut_lib when blank (D4)"
+    assert raw["dut"]["tb_inst"] == "PMU_TOP", "DUT instance (tb_inst) must round-trip from Identity"
     assert raw["supplies"]["AVDD1P0"]["dc"] == 1.0 and raw["v_out"]["vco"]["net"] == "VDD0P8_VCO"
     ok2, _ = dlg2._check()
     assert ok2, "Form-built manifest must validate after Form->Raw"
@@ -2981,7 +3018,7 @@ def _selftest_manifest_editor(win, tmp):
     raw["supplies"]["AVDD1P0"]["tb_src"] = "V_AVDD"             # unmodeled nested key under a supply
     dlg2.ed.setPlainText(json.dumps(raw, indent=2))
     dlg2.subtabs.setCurrentIndex(0)                             # Raw->Form re-parses into the stash
-    assert dlg2.f_name.text() == "pmu_top", "Raw->Form did not repopulate the form"
+    assert dlg2.f_name.text() == "wur_pmu_top", "Raw->Form did not repopulate the form"
     dlg2.subtabs.setCurrentIndex(RAW)                          # Form->Raw regenerates from the stash
     merged = json.loads(dlg2.ed.toPlainText())
     assert merged.get("_designer_note") == "keep me", "unknown top-level key lost in round-trip"
