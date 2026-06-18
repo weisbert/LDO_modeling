@@ -1,0 +1,35 @@
+{
+  "name": "wur_pmu_top",
+  "_note": "Red-zone manifest for the WuR PMU. Identity + pin roles are REAL (designer-supplied): TB sim_1108_yusheng/sim_LDO; DUT Hi1108_WuR_PMU/WuR_PMU_TOP instantiated as PMU_TOP. Each port's 'pin' is the symbol PIN name; the '<net:PIN>' nets are RESOLVER-FILLED -- run Mode A in the live Virtuoso (or hand-edit the nets) to turn them into real TB nets. v_out 'iload' is pure metadata (recorded OP load current; the Zout probe is dc=0 AC-only so the TB load still sets the OP). i_out 'dc' is the pin's compliance/operating node voltage (the probe applies it).",
+  "dut": {
+    "lib": "Hi1108_WuR_PMU",
+    "cell": "WuR_PMU_TOP",
+    "tb_lib": "sim_1108_yusheng",
+    "tb_cell": "sim_LDO",
+    "tb_inst": "PMU_TOP",
+    "extract_cell": "sim_LDO_extract",
+    "tb_view": "schematic",
+    "extract_view": "schematic"
+  },
+  "ground": "VSS",
+  "supplies": {
+    "avdd1p0": {"net": "<net:AVDD1P0>", "dc": 0.98, "pin": "AVDD1P0"}
+  },
+  "v_out": {
+    "pll": {"net": "<net:VDD0P8_PLL>", "pin": "VDD0P8_PLL", "iload": 500e-6},
+    "vco": {"net": "<net:VDD0P8_VCO>", "pin": "VDD0P8_VCO", "iload": 2e-3}
+  },
+  "i_out": {
+    "i500n_lpf":  {"net": "<net:IBP_POLY_500N_LPF>",      "pin": "IBP_POLY_500N_LPF",      "dc": 1.28,  "probe_src": "Vprobe_i500n_lpf"},
+    "i3p6u_vco":  {"net": "<net:IBP_POLY_3P6U_VCO>",       "pin": "IBP_POLY_3P6U_VCO",       "dc": 1.28,  "probe_src": "Vprobe_i3p6u_vco"},
+    "i1p5u_ptat": {"net": "<net:IBP_PTAT_TUNE_1P5U_VCO>",  "pin": "IBP_PTAT_TUNE_1P5U_VCO",  "dc": 0.667, "probe_src": "Vprobe_i1p5u_ptat"}
+  },
+  "bias": {},
+  "leave_alone": [],
+  "corners": {"pull_from_session": true, "fallback": ["tt_25c"]},
+  "current_psrr_supplies": ["avdd1p0"],
+  "analysis": {
+    "ac": "ac start=10 stop=500M dec=20",
+    "noise": "noise start=10 stop=100M dec=20"
+  }
+}
