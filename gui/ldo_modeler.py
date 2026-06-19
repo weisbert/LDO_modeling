@@ -769,7 +769,7 @@ if _HAVE_QT:
             self.path = pathlib.Path(path) if path else None
             self.saved_path = None
             self.setWindowTitle(f"Manifest editor — {self.path.name if self.path else 'new (unsaved)'}")
-            self.resize(640, 720)
+            self.resize(500, 680)
             # STASH: parse the incoming text once; the form is an overlay on THIS dict, so every
             # key the form does not model survives intact. Bad JSON -> empty stash, raw text kept.
             try:
@@ -986,6 +986,15 @@ if _HAVE_QT:
             v.addWidget(simg)
 
             v.addStretch(1)
+            # [2.5] every group's help text must WRAP -- an unwrapped rich-text QLabel reports its
+            # full single-line width as a minimum, forcing the whole group (and the dialog) ~3400px
+            # wide. Wrapping lets each group shrink to its table; the table keeps its own scrollbar.
+            for _lb in inner.findChildren(QLabel):
+                _lb.setWordWrap(True)
+            # [2.2/2.5] keep the single-line input boxes a tidy fixed size -- otherwise a QFormLayout
+            # field stretches to the full window width (an over-long blank after "Model name" etc.).
+            for _le in inner.findChildren(QLineEdit):
+                _le.setMaximumWidth(280)
             scroll.setWidget(inner)
             ov.addWidget(scroll, 1)
             return outer
@@ -1005,13 +1014,16 @@ if _HAVE_QT:
             t = QTableWidget(0, len(cols))
             t.setHorizontalHeaderLabels(cols)
             hh = t.horizontalHeader()
-            # [2.1] 'net' (always index 1) is the wide column; the trailing source-instance column
-            # no longer eats the width. Others size to content; allow a horizontal scrollbar if a
-            # table is genuinely too narrow.
+            # [2.1] NO column stretches -- a Stretch column swallows the whole viewport and
+            # balloons the table/form/dialog. Every column is Interactive (user-draggable) with a
+            # compact fixed default; the table shows its own horizontal scrollbar when the window is
+            # narrow, instead of forcing the dialog wide. 'net' is just a bit wider than the rest.
             hh.setStretchLastSection(False)
-            for c in range(len(cols)):
-                mode = (QHeaderView.Stretch if c == 1 else QHeaderView.Interactive)
-                hh.setSectionResizeMode(c, mode)
+            _WIDS = {"key": 92, "net": 168, "dc": 78, "compliance dc": 104, "src instance": 116,
+                     "probe instance": 122, "iv_sweep": 94, "PSRR→I": 60, "analysis": 72}
+            for c, name in enumerate(cols):
+                hh.setSectionResizeMode(c, QHeaderView.Interactive)
+                t.setColumnWidth(c, _WIDS.get(name, 96))
             t.setMaximumHeight(150)
             t.setToolTip("example row → " + " / ".join(f"{c}={e}" for c, e in zip(cols, example)))
             t._example = example
@@ -3889,13 +3901,17 @@ def _selftest_manifest_editor(win, tmp):
     assert dlg11.t_iout.item(0, 4).text() == "Vchar_i", "scan did not fill the i_out probe instance"
     assert dlg11.t_iout.item(0, 2).text() == "1.2", "scan did not fill the i_out compliance dc"
 
-    # 5j) [2.1] the 'net' column (index 1) stretches; the LAST column is NOT stretched -- for
-    #     ALL FOUR tables (uniform layout; bias included so it can't drift to stretch-last).
+    # 5j) [2.1/2.5] NO column stretches (a Stretch column swallows the viewport and balloons the
+    #     dialog ~3400px wide); every column is Interactive with a compact fixed width, for ALL
+    #     FOUR tables. 'net' is a touch wider than the rest but never stretched.
     from PyQt5.QtWidgets import QHeaderView as _QHV
     for _tt in (dlg11.t_supplies, dlg11.t_vout, dlg11.t_iout, dlg11.t_bias):
         _hh = _tt.horizontalHeader()
         assert not _hh.stretchLastSection(), "the last column must NOT be stretched ([2.1])"
-        assert _hh.sectionResizeMode(1) == _QHV.Stretch, "the 'net' column (index 1) must Stretch ([2.1])"
+        for _c in range(_tt.columnCount()):
+            assert _hh.sectionResizeMode(_c) != _QHV.Stretch, \
+                "no column may Stretch -- it balloons the dialog width ([2.1/2.5])"
+        assert _tt.columnWidth(1) <= 220, "the 'net' column must keep a compact fixed width ([2.5])"
 
     # 6) find/replace bar (Ctrl+F / Ctrl+H) over the Raw text
     dlg2.findbar.find.setText("VDD0P8_VCO"); dlg2.findbar.repl.setText("VDD0P8_RENAMED")
