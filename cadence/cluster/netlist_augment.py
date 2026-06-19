@@ -532,8 +532,8 @@ def _analysis_line(m, group, hot_src=None):
 
 
 # The Spectre options statement we emit to run the whole netlist at a coverage temperature.
-# box-pending: the EXACT options keyword ('temp' is the Spectre option for the analog temp) is
-# validated on the box; the name + line are stable so orchestration can wire it now.
+# Confirmed on local Spectre 18.1: `<name> options temp=<n>` is accepted (no fatal) and runs the
+# whole netlist at that analog temperature -- the exact keyword IS `temp`. ALPS keyword unverified.
 COVTEMP_NAME = "_covtemp"
 
 
@@ -567,8 +567,8 @@ def make_offline_group_netlister(base_input_scs, m, out_base, op_loads=None, tem
                      rail's load per sweep point). None (default) -> identical to today (the OP dc
                      the base carries). Keys not naming a reused v_out are ignored.
     temp             optional float: when set, the appended block emits a Spectre options
-                     statement running the WHOLE netlist at <temp> (box-pending keyword). None
-                     (default) -> no temp line.
+                     statement running the WHOLE netlist at <temp> (`options temp=`, confirmed
+                     accepted on local Spectre 18.1). None (default) -> no temp line.
     """
     op_loads = op_loads or {}
     base_path = pathlib.Path(base_input_scs)
@@ -712,10 +712,11 @@ def make_offline_group_netlister(base_input_scs, m, out_base, op_loads=None, tem
                              f"dc={float(v['dc']):g} mag={acm}")
             print(f"[netlist_augment] fallback-insert {role}.{key} "
                   f"(open pin on net '{v['net']}' -- no TB source to reuse)")
-        # box-pending: run the whole netlist at the coverage temperature (one options line)
+        # run the whole netlist at the coverage temperature (one options line); the `temp` keyword
+        # is confirmed accepted on local Spectre 18.1 (see COVTEMP_NAME).
         if temp is not None:
             lines.append(f"{COVTEMP_NAME} options temp={float(temp):g}   "
-                         f"// box-pending: validate the exact Spectre temp options keyword")
+                         f"// coverage temperature (Spectre `options temp=`, validated locally)")
         # the group's analysis (ac/noise; or the dc sweep / tran) + the targeted save union
         lines.append(_analysis_line(m, group, hot_src=hot_src))
         lines.append(_save_line(m, group))

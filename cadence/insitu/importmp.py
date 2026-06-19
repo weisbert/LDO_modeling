@@ -101,9 +101,10 @@ def _sweep_axis(d, where, swept=None, kinds=("dc", "sweep")):
     ROBUST to the box's PSF axis naming -- binary PSF / ALPS can name the swept-variable column by
     the swept PARAMETER, by "dc"/"sweep", or by the source's own dc node -- so it tries, in order:
     the explicit swept-param name (when the caller knows it), the d["_sweep"]-named column, then the
-    conventional keys, and as a last resort any non-probe-current numeric column. box-pending: the
-    EXACT swept-axis key the cluster's binpsf writes is confirmed on the box; the fallbacks below
-    keep the read working across the candidate names until then."""
+    conventional keys, and as a last resort any non-probe-current numeric column. Confirmed on
+    local Spectre 18.1 (psfascii): the DC-sweep axis is named exactly "dc" and d["_sweep"]=="dc",
+    so the first two candidates hit and the fallbacks never fire here. The fallbacks remain ONLY
+    for the box's BINARY PSF / ALPS, whose swept-variable column name is still unconfirmed."""
     cands = []
     if swept:
         cands.append(swept)
@@ -127,7 +128,8 @@ def _sweep_axis(d, where, swept=None, kinds=("dc", "sweep")):
 
 def _time_axis(d, where):
     """The transient TIME axis. psf.read_psf names the tran sweep column "time" (Spectre) and
-    stamps d["_sweep"]="time"; a box binary PSF may surface it under that stamped name. We accept
+    stamps d["_sweep"]="time"; a box binary PSF may surface it under that stamped name. Confirmed
+    on local Spectre 18.1 (psfascii): the tran axis is literally "time". We accept
     ONLY a genuine time axis: the literal "time" column, or the _sweep-stamped column WHEN the stamp
     itself denotes time. A foreign axis (e.g. an AC PSF's "freq" mis-routed to a tran read) must FAIL
     LOUD here rather than be returned as a wrong silent array."""
