@@ -169,14 +169,57 @@ def test_emit_va_skips_missing_dc(tmp_path):
     assert "no DC sweep" in tbl.read_text()
 
 
-def test_emit_va_with_dc_unchanged(tmp_path):
-    """Regression: WITH real DC, the dropout PWL + slew_en branch emit as before."""
+def test_emit_va_with_dc_additive_slew(tmp_path):
+    """GUARDRAIL-1: WITH real DC, slew_en is now ADDITIVE (no branch swap). The linear R_a
+    conductance branch is ALWAYS active and slew_en scales a nonlinear correction (the
+    dropout PWL minus its OP tangent). slew_en=0 == the pure linear core; the correction is
+    0 (value AND slope) at the OP so the at-OP small-signal Zout is identical for slew_en in
+    {0,1}; slew_en=1 reproduces the dropout deviation at the swept points."""
     ref = _with_real_dc(_small_signal_ref())
     P = _fit_single_port(ref)
     va = tmp_path / "dc.va"
     FM.emit_va(P, va, tmp_path / "dc.tbl")
     txt = va.read_text()
-    assert "if (slew_en == 0)" in txt and "max(vdrp" in txt
+    # ADDITIVE form: no branch swap, linear core always active, slew_en-scaled correction
+    assert "if (slew_en == 0)" not in txt, "branch swap must be gone (additive restructure)"
+    assert "I(vrg, nA) <+ V(vrg, nA)/R_a;" in txt, "linear R_a core must be ALWAYS active"
+    assert "I(vrg, nA) <+ slew_en * (" in txt, "additive slew_en-scaled correction missing"
+    assert "max(vdrp" in txt and "vdrp =" in txt, "the dropout PWL must still be inlined"
+    assert "NOT modeled" not in txt
+
+    # numeric: the additive correction is 0 (value AND slope) at the OP, and reproduces the
+    # (PWL - OP tangent) deviation at every swept knot. Evaluate the EMITTED expression.
+    import re
+    vreg121 = P[FM.NOMINAL]["vreg"]
+    vd, il = FM.build_pwl_arrays(vreg121)
+    i_op = FM._amps(FM.NOMINAL)
+    vdrp_op, i_pwl_op, g_op = FM._pwl_op_tangent(vd, il, i_op)
+    expr = FM._pwl_additive_va_expr(vd, il, i_op, var="vdrp")
+    pyexpr = re.sub(r"\s+", " ", expr).replace("max", "np.maximum")
+
+    def ev(vdrp):
+        return eval(pyexpr, {"np": np, "vdrp": vdrp})   # noqa: S307 (trusted, generated)
+
+    assert abs(ev(vdrp_op)) < 1e-9, "correction value at OP must be 0"
+    h = 1e-9
+    slope = (ev(vdrp_op + h) - ev(vdrp_op - h)) / (2 * h)
+    assert abs(slope) < 1e-5, "correction SLOPE at OP must be 0 (Zout unchanged)"
+    for v in vd:                      # at every swept knot: correction == PWL - OP tangent
+        expect = float(np.interp(v, vd, il)) - (i_pwl_op + g_op * (v - vdrp_op))
+        assert abs(ev(v) - expect) < 1e-9 * max(1.0, abs(expect))
+
+
+def test_emit_lib_with_dc_additive_slew(tmp_path):
+    """GUARDRAIL-1, ngspice side: emit() with real DC emits the SAME additive restructure --
+    the Bra B-source is `V(rail,nA)/R_a + slew_en * (pwl(...) - OP tangent)` (no `? :` swap),
+    so slew_en=0 is the linear core byte-for-byte and the at-OP conductance is unchanged."""
+    ref = _with_real_dc(_small_signal_ref())
+    P = _fit_single_port(ref)
+    lib = tmp_path / "dc.lib"
+    FM.emit(P, lib)
+    txt = lib.read_text()
+    assert "slew_en > 0.5" not in txt, "ternary branch swap must be gone (additive)"
+    assert "/R_a + slew_en * (pwl(" in txt, "additive linear-core + slew_en*correction missing"
     assert "NOT modeled" not in txt
 
 

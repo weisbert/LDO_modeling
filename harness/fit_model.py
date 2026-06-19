@@ -1156,6 +1156,17 @@ def build_pwl(vreg121):
     (dc_loadreg or dc_dropout absent -- e.g. a small-signal-only in-situ export). The
     caller then emits NO dropout/current-limit branch (never a fabricated-flat one).
     Mirrors _linereg_poly's existing 'not in ref.files -> inert' guard."""
+    res = build_pwl_arrays(vreg121)
+    if res is None:
+        return None
+    vdrop, il = res
+    return " ".join(f"{v:.6e},{i:.6e}" for v, i in zip(vdrop, il)).replace(" ", ",")
+
+
+def build_pwl_arrays(vreg121):
+    """The (vdrop, iload) PWL arrays behind build_pwl -- returned so emit() can compute the
+    OP tangent for the ADDITIVE slew_en correction (guardrail 1). Same gate/shape as
+    build_pwl; None when no real DC sweep is present."""
     if ref is None or "dc_loadreg" not in ref.files or "dc_dropout" not in ref.files:
         return None
     dl, dd = ref["dc_loadreg"], ref["dc_dropout"]
@@ -1166,7 +1177,7 @@ def build_pwl(vreg121):
     vdrop, il = vdrop[order], il[order]
     keep = np.concatenate([[True], np.diff(vdrop) > 1e-5])     # strictly ascending
     vdrop, il = vdrop[keep], il[keep]
-    return " ".join(f"{v:.6e},{i:.6e}" for v, i in zip(vdrop, il)).replace(" ", ",")
+    return vdrop, il
 
 
 def _noise_net():
@@ -1327,8 +1338,16 @@ def emit(P, path):
                      "*       (small-signal scope). slew_en exists (default 0) but is INERT:\n"
                      "*       slew_en=1 runs the SAME linear R_a branch (no fabricated dropout).\n")
     else:
-        bra_line = (f"Bra  {rail} nA I = {{(slew_en > 0.5) ? "
-                    f"pwl(V({rail},nA)-(vregeff-VREG121),{pwl_tab}) : V({rail},nA)/R_a}}")
+        # GUARDRAIL-1 (additive slew_en): linear R_a conductance ALWAYS active; slew_en scales
+        # an ADDITIVE nonlinear correction = the (Vdrop,Iload) PWL MINUS its OP tangent, so the
+        # correction is 0 (value AND slope) at the OP. slew_en=0 == the EXACT linear core, and
+        # the at-OP small-signal Zout is identical for slew_en in {0,1} (HB/PSS clean core).
+        _pa = build_pwl_arrays(vreg121)
+        _vdrp_op, _i_pwl_op, _g_op = _pwl_op_tangent(_pa[0], _pa[1], _amps(NOMINAL))
+        _vdarg = f"V({rail},nA)-(vregeff-VREG121)"
+        bra_line = (f"Bra  {rail} nA I = {{V({rail},nA)/R_a + slew_en * "
+                    f"(pwl({_vdarg},{pwl_tab}) - ({_i_pwl_op:.6e}) "
+                    f"- ({_g_op:.6e})*(({_vdarg})-({_vdrp_op:.6e})))}}")
         nodc_note = ""
     txt = f"""* ============================================================
 * CANDIDATE behavioral LDO model  (subckt: ldo_model, ports: vin vout gnd)
@@ -1376,8 +1395,10 @@ Breg vreg gnd V = {{vregeff}}
 * ---- Zout: branch A (R_a + L_a) || branch C (ESR+Cout) || branch B (opt) ----
 La   vout nA  {{L_a}}
 Rpl  vout nA  {{R_pl}}            $ damping across L_a (R_pl->inf = peak; finite = plateau)
-* branch-A conductance: linear R_a (slew_en=0, PSS/HB) OR nonlinear DC-curve w/
-* current-limit+dropout (slew_en=1). La in series stays -> resonance + di/dt slew.
+* branch-A conductance: linear R_a ALWAYS active (slew_en=0 = pure linear, PSS/HB core)
+* + slew_en*(nonlinear DC-curve correction = dropout/current-limit PWL MINUS its OP
+* tangent -> 0 value AND slope at the OP, so at-OP Zout is identical for slew_en in {{0,1}}).
+* La in series stays -> resonance + di/dt slew.
 {bra_line}
 Cout vout nC  {{COUT}}
 Resr nC  vreg {{ESR}}
@@ -1457,6 +1478,48 @@ def _pwl_va_expr(vd, cur, var="vdrp"):
     return ("\n                       + ").join(lines)
 
 
+def _pwl_op_tangent(vd, cur, i_op):
+    """GUARDRAIL-1 support: the OP point + local tangent of the (vdrop, iload) PWL, so the
+    nonlinear branch can be emitted as an ADDITIVE correction that vanishes (VALUE and
+    SLOPE) at the OP. Returns (vdrp_op, i_pwl_op, g_op):
+      * vdrp_op    = the vdrop where the load current equals the OP load i_op (interp on the
+                     monotone table; the model's `vdrp` coordinate at the operating point);
+      * i_pwl_op   = pwl(vdrp_op) = i_op (the OP load current on the curve);
+      * g_op       = dI/dvdrp of the PWL AT vdrp_op (the local segment slope = the DC output
+                     conductance the linear R_a core already carries when DC/AC are
+                     consistent -- guardrail 3).
+    The additive correction = pwl(vdrp) - i_pwl_op - g_op*(vdrp - vdrp_op) is then EXACTLY
+    0 with 0 slope at vdrp_op, so slew_en=0 (linear core) and slew_en=1 share the same at-OP
+    small-signal conductance (1/R_a), and slew_en=1 == linear core + the genuine nonlinear
+    dropout/current-limit deviation from that OP tangent."""
+    vd = np.asarray(vd, dtype=float)
+    cur = np.asarray(cur, dtype=float)
+    g = np.diff(cur) / np.diff(vd)
+    # OP vdrop: where the curve's load current == i_op. cur is monotone-increasing in vd
+    # (load current grows with drop), so interp on (cur -> vd) is well-posed.
+    vdrp_op = float(np.interp(i_op, cur, vd))
+    i_pwl_op = float(np.interp(vdrp_op, vd, cur))
+    # local slope: the segment containing vdrp_op (last knot <= vdrp_op). searchsorted gives
+    # the insertion index; clamp to a valid segment for the end cases (linear extrapolation).
+    k = int(np.clip(np.searchsorted(vd, vdrp_op, side="right") - 1, 0, len(g) - 1))
+    g_op = float(g[k])
+    return vdrp_op, i_pwl_op, g_op
+
+
+def _pwl_additive_va_expr(vd, cur, i_op, var="vdrp"):
+    """ADDITIVE nonlinear-correction VA expr (guardrail 1): the dropout/current-limit PWL
+    MINUS its OP tangent -- pwl(vdrp) - i_pwl_op - g_op*(vdrp - vdrp_op). It is 0 with 0
+    slope at the OP, so adding `slew_en *` this term to the ALWAYS-active linear R_a branch
+    leaves the at-OP small-signal Zout IDENTICAL (slew_en in {0,1}). Reuses _pwl_va_expr for
+    the PWL body; the OP tangent is a closed-form affine subtraction."""
+    vdrp_op, i_pwl_op, g_op = _pwl_op_tangent(vd, cur, i_op)
+    pwl_body = _pwl_va_expr(vd, cur, var=var)
+    # ( PWL ) - i_pwl_op - g_op*(vdrp - vdrp_op)   [the affine OP tangent, subtracted]
+    return (f"({pwl_body})\n"
+            f"                       - ({i_pwl_op:.6e}) "
+            f"- ({g_op:.6e})*({var}-({vdrp_op:.6e}))")
+
+
 def emit_va(P, path, tbl_path):
     """Emit an equivalent Verilog-A model for Cadence Spectre. Mirrors the validated
     SPICE topology. Noise is a decoupled Norton @vout (white + MNOISE R||C-Lorentzian
@@ -1496,11 +1559,16 @@ def emit_va(P, path, tbl_path):
         keep = np.concatenate([[True], np.diff(vd) > 1e-5]); vd, il = vd[keep], il[keep]
         tbl_path.write_text("* data record only -- the emitted .va inlines this curve\n"
                             + "\n".join(f"{v:.6e} {i:.6e}" for v, i in zip(vd, il)) + "\n")
-        pwl_expr = _pwl_va_expr(vd, il)
+        # GUARDRAIL-1: ADDITIVE nonlinear correction (dropout/current-limit PWL minus its OP
+        # tangent) -> 0 value AND 0 slope at the OP. The linear R_a branch is ALWAYS active;
+        # slew_en scales ONLY this correction, so slew_en=0 == the pure linear core and the
+        # at-OP small-signal Zout is identical for slew_en in {0,1}.
+        i_op = _amps(NOMINAL)
+        pwl_corr_expr = _pwl_additive_va_expr(vd, il, i_op)
     else:
         tbl_path.write_text("* no DC sweep in ref -> dropout/load-reg NOT modeled "
                             "(small-signal scope); no PWL curve emitted\n")
-        pwl_expr = None
+        pwl_corr_expr = None
     nk_nodes = ", ".join(f"nk{k+1}" for k in range(MNOISE))
     gvars = ", ".join(["gnw"] + [f"gn{k+1}" for k in range(MNOISE)]
                       + [f"sa{k+1}" for k in range(len(NSPUR_F))])
@@ -1569,19 +1637,25 @@ def emit_va(P, path, tbl_path):
     # Without DC -> pure linear R_a (no PWL), slew_en exists (default 0) but is INERT
     # (slew_en=1 runs the SAME linear branch), and a header NOTE records the scope.
     if have_dc:
-        slew_doc = "//   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout), INLINE PWL"
+        slew_doc = ("//   slew_en=1 : ADDS the nonlinear DC-curve correction (current-limit +\n"
+                    "//              dropout) to the linear core; =0 value AND 0 slope at the OP")
         nodc_note_va = ""
         vdrp_decl = "\n  real vddc, lrsh, vregeff, vdrp;"
-        bra_va = f"""if (slew_en == 0)
-      V(nA, {arail}) <+ R_a*I(nA, {arail});
-    else begin
-      // nonlinear DC-curve branch (current-limit + dropout): INLINE closed-form PWL of
-      // the characterized (Vdrop, Iload) table -- i = i1 + g1*(v-v1) + sum dg_k*max(v-v_k,0)
-      // == 1-D linear table interpolation, linear end extrapolation. Self-contained
-      // (no external table file -> no run-dir path issues; OpenVAF-compilable, R8 closed).
-      vdrp = V({arail}, nA) - (vregeff - VREG121);
-      I({arail}, nA) <+ {pwl_expr};
-    end"""
+        # GUARDRAIL-1 (additive slew_en): the linear R_a branch is ALWAYS active (conductance
+        # form I=V/R_a, identical small-signal to the V=R_a*I relation). slew_en scales an
+        # ADDITIVE nonlinear correction = the (Vdrop,Iload) PWL MINUS its OP tangent, so the
+        # correction is 0 with 0 slope at the OP. => slew_en=0 is the pure linear core, the
+        # at-OP Zout is identical for slew_en in {0,1}, and slew_en=1 == linear core + the
+        # genuine dropout/current-limit deviation (HB/PSS run on the clean linear core).
+        bra_va = f"""// linear core (ALWAYS active): R_a conductance branch (arail -> nA)
+    I({arail}, nA) <+ V({arail}, nA)/R_a;
+    // ADDITIVE nonlinear correction (slew_en-gated): INLINE closed-form PWL of the
+    // characterized (Vdrop, Iload) table MINUS its OP tangent -- the genuine dropout/
+    // current-limit deviation, 0 (value AND slope) at the OP so slew_en=0 is the EXACT
+    // linear core and the at-OP small-signal Zout is unchanged. Self-contained (no
+    // external table; OpenVAF-compilable, R8 closed).
+    vdrp = V({arail}, nA) - (vregeff - VREG121);
+    I({arail}, nA) <+ slew_en * ({pwl_corr_expr});"""
     else:
         slew_doc = ("//   slew_en : INERT (no DC sweep in ref -> no dropout/current-limit term);\n"
                     "//             slew_en=1 runs the same linear R_a branch (small-signal scope)")

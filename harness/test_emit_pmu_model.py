@@ -206,6 +206,159 @@ def test_pin_propagation_via_fit_multiport(tmp_path):
     assert not (set(m["v_out"]) | set(m["i_out"])) & set(ports)
 
 
+# ===================================================== ln(iload) scheduling (T3)
+def _multiload_vfit(currents, vreg0=0.8, nnoise=4):
+    """A 3-load voltage fit with REAL distinct iv per load and DISTINCT per-load param
+    values (so each scheduled poly is non-degenerate). Carries schedule_loads (what
+    fit_multiport now exposes) so emit_pmu_va takes the scheduling path."""
+    G = [1e-3, -5e-4, 2e5, 2e-4, 1e6, -1e-4, 5e6]
+    Q = (1e-3, 1e-9, 3e6, 2.0)
+    labels = [f"L{i}" for i in range(len(currents))]
+
+    def mkP(iv, scale):
+        p = dict(iv=iv, R_a=0.05 * scale, L_a=1e-7 * scale, R_pl=1e3 * scale,
+                 R_b=1e9, L_b=1e-12 * scale,
+                 G0=G[0] * scale, G1=G[1] * scale, w1=G[2] * scale, G2=G[3] * scale,
+                 w2=G[4] * scale, G3=G[5] * scale, w3=G[6] * scale,
+                 pcb0=Q[0] * scale, pcb1=Q[1] * scale, pcw0=Q[2] * scale, pcq=Q[3] * scale,
+                 gnw=1e-9 * scale, vreg=vreg0 + 0.05 * scale,
+                 _psrr={"AVDD1P0": (G, Q)})
+        for k in range(nnoise):
+            p[f"gn{k+1}"] = 1e-9 * (k + 1) * scale
+        return p
+    scales = [1.0, 1.3, 0.7][:len(currents)]
+    P = {labels[i]: mkP(currents[i], scales[i]) for i in range(len(currents))}
+    nfk = list(np.logspace(2, 6, nnoise))
+    return dict(P=P, nfk=nfk, cout=2e-8, esr=0.12, err=[], supplies=["AVDD1P0"],
+                schedule_loads=labels, pin="VPLL"), labels
+
+
+def _eval_va_expr(expr, u):
+    """Numerically evaluate an emitted clamped scheduling expr (exp/min/max/poly in u)."""
+    import re
+    py = re.sub(r"\bexp\b", "np.exp", expr)
+    py = py.replace("min(", "np.minimum(").replace("max(", "np.maximum(")
+    return float(eval(py, {"np": np, "u": u}))   # noqa: S307 (trusted, generated)
+
+
+def test_pmu_scheduling_multiload(tmp_path):
+    """A 3-load voltage fit (real distinct iv) -> the .va carries `parameter real iload_<o>`
+    + scheduled (min/max/exp/u) param exprs; AT each corner load the scheduled expr
+    evaluates (in python) to the per-corner fitted value (corner-exact to the emitted
+    6-sig-fig precision). va_sanity passes."""
+    currents = [50e-6, 580e-6, 2000e-6]
+    vfit, labels = _multiload_vfit(currents)
+    res = dict(voltage={"pll": vfit}, current=[],
+               meta=dict(name="sched", loads=labels, supplies=["AVDD1P0"]))
+    va = tmp_path / "sched.va"
+    D.emit_pmu_va(res, "PMU_sched", va, supply="AVDD1P0", ground="VSS")
+    txt = va.read_text()
+    # the per-rail iload module parameter + the clamped ln(iload) drive
+    assert "parameter real iload_VPLL =" in txt
+    assert "VPLL_u = ln(min(max(iload_VPLL," in txt
+    # a few scheduled params are min/max-clamped exp/poly in the rail's u (not literals)
+    assert "VPLL_Ra = min(max(exp(" in txt
+    assert "VPLL_G0 = min(max(" in txt          # signed -> no exp, still clamped
+    # header documents the scheduling
+    assert "load-SCHEDULED" in txt and "ln(iload" in txt
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VPLL"], [], "VSS")
+    assert ok, problems
+
+    # CORNER-EXACT: each scheduled expr evaluates to the per-corner fitted value at that
+    # corner's iload (reuse the proven fit_model._pexpr machinery -> same residual).
+    P = vfit["P"]
+    spec = list(D._SCHED_SPEC_BASE) + [(f"gn{k+1}", True) for k in range(len(vfit["nfk"]))]
+    for key, logspace in spec:
+        vals = [float(P[il][key]) for il in labels]
+        expr = D._sched_expr(currents, vals, "u", logspace)
+        for il, cur in zip(labels, currents):
+            got = _eval_va_expr(expr, np.log(cur))
+            ref = float(P[il][key])
+            assert abs(got - ref) <= 1e-4 * (abs(ref) + 1e-30), (key, il, got, ref)
+
+
+def test_pmu_single_load_bakes_literals(tmp_path):
+    """A 1-load fit (single OP / coverage-free) -> NO iload_<o> param, NO scheduled exprs:
+    params are baked as LITERALS exactly as before (byte-identical path). va_sanity passes."""
+    vfit = _vfit()                                  # single 'nom' corner, no schedule_loads
+    res = dict(voltage={"dig": vfit}, current=[],
+               meta=dict(name="single", loads=["nom"], supplies=["AVDD1P0"]))
+    res["voltage"]["dig"]["pin"] = "VDD0P8_DIG"
+    va = tmp_path / "single.va"
+    D.emit_pmu_va(res, "PMU_single", va, supply="AVDD1P0", ground="VSS")
+    txt = va.read_text()
+    assert "parameter real iload_" not in txt, "single OP must NOT emit an iload schedule"
+    assert "min(max(exp(" not in txt, "single OP must bake literals, not schedule"
+    assert "VDD0P8_DIG_Ra = 5.000000e-02;" in txt   # literal, as before
+    assert "load-SCHEDULED" not in txt
+    assert "no ln(iload) interpolation" in txt      # the single-OP header note
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VDD0P8_DIG"], [], "VSS")
+    assert ok, problems
+
+
+def test_pmu_schedule_skips_degenerate(tmp_path):
+    """schedule_loads with DUPLICATE iv (degenerate poly) -> falls back to baked literals
+    (no schedule), so a coverage run that happened to repeat one load stays well-posed."""
+    vfit, labels = _multiload_vfit([500e-6, 500e-6, 500e-6])   # all identical iv
+    res = dict(voltage={"pll": vfit}, current=[],
+               meta=dict(name="dup", loads=labels, supplies=["AVDD1P0"]))
+    va = tmp_path / "dup.va"
+    D.emit_pmu_va(res, "PMU_dup", va, supply="AVDD1P0", ground="VSS")
+    txt = va.read_text()
+    assert "parameter real iload_" not in txt, "duplicate iv must NOT schedule (degenerate)"
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VPLL"], [], "VSS")
+    assert ok, problems
+
+
+def test_pmu_mixed_scheduled_and_baked(tmp_path):
+    """A PMU with ONE scheduled rail (3 loads) + ONE single-OP rail: only the scheduled rail
+    gets an iload param; both rails coexist in one module; va_sanity passes."""
+    sched_fit, labels = _multiload_vfit([50e-6, 580e-6, 2000e-6])
+    sched_fit["pin"] = "VPLL"
+    single_fit = _vfit()
+    single_fit["pin"] = "VDIG"
+    res = dict(voltage={"pll": sched_fit, "dig": single_fit}, current=[],
+               meta=dict(name="mix", loads=labels, supplies=["AVDD1P0"]))
+    va = tmp_path / "mix.va"
+    D.emit_pmu_va(res, "PMU_mix", va, supply="AVDD1P0", ground="VSS")
+    txt = va.read_text()
+    assert "parameter real iload_VPLL =" in txt      # scheduled rail
+    assert "parameter real iload_VDIG" not in txt    # single-OP rail
+    assert "VDIG_Ra = 5.000000e-02;" in txt          # baked literal
+    assert "VPLL_Ra = min(max(exp(" in txt           # scheduled
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VPLL", "VDIG"], [], "VSS")
+    assert ok, problems
+
+
+def test_pmu_largesignal_vs_legacy_current_dispatch(tmp_path):
+    """A current row carrying idc55 -> the large-signal VA block (idc55/didt/gdd/knee);
+    a legacy row (no idc55) -> the legacy AC-only block. Both reach the emitted .va."""
+    G = [1e-3, -5e-4, 2e5, 2e-4, 1e6, -1e-4, 5e6]
+    Q = (1e-3, 1e-9, 3e6, 2.0)
+    vf = _vfit()
+    vf["pin"] = "VPLL"
+    ls_row = dict(sink="ils", pin="IB_LS", pol="sink", idc55=2.0e-4, didt=1e-7,
+                  g0=1e-7, vc=0.4, gdd=2e-7, vknee=0.05, knee_p=1.0, Cp=1e-15,
+                  in_white=0.0, in_kf=0.0, tnom_c=55.0)
+    legacy_row = _crow("ilg", g0=3e-7, pi_dc=5e-7)
+    legacy_row["pin"] = "IB_LG"
+    res = dict(voltage={"pll": vf}, current=[ls_row, legacy_row],
+               meta=dict(name="cur", loads=["nom"], supplies=["AVDD1P0"]))
+    va = tmp_path / "cur.va"
+    D.emit_pmu_va(res, "PMU_cur", va, supply="AVDD1P0", ground="VSS", supply_dc=1.05)
+    txt = va.read_text()
+    # large-signal block markers (sink fold of gdd -> -gdd)
+    assert "IB_LS_idc55 = 2.000000e-04;" in txt
+    assert "IB_LS_gdd = -2.000000e-07;" in txt
+    assert "tanh(pow(" in txt and "$temperature -" in txt
+    # legacy block markers (admittance + |PI(0)| magnitude), no large-signal core for it
+    assert "IB_LG_g0 = 3.000000e-07;" in txt
+    assert "IB_LG_pidc = 5.000000e-07;" in txt
+    assert "IB_LG_idc55" not in txt
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VPLL"], ["IB_LS", "IB_LG"], "VSS")
+    assert ok, problems
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))

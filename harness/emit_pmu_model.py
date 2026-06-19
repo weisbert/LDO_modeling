@@ -64,16 +64,106 @@ def _primary_supply_psrr(vfit, P_il, supply):
     return G, Q
 
 
+# --------------------------------------------------------- ln(iload) scheduling (T3)
+# Mirror fit_model._poly/_body/_pexpr EXACTLY so an at-corner scheduled expr evaluates
+# to the baked literal value (corner-exact) and off-corner loads stay inside the measured
+# envelope (the same CLAMP_M/CLAMP_ADD clamp). Duplicated here (not imported) so the PMU
+# emit stays self-contained and a single-port import side-effect (FM globals) is avoided.
+CLAMP_M = 1.005      # log (magnitude) params: multiplicative margin on [min, max]
+CLAMP_ADD = 0.005    # linear (signed) params: additive margin as a fraction of the span
+
+
+def _sched_poly(u, y, logspace):
+    """deg<=2 poly of y (or ln y) vs u=ln(iload) through the schedule corners. Matches
+    fit_model._poly (np hi->lo coeff order)."""
+    y = np.log(y) if logspace else y
+    deg = min(len(u) - 1, 2)                # 3 corners -> quadratic; 2 -> linear
+    return np.polyfit(u, y, deg)
+
+
+def _sched_body(c, uvar):
+    """ngspice/Verilog-A polynomial body in uvar for coeffs c (np hi->lo). Byte-identical
+    in form to fit_model._body for the standard deg-2 case."""
+    d = len(c) - 1
+    parts = []
+    for i, ci in enumerate(c):
+        p = d - i
+        if p == 0:
+            parts.append(f"({ci:.6e})")
+        elif p == 1:
+            parts.append(f"({ci:.6e})*{uvar}")
+        elif p == 2:
+            parts.append(f"({ci:.6e})*{uvar}*{uvar}")
+        else:
+            parts.append(f"({ci:.6e})*{uvar}**{p}")
+    return " + ".join(parts)
+
+
+def _sched_expr(currents, vals, uvar, logspace):
+    """CLAMPED VA expr for a scheduled param: deg<=2 poly in uvar=ln(iload) forced through
+    the schedule corners, then min/max-clamped to the measured corner envelope (margin
+    CLAMP_M/CLAMP_ADD). At a corner the poly == the baked literal AND the clamp is INACTIVE
+    -> the at-corner value (hence the scorecard) is byte-exact. Mirrors fit_model._pexpr."""
+    u = np.log(np.asarray(currents, dtype=float))
+    y = np.asarray(vals, dtype=float)
+    c = _sched_poly(u, y, logspace)
+    body = _sched_body(c, uvar)
+    if logspace:
+        lo, hi = min(vals) / CLAMP_M, max(vals) * CLAMP_M
+        return f"min(max(exp({body}),{lo:.6e}),{hi:.6e})"
+    pad = CLAMP_ADD * (max(vals) - min(vals))
+    lo, hi = min(vals) - pad, max(vals) + pad
+    return f"min(max({body},{lo:.6e}),{hi:.6e})"
+
+
+# per-rail scheduled params + their logspace flag -- EXACTLY fit_model.emit/emit_va's
+# `specs` choices (magnitude params logspace=True; signed params False). The promoted
+# per-load G0..w3 / pcb0..pcq live on each P[il] (fit_multiport line 134), so the schedule
+# reads them per corner; the noise gn<k> are appended dynamically (len(nfk) varies).
+_SCHED_SPEC_BASE = [("R_a", True), ("L_a", True), ("R_pl", True), ("R_b", True),
+                    ("L_b", True),
+                    ("G0", False), ("G1", False), ("w1", True), ("G2", False),
+                    ("w2", True), ("G3", False), ("w3", True),
+                    ("pcb0", False), ("pcb1", False), ("pcw0", True), ("pcq", True),
+                    ("gnw", True), ("vreg", False)]
+
+
+def _schedule_loads(vfit, P):
+    """The ordered abscissa label list for this rail's ln(iload) schedule: the fit's
+    `schedule_loads` (labels with a real, finite, nonzero, DISTINCT iv) when >1; else []
+    (single OP / coverage-free -> bake literals). Guards against duplicate iv (a degenerate
+    poly) by requiring >1 distinct current."""
+    sl = list(vfit.get("schedule_loads", []) or [])
+    sl = [il for il in sl if il in P]
+    if len(sl) < 2:
+        return []
+    ivs = [float(P[il]["iv"]) for il in sl]
+    if not all(np.isfinite(ivs)) or len(set(ivs)) < 2:
+        return []
+    return sl
+
+
 def _voltage_block(o, vfit, supply, ground):
     """Render the Verilog-A statements + node/var declarations for ONE voltage rail.
-    Reuses the EXACT contribution structure of fit_model.emit_va, namespaced by `<o>_`
-    and with the fitted params baked in as literals (single OP -> no interpolation)."""
+    Reuses the EXACT contribution structure of fit_model.emit_va, namespaced by `<o>_`.
+
+    TWO paths:
+      * MULTI-LOAD (schedule_loads>1, real distinct iv): each load-dependent small-signal
+        param becomes a CLAMPED quadratic in u=ln(iload_<o>) (a per-rail module parameter,
+        nominal = the middle schedule load's iv). At each corner the scheduled expr == the
+        per-corner fitted value (corner-exact); off-corner loads interpolate inside the
+        measured envelope. The model now SPANS VALID_LOAD via ln(iload).
+      * SINGLE-OP (one load / coverage-free): bake LITERALS exactly as before
+        (byte-identical -> the stand-in tests stay green). This is the DEFAULT path."""
     P = vfit["P"]
-    il = _nom_corner(P)
-    p = P[il]
     nfk = list(vfit["nfk"])
     Cout = float(vfit["cout"])
     ESR = float(vfit["esr"])
+    sched = _schedule_loads(vfit, P)
+    if sched:
+        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR)
+    il = _nom_corner(P)
+    p = P[il]
     vreg = float(p["vreg"])
     G, Q = _primary_supply_psrr(vfit, p, supply)
     pcb0, pcb1, pcw0, pcq = (float(Q[0]), float(Q[1]), float(Q[2]), float(Q[3]))
@@ -123,15 +213,23 @@ def _voltage_block(o, vfit, supply, ground):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    # --- noise sections (Norton @vout) ---
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR)
+    return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
+
+
+def _voltage_body(o, supply, ground, nfk, Cout, ESR):
+    """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
+    scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
+    between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
+    contributions stays byte-equal. References the per-rail `<o>_*` real vars."""
+    pre = o
     nsec = "\n    ".join(
         f"I({pre}_nk{k+1}, {ground}) <+ V({pre}_nk{k+1}, {ground})/NRk"
         f" + {pre}_Cn{k+1}*ddt(V({pre}_nk{k+1}, {ground}));\n"
         f"    I({pre}_nk{k+1}, {ground}) <+ white_noise(4*`P_K*$temperature/NRk, \"{pre}_nk{k+1}\");\n"
         f"    I({o}, {ground})    <+ {pre}_gn{k+1}*V({pre}_nk{k+1}, {ground});"
         for k in range(len(nfk)))
-
-    body = f"""    // ============ voltage rail {o} (Cout={Cout:.3e}F ESR={ESR:.3e}ohm) ============
+    return f"""    // ============ voltage rail {o} (Cout={Cout:.3e}F ESR={ESR:.3e}ohm) ============
     V({pre}_vrf, {ground}) <+ vdc_{supply};       // supply DC reference for {o} PSRR
     V({pre}_vrg, {ground}) <+ {pre}_vreg;          // {o} regulated output reference
 
@@ -169,7 +267,85 @@ def _voltage_block(o, vfit, supply, ground):
     I({pre}_ncs2, {pre}_vrf) <+ {pre}_Cpc*ddt(V({pre}_ncs2, {pre}_vrf));
     I({o}, {ground}) <+ -({pre}_pcb0*V({pre}_ncs2, {pre}_vrf) + {pre}_gqb1*V({supply}, {pre}_ncs1));
 """
-    return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
+
+
+def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR):
+    """MULTI-LOAD path: each load-dependent small-signal param is a CLAMPED quadratic in
+    u=ln(iload_<o>) (a per-rail module parameter, nominal = the middle schedule load's iv).
+    At a schedule corner the scheduled expr == that corner's fitted value (corner-exact);
+    off-corner loads interpolate inside the measured envelope. The body is IDENTICAL to the
+    literal path; only the @(initial_step) `asg` differ (clamped exprs instead of numbers)
+    and a `u`/`iload_<o>` are introduced. Reuses the proven fit_model interpolation
+    machinery via _sched_expr (deg<=2 poly through the corners + the same envelope clamp)."""
+    pre = o
+    P = vfit["P"]
+    currents = [float(P[il]["iv"]) for il in sched]
+    iload_nom = currents[len(currents) // 2]   # the middle schedule load's iv
+    ilo, ihi = min(currents), max(currents)
+    uvar = f"{pre}_u"
+
+    # promoted per-load PSRR params (G0..w3, pcb0..pcq) live on each P[il]; the primary-
+    # supply promotion is consistent across loads (fit_multiport line 134). Schedule the
+    # promoted fields directly so the per-corner G/Q are what the AC fit produced.
+    spec = list(_SCHED_SPEC_BASE) + [(f"gn{k+1}", True) for k in range(len(nfk))]
+
+    def _vals(key):
+        return [float(P[il][key]) for il in sched]
+
+    nks = [f"{pre}_nk{k+1}" for k in range(len(nfk))]
+    nodes = [f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
+             f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
+             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks
+
+    # u is a per-rail real var (clamped ln of the rail's iload param); all scheduled params
+    # follow exactly the literal block's rvar set.
+    rvars = [uvar,
+             f"{pre}_Ra", f"{pre}_La", f"{pre}_Rpl", f"{pre}_Rb", f"{pre}_Lb",
+             f"{pre}_G0", f"{pre}_G1", f"{pre}_w1", f"{pre}_G2", f"{pre}_w2",
+             f"{pre}_G3", f"{pre}_w3", f"{pre}_pcb0", f"{pre}_pcb1", f"{pre}_pcw0",
+             f"{pre}_pcq", f"{pre}_gnw", f"{pre}_vreg", f"{pre}_Cps",
+             f"{pre}_pca1", f"{pre}_pca2", f"{pre}_Rpc", f"{pre}_Lpc", f"{pre}_Cpc",
+             f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))]
+
+    # the per-rail iload schedule parameter (nominal = middle schedule load) + noise-corner
+    # capacitor params (same as the literal block).
+    sched_par = (f"parameter real iload_{pre} = {iload_nom:.6e};"
+                 f"   // {o} load OP [A]; ln(iload_{pre}) drives the param schedule "
+                 f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
+    Cn_par = sched_par + "".join(
+        f"\n  parameter real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
+        f"   // {o} noise corner {nfk[k]:.4g} Hz"
+        for k in range(len(nfk)))
+
+    # map our rvar names to the P-keys (the VA var is named <pre>_Ra etc; the fitted key is
+    # R_a etc). Build the scheduled-assignment lines in the SAME ORDER the literal block
+    # writes them so the .va layout stays parallel.
+    keymap = {"R_a": "Ra", "L_a": "La", "R_pl": "Rpl", "R_b": "Rb", "L_b": "Lb",
+              "G0": "G0", "G1": "G1", "w1": "w1", "G2": "G2", "w2": "w2",
+              "G3": "G3", "w3": "w3", "pcb0": "pcb0", "pcb1": "pcb1",
+              "pcw0": "pcw0", "pcq": "pcq", "gnw": "gnw", "vreg": "vreg"}
+    for k in range(len(nfk)):
+        keymap[f"gn{k+1}"] = f"gn{k+1}"
+
+    sch_lines = [
+        f"// clamp the rail load to the schedule envelope [{ilo:g},{ihi:g}] A then u=ln(iload)",
+        f"{uvar} = ln(min(max(iload_{pre}, {ilo:.6e}), {ihi:.6e}));",
+    ]
+    for key, logspace in spec:
+        expr = _sched_expr(currents, _vals(key), uvar, logspace)
+        sch_lines.append(f"{pre}_{keymap[key]} = {expr};")
+
+    asg = "\n      ".join(sch_lines + [
+        f"{pre}_Cps = 1e-12;",
+        f"{pre}_Cpc = 1e-12;",
+        f"{pre}_pca1 = 1.0/({pre}_pcq*{pre}_pcw0);  {pre}_pca2 = 1.0/({pre}_pcw0*{pre}_pcw0);",
+        f"{pre}_Rpc = {pre}_pca1/{pre}_Cpc;  {pre}_Lpc = {pre}_pca2/{pre}_Cpc;"
+        f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
+    ])
+
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR)
+    return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
+                scheduled=True, valid_load=(ilo, ihi))
 
 
 def current_crow_from_isrc_fit(p, pin=None, tnom_c=55.0):
@@ -441,19 +617,42 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
 
     banner = _coverage_banner(fit_result, provenance)
 
+    # rails whose params are scheduled in ln(iload) (>1 real distinct load); the header note
+    # + the OP/scope line adapt so the .va is self-documenting about which path was emitted.
+    sched_rails = [v_outs[i] for i, vb in enumerate(vblocks) if vb.get("scheduled")]
+    if sched_rails:
+        op_note = (f"// fitted admittance Y=g0+sCp + current-PSRR.\n"
+                   f"// {len(sched_rails)}/{len(v_outs)} rail(s) load-SCHEDULED: each "
+                   f"small-signal param is a clamped quadratic in ln(iload_<rail>)\n"
+                   f"//   scheduled rails: {', '.join(sched_rails)} "
+                   f"(set iload_<rail> to interpolate across VALID_LOAD; AT-corner = the "
+                   f"fitted value)\n"
+                   f"//   the remaining rails (single OP) bake fitted params as literals "
+                   f"(NO laplace_nd). HB/PSS-robust.")
+        scope_note = ("// SCOPE: LTI per-rail core spanning VALID_LOAD via ln(iload) "
+                      "scheduling on the rails above\n"
+                      "//        + large-signal current core -- NO tier>=T2 dropout/slew "
+                      "term is emitted here. See VALID_LOAD above.")
+    else:
+        op_note = ("// fitted admittance Y=g0+sCp + current-PSRR. Single OP -> fitted "
+                   "params baked as\n"
+                   "// literals (NO laplace_nd, no ln(iload) interpolation). HB/PSS-robust.")
+        scope_note = ("// SCOPE: pure LTI + large-signal current core -- NO tier>=T2 "
+                      "dropout/slew term is emitted\n"
+                      "//        here (the in-situ dropout/slew emission is stage 2b). "
+                      "See VALID_LOAD above.")
+
     va = f"""// ============================================================
 // Combined PMU behavioral model for Cadence Spectre (auto-gen: harness/emit_pmu_model.py)
 // ONE module: input {supply} (LEFT) / {len(v_outs)} voltage rails + {len(i_outs)} current
 // biases (RIGHT) / {ground} ground (BOTTOM). Per-rail topology reuses the validated
 // fit_model.emit_va transfer functions (Zout branches A/B/C + real PSRR bank + one
 // complex 2nd-order section + decoupled Norton @vout noise); current biases use the
-// fitted admittance Y=g0+sCp + current-PSRR. Single OP -> fitted params baked as
-// literals (NO laplace_nd, no ln(iload) interpolation). HB/PSS-robust.
+{op_note}
 //   Voltage rails: {', '.join(v_outs)}
 //   Current biases: {', '.join(i_outs) if i_outs else '(none)'}
 {banner}
-// SCOPE: pure LTI + large-signal current core -- NO tier>=T2 dropout/slew term is emitted
-//        here (the in-situ dropout/slew emission is stage 2b). See VALID_LOAD above.
+{scope_note}
 // ============================================================
 `include "constants.vams"
 `include "disciplines.vams"

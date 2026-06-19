@@ -60,12 +60,42 @@ def _fm_globals():
 
 
 # ----------------------------------------------------------------- voltage outputs
-def _fit_voltage_output(o, view, supplies, vout_dc=0.8):
+def _iload_map(ref, o, loads):
+    """Per-LABEL REAL rail current for v_out o, read off the multi-port ref's
+    meta_iload_<o> array (positionally aligned with ref['loads']). Returns
+    {label: amps} for every label whose meta current is FINITE. Absent meta key /
+    NaN entry -> the label is simply not in the map (caller falls back to a numeric
+    label parse, then 0.0). Single-OP / legacy npz (no meta_iload_<o>) -> {}."""
+    key = f"meta_iload_{o}"
+    if ref is None or key not in (ref if isinstance(ref, dict) else getattr(ref, "files", [])):
+        return {}
+    cur = np.asarray(ref[key], dtype=float).ravel()
+    reflabels = [str(x) for x in np.asarray(ref["loads"]).ravel()]
+    out = {}
+    for lbl, a in zip(reflabels, cur):
+        if np.isfinite(a):
+            out[str(lbl)] = float(a)
+    # keep only labels this view actually carries (defensive; loads is the view set)
+    return {k: v for k, v in out.items() if k in set(str(x) for x in loads)} or out
+
+
+def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     """Fit one voltage output from its single-port view (split_ports output).
     view = {"npz": {z_<il>,p_<il>,noise_<il>,loads,meta_*}, "supplies": {s:{il:arr}}, ...}.
-    Returns dict(P={il:params}, nfk, cout, esr, err=[per-corner per-metric], supplies=[...])."""
+    Returns dict(P={il:params}, nfk, cout, esr, err=[per-corner per-metric], supplies=[...],
+    schedule_loads=[labels carrying a real, finite iv]).
+
+    `iload_map` {label: amps} carries the rail's REAL per-label current (from the npz
+    meta_iload_<o>); when given it is the AUTHORITATIVE abscissa for the emit-side
+    ln(iload) schedule. When absent (single-OP / legacy numeric npz) the iv falls back
+    to a numeric label parse, then 0.0 -- byte-identical to the pre-stage-2b behavior."""
     sp = view["npz"]
-    loads = view["loads"]
+    iload_map = iload_map or {}
+    # the voltage fit operates ONLY on labels that carry a real AC Zout array (z_<il>).
+    # The once-per-temp cells (DC/iv/tran at the OP) appear in ref['loads'] but carry no
+    # z/p/noise for this rail -> they are NOT voltage-fit corners. Single-OP/legacy npz:
+    # every load carries z_<il> -> loads == view['loads'] (unchanged).
+    loads = [il for il in view["loads"] if f"z_{il}" in sp]
     nom = loads[len(loads) // 2]
     with _fm_globals():
         FM.ref = _NpzLike(sp)
@@ -80,7 +110,15 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8):
             gz = sp[f"z_{il}"]; fz = gz[:, 0]; Z = gz[:, 1] + 1j * gz[:, 2]
             R_a, L_a, R_pl, R_b, L_b = FM.fit_zout(fz, Z)
             zfits[il] = (R_a, L_a, R_pl, R_b, L_b)
-            iv = FM._amps(il) if _amps_ok(il) else 0.0
+            # iv = the rail's REAL current at this label. Priority: meta_iload_<o>[label]
+            # (the in-situ truth, set by the sweep) -> a parseable numeric label (legacy
+            # ng.amps npz) -> 0.0 (open / unparseable -> no real load, no scheduling).
+            if il in iload_map:
+                iv = float(iload_map[il])
+            elif _amps_ok(il):
+                iv = FM._amps(il)
+            else:
+                iv = 0.0
             P[il] = dict(iv=iv, R_a=R_a, L_a=L_a, R_pl=R_pl, R_b=R_b, L_b=L_b,
                          vreg=vout_dc + R_a * iv)
             # PSRR per supply -- the primary supply's params live on P[il]; all supplies'
@@ -125,7 +163,13 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8):
             e["nrms"] = float(np.sqrt(np.mean(
                 (20 * np.log10((Sm + 1e-30) / (Sg + 1e-30))) ** 2)))
             err.append(e)
-    return dict(P=P, nfk=nfk, cout=cout, esr=esr, err=err, supplies=list(supplies))
+    # schedule_loads: the labels whose iv is REAL + finite + nonzero -- the abscissa set
+    # the emit-side ln(iload) parameter schedule fits over (NaN/0 labels are NOT scheduled,
+    # per the contract). Single-OP -> one label or empty (baked literal downstream).
+    schedule_loads = [il for il in loads
+                      if np.isfinite(P[il]["iv"]) and P[il]["iv"] != 0.0]
+    return dict(P=P, nfk=nfk, cout=cout, esr=esr, err=err, supplies=list(supplies),
+                schedule_loads=schedule_loads)
 
 
 def _amps_ok(il):
@@ -169,10 +213,149 @@ def _fit_cpsrr(f, PI):
     return c0, c1, _rms_db(PIm, PI)
 
 
-def _fit_current_ports(cports, supplies):
-    """Fit each current sink's admittance + current-PSRR. Returns a list of report rows."""
+def _iv_for_sink(ref, c):
+    """Collect every I-V sweep present for sink c, keyed by its load LABEL:
+    {label: [Vsweep, I]} from ref['iv_<c>_<label>']. {} when no I-V was run for c
+    (legacy / T0 npz -> the legacy AC-only row fires)."""
+    pre = f"iv_{c}_"
+    files = ref if isinstance(ref, dict) else getattr(ref, "files", [])
+    out = {}
+    for k in files:
+        if k.startswith(pre):
+            arr = np.asarray(ref[k], float)
+            if arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] >= 2:
+                out[k[len(pre):]] = arr
+    return out
+
+
+def _temp_of_label(ref, label):
+    """The temperature (degC) stamped on a load LABEL via meta_temp (positionally aligned
+    with ref['loads']); NaN when absent / not stamped. The DC/iv once-cells are labeled
+    'Lnom_T<temp>' so this recovers the I-V curve's temperature for the didt fit."""
+    key = "meta_temp"
+    files = ref if isinstance(ref, dict) else getattr(ref, "files", [])
+    if key not in files:
+        return float("nan")
+    reflabels = [str(x) for x in np.asarray(ref["loads"]).ravel()]
+    cur = np.asarray(ref[key], float).ravel()
+    for lbl, t in zip(reflabels, cur):
+        if str(lbl) == str(label):
+            return float(t)
+    return float("nan")
+
+
+def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
+    """The P0 fix: a LARGE-SIGNAL current-bias row, REUSING fit_isrc's internal fitters on
+    the in-memory arrays (NO temp npz round-trip). Produced ONLY when sink c carries a real
+    I-V sweep (iv_<c>_<label>); it then carries idc55/didt/g0/vc/gdd/vknee/knee_p/Cp/
+    in_white/in_kf/pol/tnom_c so emit_pmu_model._current_block dispatches to the validated
+    large-signal VA block. Falls back to None (caller keeps the legacy AC-only row) on a
+    degenerate I-V.
+
+      idc/g0/vknee/knee_p : fit_isrc._fit_iv(Vo, I, vc=sink_dc, pol, rout)  -- rout from a
+                            first-pass output-conductance estimate (1/g0 from the I-V slope),
+                            consistent with the AC admittance g0.
+      idc55/didt          : fit_isrc._fit_temp(temps, idcT) over the per-temp I-V curves'
+                            OP value (Idc at each temp). Single temp -> didt=0, idc55=idc.
+      gdd (SIGNED PSRR)   : fit_isrc._fit_psrr(f, g), g=dI/dVsup = -pi (pi already carries the
+                            SIGN from importmp's PI=-I/Vsup). The sign is KEPT (guardrail 2).
+      Cp                  : the AC admittance imag (_fit_admittance). in_white/in_kf default 0
+                            (sink noise is not in the in-situ matrix -- documented; the
+                            large-signal block tolerates 0 noise)."""
+    import fit_isrc as ISR
+    # pick the OP-temperature I-V curve (the one whose label temp is nearest tnom_c, else any).
+    labels = sorted(ivmap)
+    tmap = {lbl: _temp_of_label(ref, lbl) for lbl in labels}
+    def _near_nom(lbl):
+        t = tmap[lbl]
+        return abs(t - tnom_c) if np.isfinite(t) else 1e30
+    op_label = min(labels, key=_near_nom)
+    Vo, I = ivmap[op_label][:, 0], ivmap[op_label][:, 1]
+    if np.ptp(Vo) <= 0 or Vo.size < 2:
+        return None
+    # first-pass output conductance from the I-V slope away from the knee -> rout for _fit_iv.
+    order = np.argsort(Vo)
+    Vs, Is = Vo[order], I[order]
+    dV = Vs[-1] - Vs[0]
+    g0_iv = float((Is[-1] - Is[0]) / dV) if dV != 0 else 0.0
+    rout = 1.0 / max(abs(g0_iv), 1e-12)
+    iv = ISR._fit_iv(Vs, Is, vc=float(sink_dc), pol=pol, rout=rout)   # idc/g0/vknee/knee_p
+
+    # temp law: Idc at each temp = each curve's fitted OP current (interp at sink_dc).
+    Tlist, idcT = [], []
+    for lbl in labels:
+        a = ivmap[lbl]
+        t = tmap[lbl]
+        if not np.isfinite(t):
+            continue
+        o2 = np.argsort(a[:, 0])
+        idc_l = float(np.interp(float(sink_dc), a[o2, 0], a[o2, 1]))
+        Tlist.append(t); idcT.append(idc_l)
+    if len(Tlist) >= 2:
+        tp = ISR._fit_temp(np.asarray(Tlist), np.asarray(idcT))
+        idc55, didt = float(tp["idc55"]), float(tp["didt"])
+    else:                                              # single temp -> flat in T
+        idc55, didt = float(iv["idc"]), 0.0
+
+    # gdd (SIGNED current-PSRR): g = dI/dVsup = -pi (pi = -I/Vsup from importmp). Use the
+    # model's primary current-PSRR supply (first pi key present); 0 when no pi was measured.
+    gdd = 0.0
+    pis = cp.get("pi", {})
+    pi_keys = sorted({s for (s, il) in pis})
+    if pi_keys:
+        s0 = pi_keys[0]
+        # the pi array at the OP label if present, else the first available load.
+        cand = [il for (s, il) in pis if s == s0]
+        il0 = op_label if op_label in cand else (cand[0] if cand else None)
+        if il0 is not None:
+            arr = pis[(s0, il0)]
+            f = arr[:, 0]; PI = arr[:, 1] + 1j * arr[:, 2]
+            g = -PI                                    # dI/dVsup, SIGN preserved
+            ps = ISR._fit_psrr(f, g.real if np.allclose(g.imag, 0) else g)
+            gdd = float(ps["gdd"])
+
+    # Cp from the AC admittance imag part (output cap), 0 when no y was measured.
+    Cp = 0.0
+    if cp.get("y"):
+        il_y = op_label if op_label in cp["y"] else next(iter(cp["y"]))
+        g = cp["y"][il_y]; f = g[:, 0]; Y = g[:, 1] + 1j * g[:, 2]
+        _, Cp, _ = _fit_admittance(f, Y)
+
+    return dict(sink=c, il=op_label, pol=pol, vc=float(sink_dc),
+                idc55=idc55, didt=didt, g0=float(iv["g0"]),
+                gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
+                Cp=float(Cp), in_white=0.0, in_kf=0.0, tnom_c=float(tnom_c),
+                iv_r2=float(iv["iv_r2"]))
+
+
+def _fit_current_ports(cports, supplies, ref=None, manifest=None, tnom_c=55.0):
+    """Fit each current sink's behavioral model. Returns a list of report rows.
+
+    LARGE-SIGNAL core (the P0 fix): when sink c carries a real I-V sweep (iv_<c>_<label> in
+    `ref`) it gets ONE large-signal row (idc55/didt/g0/vc/gdd/vknee/knee_p/Cp/pol/tnom_c) so
+    emit_pmu_model._current_block dispatches to the validated large-signal VA block. When NO
+    I-V sweep is present (legacy / T0 npz), it keeps producing TODAY's legacy AC-only rows
+    (g0/Cp/pi magnitude) so the legacy block fires -- byte-identical to the pre-stage-2b path.
+    `ref`/`manifest` are optional: absent -> the legacy-only behavior (single-OP tests)."""
+    m = manifest or {}
     rows = []
     for c, cp in cports.items():
+        ivmap = _iv_for_sink(ref, c) if ref is not None else {}
+        if ivmap:                                       # T2+ : the large-signal core
+            sink_dc = float((m.get("i_out") or {}).get(c, {}).get("dc", 0.0))
+            pol = str((m.get("i_out") or {}).get(c, {}).get("pol", "sink"))
+            lrow = _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref)
+            if lrow is not None:
+                # carry the AC current-PSRR report fields too (so the report table still
+                # shows pi_<s>), additive to the large-signal params.
+                lrow["pi"] = {}
+                for (s, il2), arr in cp["pi"].items():
+                    f = arr[:, 0]; PI = arr[:, 1] + 1j * arr[:, 2]
+                    _, _, prms = _fit_cpsrr(f, PI)
+                    lrow["pi"].setdefault(s, dict(rms=prms, dc=float(np.abs(PI[0]))))
+                rows.append(lrow)
+                continue                                # one large-signal row per sink
+        # legacy AC-only rows (one per load) -- unchanged
         for il in cp["loads"]:
             row = dict(sink=c, il=il)
             if il in cp["y"]:
@@ -202,14 +385,32 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
     cports = IM.current_ports(ref, m)
     supplies = list(m["supplies"])
     volt = {}
+    sched_meta = {}                                # per-rail {labels, currents} for emit
     for o in m["v_out"]:
         vdc = vmap.get(o, 0.8)
-        volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc)
+        # the rail's REAL per-label current (in-situ truth) -> the emit-side ln(iload)
+        # schedule abscissa. {} on a single-OP / legacy npz -> iv falls back to the
+        # numeric-label parse then 0.0, byte-identical to the pre-stage-2b path.
+        ilmap = _iload_map(ref, o, [str(x) for x in views[o]["loads"]])
+        volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc, iload_map=ilmap)
         # carry the designer's GUI symbol pin name (set by build_manifest) so the model
         # cell's PORT is the pin, not our internal role key. Default: the role key itself
         # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).
         volt[o]["pin"] = m["v_out"][o].get("pin", o)
-    curr = _fit_current_ports(cports, m["current_psrr_supplies"])
+        sl = volt[o].get("schedule_loads", [])
+        sched_meta[o] = dict(labels=list(sl),
+                             currents=[float(volt[o]["P"][il]["iv"]) for il in sl])
+    # nominal temp the Idc(T) fit references: middle of the manifest temps, else 55.
+    _tnom = 55.0
+    try:
+        from insitu import manifest as _Mt
+        _tps = _Mt.temps(m)
+        if _tps:
+            _tnom = float(_tps[len(_tps) // 2])
+    except Exception:                              # noqa: BLE001
+        pass
+    curr = _fit_current_ports(cports, m["current_psrr_supplies"],
+                              ref=ref, manifest=m, tnom_c=_tnom)
     for r in curr:
         r["pin"] = m["i_out"].get(r["sink"], {}).get("pin", r["sink"])
     # provenance for the emit banner (emit_pmu_va reads these off meta by default, so
@@ -234,7 +435,8 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
                           loads=[str(x) for x in ref["loads"]],
                           supplies=supplies,
                           coverage_tier=coverage_tier, valid_load=valid_load,
-                          op_iload=op_iload, op_temp=op_temp))
+                          op_iload=op_iload, op_temp=op_temp,
+                          tnom_c=_tnom, schedule_loads=sched_meta))
 
 
 def export_single_port_refs(npz_path, manifest, vout_dc=None, outdir=None):
