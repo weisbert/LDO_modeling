@@ -28,27 +28,51 @@ WORK_CLI = CADENCE / "work_pmu"          # extract_pmu.py's PSF lands here
 _CLI_PROBE_ALIASES = {"i500n": "Vb500:p", "i1u": "Vb1u:p"}
 
 
+# the extra per-point keys the coverage kinds carry (1b's netlister reads these off the group);
+# copied verbatim from the single member onto its (always size-1) group dict when present.
+_CARRY_KEYS = ("sweep", "step", "edge", "tstop", "tstep", "amp")
+
+
 def groups(m):
     """Group the measurement matrix into the minimal set of runs. AC measurements merge by
     (analysis, one-hot stimulus) -- AC superposition lets one run feed every saved port. A
     spectre NOISE analysis measures ONE oprobe, so noise NEVER merges across outputs: each
-    v_out is its own group (key includes the output net), carrying that output's oprobe."""
+    v_out is its own group (key includes the output net), carrying that output's oprobe.
+
+    The coverage kinds each get their OWN group (no merge): the 2x lin-gate ac point keys on a
+    distinct ('ac2', hot) so it never folds into the 1x Zout group; every dc (I-V / dropout) and
+    tran (slew) point keys on its unique tag (a DC/transient sweep is one run, not superposable).
+    The per-point sweep/step/edge/... are copied onto the group so 1b's netlister reads them off
+    the group dict (every coverage group has exactly one member)."""
     out = {}
     for pt in _manifest.measurements(m):
-        if pt["analysis"] == "noise":
+        a = pt["analysis"]
+        hot = tuple(sorted(tuple(h) for h in pt["hot"]))
+        if a == "noise":
             onet = pt["reads"][0][1]
             key, oprobe = ("noise", ("oprobe", onet)), onet
+        elif a == "ac" and pt.get("amp"):
+            key, oprobe = ("ac2", hot), None       # 2x lin-gate -> own group (never merges 1x ac)
+        elif a in ("dc", "tran"):
+            key, oprobe = (a, hot, pt["tag"]), None  # one group per dc/tran point (per unique tag)
         else:
-            key, oprobe = (pt["analysis"], tuple(sorted(tuple(h) for h in pt["hot"]))), None
-        g = out.setdefault(key, dict(analysis=pt["analysis"], hot=pt["hot"], oprobe=oprobe,
+            key, oprobe = (a, hot), None             # 1x ac merges by (analysis, one-hot)
+        g = out.setdefault(key, dict(analysis=a, hot=pt["hot"], oprobe=oprobe,
                                      tag=_group_tag(pt), members=[]))
         g["members"].append(pt)
+        for k in _CARRY_KEYS:                         # surface the coverage params on the group
+            if pt.get(k) is not None:
+                g[k] = pt[k]
     return list(out.values())
 
 
 def _group_tag(pt):
-    if pt["analysis"] == "noise":
+    a = pt["analysis"]
+    if a == "noise":
         return "g_" + pt["tag"]                 # one group per noise output (n_pll -> g_n_pll)
+    # the coverage kinds (2x lin-gate ac, dc I-V/dropout, tran slew) are 1:1 with their point
+    if (a == "ac" and pt.get("amp")) or a in ("dc", "tran"):
+        return "g_" + pt["tag"]
     if not pt["hot"]:
         return f"g_{pt['analysis']}"
     return "g_" + "_".join(f"{k}_{v}" for k, v in pt["hot"])

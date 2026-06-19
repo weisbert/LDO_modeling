@@ -44,10 +44,19 @@ The two consumers:
 truth shared by augment + import), so the two halves can never drift.
 """
 import json
+import math
 import pathlib
 
 # canonical roles (the designer's tagging vocabulary)
 ROLES = ("supply", "v_out", "i_out", "bias", "leave_alone")
+
+# ---------------------------------------------------------------- coverage tiers
+# The coverage tier ladder (§2 of HANDOFF_MODELING_COVERAGE): nested additive presets.
+# A tier turns ITS items on plus every lower tier's; T0 (ac/noise) is always on.
+TIERS = ("T0", "T1", "T2", "T3", "T4")
+COVERAGE_ITEMS = ("ac", "noise", "slew", "iv", "dropout", "load_schedule", "temp")
+_TIER_ITEMS = {"T0": ("ac", "noise"), "T1": ("slew",), "T2": ("iv", "dropout"),
+               "T3": ("load_schedule",), "T4": ("temp",)}
 
 # AC magnitude "hot" design-variable per stimulus, default 0 (AC superposition: a mag=1
 # AC source has dc=0 so it never moves the shared OP; setting exactly ONE acm_*=1 per
@@ -101,7 +110,79 @@ def _fill_defaults(m):
     m["analysis"].setdefault("noise", "noise start=10 stop=100M dec=20")
     d = m.setdefault("dut", {})
     d.setdefault("extract_cell", (d.get("tb_cell", "TB") + "_extract"))
+    # coverage section (§2 tiers + per-rail sweep params). DEFAULT = FULL tier ladder, but
+    # with NO declared loads/transient/iv/dropout -> the tier alone adds ZERO measurement
+    # points, so a shipped (coverage-free) manifest yields the identical T0 matrix.
+    cov = m.setdefault("coverage", {})
+    cov.setdefault("tier", "T4")            # default = FULL tier ladder
+    cov.setdefault("enable", {})            # per-item bool overrides on top of the tier
+    cov.setdefault("loads", {})             # {v_out_key: {"sweep":{...}|None, "points":[...],
+                                            #              "nominal":float?, "holdout":float?}}
+    cov.setdefault("transient", {})         # {v_out_key: {"steps":[{"from","to","label"?}],
+                                            #              "edge":float?, "tstop":float?, "tstep":float?}}
+    cov.setdefault("iv", {})                # {i_out_key: {"sweep":{"type","start","stop","n"}}}
+    cov.setdefault("dropout", {})           # {v_out_key: {"sweep":{"type","start","stop","n"}}}
+    cov.setdefault("temps", [])             # [] => single (session) temp; else e.g. [-40,55,125]
+    cov.setdefault("lin_gate", False)       # guardrail-4 2x-amplitude AC self-check (off by default)
+    cov.setdefault("slew_en", 0)            # the emitted VA param's default (0 = run LTI)
     return m
+
+
+def coverage_enabled(m, item):
+    """Is a coverage ITEM active? An explicit coverage.enable[item] override wins; else the
+    item is on when the manifest's tier is >= the tier that introduces it. ac/noise are on at
+    every tier. NB: a LOADED manifest can never carry an unknown tier -- validate()/_validate_coverage
+    reject it loudly (fail-fast on a typo). The `else len(TIERS)-1` below is purely DEFENSIVE for an
+    in-memory dict that bypassed validate() (e.g. a hand-built fixture): a junk tier degrades to full
+    rather than IndexError, it is NOT a supported manifest feature."""
+    cov = m.get("coverage") or {}
+    en = cov.get("enable") or {}
+    if item in en:
+        return bool(en[item])
+    tier = cov.get("tier", "T4")
+    idx = TIERS.index(tier) if tier in TIERS else len(TIERS) - 1   # unknown tier: defensive only
+    for t in TIERS[: idx + 1]:
+        if item in _TIER_ITEMS[t]:
+            return True
+    return False
+
+
+def _expand_sweep(sweep):
+    """A {'type':'lin'|'log','start','stop','n'} sweep -> an ascending python list of floats.
+    n<=1 -> [start]. log requires start>0,stop>0. Pure python (no numpy)."""
+    if not sweep:
+        return []
+    typ = sweep.get("type", "lin"); n = int(sweep.get("n", 0) or 0)
+    a = float(sweep["start"]); b = float(sweep["stop"])
+    if n <= 1:
+        return [a]
+    if typ == "log":
+        la, lb = math.log(a), math.log(b)
+        return [math.exp(la + (lb - la) * i / (n - 1)) for i in range(n)]
+    return [a + (b - a) * i / (n - 1) for i in range(n)]
+
+
+def load_points(m, o):
+    """Merged ascending, deduped iload values for v_out o: _expand_sweep(loads[o].sweep)
+    UNION loads[o].points UNION nominal/holdout if given. [] when nothing declared (=> the
+    single-OP behavior of today)."""
+    spec = ((m.get("coverage") or {}).get("loads") or {}).get(o) or {}
+    vals = list(_expand_sweep(spec.get("sweep")))
+    vals += [float(x) for x in (spec.get("points") or [])]
+    for k in ("nominal", "holdout"):
+        if spec.get(k) is not None:
+            vals.append(float(spec[k]))
+    out = sorted({round(v, 18) for v in vals})
+    return out
+
+
+def temps(m):
+    """The temperature corner list (coverage.temps), or [] for single (session) temp."""
+    return list((m.get("coverage") or {}).get("temps") or [])
+
+
+def slew_en_default(m):
+    return int((m.get("coverage") or {}).get("slew_en", 0) or 0)
 
 
 def _validate_analysis_override(v, where, allowed):
@@ -155,7 +236,59 @@ def validate(m):
     for s in m["current_psrr_supplies"]:
         if s not in m["supplies"]:
             raise ManifestError(f"current_psrr_supplies references unknown supply '{s}'")
+    _validate_coverage(m)
     return True
+
+
+def _validate_sweep(sweep, where):
+    """A sweep must be a {type in {lin,log}, start, stop, n} dict. Lenient on extras."""
+    if not isinstance(sweep, dict):
+        raise ManifestError(f"{where} must be a dict {{type,start,stop,n}}, got {type(sweep).__name__}")
+    for k in ("start", "stop", "n"):
+        if k not in sweep:
+            raise ManifestError(f"{where} is missing '{k}' (needs type,start,stop,n)")
+    typ = sweep.get("type", "lin")
+    if typ not in ("lin", "log"):
+        raise ManifestError(f"{where}.type must be 'lin' or 'log', got {typ!r}")
+
+
+def _validate_coverage(m):
+    """LENIENT coverage checks -- every coverage entry is optional (defaults fill it). Catches
+    a bad tier, an unknown/non-bool enable item, a loads/transient/iv/dropout key that does NOT
+    name a declared v_out/i_out, a malformed sweep, and a non-numeric temps list."""
+    cov = m.get("coverage") or {}
+    tier = cov.get("tier", "T4")
+    if tier not in TIERS:
+        raise ManifestError(f"coverage.tier '{tier}' not in {list(TIERS)}")
+    en = cov.get("enable", {})
+    if not isinstance(en, dict):
+        raise ManifestError(f"coverage.enable must be a dict, got {type(en).__name__}")
+    for k, v in en.items():
+        if k not in COVERAGE_ITEMS:
+            raise ManifestError(
+                f"coverage.enable has unknown item '{k}' (allowed: {list(COVERAGE_ITEMS)})")
+        if not isinstance(v, bool):
+            raise ManifestError(f"coverage.enable.{k} must be a bool, got {type(v).__name__}")
+    # loads/transient/dropout key a v_out; iv keys an i_out
+    for sect, owner in (("loads", "v_out"), ("transient", "v_out"),
+                        ("dropout", "v_out"), ("iv", "i_out")):
+        spec = cov.get(sect) or {}
+        if not isinstance(spec, dict):
+            raise ManifestError(f"coverage.{sect} must be a dict keyed by {owner}, "
+                                f"got {type(spec).__name__}")
+        for key, entry in spec.items():
+            if key not in m[owner]:
+                raise ManifestError(
+                    f"coverage.{sect}['{key}'] names an undeclared {owner} "
+                    f"(declared: {list(m[owner])})")
+            if isinstance(entry, dict) and entry.get("sweep") is not None:
+                _validate_sweep(entry["sweep"], f"coverage.{sect}['{key}'].sweep")
+    tps = cov.get("temps", [])
+    if not isinstance(tps, list):
+        raise ManifestError(f"coverage.temps must be a list of numbers, got {type(tps).__name__}")
+    for t in tps:
+        if isinstance(t, bool) or not isinstance(t, (int, float)):
+            raise ManifestError(f"coverage.temps must be numbers, got {t!r}")
 
 
 def analysis_override(m, role, key, kind):
@@ -230,6 +363,65 @@ def measurements(m):
             M.append(dict(tag=f"pi_{c}_{s}", analysis="ac", hot=[("supply", s)],
                           reads=[("i", probe), ("v", snet)], derive="pi",
                           key=f"pi_{c}_{s}", save=[("i", probe), ("v", snet)]))
+
+    # ---------------------------------------------------------------- coverage-gated kinds
+    # APPENDED after the T0 core (above) so the existing 6 derives stay first + byte-identical.
+    # Each kind is gated on its tier item AND on declared params: a manifest that declares no
+    # loads/transient/iv/dropout adds ZERO points here (the backward-compat lever). The new
+    # points carry EXTRA keys (sweep/step/edge/tstop/tstep/amp) that the T0 consumers ignore;
+    # only run.groups branches on analysis/amp.
+
+    # NB: the gated blocks read coverage defensively ((m.get("coverage") or {})) because
+    # measurements() is also called on manifests that bypass _fill_defaults (build_manifest's
+    # in-memory dict) -- a missing coverage section just means zero coverage points.
+    cov = m.get("coverage") or {}
+
+    # T2: i_out vdc I-V sweep (analysis 'dc') -- sweep the reused vdc, read probe current vs Vsink
+    if coverage_enabled(m, "iv"):
+        for c in sinks:
+            spec = (cov.get("iv") or {}).get(c)
+            if not spec:
+                continue
+            probe = _probe_name(m, c)
+            M.append(dict(tag=f"iv_{c}", analysis="dc", hot=[("i_out", c)],
+                          reads=[("i", probe)], derive="iv", key=f"iv_{c}",
+                          save=[("i", probe)], sweep=spec["sweep"]))
+
+    # T2: v_out DC iload sweep -> dropout / load-reg (analysis 'dc') -- sweep the reused load
+    #     isource, read Vout. Uses coverage.dropout[o].sweep, else coverage.loads[o].sweep.
+    if coverage_enabled(m, "dropout"):
+        for o in outs:
+            dspec = (cov.get("dropout") or {}).get(o)
+            sweep = (dspec or {}).get("sweep") or \
+                ((cov.get("loads") or {}).get(o) or {}).get("sweep")
+            if not sweep:
+                continue
+            onet = m["v_out"][o]["net"]
+            M.append(dict(tag=f"dc_{o}", analysis="dc", hot=[("v_out", o)],
+                          reads=[("v", onet)], derive="dropout", key=f"dc_{o}",
+                          save=[("v", onet)], sweep=sweep))
+
+    # T1: transient load steps -> slew/recovery (analysis 'tran') -- one point per declared step
+    if coverage_enabled(m, "slew"):
+        for o in outs:
+            tspec = (cov.get("transient") or {}).get(o)
+            if not tspec:
+                continue
+            onet = m["v_out"][o]["net"]
+            for st in (tspec.get("steps") or []):
+                lbl = st.get("label") or f"{st['from']:g}_{st['to']:g}"
+                M.append(dict(tag=f"tr_{o}_{lbl}", analysis="tran", hot=[("v_out", o)],
+                              reads=[("v", onet)], derive="trans", key=f"tr_{o}_{lbl}",
+                              save=[("v", onet)], step=st, edge=tspec.get("edge"),
+                              tstop=tspec.get("tstop"), tstep=tspec.get("tstep")))
+
+    # guardrail-4: 2x-amplitude linearity self-check on each Zout point (analysis 'ac', amp=2)
+    if (m.get("coverage") or {}).get("lin_gate"):
+        for o in outs:
+            onet = m["v_out"][o]["net"]
+            M.append(dict(tag=f"z2_{o}", analysis="ac", hot=[("v_out", o)],
+                          reads=[("v", onet)], derive="z", key=f"z2_{o}",
+                          save=[("v", onet)], amp=2.0))
     return M
 
 
