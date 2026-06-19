@@ -319,14 +319,49 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
 
 
 # --------------------------------------------------------------------- emit
+def _coverage_banner(fit_result, provenance):
+    """Build the .va COVERAGE/OP/VALID_LOAD provenance comment line (HANDOFF §4). EVERY
+    emitted model is self-documenting at the model boundary. Field source priority:
+    explicit `provenance` dict {tier, op_iload, op_temp, valid_load:(lo,hi)} > fit_result
+    ['meta'] (coverage_tier/op_iload/op_temp/valid_load, set by fit_multiport) > a clear
+    'unspecified'/'?' default. The banner is a COMMENT (no VA semantics) -> va_sanity
+    still passes. NOTE: emit_pmu_va is a pure LTI + large-signal current core today -- it
+    emits NO tier>=T2 dropout/slew term; the banner documents that SCOPE (the in-situ
+    dropout/slew emission is stage 2b)."""
+    prov = provenance or {}
+    meta = fit_result.get("meta", {})
+
+    def _pick(prov_key, meta_key):
+        if prov.get(prov_key) is not None:
+            return prov[prov_key]
+        return meta.get(meta_key)
+
+    tier = _pick("tier", "coverage_tier")
+    op_iload = _pick("op_iload", "op_iload")
+    op_temp = _pick("op_temp", "op_temp")
+    valid_load = _pick("valid_load", "valid_load")
+    tier_s = tier if tier else "unspecified"
+    il_s = f"{op_iload:g}" if op_iload is not None else "?"
+    t_s = f"{op_temp:g}" if op_temp is not None else "?"
+    op_s = f"{il_s}@{t_s}"
+    if valid_load is not None:
+        lo, hi = valid_load
+        vl_s = f"[{lo:g}..{hi:g}]"
+    else:
+        vl_s = "?"
+    return f"// COVERAGE={tier_s}  OP={op_s}  VALID_LOAD={vl_s}"
+
+
 def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
-                supply_dc=None, tnom_c=None):
+                supply_dc=None, tnom_c=None, provenance=None):
     """Emit ONE combined Verilog-A module `cell_name` for the whole PMU: input `supply`
     (LEFT), every voltage rail + current bias from fit_result (RIGHT), `ground` (BOTTOM).
 
     fit_result := harness.fit_multiport.fit_multiport(npz, manifest) output.
-    Returns the written va_path (pathlib.Path). Raises ValueError if the emitted text
-    fails the static VA sanity check (so a malformed interface never reaches the box)."""
+    `provenance` (optional) := {tier, op_iload, op_temp, valid_load:(lo,hi)} -> stamps the
+    header COVERAGE/OP/VALID_LOAD banner (else sourced from fit_result['meta'], else a clear
+    default). Returns the written va_path (pathlib.Path). Raises ValueError if the emitted
+    text fails the static VA sanity check (so a malformed interface never reaches the box)."""
     va_path = pathlib.Path(va_path)
     voltage = fit_result["voltage"]
     current = fit_result.get("current", [])
@@ -404,6 +439,8 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
     elec_decl = _wrap("electrical", all_elec)
     rvar_decl = _wrap("real", rvars)
 
+    banner = _coverage_banner(fit_result, provenance)
+
     va = f"""// ============================================================
 // Combined PMU behavioral model for Cadence Spectre (auto-gen: harness/emit_pmu_model.py)
 // ONE module: input {supply} (LEFT) / {len(v_outs)} voltage rails + {len(i_outs)} current
@@ -414,6 +451,9 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
 // literals (NO laplace_nd, no ln(iload) interpolation). HB/PSS-robust.
 //   Voltage rails: {', '.join(v_outs)}
 //   Current biases: {', '.join(i_outs) if i_outs else '(none)'}
+{banner}
+// SCOPE: pure LTI + large-signal current core -- NO tier>=T2 dropout/slew term is emitted
+//        here (the in-situ dropout/slew emission is stage 2b). See VALID_LOAD above.
 // ============================================================
 `include "constants.vams"
 `include "disciplines.vams"

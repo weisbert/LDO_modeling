@@ -212,10 +212,29 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
     curr = _fit_current_ports(cports, m["current_psrr_supplies"])
     for r in curr:
         r["pin"] = m["i_out"].get(r["sink"], {}).get("pin", r["sink"])
+    # provenance for the emit banner (emit_pmu_va reads these off meta by default, so
+    # step_emit needs no new args). All optional / defensive -- a coverage-free or
+    # hand-built manifest leaves them None and the banner falls back to 'unspecified'.
+    try:
+        from insitu import manifest as _Mp
+        cov = m.get("coverage") or {}
+        coverage_tier = cov.get("tier")
+        temps = list(cov.get("temps") or [])
+        op_temp = temps[len(temps) // 2] if temps else None
+        # union load envelope over every v_out's declared load_points (None when none declared)
+        all_loads = []
+        for o in m.get("v_out", {}):
+            all_loads += [float(x) for x in _Mp.load_points(m, o)]
+        valid_load = (min(all_loads), max(all_loads)) if all_loads else None
+        op_iload = all_loads[0] if all_loads else None
+    except Exception:                              # noqa: BLE001 -- provenance is best-effort
+        coverage_tier = valid_load = op_iload = op_temp = None
     return dict(voltage=volt, current=curr,
                 meta=dict(name=pathlib.Path(npz_path).stem,
                           loads=[str(x) for x in ref["loads"]],
-                          supplies=supplies))
+                          supplies=supplies,
+                          coverage_tier=coverage_tier, valid_load=valid_load,
+                          op_iload=op_iload, op_temp=op_temp))
 
 
 def export_single_port_refs(npz_path, manifest, vout_dc=None, outdir=None):
@@ -224,10 +243,17 @@ def export_single_port_refs(npz_path, manifest, vout_dc=None, outdir=None):
     Fit/Compare tabs and the Verilog-A emit work per output with ZERO new fit/emit code.
 
     The in-situ OP (one iload, set by the designer's TB) maps to fit_model's iload axis:
-    the corner key is the manifest iload (e.g. '500u'). A minimal DC record (flat
-    load/line regulation at vout_dc -- the stand-in carries no DC sweep) is synthesized so
-    fit_variant/emit_va run; this is the honest minimal DC model for a small-signal-only
-    extraction (a DC-characterized run would replace it). Returns {output: path}.
+    the corner key is the manifest iload (e.g. '500u').
+
+    ANTI-FOOTGUN (stage 2a): we DO NOT fabricate DC. When the SOURCE multi-port npz carries
+    a REAL dropout sweep for output o (key 'dc_<o>' or 'dc_<o>_<load>', shape [Iload, Vout]
+    from importmp's 'dropout' derive), we carry it through as fit_model's dc_loadreg AND
+    dc_dropout (the same real load sweep of the regulated output -- the in-situ sweep does
+    not distinguish the two, so both read the one real curve). When the npz has NO real dc
+    array for o (a small-signal-only T0 export), we OMIT dc_loadreg/dc_dropout ENTIRELY ->
+    the single-port emit emits NO dropout/load-reg/current-limit term (honest scope), rather
+    than a flat fabricated stand-in. dc_linereg has no in-situ line-reg sweep yet -> always
+    omitted (never fabricated) unless a real one is present. Returns {output: path}.
 
     NOTE on axes: multi-PVT-corner single-port modeling (PVT != iload) is handled by the
     multiport report's own per-load loop; this single-port export targets the GUI's
@@ -255,11 +281,23 @@ def export_single_port_refs(npz_path, manifest, vout_dc=None, outdir=None):
                f"noise_{ilkey}": sp[f"noise_{nom}"],
                "meta_cout": sp.get("meta_cout", np.array(np.nan)),
                "meta_esr": sp.get("meta_esr", np.array(np.nan)),
-               "meta_port": np.array(o), "meta_vout_dc": np.array(vdc),
-               # minimal synthesized DC (flat regulation): honest for a small-signal stand-in
-               "dc_loadreg": np.array([[1e-12, vdc], [iload, vdc], [2 * iload, vdc]]),
-               "dc_dropout": np.array([[1e-12, vdc], [iload, vdc - 1e-3], [2 * iload, vdc - 2e-3]]),
-               "dc_linereg": np.array([[1.0, vdc], [1.05, vdc], [1.1, vdc]])}
+               "meta_port": np.array(o), "meta_vout_dc": np.array(vdc)}
+        # REAL DC only -- no fabrication. The dropout sweep lands in the FULL multi-port ref
+        # (split_ports does not carry it into the per-output view), keyed 'dc_<o>' or
+        # 'dc_<o>_<load>', shape [Iload, Vout]. When present, feed it to fit_model as BOTH
+        # dc_loadreg and dc_dropout (the one real load sweep of the regulated output). When
+        # absent -> emit NOTHING for the DC term (small-signal-only scope; the consumers in
+        # fit_model gracefully skip the dropout/load-reg branch). dc_linereg: no in-situ
+        # line-reg sweep -> omitted unless a real one is present.
+        dckey = next((k for k in ref if k == f"dc_{o}" or k.startswith(f"dc_{o}_")), None)
+        if dckey is not None:
+            dc_real = np.asarray(ref[dckey])
+            rec["dc_loadreg"] = dc_real
+            rec["dc_dropout"] = dc_real
+        lrkey = next((k for k in ref
+                      if k == f"linereg_{o}" or k.startswith(f"linereg_{o}_")), None)
+        if lrkey is not None:
+            rec["dc_linereg"] = np.asarray(ref[lrkey])
         p = outdir / f"{stem}_{o}.npz"
         np.savez(p, **rec)
         out_paths[o] = p

@@ -876,10 +876,17 @@ def fit_all():
     zfits = {}
     print(f"{'load':>5} | {'R_a':>7} {'L_a[uH]':>8} {'R_pl':>9} {'R_b':>9} {'Zrms':>6} | "
           f"{'G0':>9} {'G1':>9} {'w1[MHz]':>7} {'sec':>4} {'Prms':>6} {'Pdeg':>5} | {'Nrms':>6} {'Vreg':>7}")
+    # ANTI-FOOTGUN (stage 2a): the DC load-reg curve is OPTIONAL. When absent (a
+    # small-signal-only in-situ export carries no real DC sweep), the regulated DC
+    # falls back to the export's meta_vout_dc (else the module VREF) -- NEVER a
+    # fabricated flat curve, and emit/emit_va drop the dropout/load-reg branch entirely.
+    have_dc = ref is not None and "dc_loadreg" in ref.files
+    dc_fallback = (float(ref["meta_vout_dc"]) if (ref is not None
+                   and "meta_vout_dc" in ref.files) else float(VREF))
     for il in LOADS:
         gz = ref[f"z_{il}"]; fz = gz[:, 0]; Z = gz[:, 1] + 1j*gz[:, 2]
         gp = ref[f"p_{il}"]; fp = gp[:, 0]; H = gp[:, 1] + 1j*gp[:, 2]
-        dl = ref["dc_loadreg"]; iv = ng.amps(il)
+        iv = ng.amps(il)
         R_a, L_a, R_pl, R_b, L_b = fit_zout(fz, Z)
         G, Q = fit_psrr(fp, H, R_a, L_a, R_pl, R_b, L_b)   # G=[G0,G1,w1,..]; Q=(b0,b1,w0,Qf)
         zfits[il] = (R_a, L_a, R_pl, R_b, L_b)
@@ -890,7 +897,11 @@ def fit_all():
         pph = np.degrees(np.sqrt(np.mean(np.angle(Hm[sel] / H[sel]) ** 2)))
         cpx = 1 if (Q[0] != 0.0 or Q[1] != 0.0) else 0
         nsec = 1 + sum(1 for i in (1, 2) if abs(G[1 + 2 * i]) > 1e-12) + cpx
-        vout_dc = np.interp(iv, dl[:, 0], dl[:, 1])
+        if have_dc:
+            dl = ref["dc_loadreg"]
+            vout_dc = np.interp(iv, dl[:, 0], dl[:, 1])
+        else:
+            vout_dc = dc_fallback               # no DC sweep -> flat regulated DC reference
         vreg = vout_dc + R_a * iv               # so Vout = vreg - R_a*iload matches DC
         P[il] = dict(iv=iv, R_a=R_a, L_a=L_a, R_pl=R_pl, R_b=R_b, L_b=L_b,
                      G0=G[0], G1=G[1], w1=G[2], G2=G[3], w2=G[4], G3=G[5], w3=G[6],
@@ -1139,7 +1150,14 @@ def _pexpr(P, key, logspace):
 def build_pwl(vreg121):
     """Nonlinear branch-A conductance table: (Vdrop, I) from the GT DC curve, where
     Vdrop=vreg121-Vout, I=Iload. Local slope = GT load-dep Zout(0) (preserves small
-    signal); saturation = device current limit (dropout). Fine at low I, coarse to 6mA."""
+    signal); saturation = device current limit (dropout). Fine at low I, coarse to 6mA.
+
+    ANTI-FOOTGUN (stage 2a): returns None when the ref carries NO real DC sweep
+    (dc_loadreg or dc_dropout absent -- e.g. a small-signal-only in-situ export). The
+    caller then emits NO dropout/current-limit branch (never a fabricated-flat one).
+    Mirrors _linereg_poly's existing 'not in ref.files -> inert' guard."""
+    if ref is None or "dc_loadreg" not in ref.files or "dc_dropout" not in ref.files:
+        return None
     dl, dd = ref["dc_loadreg"], ref["dc_dropout"]
     il = np.concatenate([dl[::6, 0], dd[dd[:, 0] > 5e-4, 0]])
     vo = np.concatenate([dl[::6, 1], dd[dd[:, 0] > 5e-4, 1]])
@@ -1296,12 +1314,22 @@ def emit(P, path):
     # template fragments so the legacy render stays byte-equal. NOTE the
     # (vreg-VREG121) inside pwl() is the .param vreg (a NUMBER), not the node --
     # it stays 'vreg' in BOTH fragments.
-    if NOISE_MODE == "hybrid":
-        bra_line = (f"Bra  vrgn nA I = {{(slew_en > 0.5) ? "
-                    f"pwl(V(vrgn,nA)-(vregeff-VREG121),{pwl_tab}) : V(vrgn,nA)/R_a}}")
+    # ANTI-FOOTGUN (stage 2a): pwl_tab is None when the ref carries NO real DC sweep.
+    # Then branch A is the PURE linear R_a (no nonlinear dropout/current-limit term);
+    # the slew_en instance param still EXISTS (default 0) but slew_en=1 collapses to the
+    # same linear branch so a netlist that sets it still runs (just linear). A header
+    # NOTE documents the small-signal scope. Never KeyError, never fabricate.
+    rail = "vrgn" if NOISE_MODE == "hybrid" else "vreg"
+    if pwl_tab is None:
+        bra_line = (f"Bra  {rail} nA I = {{V({rail},nA)/R_a}}"
+                    "   $ no DC sweep -> linear branch only (slew_en inert)")
+        nodc_note = ("* NOTE: no DC sweep in ref -> dropout/load-reg/current-limit NOT modeled\n"
+                     "*       (small-signal scope). slew_en exists (default 0) but is INERT:\n"
+                     "*       slew_en=1 runs the SAME linear R_a branch (no fabricated dropout).\n")
     else:
-        bra_line = (f"Bra  vreg nA I = {{(slew_en > 0.5) ? "
-                    f"pwl(V(vreg,nA)-(vregeff-VREG121),{pwl_tab}) : V(vreg,nA)/R_a}}")
+        bra_line = (f"Bra  {rail} nA I = {{(slew_en > 0.5) ? "
+                    f"pwl(V({rail},nA)-(vregeff-VREG121),{pwl_tab}) : V({rail},nA)/R_a}}")
+        nodc_note = ""
     txt = f"""* ============================================================
 * CANDIDATE behavioral LDO model  (subckt: ldo_model, ports: vin vout gnd)
 * Instance params: iload (OP current), slew_en (0=linear PSS/HB core),
@@ -1323,7 +1351,7 @@ def emit(P, path):
 *   Noise= DECOUPLED Norton @vout: white + {MNOISE} Lorentzian current sections fit to
 *          In=Sv/|Zout| -> output PSD = In*|Zout| exactly, independent of Zout synthesis
 * ============================================================
-.subckt ldo_model vin vout gnd iload={NOMINAL} slew_en=0 vdd={VREF:g} voutdc=0
+{nodc_note}.subckt ldo_model vin vout gnd iload={NOMINAL} slew_en=0 vdd={VREF:g} voutdc=0
 .param ic = {{min(max(iload,{LOADS[0]}),{LOADS[-1]})}}
 .param u  = {{ln(ic)}}
 .param VREG121 = {vreg121:.6e}    $ nominal-corner Vreg (DC-curve table reference)
@@ -1454,15 +1482,25 @@ def emit_va(P, path, tbl_path):
     vreg121 = P[NOMINAL]["vreg"]
     # dropout table (Vdrop relative to nominal vreg, I): INLINED as a closed-form PWL
     # expression; the .tbl file is still written as a human-readable data record only.
-    dl, dd = ref["dc_loadreg"], ref["dc_dropout"]
-    il = np.concatenate([dl[::6, 0], dd[dd[:, 0] > 5e-4, 0]])
-    vo = np.concatenate([dl[::6, 1], dd[dd[:, 0] > 5e-4, 1]])
-    vd = vreg121 - vo
-    o = np.argsort(vd); vd, il = vd[o], il[o]
-    keep = np.concatenate([[True], np.diff(vd) > 1e-5]); vd, il = vd[keep], il[keep]
-    tbl_path.write_text("* data record only -- the emitted .va inlines this curve\n"
-                        + "\n".join(f"{v:.6e} {i:.6e}" for v, i in zip(vd, il)) + "\n")
-    pwl_expr = _pwl_va_expr(vd, il)
+    # ANTI-FOOTGUN (stage 2a): the DC sweep is OPTIONAL. have_dc is False when the ref
+    # carries NO real dc_loadreg/dc_dropout (a small-signal-only in-situ export). Then NO
+    # dropout PWL is emitted -- the slew_en=1 branch collapses to the linear R_a branch and
+    # a header NOTE records the small-signal scope. NEVER KeyError, NEVER fabricate.
+    have_dc = ref is not None and "dc_loadreg" in ref.files and "dc_dropout" in ref.files
+    if have_dc:
+        dl, dd = ref["dc_loadreg"], ref["dc_dropout"]
+        il = np.concatenate([dl[::6, 0], dd[dd[:, 0] > 5e-4, 0]])
+        vo = np.concatenate([dl[::6, 1], dd[dd[:, 0] > 5e-4, 1]])
+        vd = vreg121 - vo
+        o = np.argsort(vd); vd, il = vd[o], il[o]
+        keep = np.concatenate([[True], np.diff(vd) > 1e-5]); vd, il = vd[keep], il[keep]
+        tbl_path.write_text("* data record only -- the emitted .va inlines this curve\n"
+                            + "\n".join(f"{v:.6e} {i:.6e}" for v, i in zip(vd, il)) + "\n")
+        pwl_expr = _pwl_va_expr(vd, il)
+    else:
+        tbl_path.write_text("* no DC sweep in ref -> dropout/load-reg NOT modeled "
+                            "(small-signal scope); no PWL curve emitted\n")
+        pwl_expr = None
     nk_nodes = ", ".join(f"nk{k+1}" for k in range(MNOISE))
     gvars = ", ".join(["gnw"] + [f"gn{k+1}" for k in range(MNOISE)]
                       + [f"sa{k+1}" for k in range(len(NSPUR_F))])
@@ -1526,6 +1564,33 @@ def emit_va(P, path, tbl_path):
                   if CFT > 0 else "")
     cft_va = ("\n\n    // ---- gated vin->vout feedthrough cap (pass-device/package) ----"
               "\n    I(vin, vout) <+ Cft*ddt(V(vin, vout));" if CFT > 0 else "")
+    # ANTI-FOOTGUN (stage 2a): branch-A contribution + the slew_en doc line + the vdrp
+    # decl are all selected by have_dc. With DC -> the legacy slew_en if/else dropout PWL.
+    # Without DC -> pure linear R_a (no PWL), slew_en exists (default 0) but is INERT
+    # (slew_en=1 runs the SAME linear branch), and a header NOTE records the scope.
+    if have_dc:
+        slew_doc = "//   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout), INLINE PWL"
+        nodc_note_va = ""
+        vdrp_decl = "\n  real vddc, lrsh, vregeff, vdrp;"
+        bra_va = f"""if (slew_en == 0)
+      V(nA, {arail}) <+ R_a*I(nA, {arail});
+    else begin
+      // nonlinear DC-curve branch (current-limit + dropout): INLINE closed-form PWL of
+      // the characterized (Vdrop, Iload) table -- i = i1 + g1*(v-v1) + sum dg_k*max(v-v_k,0)
+      // == 1-D linear table interpolation, linear end extrapolation. Self-contained
+      // (no external table file -> no run-dir path issues; OpenVAF-compilable, R8 closed).
+      vdrp = V({arail}, nA) - (vregeff - VREG121);
+      I({arail}, nA) <+ {pwl_expr};
+    end"""
+    else:
+        slew_doc = ("//   slew_en : INERT (no DC sweep in ref -> no dropout/current-limit term);\n"
+                    "//             slew_en=1 runs the same linear R_a branch (small-signal scope)")
+        nodc_note_va = ("//\n// NOTE: no DC sweep in ref -> dropout/load-reg/current-limit NOT modeled\n"
+                        "//       (small-signal scope). The slew_en param exists (default 0) but is\n"
+                        "//       INERT; slew_en=1 runs the SAME linear R_a branch (no fabricated DC).\n")
+        vdrp_decl = "\n  real vddc, lrsh, vregeff;"   # vdrp unused without the dropout branch
+        bra_va = (f"// no DC sweep -> linear branch only (slew_en inert; no nonlinear dropout)\n"
+                  f"    V(nA, {arail}) <+ R_a*I(nA, {arail});")
     va = f"""// ============================================================
 // Behavioral LDO model for Cadence Spectre  (auto-gen: harness/fit_model.py)
 // Equivalent to model/ldo_model.lib (validated in ngspice). NO laplace_nd.
@@ -1535,12 +1600,12 @@ def emit_va(P, path, tbl_path):
 //          (V4/V3). LP filter resistors are noiseless conductances (no thermal noise).
 //   Noise= DECOUPLED Norton @vout: white-R + {MNOISE} R||C-Lorentzian current sections,
 //          transconducted into vout (gm sets amplitude) -> In*|Zout| = Sv. pnoise/hbnoise.
-//   slew_en=1 : nonlinear DC-curve branch (current-limit + dropout), INLINE PWL
+{slew_doc}
 // Ports: vin vout gnd (explicit ground -- no global-ground references inside).
 // Instance params: iload, slew_en, vdd (supply DC ref + dc_linereg Vout tracking),
 //   voutdc (>0 pins Vout DC; 0 = characterized). Defaults = characterized behavior.
 // Params interpolated as quadratics in ln(iload) through corners {{{','.join(LOADS)}}}.
-// ============================================================
+{nodc_note_va}// ============================================================
 `include "constants.vams"
 `include "disciplines.vams"
 
@@ -1562,8 +1627,7 @@ module ldo_model(vin, vout, gnd);
   {Cn_par}
 
   real u, ic, R_a, L_a, R_pl, R_b, L_b, G0, G1, w1, G2, w2, G3, w3, {gvars}, vreg, Cps;
-  real pcb0, pcb1, pcw0, pcq, pca1, pca2, Rpc, Lpc, Cpc, gqb1;
-  real vddc, lrsh, vregeff, vdrp;
+  real pcb0, pcb1, pcw0, pcq, pca1, pca2, Rpc, Lpc, Cpc, gqb1;{vdrp_decl}
 
   analog begin
     @(initial_step) begin
@@ -1596,16 +1660,7 @@ module ldo_model(vin, vout, gnd);
     // ---- Zout branch A: (L_a || R_pl) + (R_a | nonlinear dropout) ----
     // L_a||R_pl as summed current contributions (idt form admits the parallel R)
     I(vout, nA) <+ idt(V(vout, nA))/L_a + V(vout, nA)/R_pl;
-    if (slew_en == 0)
-      V(nA, {arail}) <+ R_a*I(nA, {arail});
-    else begin
-      // nonlinear DC-curve branch (current-limit + dropout): INLINE closed-form PWL of
-      // the characterized (Vdrop, Iload) table -- i = i1 + g1*(v-v1) + sum dg_k*max(v-v_k,0)
-      // == 1-D linear table interpolation, linear end extrapolation. Self-contained
-      // (no external table file -> no run-dir path issues; OpenVAF-compilable, R8 closed).
-      vdrp = V({arail}, nA) - (vregeff - VREG121);
-      I({arail}, nA) <+ {pwl_expr};
-    end
+    {bra_va}
 
     {noise_va}
 
