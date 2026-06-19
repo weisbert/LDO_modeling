@@ -416,7 +416,8 @@ class ExtractCore:
 
     def run_cluster_sweep(self, *, netlistdir, pdk_model_dir=None, ahdllibdir=None,
                           engine="alps", donau=None, runner=None, work_root=None,
-                          dry_run=False, group_status=None, log=None, cancel=None):
+                          dry_run=False, group_status=None, log=None, cancel=None,
+                          max_parallel=1):
         """Run a FULL Donau+ALPS measurement sweep from the loaded manifest, pure-CLI (no ADE /
         no skillbridge): build each measurement GROUP's one-hot netlist OFFLINE from the
         designer's base input.scs, submit one dsub+alps job per group, collect the per-group PSF,
@@ -432,7 +433,8 @@ class ExtractCore:
         dry_run        assemble the per-group dsub commands WITHOUT submitting (returns them).
         group_status   callback(i, n, group, state) -- drives the GUI per-group status table.
         log            callback(msg) -- streamed progress lines.
-        cancel         callback() -> bool -- checked between groups (cooperative Cancel).
+        cancel         callback() -> bool -- stops launching NEW groups (cooperative Cancel).
+        max_parallel   cap on how many GROUP jobs run on Donau at once (default 1 = serial).
 
         Returns dict(dry_run, dsub_cmds, n_groups[, npz_path, gate, report, ports, psf_map])."""
         if self.manifest is None:
@@ -452,7 +454,8 @@ class ExtractCore:
                                   pdk_model_dir=pdk_model_dir, progress=_log)
         runres = PC.step_run(netinfo, dirs["psf"], m, engine=engine, donau=donau or DonauCfg(),
                              runner=runner, dry_run=dry_run, group_netlister=factory,
-                             group_status=group_status, cancel=cancel, progress=_log)
+                             group_status=group_status, cancel=cancel, progress=_log,
+                             max_parallel=max_parallel)
         if dry_run:
             return dict(dry_run=True, dsub_cmds=runres["dsub_cmds"],
                         n_groups=len(runres["dsub_cmds"]))
@@ -566,22 +569,28 @@ if _HAVE_QT:
         group_state = QtCore.pyqtSignal(int, int, str, str, str)   # i, n, tag, analysis, state
         cancelled = QtCore.pyqtSignal()
 
-        def __init__(self, extract, *, netlistdir, pdk, ahdl, engine, donau_cfg, dry_run):
+        def __init__(self, extract, *, netlistdir, pdk, ahdl, engine, donau_cfg, dry_run,
+                     max_parallel=1):
             super().__init__()
             self.extract = extract
             self.netlistdir, self.pdk, self.ahdl = netlistdir, pdk, ahdl
             self.engine, self.donau_cfg, self.dry_run = engine, donau_cfg, dry_run
+            self.max_parallel = max_parallel
+            self._done_groups = set()                 # indices whose PSF has landed (bar driver)
             self._cancel = False
 
         def cancel(self):
-            """Request cancellation (UI thread). step_run checks it BETWEEN groups and raises
-            CancelledError -- a submitted job already on the queue is left to finish."""
+            """Request cancellation (UI thread). step_run stops launching NEW groups and raises
+            CancelledError -- jobs already on the queue are drained first."""
             self._cancel = True
 
         def _gs(self, i, n, group, state):
             self.group_state.emit(i, n, group["tag"], group["analysis"], state)
-            # drive the bar off the per-group progress: a group counts ~done when its PSF lands
-            frac = (i + (1.0 if state in ("done", "preview") else 0.35)) / max(n, 1)
+            # With several groups in flight at once, drive the bar off COMPLETED groups (not a
+            # single-i estimate): count each group once its PSF lands / preview is assembled.
+            if state in ("done", "preview"):
+                self._done_groups.add(i)
+            frac = len(self._done_groups) / max(n, 1)
             self.progressed.emit(min(1.0, frac), f"group {i+1}/{n} {group['tag']}: {state}")
 
         def run(self):
@@ -592,7 +601,7 @@ if _HAVE_QT:
                     ahdllibdir=self.ahdl or None, engine=self.engine, donau=self.donau_cfg,
                     dry_run=self.dry_run, group_status=self._gs,
                     log=lambda m: self.progressed.emit(-1.0, m),
-                    cancel=lambda: self._cancel)
+                    cancel=lambda: self._cancel, max_parallel=self.max_parallel)
                 self.done.emit(out)
             except CancelledError:
                 self.cancelled.emit()
@@ -1375,7 +1384,7 @@ if _HAVE_QT:
                 "b_netlist": self.xb_netlist["edit"], "b_pdk": self.xb_pdk["edit"],
                 "b_ahdl": self.xb_ahdl["edit"],
                 "d_account": self.xd_account, "d_queue": self.xd_queue,
-                "d_cpu": self.xd_cpu, "d_mem": self.xd_mem,
+                "d_cpu": self.xd_cpu, "d_mem": self.xd_mem, "d_maxjobs": self.xd_maxjobs,
                 "p_name": self.e_name, "p_vref": self.e_vref, "p_loads": self.e_loads,
                 "p_nom": self.e_nom, "p_cout": self.e_cout, "p_esr": self.e_esr,
             }
@@ -1835,6 +1844,14 @@ if _HAVE_QT:
             crow.addWidget(QLabel("CPU")); crow.addWidget(self.xd_cpu)
             crow.addWidget(QLabel("MEM [MB]")); crow.addWidget(self.xd_mem); crow.addStretch(1)
             cw = QWidget(); cw.setLayout(crow); df.addRow("Resources (-R)", cw)
+            self.xd_maxjobs = QtWidgets.QSpinBox(); self.xd_maxjobs.setRange(1, 32)
+            self.xd_maxjobs.setValue(4)
+            self.xd_maxjobs.setToolTip(
+                "How many measurement-group jobs run on the cluster AT ONCE (Donau runs them in "
+                "parallel; the sweep just stops blocking on one before submitting the next). 1 = "
+                "strict serial.\nWARNING: ALPS is licensed PER SEAT — a high count can exhaust the "
+                "available license seats and stall the whole sweep.")
+            df.addRow("Max parallel jobs", self.xd_maxjobs)
             outer.addWidget(self.x_grp_donau)
 
             self.x_summary = QTextEdit(); self.x_summary.setReadOnly(True)
@@ -2216,7 +2233,8 @@ if _HAVE_QT:
                 f"{'Previewing' if dry else 'Running'} Donau+ALPS sweep — {len(groups)} "
                 f"measurement group(s), engine={eng}…")
             self._xw = _ClusterSweepWorker(self.extract, netlistdir=netdir, pdk=pdk, ahdl=ahdl,
-                                           engine=eng, donau_cfg=cfg, dry_run=dry)
+                                           engine=eng, donau_cfg=cfg, dry_run=dry,
+                                           max_parallel=self.xd_maxjobs.value())
             self._xw.group_state.connect(self._x_status_set)
             self._xw.progressed.connect(self._x_progress)
             self._xw.done.connect(self._x_cluster_done)
@@ -3282,8 +3300,9 @@ def _selftest_cluster_sweep(win, tmp, app):
     ngroups = len(grps)
     assert ngroups == 3, f"expected 3 groups (z/noise/supply), got {ngroups}"
     seen = []
+    # max_parallel is forwarded through the core (dry-run never submits, so it just must not crash)
     out = xc.run_cluster_sweep(netlistdir=str(base), pdk_model_dir=str(tmp), engine="alps",
-                               work_root=str(tmp), dry_run=True,
+                               work_root=str(tmp), dry_run=True, max_parallel=3,
                                group_status=lambda i, n, g, st: seen.append((g["tag"], st)))
     assert out["dry_run"] and out["n_groups"] == ngroups and len(out["dsub_cmds"]) == ngroups, out
     _, dirs = PC.corner_dir(str(tmp), PC._gui_from_manifest(xc.manifest), xc._corner())
@@ -3305,9 +3324,10 @@ def _selftest_cluster_sweep(win, tmp, app):
         win.extract.load_manifest(str(mpath))
         win.xb_netlist["edit"].setText(str(base)); win.xb_pdk["edit"].setText(str(tmp))
         win.xb_ahdl["edit"].setText("")                  # blank -> the -ahdllibdir flag is dropped
-        win.xd_cpu.setValue(16); win.xd_mem.setValue(16000)
+        win.xd_cpu.setValue(16); win.xd_mem.setValue(16000); win.xd_maxjobs.setValue(3)
         win.x_dryrun.setChecked(True)
         win._x_run()                                     # cluster -> the dry-run sweep worker
+        assert win._xw.max_parallel == 3, "worker must take the Max-parallel-jobs spinbox value"
         assert win._xw.wait(15000), "cluster sweep worker did not finish"
         app.processEvents()                              # deliver the queued done/group_state signals
     finally:
@@ -3324,7 +3344,17 @@ def _selftest_cluster_sweep(win, tmp, app):
     states = {win.x_status.item(i, 3).text() for i in range(win.x_status.rowCount())}
     assert states == {"preview"}, f"dry-run rows should be 'preview', got {states}"
     win.x_dryrun.setChecked(False)
-    print(f"  cluster: GUI dry-run sweep -> {ngroups} per-group dsub cmds + live status table OK")
+
+    # the bounded-parallel surface is wired end to end: the core accepts max_parallel, the
+    # worker constructor accepts + stores it (no submit needed to check the plumbing).
+    import inspect
+    assert "max_parallel" in inspect.signature(ExtractCore.run_cluster_sweep).parameters, \
+        "ExtractCore.run_cluster_sweep must accept a max_parallel kwarg"
+    w = _ClusterSweepWorker(ExtractCore(), netlistdir=str(base), pdk=str(tmp), ahdl="",
+                            engine="alps", donau_cfg=None, dry_run=True, max_parallel=7)
+    assert w.max_parallel == 7, "worker constructor must accept + store max_parallel"
+    print(f"  cluster: GUI dry-run sweep -> {ngroups} per-group dsub cmds + live status table "
+          f"+ max-parallel plumbing OK")
 
 
 def _selftest_manifest_editor(win, tmp):

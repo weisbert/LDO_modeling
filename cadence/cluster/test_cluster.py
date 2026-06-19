@@ -270,6 +270,18 @@ def test_poll_holds_state_on_empty_djob():
     assert seen == ["running", "done"]            # empty reply held 'running', no re-fire
 
 
+def test_poll_once_single_query_maps_state():
+    # ONE djob query -> (mapped state, raw). A "State: RUNNING" line -> ("running", raw).
+    runner = FakeRunner({"djob": DJOB_RUNNING})
+    state, raw = donau.poll_once("37238970", runner)
+    assert state == "running"
+    assert "RUNNING" in raw
+    assert runner.cmds("djob") == [["djob", "37238970"]]   # exactly one query, no loop
+    # no known state token -> None (the caller decides whether to hold/keep polling)
+    state2, raw2 = donau.poll_once("1", FakeRunner({"djob": ok("garbled no-state output")}))
+    assert state2 is None and "garbled" in raw2
+
+
 def test_poll_failed_is_terminal():
     runner = FakeRunner({"djob": [DJOB_RUNNING, DJOB_FAILED]})
     seen = []
@@ -375,6 +387,30 @@ def test_run_corner_happy_path_alps(tmp_path):
     assert pathlib.Path(out) == psfdir
     assert seen == ["pending", "running", "done"]
     assert runner.cmds("dsub") and runner.cmds("djob")
+
+
+def test_submit_and_finalize_corner_smoke(tmp_path):
+    # submit_corner does the prep + the async submit -> dict(job_id, out_abs, require_simdone,
+    # dsub_cmd); finalize_corner verifies the seeded PSF and returns str(out_abs). Together they
+    # reproduce run_corner's happy path WITHOUT the blocking poll (the parallel scheduler's seam).
+    netdir = tmp_path / "netlist"; netdir.mkdir()
+    psfdir = _fake_psf(tmp_path, with_simdone=True)    # sim "already produced" output
+    runner = FakeRunner({"dsub": DSUB_OK, "djob": [DJOB_DONE]})
+    sub = rc.submit_corner(str(netdir), "/pdk/c1x", "/ahdl", str(psfdir),
+                           engine="alps", runner=runner)
+    assert sub["job_id"] == "37238970"
+    assert sub["out_abs"] == psfdir and sub["require_simdone"] is True   # alps -> sentinel required
+    s = _join(sub["dsub_cmd"])
+    assert sub["dsub_cmd"][0] == "dsub" and "-ade" in s and "-I /pdk/c1x/alps" in s
+    assert runner.cmds("dsub") and not runner.cmds("djob")              # submitted, NOT polled
+    # finalize verifies + returns the dir (the post-poll tail)
+    out = rc.finalize_corner(sub["out_abs"], require_simdone=sub["require_simdone"],
+                             job_id=sub["job_id"], runner=runner)
+    assert pathlib.Path(out) == psfdir
+    # spectre -> no .simDone required
+    sub2 = rc.submit_corner(str(netdir), "/pdk", "/ahdl", str(psfdir), engine="spectre",
+                            runner=FakeRunner({"dsub": DSUB_OK}))
+    assert sub2["require_simdone"] is False
 
 
 def test_run_corner_failed_job_surfaces_error_with_tail(tmp_path):

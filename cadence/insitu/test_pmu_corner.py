@@ -601,5 +601,118 @@ def test_step_run_cancel_between_groups(tmp_path):
     assert not (dirs["netlist"] / grps[1]["tag"]).exists()
 
 
+# =====================================================================================
+# (G) BOUNDED-PARALLEL scheduler: max_parallel > 1 overlaps group jobs (Donau runs them in
+#     parallel; the sweep just stops blocking on one before submitting the next). A serial
+#     max_parallel=1 is already locked by (A)/(F); these lock the parallel + cancel-drain paths.
+# =====================================================================================
+class ConcurrentFakeRunner:
+    """A fake runner that gives each dsub a UNIQUE job_id and holds every job RUNNING for
+    >=2 djob polls before DONE, so several jobs are genuinely in flight at once under a >1 cap.
+    Tracks the PEAK number of simultaneously in-flight job_ids (submitted, not yet returned
+    DONE) so the test can assert the scheduler honoured min(cap, n_groups)."""
+
+    def __init__(self, running_polls=2):
+        self.calls = []
+        self.running_polls = running_polls          # djob polls spent RUNNING before DONE
+        self._next = 0
+        self._polls = {}                            # job_id -> how many djob queries seen
+        self._live = set()                          # job_ids submitted but not yet DONE
+        self.peak = 0
+
+    def __call__(self, argv, timeout=None, check=False):
+        self.calls.append(list(argv))
+        head = argv[0]
+        if head == "dsub":
+            self._next += 1
+            jid = str(40000000 + self._next)
+            self._polls[jid] = 0
+            self._live.add(jid)
+            self.peak = max(self.peak, len(self._live))   # concurrency at submit time
+            return RunResult(0, f"Submit job successfully. JOBID {jid}\n", "", list(argv))
+        if head == "djob":
+            jid = str(argv[1])
+            k = self._polls.get(jid, 0)
+            self._polls[jid] = k + 1
+            if k == 0:
+                state = "PENDING"
+            elif k <= self.running_polls:
+                state = "RUNNING"
+            else:
+                state = "DONE"
+                self._live.discard(jid)
+            line = {"PENDING": f"JobId: {jid}  State: PENDING  Queue: short\n",
+                    "RUNNING": f"JobId: {jid}  State: RUNNING  Node: sinct20-hs\n",
+                    "DONE":    f"JobId: {jid}  State: DONE  Exit: 0\n"}[state]
+            return RunResult(0, line, "", list(argv))
+        raise AssertionError(f"ConcurrentFakeRunner: no scripted reply for {head!r} ({argv})")
+
+    def cmds(self, head):
+        return [c for c in self.calls if c and c[0] == head]
+
+
+def test_step_run_parallel_overlaps(tmp_path):
+    """max_parallel=3 over the wur groups (>=4): the scheduler keeps min(3, n) jobs in flight,
+    every member tag lands in psf_map, and exactly one dsub per group."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    assert len(grps) >= 4
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+    _seed_all_group_psf(dirs, grps)
+    netinfo = PC.step_netlist(dirs, netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"))
+
+    runner = ConcurrentFakeRunner(running_polls=2)
+    res = PC.step_run(netinfo, dirs["psf"], m, engine="alps", runner=runner,
+                      group_netlister=gnl, sleep=lambda *_: None, max_parallel=3)
+
+    assert runner.peak == min(3, len(grps)), (runner.peak, len(grps))   # honoured the cap
+    assert len(runner.cmds("dsub")) == len(grps)                        # one job per group
+    assert len(res["dsub_cmds"]) == len(grps)
+    meas_tags = {pt["tag"] for pt in M.measurements(m)}
+    assert set(res["psf_map"]) == meas_tags                             # all members mapped
+    for g in grps:
+        gdir = str(dirs["psf"] / g["tag"])
+        for pt in g["members"]:
+            assert res["psf_map"][pt["tag"]] == gdir
+    assert res["ran"] is True
+
+
+def test_step_run_parallel_cancel_drains(tmp_path):
+    """With max_parallel>=2, a cancel() that flips True after a couple of submits stops launching
+    NEW groups, DRAINS the in-flight ones (their PSF still maps), and raises CancelledError; no
+    group beyond those already launched gets netlisted."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+    _seed_all_group_psf(dirs, grps)
+    netinfo = PC.step_netlist(dirs, netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"))
+
+    runner = ConcurrentFakeRunner(running_polls=2)
+    psf_map = {}
+    with pytest.raises(RUN.CancelledError):
+        PC.step_run(netinfo, dirs["psf"], m, engine="alps", runner=runner,
+                    group_netlister=gnl, sleep=lambda *_: None, max_parallel=2,
+                    cancel=lambda: len(runner.cmds("dsub")) >= 2)   # cancel once 2 are launched
+
+    n_sub = len(runner.cmds("dsub"))
+    assert n_sub == 2, n_sub                            # exactly the 2 launched before cancel
+    # the launched groups are the first two in FIFO order; only those got netlisted
+    launched = {g["tag"] for g in grps[:n_sub]}
+    for g in grps[:n_sub]:
+        assert (dirs["netlist"] / g["tag"]).exists(), g["tag"]
+    for g in grps[n_sub:]:
+        assert not (dirs["netlist"] / g["tag"]).exists(), g["tag"]
+    # every djob job reached DONE -> all live jobs drained before the raise
+    assert runner._live == set()
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

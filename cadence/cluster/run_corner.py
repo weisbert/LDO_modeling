@@ -68,8 +68,8 @@ def run_corner(netlistdir, pdk_model_dir, ahdllibdir, out_psf_dir,
         raise RunCornerError(
             f"DonauCfg.resource={cfg.resource!r} has no cpu= count, so -mt cannot be matched "
             f"to the Donau allocation (oversubscription risk). Use resource='cpu=N;mem=M'.")
-    if require_simdone is None:
-        require_simdone = (engine == "alps")
+    # require_simdone's default (None -> engine=='alps') is owned by submit_corner; the non-dry
+    # path forwards it there. The inline prep below only assembles the dry_run dsub_cmd.
 
     netdir = pathlib.Path(netlistdir)
     out_abs = pathlib.Path(out_psf_dir)
@@ -86,8 +86,10 @@ def run_corner(netlistdir, pdk_model_dir, ahdllibdir, out_psf_dir,
     if dry_run:
         return dsub_cmd
 
-    # 1. submit (async) -> JOBID
-    sub = _donau.submit(cfg, payload, netdir, runner, x_all=True, block=False, json=True)
+    # 1. submit (async) -> JOBID  (reuses submit_corner's prep, so the flags never diverge)
+    sub = submit_corner(netlistdir, pdk_model_dir, ahdllibdir, out_psf_dir, engine=engine,
+                        donau=cfg, runner=runner, alps_wrapper=alps_wrapper,
+                        require_simdone=require_simdone, input_scs=input_scs)
     job_id = sub["job_id"]
     # 2. poll to a terminal state, reporting each transition
     try:
@@ -104,6 +106,45 @@ def run_corner(netlistdir, pdk_model_dir, ahdllibdir, out_psf_dir,
             + (f"\n--- dpeek tail ---\n{tail}" if tail else
                "\n(no dpeek output available)"))
     # 3. verify the PSF landed (+ sentinel) before handing the dir back to the npz path
+    return finalize_corner(sub["out_abs"], require_simdone=sub["require_simdone"],
+                          job_id=job_id, runner=runner)
+
+
+def submit_corner(netlistdir, pdk_model_dir, ahdllibdir, out_psf_dir, *, engine="alps",
+                  donau=None, runner=None, alps_wrapper=alps_cli.ALPS_WRAPPER_DEFAULT,
+                  require_simdone=None, input_scs=INPUT_SCS):
+    """The SUBMIT half of run_corner: everything up to and INCLUDING the async Donau submit
+    (cpu/mt check -> -o relpath -> alps_cli payload -> build_dsub_cmd -> donau.submit). Returns
+    dict(job_id, out_abs (Path), require_simdone (resolved bool), dsub_cmd (argv list)). The
+    bounded parallel scheduler launches each group via this, then poll_once + finalize_corner
+    drive the in-flight jobs to completion. Reuses the EXACT prep run_corner builds inline."""
+    cfg = donau or DonauCfg()
+    runner = runner or _donau.SubprocessRunner()
+    # -mt MUST equal the Donau cpu= allocation (§1c) -- refuse if the resource carries no cpu=.
+    mt = cfg.cpu
+    if mt is None:
+        raise RunCornerError(
+            f"DonauCfg.resource={cfg.resource!r} has no cpu= count, so -mt cannot be matched "
+            f"to the Donau allocation (oversubscription risk). Use resource='cpu=N;mem=M'.")
+    if require_simdone is None:
+        require_simdone = (engine == "alps")
+
+    netdir = pathlib.Path(netlistdir)
+    out_abs = pathlib.Path(out_psf_dir)
+    out_arg = _relpath(out_abs, netdir)
+    payload = alps_cli.build_sim_cmd(
+        engine, input_scs, out_arg, pdk_model_dir, ahdllibdir, mt=mt,
+        alps_wrapper=alps_wrapper, ade=(engine == "alps"))
+    dsub_cmd = _donau.build_dsub_cmd(cfg, payload, netdir, x_all=True, block=False, json=True)
+    sub = _donau.submit(cfg, payload, netdir, runner, x_all=True, block=False, json=True)
+    return dict(job_id=sub["job_id"], out_abs=out_abs, require_simdone=require_simdone,
+                dsub_cmd=dsub_cmd)
+
+
+def finalize_corner(out_abs, *, require_simdone, job_id, runner):
+    """The FINALIZE half of run_corner: the post-poll tail -- verify the PSF landed (+ the
+    .simDone sentinel under -ade) and return str(out_abs). Raises RunCornerError on missing
+    output (with the dpeek tail)."""
     _verify_psf(out_abs, require_simdone=require_simdone, job_id=job_id, runner=runner)
     return str(out_abs)
 

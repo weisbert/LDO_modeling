@@ -200,6 +200,18 @@ def submit(cfg, payload_cmd, netlistdir, runner, x_all=True, block=False, json=T
     return dict(job_id=job_id, cmd=cmd, result=res)
 
 
+def poll_once(job_id, runner):
+    """ONE non-blocking `djob <job_id>` query -> (state, raw). state is map_state(raw)
+    (None when the djob output carries no known state token -- the caller decides whether to
+    hold the prior state or keep polling). raw is the combined stdout+stderr that produced it.
+
+    This is the single-poll primitive the bounded parallel scheduler (insitu.pmu_corner.step_run)
+    drives across many in-flight jobs; the blocking poll() below loops over it."""
+    res = runner(build_djob_cmd(job_id))
+    raw = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
+    return map_state(raw), raw
+
+
 def poll(job_id, runner, on_status=None, interval=5.0, timeout=10800.0, sleep=None):
     """Poll `djob <job_id>` until the job reaches a terminal state (done|failed) or timeout.
 
@@ -216,12 +228,10 @@ def poll(job_id, runner, on_status=None, interval=5.0, timeout=10800.0, sleep=No
     last_state = None
     waited = 0.0
     while True:
-        res = runner(build_djob_cmd(job_id))
-        raw = (res.stdout or "") + (("\n" + res.stderr) if res.stderr else "")
         # A failed djob query itself (rc!=0) is not a job-failed signal unless its output
         # actually says so -- treat an unparseable/empty reply as "keep polling" until the
         # last seen state or timeout decides. But a clearly-FAILED state IS terminal.
-        state = map_state(raw)
+        state, raw = poll_once(job_id, runner)
         if state is None:
             state = last_state           # transient/empty djob output: hold prior state
         if state is not None and state != last_state:

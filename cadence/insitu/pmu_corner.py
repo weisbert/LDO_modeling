@@ -59,6 +59,7 @@ import emit_pmu_model as _emit          # harness/emit_pmu_model.py
 import fit_multiport as _fit            # harness/fit_multiport.py
 import cluster                          # cadence/cluster (package)
 from cluster import run_corner as _runc
+from cluster import donau as _donau
 from cluster.donau import DonauCfg
 
 
@@ -251,7 +252,7 @@ def _live_group_netlister(ws, session_name, test, m, netlist_base):
 def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
              on_status=None, dry_run=False, progress=None, group_netlister=None,
              group_status=None, cancel=None,
-             poll_interval=5.0, poll_timeout=10800.0, sleep=None):
+             poll_interval=5.0, max_parallel=1, poll_timeout=10800.0, sleep=None):
     """5) run ONE corner as a PER-GROUP SWEEP via the pure-CLI Donau+ALPS path (Component A).
 
     grps = run.groups(m). For each group g (i/N) we get the group's netlist dir from the
@@ -264,64 +265,125 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
     to prefix 'group i/N {g.tag}'. poll_interval/poll_timeout/sleep are forwarded into
     run_corner so tests drive the status loop with zero real sleeping.
 
+    max_parallel (default 1) caps how many GROUP jobs are in flight on Donau at once. With
+    max_parallel==1 the behavior is identical to the old strict-serial loop (submit one, poll
+    to done, submit the next). With >1 a single-threaded BOUNDED poll-scheduler launches up to
+    the cap, then poll_once's each in-flight job per tick (Donau runs the jobs in parallel; we
+    just stop blocking on one before submitting the next). NO Python threads -- step_run already
+    runs on the GUI's QThread.
+
     group_netlister(group) -> netlistdir is the seam: the DEFAULT (ade_group_netlist, bound by
     run_pmu_corner with the live ws/session/test) reuses the run_ade wiring to netlist each
     one-hot on the box; tests inject a fake that writes a stub input.scs per group.
 
     group_status(i, n, group, state) is an optional STRUCTURED per-group status callback (the
     GUI's per-group table feeds off it): 'pending' -> the Donau states ('pending'/'running'/
-    'done'/'failed' from run_corner's poll) -> 'done' once the PSF lands, or 'preview' on a
-    dry_run. cancel() -> bool is checked BETWEEN groups (a long ALPS job is NOT interrupted
-    mid-poll); when it returns True the sweep raises run.CancelledError so the GUI Cancel reports
-    cleanly rather than wedging the window."""
+    'done'/'failed') -> 'done' once the PSF lands, or 'preview' on a dry_run. cancel() -> bool
+    stops launching NEW groups; already-in-flight jobs are drained, then run.CancelledError is
+    raised so the GUI Cancel reports cleanly rather than wedging the window."""
+    import time
     cfg = donau or DonauCfg()
     grps = _run.groups(m)
     n = len(grps) or 1
     psf_root = pathlib.Path(psf_root)
     psf_map, dsub_cmds = {}, []
+    _sleep = sleep or time.sleep
 
-    for i, g in enumerate(grps):
-        if cancel and cancel():                        # cooperative cancel BETWEEN groups
-            raise _run.CancelledError(
-                f"cluster sweep cancelled before group {i+1}/{n} ({g['tag']})")
-        tag = g["tag"]
-        if group_status:
-            group_status(i, n, g, "pending")
-        group_netdir = group_netlister(g)             # the seam -> this group's netlist dir
-        group_psf = psf_root / tag
-
-        # the assembled command is ALWAYS available (run_corner dry_run never executes)
-        dsub_cmd = _runc.run_corner(
-            group_netdir, netinfo["pdk_model_dir"], netinfo["ahdllibdir"], str(group_psf),
-            engine=engine, donau=cfg, dry_run=True)
-        dsub_cmds.append(dsub_cmd)
-
-        def _status(state, raw, _i=i, _g=g, _tag=tag):
-            _progress(progress, "run", f"group {_i+1}/{n} {_tag}: Donau job {state.upper()}")
+    # ---- dry_run path: assemble each per-group dsub command, submit NOTHING (verbatim) -------
+    if dry_run:
+        for i, g in enumerate(grps):
+            tag = g["tag"]
             if group_status:
-                group_status(_i, n, _g, state)
-            if on_status:
-                on_status(state, raw)
-
-        if dry_run:
+                group_status(i, n, g, "pending")
+            group_netdir = group_netlister(g)         # the seam -> this group's netlist dir
+            dsub_cmd = _runc.run_corner(
+                group_netdir, netinfo["pdk_model_dir"], netinfo["ahdllibdir"],
+                str(psf_root / tag), engine=engine, donau=cfg, dry_run=True)
+            dsub_cmds.append(dsub_cmd)
             _progress(progress, "run",
                       f"DRY -- group {i+1}/{n} {tag}: assembled dsub command, not executing")
             if group_status:
                 group_status(i, n, g, "preview")
-            continue
+        return dict(psf_map=psf_map, dsub_cmds=dsub_cmds, ran=False)
 
-        _progress(progress, "run", f"group {i+1}/{n} {tag}: submitting")
-        out = _runc.run_corner(
-            group_netdir, netinfo["pdk_model_dir"], netinfo["ahdllibdir"], str(group_psf),
-            engine=engine, donau=cfg, on_status=_status, runner=runner, dry_run=False,
-            poll_interval=poll_interval, poll_timeout=poll_timeout, sleep=sleep)
-        _progress(progress, "run", f"group {i+1}/{n} {tag}: PSF landed: {out}")
-        if group_status:
-            group_status(i, n, g, "done")
-        for pt in g["members"]:                        # map EVERY member tag at this group PSF
-            psf_map[pt["tag"]] = str(out)
+    # ---- real path: a single-threaded BOUNDED poll-scheduler --------------------------------
+    pending = list(enumerate(grps))                    # FIFO of (i, g)
+    inflight = {}                                      # job_id -> ctx dict
+    cancelling = False
+    while pending or inflight:
+        # (1) launch up to the cap (unless cancelling)
+        while (not cancelling) and pending and len(inflight) < max(1, max_parallel):
+            if cancel and cancel():
+                cancelling = True
+                break
+            i, g = pending.pop(0)
+            tag = g["tag"]
+            if group_status:
+                group_status(i, n, g, "pending")       # emit BEFORE netlist/submit
+            netdir = group_netlister(g)                # the seam -> this group's netlist dir
+            sub = _runc.submit_corner(
+                netdir, netinfo["pdk_model_dir"], netinfo["ahdllibdir"],
+                str(psf_root / tag), engine=engine, donau=cfg, runner=runner)
+            dsub_cmds.append(sub["dsub_cmd"])          # one per launched group, in group order
+            _progress(progress, "run", f"group {i+1}/{n} {tag}: submitting")
+            inflight[sub["job_id"]] = dict(i=i, g=g, out_abs=sub["out_abs"],
+                                           require_simdone=sub["require_simdone"],
+                                           last=None, waited=0.0)
+        if not inflight:
+            break                                      # nothing in flight (cancel before any launch)
+        # (2) poll each in-flight job ONCE; report transitions; collect terminals
+        for job_id, ctx in list(inflight.items()):
+            state, raw = _donau.poll_once(job_id, runner)
+            if state is None:
+                state = ctx["last"]
+            if state is not None and state != ctx["last"]:
+                ctx["last"] = state
+                i, g, tag = ctx["i"], ctx["g"], ctx["g"]["tag"]
+                if on_status:
+                    on_status(state, raw)              # raw Donau stream: ALL transitions
+                # the row goes 'pending'/'running' live; the TERMINAL 'done'/'failed' status
+                # fires in the handlers below -- 'done' only AFTER finalize verifies the PSF, so
+                # the table never shows a group green that actually failed PSF verification (and
+                # never double-fires 'done').
+                if group_status and state not in ("done", "failed"):
+                    group_status(i, n, g, state)
+                _progress(progress, "run",
+                          f"group {i+1}/{n} {tag}: Donau job {state.upper()}")
+            if state == "failed":
+                if group_status:
+                    group_status(ctx["i"], n, ctx["g"], "failed")
+                tail = _donau.peek_tail(job_id, runner)
+                raise _runc.RunCornerError(
+                    f"group {ctx['g']['tag']} (job {job_id}) FAILED"
+                    + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
+            if state == "done":
+                out = _runc.finalize_corner(ctx["out_abs"],
+                                            require_simdone=ctx["require_simdone"],
+                                            job_id=job_id, runner=runner)
+                _progress(progress, "run",
+                          f"group {ctx['i']+1}/{n} {ctx['g']['tag']}: PSF landed: {out}")
+                for pt in ctx["g"]["members"]:         # map EVERY member tag at this group PSF
+                    psf_map[pt["tag"]] = str(out)
+                if group_status:
+                    group_status(ctx["i"], n, ctx["g"], "done")
+                del inflight[job_id]
+                continue
+            ctx["waited"] += poll_interval
+            if ctx["waited"] >= poll_timeout:
+                raise _runc.RunCornerError(
+                    f"job {job_id} (group {ctx['g']['tag']}) did not finish within "
+                    f"{poll_timeout:.0f}s. Check djob/dpeek; the cluster job may be hung.")
+        # (3) a cancel stops launching NEW groups; the in-flight ones above already drained
+        if cancel and cancel():
+            cancelling = True
+        # (4) pace the loop only while jobs are still in flight
+        if inflight:
+            _sleep(poll_interval)
 
-    return dict(psf_map=psf_map, dsub_cmds=dsub_cmds, ran=not dry_run)
+    if cancelling and pending:
+        raise _run.CancelledError(
+            f"cluster sweep cancelled ({len(pending)} group(s) not started)")
+    return dict(psf_map=psf_map, dsub_cmds=dsub_cmds, ran=True)
 
 
 def step_import(m, psf_map, *, npz_dir, npz_in=None, load=None, probe_aliases=None,
@@ -453,7 +515,7 @@ def run_pmu_corner(gui=None, work_root=None, corner=None, engine="alps",
                    donau=None, npz_in=None, fit_manifest=None, supply_pin=None,
                    ground=None, progress=None, group_netlister=None, manifest=None,
                    extract_test="insitu_extract", session_name="fnxSession0",
-                   poll_interval=5.0, poll_timeout=10800.0, sleep=None):
+                   poll_interval=5.0, max_parallel=1, poll_timeout=10800.0, sleep=None):
     """Run ONE process corner of in-situ PMU LDO modeling end-to-end (the 9-step flow).
 
     gui            the designer's GUI inputs (build_manifest schema: tb_lib/tb_cell/tb_view,
@@ -495,8 +557,11 @@ def run_pmu_corner(gui=None, work_root=None, corner=None, engine="alps",
                    handoff netlistdir for every group (so the dsub commands still assemble).
                    Tests inject a fake that writes a stub input.scs per group.
     extract_test   the ADE-XL extract test name the default group_netlister netlists per group.
-    poll_interval/poll_timeout/sleep  forwarded into each group's run_corner status loop (so
-                   tests drive pending->running->done with zero real sleeping).
+    poll_interval/poll_timeout/sleep  forwarded into the step-5 status loop (so tests drive
+                   pending->running->done with zero real sleeping).
+    max_parallel   cap on how many GROUP jobs run on Donau at once (default 1 = strict serial,
+                   identical to the old behavior); >1 launches up to the cap and polls them
+                   together (Donau runs them in parallel).
 
     Returns a result dict with ALL artifact paths (manifest, netlist used, psf root, npz, va,
     model cell) + the fit report + the BY-TAG psf_map + per-group dsub commands (dsub_cmd is
@@ -610,7 +675,7 @@ def run_pmu_corner(gui=None, work_root=None, corner=None, engine="alps",
         runres = step_run(netinfo, psf_root, m, engine=engine, donau=donau, runner=runner,
                           on_status=on_status, dry_run=dry_run, progress=progress,
                           group_netlister=gnl, poll_interval=poll_interval,
-                          poll_timeout=poll_timeout, sleep=sleep)
+                          max_parallel=max_parallel, poll_timeout=poll_timeout, sleep=sleep)
         res["dsub_cmds"] = runres["dsub_cmds"]
         res["dsub_cmd"] = runres["dsub_cmds"][0] if runres["dsub_cmds"] else None
         res["psf_map"] = runres["psf_map"]
