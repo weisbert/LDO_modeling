@@ -15,10 +15,19 @@ instead of in-process spectre runs):
     y      Y = -I(probe)                    (1 V AC on the sink pin)
     pi     dI/dVsup = -I(probe)/Vsup        (1 V AC on the supply, read sink probe)
 
+Coverage-gated kinds (STAGE 1b -- these read RAW points; the extraction of slope/slew
+lives model-side in stage 2, never here):
+    iv     I-V curve    = [Vsweep, I.real]  (DC sweep of the reused i_out vdc -> probe :p)
+    trans  slew wave    = [t, V.real]       (transient: time axis + the v_out node voltage)
+
 Output schema (SAME keys cadence/extract_pmu.py writes, validated against the trusted
 results/ref/pmu_standin.npz by the P4 gate):
     z_<o>_<load>, couple_<a>_<b>_<load>, noise_<o>_<load>,
     p_<o>_<s>_<load>, y_<c>_<load>, pi_<c>_<s>_<load>     (+ loads, meta_*)
+  coverage-gated (STAGE 1b, present only when the manifest declares the params):
+    iv_<c>_<load> = [Vsweep, I], dc_<o>_<load> = [Iload, Vout], tr_<o>_<label>_<load> = [t, V]
+  GUARDRAIL-3: check_zout_dc_consistency(ref, manifest) cross-checks Zout(s->0) vs the DC
+  load-reg slope (a cheap post-assemble sanity warning, never a hard gate).
 
 A "load" is a designer-defined OPAQUE corner label, pulled from the session (P3) or the
 manifest fallback -- never interpreted here.
@@ -35,7 +44,7 @@ import psf                       # cadence/psf.py (on sys.path via insitu/__init
 from . import manifest as _manifest
 
 
-_EXT = {"ac": ".ac", "noise": ".noise"}
+_EXT = {"ac": ".ac", "noise": ".noise", "dc": ".dc", "tran": ".tran"}
 
 
 # --------------------------------------------------------------------------- locate
@@ -84,11 +93,80 @@ def _read_current(d, probe, where, probe_alias):
                    f"save, not allpub). available: {[k for k in d if k.endswith(':p')]}")
 
 
+def _sweep_axis(d, where, swept=None, kinds=("dc", "sweep")):
+    """The swept independent variable of a DC sweep PSF (the I-V vdc voltage / dropout iload).
+
+    We emit the Spectre DC sweep as `dc dev=<src> param=dc ...` (netlist_augment._analysis_line),
+    so psf.read_psf names the sweep column "dc" and stamps d["_sweep"]="dc". This helper is
+    ROBUST to the box's PSF axis naming -- binary PSF / ALPS can name the swept-variable column by
+    the swept PARAMETER, by "dc"/"sweep", or by the source's own dc node -- so it tries, in order:
+    the explicit swept-param name (when the caller knows it), the d["_sweep"]-named column, then the
+    conventional keys, and as a last resort any non-probe-current numeric column. box-pending: the
+    EXACT swept-axis key the cluster's binpsf writes is confirmed on the box; the fallbacks below
+    keep the read working across the candidate names until then."""
+    cands = []
+    if swept:
+        cands.append(swept)
+    sw = d.get("_sweep")
+    if sw:
+        cands.append(sw)
+    cands += list(kinds) + ["_sweep"]
+    for k in cands:
+        if k and k != "_sweep" and k in d:
+            return np.asarray(d[k]).real
+    # last resort: the first plain (non-current, non-marker) column -- the source's own dc node
+    for k, v in d.items():
+        if k in ("_sweep", "freq", "time") or k.endswith(":p"):
+            continue
+        arr = np.asarray(v)
+        if arr.dtype.kind in "fi":                    # a real-valued swept node, not a complex sig
+            return arr.real
+    raise KeyError(f"{where}: no DC sweep axis in PSF "
+                   f"(tried {cands}). available: {[k for k in d if k != '_sweep']}")
+
+
+def _time_axis(d, where):
+    """The transient TIME axis. psf.read_psf names the tran sweep column "time" (Spectre) and
+    stamps d["_sweep"]="time"; a box binary PSF may surface it under that stamped name. We accept
+    ONLY a genuine time axis: the literal "time" column, or the _sweep-stamped column WHEN the stamp
+    itself denotes time. A foreign axis (e.g. an AC PSF's "freq" mis-routed to a tran read) must FAIL
+    LOUD here rather than be returned as a wrong silent array."""
+    if "time" in d:
+        return np.asarray(d["time"]).real
+    stamp = d.get("_sweep")
+    if stamp and "time" in str(stamp).lower() and stamp in d:
+        return np.asarray(d[stamp]).real
+    raise KeyError(f"{where}: no transient time axis in PSF (need a 'time' column or a time-stamped "
+                   f"_sweep; refusing a non-time axis). available: {[k for k in d if k != '_sweep']}")
+
+
 def _derive(point, d, probe_alias=None):
     """Apply one measurement point's derive rule to its parsed PSF dict -> npz array."""
-    f = _signal(d, "freq", point["tag"]).real
     kind = point["derive"]
     rd = point["reads"]
+    # coverage-gated DC/transient kinds have NO freq axis -- handle them before the AC freq read
+    if kind == "iv":                                  # i_out vdc I-V sweep: [Vsweep, I.real]
+        # the swept voltage (DC axis) vs the probe current into the sink. The probe key is the
+        # reads[0][1] sink probe; reuse _read_current (it resolves <probe>:p + the CLI alias).
+        # DC current is real (no AC phase) -> I.real is the physical current into the sink.
+        V = _sweep_axis(d, point["tag"])
+        I = _read_current(d, rd[0][1], point["tag"], probe_alias).real
+        return np.c_[V, I]
+    if kind == "dropout":                             # v_out load-isource DC sweep: [Iload, Vout]
+        # the swept LOAD current (DC axis) vs the output node voltage -> the load-regulation /
+        # dropout curve. The sibling of `iv` (sweep a reused source, read a real DC signal); here
+        # the swept variable is the load isource current and the read is the v_out node voltage.
+        # GUARDRAIL-3 (check_zout_dc_consistency) consumes this [Iload, Vout] array.
+        Iload = _sweep_axis(d, point["tag"])
+        V = _signal(d, rd[0][1], point["tag"]).real
+        return np.c_[Iload, V]
+    if kind == "trans":                               # transient slew waveform: [t, V.real]
+        # the RAW waveform only. The slew-rate / LTI-subtracted-residual EXTRACTION is the model
+        # side (stage 2), NOT here -- importmp's job is the firewall, not the fit.
+        t = _time_axis(d, point["tag"])
+        V = _signal(d, rd[0][1], point["tag"]).real
+        return np.c_[t, V]
+    f = _signal(d, "freq", point["tag"]).real
     if kind in ("z", "couple"):                       # V at the read net (1 A injected)
         V = _signal(d, rd[0][1], point["tag"])
         return np.c_[f, V.real, V.imag]
@@ -216,6 +294,63 @@ def current_ports(ref, manifest):
               if f"pi_{c}_{s}_{il}" in ref}
         res[c] = {"loads": loads, "y": y, "pi": pi}
     return res
+
+
+# --------------------------------------------------------------- GUARDRAIL-3 cross-check
+def check_zout_dc_consistency(ref, manifest, tol=0.25):
+    """GUARDRAIL-3 (HANDOFF_MODELING_COVERAGE §5.3): Zout(s->0) <-> DC load-reg consistency.
+
+    A CHEAP cross-derive sanity check the orchestration calls AFTER assemble. For each v_out o
+    that carries BOTH an AC Zout array (z_<o>_<load>) AND a DC dropout array (dc_<o>...), it
+    compares the AC small-signal output resistance at s->0 against the LOCAL DC load-regulation
+    slope dVout/dIload measured straight off the dropout curve. A fabricated / mis-scaled DC
+    curve shows up immediately as a large mismatch (HANDOFF: "catches a fabricated/mis-scaled DC
+    curve immediately").
+
+    Returns a list[str] of human-readable WARNINGS (it never raises -- a guardrail informs, it
+    does not gate). Returns [] when either array is absent for an output (nothing to check).
+
+      Zout(0)  = |z| at the LOWEST-frequency row of z_<o>_<load>  (sqrt(re^2+im^2); col1=re,col2=im).
+      dVout/dIload = robust least-squares slope of Vout vs Iload over the dropout sweep
+                     (dropout array is [Iload, Vout] from the 'dropout' derive).
+    We compare MAGNITUDES: a real LDO droops under load so dVout/dIload is NEGATIVE, while Zout(0) is
+    an impedance magnitude (>=0); the physical output resistance is |dVout/dIload|, and consistency
+    means |Zout(0)| ~= |dVout/dIload|. A relative mismatch
+    |zdc - |slope|| / max(|slope|, eps) > tol -> one warning naming o + numbers.
+
+    Pure (no I/O); operates on the assembled multi-port `ref` dict + the loaded `manifest`."""
+    m = manifest
+    eps = 1e-30
+    warns = []
+    for o in m["v_out"]:
+        # the AC Zout: any load corner present (z_<o>_<load>); take the first found.
+        zkey = next((k for k in ref if k.startswith(f"z_{o}_")), None)
+        # the DC dropout curve: any key starting "dc_<o>" (dc_<o>, dc_<o>_<load>, ...).
+        dkey = next((k for k in ref if k.startswith(f"dc_{o}")), None)
+        if zkey is None or dkey is None:
+            continue                                      # one side absent -> nothing to check
+        z = np.asarray(ref[zkey])
+        drop = np.asarray(ref[dkey])
+        if z.ndim != 2 or z.shape[0] < 1 or z.shape[1] < 3 or drop.ndim != 2 or drop.shape[0] < 2:
+            continue                                      # malformed -> skip (be defensive, no raise)
+        # Zout at s->0 = |z| at the lowest-frequency row (z is [f, re, im]; rows may be ascending
+        # OR not, so pick the min-frequency row rather than assume row 0).
+        i0 = int(np.argmin(z[:, 0].real))
+        zdc = float(np.hypot(z[i0, 1].real, z[i0, 2].real))
+        # local DC load-reg slope dVout/dIload: a least-squares line over the (Iload, Vout) sweep.
+        Iload = drop[:, 0].real.astype(float)
+        Vout = drop[:, 1].real.astype(float)
+        if np.ptp(Iload) <= eps:
+            continue                                      # degenerate axis -> can't slope it
+        slope = float(np.polyfit(Iload, Vout, 1)[0])      # dVout/dIload (signed; <0 for a real LDO)
+        rout = abs(slope)                                 # the DC output resistance magnitude (V/A)
+        rel = abs(zdc - rout) / max(rout, eps)            # compare MAGNITUDES (see docstring)
+        if rel > tol:
+            warns.append(
+                f"GUARDRAIL-3: v_out '{o}' Zout(s->0)={zdc:.4g} ohm disagrees with DC "
+                f"load-reg |dVout/dIload|={rout:.4g} ohm (signed slope {slope:.4g}; rel mismatch "
+                f"{rel:.2f} > tol {tol:.2f}) -- check the dropout DC curve (fabricated / mis-scaled?).")
+    return warns
 
 
 def load_multiport(path):

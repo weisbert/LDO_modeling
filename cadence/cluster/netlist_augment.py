@@ -71,6 +71,9 @@ ANALYSIS_KEYWORDS = frozenset({
 # A stable analysis name for the emitted ac / noise statement (one per group netlist).
 AC_NAME = "acz"
 NOISE_NAME = "nz"
+# Stable analysis names for the coverage DC sweep (I-V / dropout) and transient (slew) groups.
+DC_NAME = "dcz"
+TRAN_NAME = "trz"
 
 
 class NetlistAugmentError(RuntimeError):
@@ -347,6 +350,76 @@ def _modify_mag(base_text, src_name, mag_expr):
 _modify_supply_mag = _modify_mag
 
 
+def _set_dc_on_line(line, value):
+    """Rewrite an instance line to carry dc=<value:g>: replace an existing `dc=...` token, else
+    append one. Mirrors _set_mag_on_line EXACTLY (trailing-comment + indent preserving)."""
+    body, sep, comment = line.partition("//")
+    toks = body.split()
+    expr = f"{float(value):g}"
+    replaced = False
+    for i, t in enumerate(toks):
+        if t.startswith("dc="):
+            toks[i] = f"dc={expr}"
+            replaced = True
+            break
+    if not replaced:
+        toks.append(f"dc={expr}")
+    indent = line[:len(line) - len(line.lstrip())]
+    out = indent + " ".join(toks)
+    if sep:
+        out = out + " " + sep + comment
+    return out
+
+
+def _modify_dc(base_text, src_name, value):
+    """Find ANY source instance by NAME (name-based + type-agnostic, mirrors _modify_mag) and set
+    its dc=<value:g> in place. Returns (new_text, found). The first node-list instance whose name
+    == src_name wins; a multi-line statement is collapsed to ONE clean line carrying the dc, so
+    `dc=` never lands mid-statement after a dangling backslash. Used to set a rail's load per
+    sweep point (op_loads)."""
+    out, found = [], False
+    for logical, phys in _logical_lines(base_text):
+        toks = _statement_tokens(logical)
+        if not found and len(toks) >= 2 and toks[0] == src_name and toks[1].startswith("("):
+            out.append(_set_dc_on_line(logical, value))
+            found = True
+        else:
+            out.extend(phys)                              # unmodified -> verbatim physical lines
+    return "\n".join(out), found
+
+
+def _set_pwl_on_line(line, wave_tokens):
+    """Rewrite an instance line into a PWL source: DROP its dc=.. and mag=.. tokens and append
+    'type=pwl wave=[<wave_tokens>]', keeping the name + node list + master + any other params.
+    Mirrors _set_mag_on_line's trailing-comment + indent handling."""
+    body, sep, comment = line.partition("//")
+    toks = [t for t in body.split() if not (t.startswith("dc=") or t.startswith("mag="))]
+    toks.append("type=pwl")
+    toks.append(f"wave=[{wave_tokens}]")
+    indent = line[:len(line) - len(line.lstrip())]
+    out = indent + " ".join(toks)
+    if sep:
+        out = out + " " + sep + comment
+    return out
+
+
+def _modify_to_pwl(base_text, src_name, wave_tokens):
+    """Find ANY source instance by NAME (name-based, mirrors _modify_mag) and replace its dc=.. and
+    mag=.. tokens with 'type=pwl wave=[<wave_tokens>]' in place (the node list + master kept).
+    Returns (new_text, found). The first node-list instance whose name == src_name wins; a
+    multi-line statement is collapsed to ONE clean line. Used to drive the transient stepped
+    source (the reused v_out load isource)."""
+    out, found = [], False
+    for logical, phys in _logical_lines(base_text):
+        toks = _statement_tokens(logical)
+        if not found and len(toks) >= 2 and toks[0] == src_name and toks[1].startswith("("):
+            out.append(_set_pwl_on_line(logical, wave_tokens))
+            found = True
+        else:
+            out.extend(phys)                              # unmodified -> verbatim physical lines
+    return "\n".join(out), found
+
+
 # --------------------------------------------------------------------- acm parameters
 def _all_acm_vars(m):
     """Every acm_* design variable the manifest can drive, default 0 (mirrors
@@ -363,10 +436,21 @@ def _all_acm_vars(m):
 
 
 def _params_line(m, group):
-    """The one-hot `parameters` line: EVERY acm var default 0, THIS group's hot vars = 1."""
+    """The `parameters` line: EVERY acm var default 0, THIS group's hot vars set.
+
+    Plain ac/noise -> the one-hot (this group's hot vars = 1). An "ac" group carrying g['amp']
+    (the 2x lin-gate self-check) sets its hot var to that amp value (e.g. 2.0) instead of 1. A
+    "dc"/"tran" group has NO AC stimulus -> EVERY acm var is 0 (the swept/PWL source carries the
+    stimulus); the var declarations stay present so the reused-source mag= references resolve."""
     from insitu import manifest as _manifest          # function-local: avoid circular import
-    hot = {_manifest.acm_var(k, v) for k, v in group["hot"]}
-    pairs = [f"{var}={'1' if var in hot else '0'}" for var in _all_acm_vars(m)]
+    analysis = group["analysis"]
+    if analysis in ("dc", "tran"):
+        hotval = {}                                  # no AC stimulus -> every acm at 0
+    else:
+        amp = group.get("amp")
+        val = f"{float(amp):g}" if amp else "1"      # ac-with-amp -> the amp; else the one-hot 1
+        hotval = {_manifest.acm_var(k, v): val for k, v in group["hot"]}
+    pairs = [f"{var}={hotval.get(var, '0')}" for var in _all_acm_vars(m)]
     return "parameters " + " ".join(pairs)
 
 
@@ -404,13 +488,39 @@ def _noise_owner(m, group):
     return None
 
 
-def _analysis_line(m, group):
+def _sweep_clause(sweep):
+    """The Spectre DC-sweep clause for a coverage sweep dict: 'start=<a> stop=<b> lin=<n>' for a
+    lin sweep, 'start=<a> stop=<b> log=<n>' for a log sweep (n = points). Mirrors _expand_sweep's
+    type/start/stop/n contract so the offline sweep matches the manifest's intended grid."""
+    a = float(sweep["start"]); b = float(sweep["stop"]); n = int(sweep.get("n", 0) or 0)
+    kw = "log" if sweep.get("type") == "log" else "lin"
+    return f"start={a:g} stop={b:g} {kw}={n}"
+
+
+def _analysis_line(m, group, hot_src=None):
     """The group's analysis statement, with the PER-OBJECT analysis override applied (keyed by
     the group OWNER), falling back to the global m['analysis']. ac group -> '<AC_NAME> <ac>';
     noise group -> '<NOISE_NAME> (<oprobe> <ground>) <noise>' (the output port Spectre emits the
-    'out' signal for -- importmp's noise read needs it)."""
+    'out' signal for -- importmp's noise read needs it).
+
+    Coverage kinds:
+      dc  (iv / dropout) -> '<DC_NAME> dc dev=<hot_src> param=dc <sweep>' (sweep the reused source
+          of the group's single hot stimulus over g['sweep']; hot_src is its instance name).
+      tran(slew)         -> '<TRAN_NAME> tran stop=<tstop:g>' (+ ' step=<tstep:g>' when set); the
+          stepped source itself is rewritten to a PWL in the netlist text (not here)."""
     from insitu import manifest as _manifest          # function-local: avoid circular import
-    if group["analysis"] == "noise":
+    analysis = group["analysis"]
+    if analysis == "dc":
+        sweep = group["sweep"]
+        return f"{DC_NAME} dc dev={hot_src} param=dc {_sweep_clause(sweep)}"
+    if analysis == "tran":
+        e = group.get("edge") or 1e-9
+        stop = group.get("tstop") or (e * 1000)
+        line = f"{TRAN_NAME} tran stop={float(stop):g}"
+        if group.get("tstep"):
+            line += f" step={float(group['tstep']):g}"
+        return line
+    if analysis == "noise":
         ground = m["ground"]
         o = _noise_owner(m, group)
         noise = _manifest.analysis_line_for(m, "v_out", o, "noise") if o else m["analysis"]["noise"]
@@ -421,21 +531,46 @@ def _analysis_line(m, group):
     return f"{AC_NAME} {ac}"
 
 
+# The Spectre options statement we emit to run the whole netlist at a coverage temperature.
+# box-pending: the EXACT options keyword ('temp' is the Spectre option for the analog temp) is
+# validated on the box; the name + line are stable so orchestration can wire it now.
+COVTEMP_NAME = "_covtemp"
+
+
+def _group_hot_role_key(group):
+    """The (role, key) of a group's single hot stimulus, role-mapped to the manifest role name
+    ('supply'->'supplies', else the kind 1:1). None for a group with no hot stimulus."""
+    if not group["hot"]:
+        return None
+    kind, key = group["hot"][0]
+    role = "supplies" if kind == "supply" else kind
+    return role, key
+
+
 # --------------------------------------------------------------------------- the factory
-def make_offline_group_netlister(base_input_scs, m, out_base):
+def make_offline_group_netlister(base_input_scs, m, out_base, op_loads=None, temp=None):
     """Build the OFFLINE group_netlister: callable(group) -> netlistdir.
 
     Reads the base maestro `input.scs` ONCE (the designer's .tran TB) and, per group g,
     writes out_base/<g['tag']>/input.scs that strips the base analysis and appends g's
-    one-hot ac/noise extraction (stimuli + targeted saves). The returned callable plugs
-    straight into insitu.pmu_corner.step_run's group_netlister seam.
+    extraction (one-hot ac/noise; or a DC sweep / transient PWL for the coverage kinds) plus
+    targeted saves. The returned callable plugs straight into insitu.pmu_corner.step_run's
+    group_netlister seam.
 
     base_input_scs   path to the base input.scs (a dir holding it, or the file itself).
     m                the loaded manifest dict (the single source of truth). B+ net resolution
                      runs here against the base netlist: a '<net:PIN>' where PIN is a real base
                      net resolves silently to PIN (mutated in place); net!=pin hard-stops.
     out_base         dir under which each group's <tag>/input.scs is written.
+    op_loads         optional {v_out_key: dc_float}: AFTER the reuse-mag pass, rewrite each named
+                     v_out's REUSED load isource's dc= to the given float (orchestration sets each
+                     rail's load per sweep point). None (default) -> identical to today (the OP dc
+                     the base carries). Keys not naming a reused v_out are ignored.
+    temp             optional float: when set, the appended block emits a Spectre options
+                     statement running the WHOLE netlist at <temp> (box-pending keyword). None
+                     (default) -> no temp line.
     """
+    op_loads = op_loads or {}
     base_path = pathlib.Path(base_input_scs)
     if base_path.is_dir():
         base_path = base_path / "input.scs"
@@ -464,44 +599,107 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
             if role == "i_out" and src and not fallback:
                 v["probe_src"] = src
 
+    def _apply_op_loads(text):
+        """Rewrite each named v_out's REUSED load isource dc= to op_loads[key] (the orchestration
+        per-point rail load). Only v_out roles with a reused (non-fallback) source are touched;
+        keys not naming such a v_out are ignored. A no-op when op_loads is empty."""
+        for key, dc in op_loads.items():
+            v = m.get("v_out", {}).get(key)
+            if not v:
+                continue                                # not a v_out role -> ignore
+            src, fallback = role_srcs.get(("v_out", key), (None, True))
+            if not src or fallback:
+                continue                                # open pin (no reused isource) -> ignore
+            text, _found = _modify_dc(text, src, dc)
+        return text
+
+    def _hot_src(group):
+        """The reused source instance name of a coverage group's single hot stimulus (the swept
+        DC source / the stepped transient source). Raises if the hot pin is open (no source to
+        sweep/step -- a coverage point needs a real source on its rail)."""
+        rk = _group_hot_role_key(group)
+        if rk is None:
+            raise NetlistAugmentError(
+                f"coverage group {group['tag']} ({group['analysis']}) has no hot stimulus to "
+                f"sweep/step.")
+        src, fallback = role_srcs.get(rk, (None, True))
+        if not src or fallback:
+            raise NetlistAugmentError(
+                f"coverage group {group['tag']} ({group['analysis']}) hot {rk} has no reused "
+                f"source on its net (open pin). Name/place a source on {rk[0]}.{rk[1]} to "
+                f"sweep/step it.")
+        return src
+
     def _netlister(group):
         from insitu import manifest as _manifest      # function-local: avoid circular import
         ground = m["ground"]
+        analysis = group["analysis"]
         # 1) start from the base, strip its .tran TB analysis (commented, visibly marked)
         text, n_stripped = _strip_analyses(base_text)
-        # 2) REUSE every existing role source: set its mag=acm in place. supplies always reuse
-        #    (a missing supply source already errored at factory build); v_out/i_out reuse when a
-        #    source was found, else fall back to inserting Iext/Vprobe (the OPEN-pin path).
         inserts = []                                   # (role, key) that fall back to insert
-        for role in ("supplies", "v_out", "i_out"):
-            kind = "supply" if role == "supplies" else role
-            for key, v in m[role].items():
-                acm = _manifest.acm_var(kind, key)
-                src, fallback = role_srcs[(role, key)]
-                if fallback:
-                    inserts.append((role, key))
-                    continue
-                text, found = _modify_mag(text, src, acm)
-                if not found:                          # pre-resolve named it but it vanished
-                    raise NetlistAugmentError(
-                        f"{role}.{key} source '{src}' is not an instance in the base netlist "
-                        f"-- named/auto-detect picked a source that does not exist. Check "
-                        f"{role}.{key}.{_SRC_FIELD[role]} against the base input.scs.")
+        hot_src = None                                 # the dc-swept source name (dc groups only)
 
-        # 3) build the appended one-hot extraction block
+        if analysis in ("ac", "noise"):
+            # 2a) REUSE every existing role source: set its mag=acm in place. supplies always
+            #     reuse (a missing supply source already errored at factory build); v_out/i_out
+            #     reuse when a source was found, else fall back to inserting Iext/Vprobe (open pin).
+            for role in ("supplies", "v_out", "i_out"):
+                kind = "supply" if role == "supplies" else role
+                for key, v in m[role].items():
+                    acm = _manifest.acm_var(kind, key)
+                    src, fallback = role_srcs[(role, key)]
+                    if fallback:
+                        inserts.append((role, key))
+                        continue
+                    text, found = _modify_mag(text, src, acm)
+                    if not found:                      # pre-resolve named it but it vanished
+                        raise NetlistAugmentError(
+                            f"{role}.{key} source '{src}' is not an instance in the base netlist "
+                            f"-- named/auto-detect picked a source that does not exist. Check "
+                            f"{role}.{key}.{_SRC_FIELD[role]} against the base input.scs.")
+            text = _apply_op_loads(text)               # per-point rail loads (op_loads)
+        elif analysis == "dc":
+            # 2b) DC sweep (iv / dropout): do NOT one-hot mag -- every source keeps its OP dc.
+            #     The group's single hot stimulus is SWEPT by the dc analysis (dev=<hot_src>).
+            #     op_loads still set the non-swept rails' loads (the swept rail's dc is overridden
+            #     by the sweep regardless).
+            hot_src = _hot_src(group)
+            text = _apply_op_loads(text)
+        elif analysis == "tran":
+            # 2c) transient slew: rewrite the group's stepped source (the reused v_out load
+            #     isource) to a PWL stepping from->to; every other source keeps its OP dc.
+            step = group["step"]
+            f, t = float(step["from"]), float(step["to"])
+            e = group.get("edge") or 1e-9
+            stop = group.get("tstop") or (e * 1000)
+            t0 = stop * 0.1
+            t1 = t0 + e
+            wave = f"0 {f:g} {t0:g} {f:g} {t1:g} {t:g} {stop:g} {t:g}"
+            text = _apply_op_loads(text)               # other rails' loads (the stepped one PWL'd)
+            stepped = _hot_src(group)
+            text, found = _modify_to_pwl(text, stepped, wave)
+            if not found:
+                raise NetlistAugmentError(
+                    f"tran group {group['tag']}: stepped source '{stepped}' is not an instance "
+                    f"in the base netlist.")
+        else:
+            raise NetlistAugmentError(
+                f"group {group['tag']}: unknown analysis '{analysis}'.")
+
+        # 3) build the appended extraction block
         lines = [
             "",
             "// ============================================================",
             f"// [offline-netlister] group {group['tag']} -- "
-            f"{group['analysis']} one-hot {group['hot']} "
+            f"{analysis} one-hot {group['hot']} "
             f"({n_stripped} base analysis stmt(s) stripped above)",
             "// ============================================================",
             "simulator lang=spectre",          # guard a trailing spice-lang section
             _params_line(m, group),
         ]
-        # FALLBACK-INSERT (open pin only): the old Iext/Vprobe strings -- the ONLY place they
-        # survive. v_out isource PLUS=ground MINUS=net (+1A into the out net, mirrors augment);
-        # i_out probe vsource PLUS=net MINUS=ground dc=<compliance>; read <probe>:p.
+        # FALLBACK-INSERT (open pin only, ac/noise path): the old Iext/Vprobe strings -- the ONLY
+        # place they survive. v_out isource PLUS=ground MINUS=net (+1A into the out net, mirrors
+        # augment); i_out probe vsource PLUS=net MINUS=ground dc=<compliance>; read <probe>:p.
         for role, key in inserts:
             v = m[role][key]
             if role == "v_out":
@@ -514,8 +712,12 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
                              f"dc={float(v['dc']):g} mag={acm}")
             print(f"[netlist_augment] fallback-insert {role}.{key} "
                   f"(open pin on net '{v['net']}' -- no TB source to reuse)")
-        # the group's analysis (ac, or noise with its output port) + the targeted save union
-        lines.append(_analysis_line(m, group))
+        # box-pending: run the whole netlist at the coverage temperature (one options line)
+        if temp is not None:
+            lines.append(f"{COVTEMP_NAME} options temp={float(temp):g}   "
+                         f"// box-pending: validate the exact Spectre temp options keyword")
+        # the group's analysis (ac/noise; or the dc sweep / tran) + the targeted save union
+        lines.append(_analysis_line(m, group, hot_src=hot_src))
         lines.append(_save_line(m, group))
         lines.append("")
 
@@ -523,7 +725,7 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
         netdir.mkdir(parents=True, exist_ok=True)
         (netdir / "input.scs").write_text(text + "\n" + "\n".join(lines))
         print(f"[netlist_augment] {group['tag']}: stripped {n_stripped} base analysis "
-              f"stmt(s), wrote one-hot {group['analysis']} netlist -> {netdir/'input.scs'}")
+              f"stmt(s), wrote {analysis} netlist -> {netdir/'input.scs'}")
         return str(netdir)
 
     return _netlister

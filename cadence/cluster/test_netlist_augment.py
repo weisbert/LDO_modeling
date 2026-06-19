@@ -38,6 +38,23 @@ def _resolved_manifest():
     return M.load(_write_tmp(d))
 
 
+def _resolved_coverage_manifest():
+    """A RESOLVED wur manifest with COVERAGE params injected so the new dc/tran/ac2 groups appear:
+    an iv sweep on the i500n_lpf sink, a dropout sweep on the pll v_out, a transient step on pll,
+    and the 2x lin-gate self-check. A coverage-free manifest (above) makes NONE of these."""
+    raw = re.sub(r"<net:([^>]+)>", r"\1", WUR.read_text())
+    d = json.loads(raw)
+    d["coverage"] = {
+        "tier": "T4",
+        "iv": {"i500n_lpf": {"sweep": {"type": "lin", "start": 0.0, "stop": 1.0, "n": 11}}},
+        "dropout": {"pll": {"sweep": {"type": "log", "start": 1e-4, "stop": 3e-3, "n": 8}}},
+        "transient": {"pll": {"steps": [{"from": 5e-4, "to": 2e-3, "label": "step1"}],
+                              "edge": 1e-9, "tstop": 1e-5, "tstep": 1e-9}},
+        "lin_gate": True,
+    }
+    return M.load(_write_tmp(d))
+
+
 _TMP = []
 
 
@@ -607,6 +624,168 @@ def test_missing_base_netlist_errors(tmp_path):
     m = _resolved_manifest()
     with pytest.raises(NA.NetlistAugmentError):
         NA.make_offline_group_netlister(tmp_path / "nope", m, tmp_path / "out")
+
+
+# =====================================================================================
+# (7) STAGE 1b coverage kinds: dc (iv / dropout), tran (slew), ac2 (lin-gate) + op_loads/temp
+# =====================================================================================
+def test_dc_iv_group_emits_dc_sweep_no_mag_onehot(tmp_path):
+    # an I-V group sweeps the REUSED vdc (Vbias_500n_lpf) by a Spectre DC sweep, reads its :p,
+    # and does NOT one-hot mag (every acm var stays 0; the swept source carries no mag=)
+    m = _resolved_coverage_manifest()
+    txt = _netlist_text(tmp_path, m, "g_iv_i500n_lpf")
+    dcl = next(l for l in txt.splitlines() if l.startswith(NA.DC_NAME + " "))
+    assert dcl == f"{NA.DC_NAME} dc dev=Vbias_500n_lpf param=dc start=0 stop=1 lin=11"
+    # the swept i_out save reads the reused vdc :p
+    sline = next(l for l in txt.splitlines() if l.startswith("save "))
+    assert "Vbias_500n_lpf:p" in set(sline.split()[1:])
+    # no mag one-hot anywhere: every acm var is 0 and no source carries mag=
+    pline = next(l for l in txt.splitlines() if l.startswith("parameters "))
+    assert "=1" not in pline and "=2" not in pline
+    assert "mag=" not in txt
+
+
+def test_dc_dropout_group_emits_dc_sweep_on_load_isource(tmp_path):
+    # a dropout/load-reg group sweeps the REUSED v_out load isource (Iload_pll) and reads Vout
+    m = _resolved_coverage_manifest()
+    txt = _netlist_text(tmp_path, m, "g_dc_pll")
+    dcl = next(l for l in txt.splitlines() if l.startswith(NA.DC_NAME + " "))
+    assert dcl.startswith(f"{NA.DC_NAME} dc dev=Iload_pll param=dc start=")
+    assert "log=8" in dcl                              # the log sweep type -> log=<n>
+    sline = next(l for l in txt.splitlines() if l.startswith("save "))
+    assert m["v_out"]["pll"]["net"] in set(sline.split()[1:])
+    assert "mag=" not in txt                           # dc sweep -> never one-hot mag
+
+
+def test_tran_group_rewrites_stepped_source_to_pwl(tmp_path):
+    # a slew/transient group rewrites the reused v_out load isource (Iload_pll) to a PWL stepping
+    # from->to, emits a tran analysis, reads Vout, and leaves NO stray dc=/mag= on the source line
+    m = _resolved_coverage_manifest()
+    txt = _netlist_text(tmp_path, m, "g_tr_pll_step1")
+    trl = next(l for l in txt.splitlines() if l.startswith(NA.TRAN_NAME + " "))
+    assert trl == f"{NA.TRAN_NAME} tran stop=1e-05 step=1e-09"
+    iload = next(l for l in txt.splitlines() if l.strip().startswith("Iload_pll "))
+    assert "type=pwl" in iload and "wave=[" in iload
+    assert "0.0005" in iload and "0.002" in iload       # the from + to values appear in the wave
+    assert "dc=" not in iload and "mag=" not in iload   # the dc/mag tokens are dropped
+    assert "\\" not in iload                             # collapsed: no dangling backslash
+    sline = next(l for l in txt.splitlines() if l.startswith("save "))
+    assert m["v_out"]["pll"]["net"] in set(sline.split()[1:])
+
+
+def test_tran_group_pwl_backslash_continuation_safe(tmp_path):
+    # the stepped-source rewrite is logical-line aware: a backslash-continued Iload_pll is joined
+    # to ONE clean PWL line (no half-rewrite below a dangling backslash)
+    m = _resolved_coverage_manifest()
+    base = _base_scs().replace(
+        "Iload_pll (VDD0P8_PLL 0) isource dc=500u",
+        "Iload_pll (VDD0P8_PLL 0) isource dc=500u \\\n    type=idc")
+    txt = _netlist_text(tmp_path, m, "g_tr_pll_step1", base_text=base)
+    iload = next(l for l in txt.splitlines() if l.strip().startswith("Iload_pll "))
+    assert "type=pwl" in iload and "wave=[" in iload and "\\" not in iload
+    assert "type=idc" in iload                           # the continued token survives, joined
+    assert "dc=" not in iload                            # the dc token dropped on the joined line
+    assert not any(l.strip() == "type=idc" for l in txt.splitlines())   # never orphaned/live
+
+
+def test_ac2_lin_gate_group_sets_hot_var_to_amp(tmp_path):
+    # the 2x lin-gate group is a normal reuse-mag ac group, but its ONE hot var = the amp (2),
+    # not 1 -- and it reads the Zout node voltage (the v_out net) like the 1x Zout point
+    m = _resolved_coverage_manifest()
+    txt = _netlist_text(tmp_path, m, "g_z2_pll")
+    pline = next(l for l in txt.splitlines() if l.startswith("parameters "))
+    assert "acm_v_out_pll=2" in pline                    # hot var = the amp, not 1
+    assert pline.count("=2") == 1                         # exactly one hot at the amp
+    for var in ("acm_v_out_vco", "acm_supply_avdd1p0", "acm_i_out_i500n_lpf"):
+        assert f"{var}=0" in pline
+    # the reused load isource still carries its mag (this IS a reuse-mag ac group)
+    iload = next(l for l in txt.splitlines() if l.strip().startswith("Iload_pll "))
+    assert "mag=acm_v_out_pll" in iload
+    # z read: the v_out net is saved + the ac analysis is emitted (not dc/tran)
+    sline = next(l for l in txt.splitlines() if l.startswith("save "))
+    assert m["v_out"]["pll"]["net"] in set(sline.split()[1:])
+    assert f"{NA.AC_NAME} {m['analysis']['ac']}" in txt
+
+
+def test_op_loads_rewrites_reused_load_dc(tmp_path):
+    # op_loads={pll:1.7e-3} rewrites the REUSED Iload_pll dc= to 1.7m (:g -> 0.0017); the default
+    # path (op_loads=None) leaves the base dc=500u verbatim
+    m = _resolved_coverage_manifest()
+    a = tmp_path / "a"; a.mkdir()
+    gnl = NA.make_offline_group_netlister(_base_dir(a), m, a / "out", op_loads={"pll": 1.7e-3})
+    txt = pathlib.Path(gnl(_group(m, "g_v_out_vco")), "input.scs").read_text()
+    iload = next(l for l in txt.splitlines() if l.strip().startswith("Iload_pll "))
+    assert "dc=0.0017" in iload and "dc=500u" not in iload
+    # default path: no op_loads -> the base dc=500u survives verbatim
+    b = tmp_path / "b"; b.mkdir()
+    txt0 = _netlist_text(b, m, "g_v_out_vco")
+    iload0 = next(l for l in txt0.splitlines() if l.strip().startswith("Iload_pll "))
+    assert "dc=500u" in iload0
+
+
+def test_op_loads_overrides_swept_rail_but_sweep_wins(tmp_path):
+    # for a dc dropout group, op_loads still applies (other rails take their op dc); the swept
+    # rail's load is set by op_loads in the source line, but the DC sweep over it is what runs
+    m = _resolved_coverage_manifest()
+    out = tmp_path / "out"
+    gnl = NA.make_offline_group_netlister(_base_dir(tmp_path), m, out, op_loads={"vco": 3e-3})
+    txt = pathlib.Path(gnl(_group(m, "g_dc_pll")), "input.scs").read_text()
+    # the non-swept rail (vco) takes the op_loads dc
+    ivco = next(l for l in txt.splitlines() if l.strip().startswith("Iload_vco "))
+    assert "dc=0.003" in ivco
+    # the swept rail still has its dc analysis (the sweep drives it regardless)
+    assert any(l.startswith(f"{NA.DC_NAME} dc dev=Iload_pll ") for l in txt.splitlines())
+
+
+def test_temp_emits_options_line_when_set(tmp_path):
+    # temp=125 -> a '_covtemp options temp=125' line; temp=None -> absent
+    m = _resolved_coverage_manifest()
+    a = tmp_path / "a"; a.mkdir()
+    gnl = NA.make_offline_group_netlister(_base_dir(a), m, a / "out", temp=125)
+    txt = pathlib.Path(gnl(_group(m, "g_v_out_pll")), "input.scs").read_text()
+    tline = next(l for l in txt.splitlines() if l.strip().startswith(NA.COVTEMP_NAME + " "))
+    assert tline.split("//")[0].split() == [NA.COVTEMP_NAME, "options", "temp=125"]
+    # temp=None (default) -> no covtemp line at all
+    b = tmp_path / "b"; b.mkdir()
+    txt0 = _netlist_text(b, m, "g_v_out_pll")
+    assert NA.COVTEMP_NAME not in txt0
+
+
+def test_temp_applies_to_coverage_and_ac_groups_alike(tmp_path):
+    # the temp options line is emitted on a dc group too (it runs the WHOLE netlist hot)
+    m = _resolved_coverage_manifest()
+    out = tmp_path / "out"
+    gnl = NA.make_offline_group_netlister(_base_dir(tmp_path), m, out, temp=-40)
+    txt = pathlib.Path(gnl(_group(m, "g_iv_i500n_lpf")), "input.scs").read_text()
+    assert any(l.strip().startswith(f"{NA.COVTEMP_NAME} options temp=-40")
+               for l in txt.splitlines())
+
+
+# =====================================================================================
+# (8) BACKWARD-COMPAT: a coverage-free manifest yields the IDENTICAL 8 groups + text
+# =====================================================================================
+def test_coverage_free_manifest_yields_same_eight_groups(tmp_path):
+    # the resolved wur (no coverage params) still produces exactly the 8 T0 groups -- the new
+    # dc/tran/ac2 group kinds NEVER appear without declared coverage params
+    m = _resolved_manifest()
+    tags = sorted(g["tag"] for g in RUN.groups(m))
+    assert len(tags) == 8
+    assert not any(t.startswith(("g_iv_", "g_dc_", "g_tr_", "g_z2_")) for t in tags)
+
+
+def test_coverage_free_text_unchanged_by_new_kwargs_defaults(tmp_path):
+    # with the new kwargs at their defaults (op_loads=None, temp=None) every T0 group's emitted
+    # text is byte-identical to the no-kwargs call -- the new paths fire ONLY for the new kinds
+    m = _resolved_manifest()
+    for i, tag in enumerate(g["tag"] for g in RUN.groups(m)):
+        ad = tmp_path / f"a{i}"; ad.mkdir()
+        bd = tmp_path / f"b{i}"; bd.mkdir()
+        a = _netlist_text(ad, m, tag)                    # the no-kwargs call (via _netlist_text)
+        gnl = NA.make_offline_group_netlister(_base_dir(bd), m, bd / "out",
+                                              op_loads=None, temp=None)
+        b = pathlib.Path(gnl(_group(m, tag)), "input.scs").read_text()
+        assert a == b, f"new-kwargs default changed T0 text for {tag}"
+        assert NA.COVTEMP_NAME not in a                  # no temp line on a coverage-free run
 
 
 if __name__ == "__main__":
