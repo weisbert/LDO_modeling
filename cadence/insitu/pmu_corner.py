@@ -48,6 +48,7 @@ import pathlib
 from . import build_manifest as _bm
 from . import augment as _augment
 from . import importmp as _imp
+from . import manifest as _manifest
 from . import run as _run
 from . import adestate as _adestate
 from . import SKILL_DIR
@@ -251,7 +252,7 @@ def _live_group_netlister(ws, session_name, test, m, netlist_base):
 
 def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
              on_status=None, dry_run=False, progress=None, group_netlister=None,
-             group_status=None, cancel=None,
+             group_status=None, cancel=None, groups=None,
              poll_interval=5.0, max_parallel=1, poll_timeout=10800.0, sleep=None):
     """5) run ONE corner as a PER-GROUP SWEEP via the pure-CLI Donau+ALPS path (Component A).
 
@@ -280,10 +281,17 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
     GUI's per-group table feeds off it): 'pending' -> the Donau states ('pending'/'running'/
     'done'/'failed') -> 'done' once the PSF lands, or 'preview' on a dry_run. cancel() -> bool
     stops launching NEW groups; already-in-flight jobs are drained, then run.CancelledError is
-    raised so the GUI Cancel reports cleanly rather than wedging the window."""
+    raised so the GUI Cancel reports cleanly rather than wedging the window.
+
+    groups (default None) is the ONE additive seam for the STAGE-1b coverage SWEEP: pass an
+    explicit PRE-SPLIT list of groups to run ONLY that subset (one load x temp cell's groups);
+    None reproduces today's behavior EXACTLY (the full run.groups(m) set). Nothing else changes."""
     import time
     cfg = donau or DonauCfg()
-    grps = _run.groups(m)
+    # ADDITIVE seam (default None => identical to today): the coverage SWEEP driver passes a
+    # PRE-SPLIT subset of groups (e.g. only the load-swept ac/noise groups for one load cell);
+    # every existing caller passes nothing -> we compute the full group set exactly as before.
+    grps = groups if groups is not None else _run.groups(m)
     n = len(grps) or 1
     psf_root = pathlib.Path(psf_root)
     psf_map, dsub_cmds = {}, []
@@ -738,6 +746,258 @@ def run_pmu_corner(gui=None, work_root=None, corner=None, engine="alps",
         _ran("cell")
 
     return res
+
+
+# ===================================================================== coverage sweep
+# STAGE 1b part 2: the LOAD x TEMPERATURE coverage SWEEP. A NEW, SEPARATE driver that REUSES
+# the single-corner step functions (step_netlist / step_run / step_fit / step_emit / step_cell)
+# -- it reimplements NONE of them. The single-corner run_pmu_corner is UNCHANGED; only step_run
+# gained the additive `groups=` kwarg above, so a sweep cell can run a PRE-SPLIT subset of groups.
+#
+# WHY a sweep, and HOW it routes (HANDOFF_MODELING_COVERAGE §1, §3, §6):
+#   * small-signal (1x AC + .noise) is LTI AT THE OP, so its transfer functions must be
+#     re-extracted at EACH load point -> these "load-swept" groups REPEAT across the load axis.
+#   * the dc (I-V / dropout) + tran (slew) + 2x-lin-gate groups characterize the load /
+#     large-signal dimension INTERNALLY (a DC sweep already walks the load) -> they run ONCE at
+#     the TB OP, not per load point.
+#   * temperature is an OUTER axis: every cell (once + per-load) repeats per declared temp.
+# Each (groups-subset, op_loads, temp) is ONE "cell": its own netlist dir + PSF dir under the
+# workarea corner dir, read into a per-cell arrays dict keyed by the cell LABEL, then ALL cells
+# are assembled into ONE sweep npz the existing fit/emit consume.
+
+def _has_coverage_sweep(m):
+    """True when a manifest declares a coverage SWEEP (>1 load point on some rail, OR any temp
+    corner) -- so a stage-3 GUI can dispatch run_pmu_corner (single OP) vs run_pmu_coverage_sweep.
+    Pure (no I/O). A coverage-free manifest (no loads, no temps) is False -> single-corner path."""
+    return len(_run.load_axis(m)) > 1 or bool(_manifest.temps(m))
+
+
+def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alps",
+                           netlistdir=None, ahdllibdir=None, pdk_model_dir=None,
+                           base_netlist=None, model_lib=None, model_cell=None, model_path=None,
+                           supply_pin=None, ground=None, runner=None, on_status=None,
+                           dry_run=False, progress=None, netlister_factory=None, donau=None,
+                           poll_interval=5.0, max_parallel=1, poll_timeout=10800.0, sleep=None,
+                           steps=None):
+    """Run the LOAD x TEMPERATURE coverage SWEEP for ONE process corner (the STAGE-1b driver).
+
+    REUSES run_pmu_corner's step functions per CELL -- a cell = one (groups-subset, op_loads,
+    temp). Routing (see the module comment + HANDOFF §1/§3/§6): the load-swept small-signal
+    groups (1x AC + .noise) REPEAT across the load axis; the dc/tran/2x-lin-gate groups run ONCE
+    at the TB OP; temperature is the outer axis (every cell repeats per declared temp). With NO
+    load sweep, ALL groups run once per temp. Each cell gets its OWN netlist + PSF dir under the
+    workarea corner dir; all cells assemble into ONE sweep npz the existing fit/emit consume.
+
+    manifest         a LOADED manifest dict (the source of truth; drives the run verbatim).
+    work_root        writable $WORK_ROOT (else env WORK_ROOT, else ~/ldo_workarea).
+    corner           process-corner label (else manifest['corner'] / corners.fallback[0]).
+    engine           'alps' (default) | 'spectre'.
+    netlistdir/ahdllibdir/pdk_model_dir   the step-4 HANDOFF (the pdk/ahdl the sweep runs need,
+                     exactly like the single path's step_netlist).
+    base_netlist     the base maestro input.scs (dir or file) the DEFAULT netlister_factory
+                     rewrites per cell. REQUIRED unless netlister_factory= is injected.
+    netlister_factory(op_loads, temp, out_base) -> callable(group)->netlistdir : the seam tests
+                     inject. DEFAULT builds cluster.netlist_augment.make_offline_group_netlister
+                     from base_netlist + the manifest (op_loads rewrites each rail's reused load
+                     isource dc=; temp= emits the options temp= line).
+    runner/on_status/dry_run/progress/donau/poll_interval/max_parallel/poll_timeout/sleep
+                     forwarded into step_run per cell (so tests drive the status loop with zero
+                     real sleeping). dry_run assembles every cell's dsub command, executes nothing.
+    steps            an allow-list through 'emit' (default: netlist..emit; 'cell' only with a
+                     live session, which this offline driver does not take -> a dry plan).
+
+    Returns a result dict (corner, corner_dir, dirs, manifest copy path, netlistdir, psf_dir,
+    npz, va, model_lib/cell/path, dsub_cmds, dsub_cmd, loads (the cell labels), temps, load_swept,
+    guardrail_warnings, warnings, steps_run)."""
+    import numpy as np
+    m = manifest
+    gui = _gui_from_manifest(m)
+    corner = corner or m.get("corner") or (m.get("corners", {}).get("fallback") or ["nom"])[0]
+    base, dirs = corner_dir(work_root, gui, corner)
+
+    # resolve the model + supply/ground exactly like run_pmu_corner's manifest-driven branch
+    supply_pin = supply_pin or (_bm.supply_pins(gui) or [""])[0]
+    ground = ground or gui.get("ground") or "VSS"
+    model_lib = model_lib or "LDO_model_lab"
+    model_cell = model_cell or (gui.get("model_cell") or f"{gui.get('dut_cell', 'model')}_model")
+    model_path = model_path or gui.get("model_path") or str(base / "model" / "cds" / model_lib)
+
+    want = set(steps) if steps is not None else {"netlist", "run", "import", "fit", "emit", "cell"}
+    res = {
+        "corner": corner, "work_root": str(resolve_work_root(work_root)),
+        "corner_dir": str(base), "dirs": {k: str(v) for k, v in dirs.items()},
+        "manifest": None, "netlistdir": None, "psf_dir": str(dirs["psf"]), "npz": None,
+        "va": None, "model_lib": model_lib, "model_cell": model_cell, "model_path": model_path,
+        "model_built": False, "dsub_cmds": [], "dsub_cmd": None,
+        "loads": [], "temps": [], "load_swept": False,
+        "guardrail_warnings": [], "warnings": list(m.get("_warnings", [])), "steps_run": [],
+    }
+
+    def _ran(s):
+        if s not in res["steps_run"]:
+            res["steps_run"].append(s)
+
+    # persist a workarea copy of the manifest for traceability (mirrors run_pmu_corner) ----
+    man_path = dirs["netlist"].parent / f"{gui['tb_cell']}_{corner}.manifest.json"
+    man_path.parent.mkdir(parents=True, exist_ok=True)
+    man_path.write_text(json.dumps(m, indent=2) + "\n")
+    res["manifest"] = str(man_path)
+
+    # 2) the pdk/ahdl handoff -- the sweep needs it like the single path -------------------
+    netinfo = step_netlist(dirs, netlistdir=netlistdir, ahdllibdir=ahdllibdir,
+                           pdk_model_dir=pdk_model_dir, progress=progress)
+    res["netlistdir"] = netinfo["netlistdir"]
+    _ran("netlist")
+
+    # 3) the NETLISTER FACTORY seam: netlister_factory(op_loads, temp, out_base) -> per-group
+    #    netlister. DEFAULT (None) builds the offline cluster.netlist_augment netlister from the
+    #    base input.scs + the manifest. A missing base AND no factory cannot make a netlist.
+    if netlister_factory is None:
+        if base_netlist is None:
+            raise PmuCornerError(
+                "run_pmu_coverage_sweep needs a base netlist to sweep: pass base_netlist= (the "
+                "maestro input.scs dir/file the offline netlister rewrites per cell) or inject "
+                "netlister_factory=.")
+        from cluster import netlist_augment as _na
+        netlister_factory = (lambda op_loads, temp, out_base:
+                             _na.make_offline_group_netlister(base_netlist, m, out_base,
+                                                              op_loads=op_loads, temp=temp))
+
+    # 4) the axes + the group split (ONCE) ------------------------------------------------
+    temps_axis = _manifest.temps(m) or [None]
+    load_axis = _run.load_axis(m)
+    load_swept = len(load_axis) > 1
+    res["load_swept"] = load_swept
+    res["temps"] = list(temps_axis)
+    all_grps = _run.groups(m)
+    swept = [g for g in all_grps if _run.is_load_swept_group(g)]      # 1x AC + noise (per load)
+    once = [g for g in all_grps if not _run.is_load_swept_group(g)]   # dc/tran/2x (at the OP)
+
+    # 5) the per-cell runner: run ONE cell (a groups-subset at one op_loads+temp). Each cell has
+    #    its OWN netlist + PSF dir under <corner>/{netlist,psf}/<cell_label> (never /simulation/).
+    #    On a real run we read the cell's PSF -> arrays keyed by the cell LABEL (strict=False: a
+    #    cell ran only ITS subset, so the other measurement tags are legitimately absent + skipped).
+    cmds, merged, labels = [], {}, []
+
+    def _cell(groups_subset, op_loads, temp, cell_label):
+        if not groups_subset:
+            return {}
+        nl_dir = dirs["netlist"] / cell_label
+        psf_cell = dirs["psf"] / cell_label
+        psf_cell.mkdir(parents=True, exist_ok=True)
+        gnl = netlister_factory(op_loads, temp, nl_dir)
+        rr = step_run(netinfo, psf_cell, m, engine=engine, donau=donau, runner=runner,
+                      on_status=on_status, dry_run=dry_run, progress=progress,
+                      group_netlister=gnl, groups=groups_subset, poll_interval=poll_interval,
+                      max_parallel=max_parallel, poll_timeout=poll_timeout, sleep=sleep)
+        cmds.extend(rr["dsub_cmds"])
+        if rr.get("psf_map"):
+            # read the cell's PSF by TAG; key each array by the cell LABEL (the sweep's "load")
+            reads = _imp.from_psf_multiport(
+                manifest=m, psf_map={k: str(v) for k, v in rr["psf_map"].items()},
+                load=cell_label, strict=False)
+            reads.pop("_skipped", None)            # a per-cell subset legitimately skips the rest
+            merged.update(reads)
+        if cell_label not in labels:
+            labels.append(cell_label)              # a cell that actually ran -> its label is real
+        return rr
+
+    def _lbl(load_label, temp):
+        t = None if temp is None else f"T{temp:g}"
+        base_l = load_label or "Lnom"
+        return base_l if t is None else f"{base_l}_{t}"
+
+    # 6) the LOOP -- per HANDOFF routing. With a load sweep: the once-groups run at the TB OP
+    #    (op_loads=None) per temp, then the swept groups repeat per load point. With NO load
+    #    sweep: ALL groups run once per temp.
+    if "run" in want:
+        for temp in temps_axis:
+            if load_swept:
+                _cell(once, None, temp, _lbl("Lnom", temp))            # dc/tran/2x at the OP, once
+                for (load_label, op) in load_axis:
+                    _cell(swept, op, temp, _lbl(load_label, temp))     # AC/noise per load point
+            else:
+                _cell(all_grps, None, temp, _lbl(None, temp))          # everything once per temp
+        _ran("run")
+    res["dsub_cmds"] = cmds
+    res["dsub_cmd"] = cmds[0] if cmds else None
+    res["loads"] = labels
+
+    # 7) assemble ONE sweep npz: every cell's arrays + the cell labels + per-cell meta (the rail
+    #    iload + the temp per label, NaN where a cell did not set that rail / had no temp). On a
+    #    pure dry_run (no PSF read) merged is empty -> we still wrote the manifest copy above and
+    #    return the assembled dsub commands (no npz).
+    npz_path = None
+    if merged:
+        ref = {"loads": np.array(labels), **merged}
+        # meta_iload_<o>: the rail's iload per label (NaN where that cell did not set the rail).
+        # We re-derive each cell's op_loads from its label by replaying the loop bookkeeping.
+        label_ops, label_temp = _sweep_label_meta(load_axis, temps_axis, load_swept, _lbl)
+        for o in m["v_out"]:
+            ref[f"meta_iload_{o}"] = np.array(
+                [label_ops.get(lbl, {}).get(o, float("nan")) for lbl in labels], dtype=float)
+        ref["meta_temp"] = np.array(
+            [label_temp.get(lbl, float("nan")) for lbl in labels], dtype=float)
+        npz_path = dirs["npz"] / f"{m['name']}_sweep.npz"
+        np.savez(npz_path, **ref)
+        res["npz"] = str(npz_path)
+        _ran("import")
+        _progress(progress, "import",
+                  f"assembled sweep npz: {npz_path.name} ({len(labels)} cells, "
+                  f"{len(merged)} arrays)")
+
+        # 8) GUARDRAIL-3: Zout(s->0) <-> DC load-reg consistency (only when there is data) ----
+        warns = _imp.check_zout_dc_consistency(ref, m)
+        if warns:
+            res["guardrail_warnings"] = warns
+            for w in warns:
+                _progress(progress, "import", "GUARDRAIL-3: " + w)
+                if on_status:
+                    on_status("guardrail", w)
+
+    # 9) fit -> emit (-> cell only with a live session; this offline driver -> a dry plan). Reuse
+    #    the existing step functions on the assembled npz, exactly like run_pmu_corner does.
+    fit_result = None
+    if "fit" in want and not dry_run and npz_path is not None:
+        fit_result, txt = step_fit(npz_path, m, progress=progress)
+        res["fit_report"] = txt
+        _ran("fit")
+    if "emit" in want and fit_result is not None:
+        va_path = dirs["model"] / f"{model_cell}.va"
+        p = step_emit(fit_result, cell_name=model_cell, va_path=va_path,
+                      supply=supply_pin, ground=ground, progress=progress)
+        res["va"] = str(p)
+        _ran("emit")
+    if "cell" in want and res["va"] is not None:
+        # no session param here -> step_cell degrades to the SKILL PLAN (dry). A live cell build
+        # is a stage-3 GUI concern (it owns the session); the sweep driver stops at the .va.
+        cellres = step_cell(fit_result, res["va"], model_lib=model_lib, model_cell=model_cell,
+                            model_path=model_path, supply=supply_pin, ground=ground,
+                            session=None, dry_run=True, progress=progress)
+        res["model_built"] = cellres["built"]
+        res["cell_plan"] = cellres["plan"]
+        _ran("cell")
+
+    return res
+
+
+def _sweep_label_meta(load_axis, temps_axis, load_swept, lbl_fn):
+    """Reconstruct, per cell LABEL, its op_loads dict + its temp -- the meta the sweep npz stamps.
+    Pure bookkeeping that REPLAYS run_pmu_coverage_sweep's loop label scheme (so the meta arrays
+    line up with the `loads` label array). Returns (label_ops, label_temp)."""
+    label_ops, label_temp = {}, {}
+    for temp in temps_axis:
+        tval = float("nan") if temp is None else float(temp)
+        if load_swept:
+            label_ops[lbl_fn("Lnom", temp)] = {}                 # the OP once-cell sets no rail load
+            label_temp[lbl_fn("Lnom", temp)] = tval
+            for (load_label, op) in load_axis:
+                label_ops[lbl_fn(load_label, temp)] = dict(op or {})
+                label_temp[lbl_fn(load_label, temp)] = tval
+        else:
+            label_ops[lbl_fn(None, temp)] = {}
+            label_temp[lbl_fn(None, temp)] = tval
+    return label_ops, label_temp
 
 
 # --------------------------------------------------------------------------- CLI

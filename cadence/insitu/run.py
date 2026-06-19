@@ -78,6 +78,39 @@ def _group_tag(pt):
     return "g_" + "_".join(f"{k}_{v}" for k, v in pt["hot"])
 
 
+# --------------------------------------------------------------- coverage sweep axes
+# The two pure helpers the STAGE-1b coverage SWEEP driver (pmu_corner.run_pmu_coverage_sweep)
+# uses to split the load x temp grid. They live here -- beside groups() -- so the "which group
+# repeats per load" rule sits next to the grouping it keys off, and so a stage-3 GUI can import
+# them without pulling in the orchestrator.
+
+def load_axis(m):
+    """The load-sweep axis: a list of (label, op_loads) where op_loads={v_out_key: iload_at_k}.
+    Index k -> each rail's load_points(m,o)[min(k, last)]; axis length = max rail load-point count.
+    A rail that declares NO loads is simply absent from op_loads (it keeps its TB-default OP).
+    Returns [(None, None)] when NO v_out declares any loads (=> a single OP, today's behavior)."""
+    outs = list(m["v_out"])
+    per = {o: _manifest.load_points(m, o) for o in outs}
+    nmax = max((len(v) for v in per.values()), default=0)
+    if nmax == 0:
+        return [(None, None)]
+    axis = []
+    for k in range(nmax):
+        # a rail shorter than the axis HOLDS at its last declared point (min(k, last)); a rail
+        # with no loads at all is absent from op_loads -> it keeps the base TB OP unchanged.
+        op = {o: per[o][min(k, len(per[o]) - 1)] for o in outs if per[o]}
+        axis.append((f"L{k}", op))
+    return axis
+
+
+def is_load_swept_group(g):
+    """True for a group that REPEATS across the load axis (small-signal at the OP: 1x AC + noise).
+    The dc/tran/2x-lin-gate groups are corner-ONCE (they characterize the load / large-signal
+    dimension internally) -> they run once at the TB OP, not per load point."""
+    a = g["analysis"]
+    return a == "noise" or (a == "ac" and not g.get("amp"))
+
+
 # ---------------------------------------------------------------- spectre_cli backend
 def run_spectre_cli(m, regenerate=False):
     """Return a {measurement_tag: PSF-dir} map over extract_pmu.py's CLI runs. With
