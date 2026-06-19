@@ -1,8 +1,29 @@
-# HANDOFF — Coverage-Driven Modeling: BUILT + locally validated
+# HANDOFF — Coverage-Driven Modeling: BUILT + locally validated + LOCKED IN
 
 **Status (2026-06-19):** the full coverage-driven modeling feature from `HANDOFF_MODELING_COVERAGE.md`
-(the locked plan, commit `75e2188`) is **BUILT, committed, and pushed to `main`**, and **validated on
-the LOCAL Spectre 18.1 + ngspice** this session. `267` backend tests + GUI selftest green.
+(the locked plan, commit `75e2188`) is **BUILT, committed, and pushed to `main`**, **validated on the
+LOCAL Spectre 18.1 + ngspice**, and now **LOCKED IN as regression tests** (`bd36b39`). `275` backend
+tests + GUI selftest green. **The whole local-validatable scope is DONE — only red-zone box items
+(§5) remain.**
+
+> **LOCK-IT-IN DONE (`bd36b39`, main, pushed):** §4 below is complete. (1) Folded the local-spectre
+> findings into code comments — the "box-pending" hedges in `importmp._sweep_axis`/`_time_axis` and
+> `netlist_augment.COVTEMP_NAME` are gone (confirmed: Spectre dc axis `"dc"`, tran axis `"time"`,
+> `options temp=` accepted). (2) Two engine-gated regression tests (skip cleanly when the engine is
+> absent via an env-override guard; never silently pass):
+> - `cadence/cluster/test_coverage_spectre.py` (5 tests) — inline behavioral PMU DUT (v_out = 0.8 V
+>   behind Rout=20, i_out = 800k sink) → the REAL offline netlister (dropout/iv/transient + temp=55)
+>   → REAL spectre. Asserts dc/tran/iv converge; `_sweep == "dc"`/`"time"`; importmp iv/dropout/trans
+>   derives correct; GUARDRAIL-3 dropout slope = −20.000 (= DUT Rout) AND `check_zout_dc_consistency`
+>   fires on a mismatched Zout; the `_covtemp options temp=55` line is accepted.
+> - `harness/test_coverage_ngspice.py` (3 tests) — `fit_variant('v2_capless')` → emit additive
+>   slew_en → REAL ngspice. GUARDRAIL-1: at OP the AC Zout is identical for slew_en in {0,1}
+>   (23.2301 Ω, rel 4.3e-8); at 6 mA slew_en=1 shows a real 187 mV dropout while slew_en=0 stays on
+>   the linear R_a extrapolation.
+>
+> Suite `267 → 275` (8 additive). Built + adversarially verified via workflow (both verdicts
+> pass / no issues). Re-checked by hand: full suite 275 green; new files 8 green on real engines;
+> spectre hidden → 5 skipped, ngspice hidden → 3 skipped.
 
 ---
 
@@ -42,15 +63,15 @@ the REAL offline netlister → real spectre):
 `python3 -m pytest harness cadence -q` → **267 passed** (3 benign scipy AAA warnings).
 `QT_QPA_PLATFORM=offscreen python3 gui/ldo_modeler.py --selftest --require-qt` → **GUI selftest PASS**.
 
-## 4. NEXT (next build session — small, lock-it-in)
-1. **Fold the local-spectre findings into the code** (remove the now-resolved "box-pending" hedges):
-   `importmp._sweep_axis`/`_time_axis` comments note "confirmed on local Spectre 18.1: dc axis `'dc'`,
-   tran axis `'time'`"; `netlist_augment.COVTEMP_NAME` notes "spectre accepts `options temp=`".
-2. **Add spectre-gated + ngspice-gated regression tests** (skip cleanly when the engine is absent, like
-   the existing `spectre_cli` fixtures): (a) coverage dc/tran/iv → real spectre → `importmp` derives +
-   guardrail-3 on a tiny behavioral PMU TB; (b) the additive-`slew_en` ngspice check (OP `Zout(slew0)==
-   Zout(slew1)`, dropout at high load) so a future emit change can't silently break guardrail-1.
-3. (Optional) a `HANDOFF_MODELING_COVERAGE.md` "BUILT" banner pointing here.
+## 4. Lock-it-in — DONE (`bd36b39`)
+Both items below shipped this session (see the banner at the top for details):
+1. ✅ **Folded the local-spectre findings into the code** — `importmp._sweep_axis`/`_time_axis` and
+   `netlist_augment.COVTEMP_NAME` no longer say "box-pending"; they record the confirmed local-Spectre
+   axis names (`"dc"`/`"time"`) and the accepted `options temp=`.
+2. ✅ **Added spectre-gated + ngspice-gated regression tests** — `cadence/cluster/test_coverage_spectre.py`
+   (5) and `harness/test_coverage_ngspice.py` (3), engine-gated with an env-overridable skip guard.
+3. (Skipped — optional) a `HANDOFF_MODELING_COVERAGE.md` "BUILT" banner; not needed, this doc is the
+   live status.
 
 ## 5. Genuinely box-only (red zone) remaining
 A REAL Donau+ALPS sweep of the actual wur 2v+3i silicon DUT (vs my behavioral TB), the ALPS engine
