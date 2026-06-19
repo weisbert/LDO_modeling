@@ -235,6 +235,13 @@ def test_parse_job_id():
     assert donau.parse_job_id("Submit job successfully. JOBID 37238970") == "37238970"
     assert donau.parse_job_id('{"id": 12345, "queue": "short"}') == "12345"
     assert donau.parse_job_id("no id here") is None
+    # the REAL Donau dsub --json envelope: id at data.jobId as a QUOTED value, plus a
+    # non-numeric requestId that must NOT be picked up (regression for the box failure).
+    real = ('{"data":{"jobId":"37322154"},"message":"Submit job successfully.",'
+            '"code":"success","requestId":"req-e7153a68-253c-4fec-836b-3da9c6ca33d5"}')
+    assert donau.parse_job_id(real) == "37322154"
+    assert donau.parse_job_id('{"data":{"jobId": 555}}') == "555"        # unquoted value
+    assert donau.parse_job_id('loading...\nok\n{"data":{"jobId":"42"}}\n') == "42"  # noisy banner
 
 
 # =====================================================================================

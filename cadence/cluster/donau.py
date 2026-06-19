@@ -18,6 +18,7 @@ ALL subprocess execution goes through an injectable `runner(argv, **kw) -> RunRe
 output, so NO dsub is needed to test the state machine.
 """
 import dataclasses
+import json as _json
 import re
 import shlex
 import subprocess
@@ -150,13 +151,32 @@ def map_state(raw):
     return None
 
 
-_JOBID_RE = re.compile(r"(?:JOBID|job\s*id|jobId|\"id\"\s*:)\s*\"?(\d+)", re.IGNORECASE)
+# Match a job-id token in noisy/streamed output. Handles `JOBID 37238970` (space),
+# `"jobId":"37322154"` (Donau JSON: key, quote, colon, quote, digits), `"jobId": 372` (unquoted),
+# and `"id": 372`. The separator class swallows the closing key-quote, the colon/equals, and the
+# opening value-quote so the digits are reached in every form.
+_JOBID_RE = re.compile(r'(?:job[\s_]*id|"id)["\s]*[:=]?\s*"?(\d+)', re.IGNORECASE)
 
 
 def parse_job_id(stdout):
-    """Pull the numeric JOBID out of dsub stdout. Handles the streamed form
-    `... JOBID 37238970 ...` (§9) and a `-J` JSON `"id": 37238970`. None if not found."""
-    m = _JOBID_RE.search(stdout or "")
+    """Pull the numeric JOBID out of dsub stdout. Primary: the Donau JSON envelope
+    `{"data":{"jobId":"37322154"},"code":"success",...}` (dsub --json). Fallbacks: a `-J` JSON
+    `"id": 37238970` and the streamed `... JOBID 37238970 ...` form (§9). None if not found."""
+    text = stdout or ""
+    # 1) JSON envelope -- read data.jobId / jobId / id when the whole stdout parses as JSON.
+    try:
+        obj = _json.loads(text)
+    except (ValueError, TypeError):
+        obj = None
+    if isinstance(obj, dict):
+        data = obj.get("data") if isinstance(obj.get("data"), dict) else {}
+        for src in (data, obj):
+            for k in ("jobId", "jobid", "JOBID", "job_id", "id"):
+                v = src.get(k)
+                if v is not None and re.fullmatch(r"\d+", str(v).strip()):
+                    return str(v).strip()
+    # 2) Loose / streamed output (or JSON embedded in a noisy banner): regex the first id.
+    m = _JOBID_RE.search(text)
     return m.group(1) if m else None
 
 
