@@ -73,11 +73,24 @@ Both items below shipped this session (see the banner at the top for details):
 3. (Skipped — optional) a `HANDOFF_MODELING_COVERAGE.md` "BUILT" banner; not needed, this doc is the
    live status.
 
+## 4b. VA-compiles-in-Cadence — also done locally (`cadence/test_va_compile_spectre.py`)
+The emitted **Verilog-A deliverable** (`fit_model.emit_va`, the additive-slew_en `module ldo_model`)
+now **compiles through the LOCAL Cadence Spectre's `ahdlcmi -64` and simulates** — this was wrongly
+shelved as box-only before. A 3rd SPECTRE-gated test (skip-guarded, env-overridable) pins it:
+- (1) `ahdlcmi -64` compiles the 26 KB `.va` and the AC op converges to a finite LF Zout;
+- (2) GUARDRAIL-1 holds **in the Cadence engine** too — at the OP `|Zout|` is identical for
+  `slew_en ∈ {0,1}` (rel `0.00e+00`);
+- (3) **cross-engine**: Spectre-VA LF Zout `23.230100 Ω` == the fit's `R_a` (rel `2e-6`) ==
+  the ngspice SPICE-subckt measurement `23.2301 Ω` (rel `9e-13`). Same physics, two engines.
+
+The mechanism is exactly `cadence/isrc_spectre.py`'s (`ahdl_include` + ahdlcmi -64). Suite `275 → 278`.
+
 ## 5. Genuinely box-only (red zone) remaining
-A REAL Donau+ALPS sweep of the actual wur 2v+3i silicon DUT (vs my behavioral TB), the ALPS engine
-(vs local spectre), and the generated `.va` compiling+running in the Cadence flow. Plus `bash apply`
-to deploy to the red zone. The methodology + netlist generation + PSF reading + derives + guardrails
-are now simulator-validated locally.
+A REAL Donau+ALPS sweep of the actual wur 2v+3i silicon DUT (vs my behavioral TB), and the **ALPS
+engine's OWN Verilog-A compiler** accepting the `.va` (Spectre's ahdlcmi has now accepted it locally
+— §4b — but Empyrean ALPS has a separate VA compiler, still unverified). Plus `bash apply` to deploy
+to the red zone. The methodology + netlist generation + PSF reading + derives + guardrails + the VA
+compiling/simulating in Cadence Spectre are all simulator-validated locally.
 
 Related: `HANDOFF_MODELING_COVERAGE.md` (the plan/spec), memory `[[next-coverage-modeling-build]]`,
 `[[ldo-unified-source-reuse]]`, `[[ngspice-built-from-source]]`, `[[redzone-install-prefix]]`.
