@@ -1,6 +1,6 @@
 {
   "name": "pmu_real",
-  "_note": "GOLDEN TEMPLATE for the REAL PMU (the exact user pins). The <...> placeholders are RESOLVER-FILLED: the GUI hands symbol PIN names (kept verbatim in each port's 'pin' field) and cadence/insitu/resolve.py turns them into the '<net:PIN>' slots below. <tb_lib>/<tb_cell>/<dut_lib>/<dut_cell>/<dut_inst>/<corner> come straight from the GUI. This file is the shape build_manifest(gui, netmap) emits; hand-edit only the placeholders. In-situ bias policy: no v_out 'iload' and no i_out 'dc' here because the user supplied none -- the TB's real loads/sources set the OP. (manifest.validate() will default i_out.dc=0.0 at load time purely for the read-side derivation; that is intentionally NOT written here.)",
+  "_note": "GOLDEN TEMPLATE for the REAL PMU (the exact user pins). The <...> placeholders are RESOLVER-FILLED: the GUI hands symbol PIN names (kept verbatim in each port's 'pin' field) and cadence/insitu/resolve.py turns them into the '<net:PIN>' slots below. <tb_lib>/<tb_cell>/<dut_lib>/<dut_cell>/<dut_inst>/<corner> come straight from the GUI. This file is the shape build_manifest(gui, netmap) emits; hand-edit only the placeholders. UNIFIED SOURCE-REUSE: no v_out 'src' / i_out 'probe_src' / supply 'tb_src' here unless the GUI names the existing TB source to reuse -- absent, the netlister auto-detects the source on the net (or falls back to inserting Iext/Vprobe for an OPEN pin). In-situ bias policy: no v_out 'iload' and no i_out 'dc' here because the user supplied none -- the TB's real loads/sources set the OP. (manifest.validate() will default i_out.dc=0.0 at load time purely for the read-side derivation; that is intentionally NOT written here.)",
   "dut": {
     "lib": "<dut_lib>",
     "cell": "<dut_cell>",
@@ -21,9 +21,9 @@
     "vco": {"net": "<net:VDD0P8_VCO>", "pin": "VDD0P8_VCO"}
   },
   "i_out": {
-    "i1p8u": {"net": "<net:IBP_POLY_1P8U_VCO>",      "pin": "IBP_POLY_1P8U_VCO",      "probe_src": "Vprobe_i1p8u"},
-    "i500n": {"net": "<net:IBP_POLY_500N_VCO_Fit>",  "pin": "IBP_POLY_500N_VCO_Fit",  "probe_src": "Vprobe_i500n"},
-    "i1p5u": {"net": "<net:IBP_PTAT_TUNE_1P5U_VCO>", "pin": "IBP_PTAT_TUNE_1P5U_VCO", "probe_src": "Vprobe_i1p5u"}
+    "i1p8u": {"net": "<net:IBP_POLY_1P8U_VCO>",      "pin": "IBP_POLY_1P8U_VCO"},
+    "i500n": {"net": "<net:IBP_POLY_500N_VCO_Fit>",  "pin": "IBP_POLY_500N_VCO_Fit"},
+    "i1p5u": {"net": "<net:IBP_PTAT_TUNE_1P5U_VCO>", "pin": "IBP_PTAT_TUNE_1P5U_VCO"}
   },
   "bias": {},
   "leave_alone": [],

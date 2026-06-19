@@ -220,6 +220,12 @@ def build_manifest(gui, netmap):
     iload_in = gui.get("iload") or {}
     vdc_in = gui.get("vdc") or {}
     iv_in = gui.get("iv_sweep") or {}            # per i_out I-V knee sweep: [vlo,vhi,step] | "auto"
+    # UNIFIED SOURCE-REUSE: the existing TB source to REUSE on each port, GUI-collected. Absent
+    # -> the netlister auto-detects the source on the net (or, for an OPEN v_out/i_out pin, falls
+    # back to inserting Iext/Vprobe). We do NOT fabricate a name -- a fabricated probe_src would
+    # name a non-existent source and trip the type/exists guardrail.
+    v_src_in = gui.get("v_src") or gui.get("src") or {}        # per v_out: existing load isource
+    i_src_in = gui.get("i_src") or gui.get("probe_src") or {}  # per i_out: existing vdc vsource
 
     # --- DUT block -------------------------------------------------------
     tb_cell = gui["tb_cell"]
@@ -258,6 +264,9 @@ def build_manifest(gui, netmap):
         # in-situ bias policy: only carry iload when the user supplied one
         if pin in iload_in and iload_in[pin] is not None:
             entry["iload"] = iload_in[pin]
+        # reuse: the existing TB load isource, only when the GUI named one (else auto-detect)
+        if v_src_in.get(pin):
+            entry["src"] = v_src_in[pin]
         v_out[key] = entry
 
     # --- i_out current sinks --------------------------------------------
@@ -265,13 +274,16 @@ def build_manifest(gui, netmap):
     i_out = {}
     no_compliance = []
     for key, pin in i_keys.items():
-        entry = {"net": _net(netmap, pin, f"i_out.{key}"), "pin": pin,
-                 "probe_src": f"Vprobe_{key}"}
-        # A current output is PORT-ISOLATED: augment owns a probe vsource at the pin that
-        # BOTH applies the compliance dc AND injects the AC -- it replaces the node's DC
-        # driver. So 'dc' here is the pin's operating node voltage; supply vdc per i_out for
-        # a real OP. If omitted, manifest.validate defaults dc=0.0 (clamps the node to 0 V,
-        # almost never the real compliance) -> flag it in m['_warnings'].
+        entry = {"net": _net(netmap, pin, f"i_out.{key}"), "pin": pin}
+        # reuse: the existing TB compliance vdc vsource to set acm on, only when the GUI named
+        # one (else the netlister auto-detects the vsource on the net, or -- for an OPEN pin --
+        # falls back to inserting Vprobe_<key>; the read derives the probe name the same way).
+        if i_src_in.get(pin):
+            entry["probe_src"] = i_src_in[pin]
+        # A current output reuses the designer's vdc at the pin (it already applies the
+        # compliance AND we add the AC mag). 'dc' here is the pin's operating node voltage;
+        # supply vdc per i_out for a real OP. If omitted, manifest.validate defaults dc=0.0
+        # (clamps the node to 0 V, almost never the real compliance) -> flag it in m['_warnings'].
         if pin in vdc_in and vdc_in[pin] is not None:
             entry["dc"] = vdc_in[pin]
         else:

@@ -10,9 +10,9 @@ load/save it). Schema:
       "name": "pmu_top",
       "dut": {"lib","cell","tb_lib","tb_cell","tb_inst","extract_cell"},
       "ground": "gnd!",
-      "supplies": { "<s>": {"net","dc","tb_src"?} },        # role: supply
-      "v_out":    { "<o>": {"net","iload"?} },               # role: voltage output
-      "i_out":    { "<c>": {"net","dc","probe_src"?} },      # role: current output (sink)
+      "supplies": { "<s>": {"net","dc","tb_src"?,"analysis"?} },        # role: supply
+      "v_out":    { "<o>": {"net","iload"?,"src"?,"analysis"?} },        # role: voltage output
+      "i_out":    { "<c>": {"net","dc","probe_src"?,"analysis"?} },      # role: current output (sink)
       "bias":     { "<b>": {"net","dc"} },                   # role: bias port (held, optional)
       "leave_alone": ["BIAS_EN", "PLL_CTRL<3:0>", ...],      # role: leave_alone
       "corners":  {"pull_from_session": true, "fallback": ["nom"]},
@@ -20,9 +20,22 @@ load/save it). Schema:
       "analysis": {"ac": "...", "noise": "..."}  # ALPS/Spectre-shared analysis lines
     }
 
+Source-reuse model (the UNIFIED contract): EVERY role REUSES the existing TB source on its
+net rather than appending a fresh one -- the designer's TB already places an idc/vdc on
+every v_out / i_out pin, so appending a 2nd driver would double-drive the node. Per role:
+  supply s : reuse supplies.<s>.tb_src (else auto-detect the VSOURCE on net), set mag=acm.
+  v_out  o : reuse v_out.<o>.src      (else auto-detect the ISOURCE  on net), set mag=acm.
+  i_out  c : reuse i_out.<c>.probe_src (else auto-detect the VSOURCE on net), set mag=acm.
+An OPEN pin with no source falls back to the old insert (append Iext_<o>/Vprobe_<c>).
+
+Per-object analysis override (OPTIONAL): supplies.<s>.analysis, v_out.<o>.analysis,
+i_out.<c>.analysis are dicts {ac?, noise?} (v_out may carry both; supply/i_out only ac).
+Absent -> the global m["analysis"] is used. The netlister keys the override by the group
+OWNER (the one-hot stimulus, or the v_out owning a noise group).
+
 The two consumers:
-  * augment (P2) reads supplies/v_out/i_out to know WHERE to append acm_* sources/probes
-    and WHAT to save (targeted, never allpub).
+  * augment (P2) reads supplies/v_out/i_out to know WHICH existing source to set acm on
+    (or, for an open pin, where to append) and WHAT to save (targeted, never allpub).
   * importmp (P4) reads the SAME roles to know HOW to derive each contract array from the
     raw PSF (Zout=V@1A, PSRR=Vout/Vsup, Y=-I, etc.) -- the read-side is the dual of the
     stimulus-side, both pinned by this one manifest.
@@ -91,6 +104,23 @@ def _fill_defaults(m):
     return m
 
 
+def _validate_analysis_override(v, where, allowed):
+    """A per-object 'analysis' override is OPTIONAL. When present it must be a dict carrying
+    only string-valued keys drawn from `allowed` ({'ac'} for supply/i_out, {'ac','noise'} for
+    v_out). Raises ManifestError on a non-dict, an unknown key, or a non-string value."""
+    a = v.get("analysis")
+    if a is None:
+        return
+    if not isinstance(a, dict):
+        raise ManifestError(f"{where}.analysis must be a dict {{ac?, noise?}}, got {type(a).__name__}")
+    for k, val in a.items():
+        if k not in allowed:
+            raise ManifestError(
+                f"{where}.analysis has unsupported key '{k}' (allowed: {sorted(allowed)})")
+        if not isinstance(val, str):
+            raise ManifestError(f"{where}.analysis.{k} must be a string analysis line")
+
+
 def validate(m):
     """Pure structural checks (no simulator/session). Raises ManifestError on violation."""
     if not m.get("name"):
@@ -112,17 +142,35 @@ def validate(m):
         claim(v.get("net"), f"supplies.{s}")
         if "dc" not in v:
             raise ManifestError(f"supplies.{s}.dc is required (the rail's DC value / OP)")
+        _validate_analysis_override(v, f"supplies.{s}", {"ac"})
     for o, v in m["v_out"].items():
         claim(v.get("net"), f"v_out.{o}")
+        _validate_analysis_override(v, f"v_out.{o}", {"ac", "noise"})
     for c, v in m["i_out"].items():
         claim(v.get("net"), f"i_out.{c}")
         v.setdefault("dc", 0.0)
+        _validate_analysis_override(v, f"i_out.{c}", {"ac"})
     for b, v in m["bias"].items():
         claim(v.get("net"), f"bias.{b}")
     for s in m["current_psrr_supplies"]:
         if s not in m["supplies"]:
             raise ManifestError(f"current_psrr_supplies references unknown supply '{s}'")
     return True
+
+
+def analysis_override(m, role, key, kind):
+    """The per-object analysis line for (role, key, kind in {'ac','noise'}), or None to fall
+    back to the global m['analysis'][kind]. role in {'supplies','v_out','i_out'}. This is the
+    single lookup the netlister uses so the offline + live paths read the override identically."""
+    v = (m.get(role) or {}).get(key) or {}
+    a = v.get("analysis") or {}
+    return a.get(kind)
+
+
+def analysis_line_for(m, role, key, kind):
+    """The resolved analysis line for (role, key, kind): the per-object override if present,
+    else the global m['analysis'][kind]."""
+    return analysis_override(m, role, key, kind) or m["analysis"][kind]
 
 
 def measurements(m):

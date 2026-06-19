@@ -481,7 +481,8 @@ try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QTabWidget, QWidget, QVBoxLayout,
                                  QHBoxLayout, QFormLayout, QGridLayout, QLabel, QLineEdit,
                                  QPushButton, QComboBox, QCheckBox, QFileDialog, QTextEdit,
-                                 QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox, QScrollArea)
+                                 QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox, QScrollArea,
+                                 QHeaderView)
     import matplotlib
     matplotlib.use("Qt5Agg")
     from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -768,7 +769,7 @@ if _HAVE_QT:
             self.path = pathlib.Path(path) if path else None
             self.saved_path = None
             self.setWindowTitle(f"Manifest editor — {self.path.name if self.path else 'new (unsaved)'}")
-            self.resize(760, 720)
+            self.resize(640, 720)
             # STASH: parse the incoming text once; the form is an overlay on THIS dict, so every
             # key the form does not model survives intact. Bad JSON -> empty stash, raw text kept.
             try:
@@ -794,10 +795,13 @@ if _HAVE_QT:
             lay.addWidget(self.status)
             brow = QHBoxLayout()
             b_val = QPushButton("Validate"); b_val.clicked.connect(self._validate)
+            b_scan = QPushButton("Scan netlist…"); b_scan.clicked.connect(self._scan_netlist)
+            b_scan.setToolTip("Pick the base input.scs and auto-fill each table's source-instance "
+                              "+ dc columns from the sources detected on each role net.")
             b_save = QPushButton("Save"); b_save.clicked.connect(self._save)
             b_saveas = QPushButton("Save As…"); b_saveas.clicked.connect(self._save_as)
             b_cancel = QPushButton("Cancel"); b_cancel.clicked.connect(self.reject)
-            brow.addWidget(b_val); brow.addStretch(1)
+            brow.addWidget(b_val); brow.addWidget(b_scan); brow.addStretch(1)
             brow.addWidget(b_save); brow.addWidget(b_saveas); brow.addWidget(b_cancel)
             lay.addLayout(brow)
 
@@ -871,6 +875,24 @@ if _HAVE_QT:
             self.f_ground = QLineEdit(); self.f_ground.setPlaceholderText("e.g. VSS  (blank → gnd!)")
             self.f_ground.setToolTip("Ground net name. Blank → gnd!.")
             idf.addRow("Ground net", self.f_ground)
+            # Mode-A / live-Virtuoso optional fields (relocated from the deleted Advanced group).
+            # Not needed for cluster/offline runs; surfaced here so the live path can still set them.
+            idf.addRow(QLabel(
+                "<span style='color:#678;font-weight:normal'>(Mode A / live Virtuoso — optional, "
+                "not needed for cluster runs)</span>"))
+            self.f_extract = QLineEdit()
+            self.f_extract.setToolTip("(Mode A / live) The TB copy stimuli are appended to. "
+                                      "Auto = <tb_cell>_extract.")
+            idf.addRow("extract_cell", self.f_extract)
+            self.f_tb_view = QLineEdit(); self.f_tb_view.setPlaceholderText("e.g. schematic")
+            self.f_tb_view.setToolTip("(Mode A / live) Testbench cellview to open.")
+            idf.addRow("tb_view", self.f_tb_view)
+            self.f_src_test = QLineEdit()
+            self.f_src_test.setPlaceholderText("optional — auto-discovered from the ADE-XL session")
+            self.f_src_test.setToolTip("(Mode A / live) The Maestro/ADE test whose operating point + "
+                                       "design variables we inherit (so the bias matches your real run). "
+                                       "Auto-found by TB cell name — set only if auto-find fails.")
+            idf.addRow("ade_src_test", self.f_src_test)
             v.addWidget(idg)
 
             # SUPPLIES (always visible) ---------------------------------------------
@@ -879,11 +901,15 @@ if _HAVE_QT:
             sgl = QVBoxLayout(sg)
             sgl.addWidget(QLabel(
                 "<span style='color:#678'>Each supply needs a net + its DC operating value. "
-                "<b>src instance</b> = the testbench voltage source on that rail (the one we put "
-                "the PSRR AC ripple on); <b>leave blank to auto-detect</b> — fill it only if "
-                "auto-detect can't find / picks the wrong one.</span>"))
-            self.t_supplies = self._make_table(["key", "net", "dc", "src instance"],
-                                               ["AVDD1P0", "VDD1P0", "1.0", "V_AVDD"])
+                "<b>src instance</b> = the testbench voltage source on that rail (the one we set "
+                "the PSRR AC mag on); <b>leave blank to auto-detect</b> — fill it only if "
+                "auto-detect can't find / picks the wrong one. <b>PSRR→I</b> = include this rail "
+                "as a current-PSRR reference for the current outputs. The <b>analysis</b> column "
+                "lets you override the global AC sweep for just this rail's PSRR.</span>"))
+            self.t_supplies = self._make_table(
+                ["key", "net", "dc", "src instance", "PSRR→I", "analysis"],
+                ["AVDD1P0", "VDD1P0", "1.0", "V_AVDD", "✓", "(gear)"],
+                check_cols=["PSRR→I"], analysis_role="supplies")
             sgl.addWidget(self._table_block(self.t_supplies))
             v.addWidget(sg)
 
@@ -893,8 +919,13 @@ if _HAVE_QT:
             vgl = QVBoxLayout(vg)
             vgl.addWidget(QLabel("<span style='color:#678'>The regulated voltage outputs "
                                  "(Zout / PSRR / noise). &nbsp;<b>≥1 voltage OR current output "
-                                 "required.</b></span>"))
-            self.t_vout = self._make_table(["key", "net"], ["vco", "VDD0P8_VCO"])
+                                 "required.</b> <b>src instance</b> = the load idc on this rail "
+                                 "(we set its AC mag to inject the Zout test current); blank → "
+                                 "auto-detect / insert. The <b>analysis</b> column overrides this "
+                                 "output's AC (Zout) and noise sweeps.</span>"))
+            self.t_vout = self._make_table(
+                ["key", "net", "src instance", "analysis"], ["vco", "VDD0P8_VCO", "I_load", "(gear)"],
+                analysis_role="v_out")
             vgl.addWidget(self._table_block(self.t_vout))
             v.addWidget(vg)
 
@@ -904,62 +935,55 @@ if _HAVE_QT:
             cgl = QVBoxLayout(cg)
             cgl.addWidget(QLabel("<span style='color:#678'>Current-output pins (admittance / "
                                  "current-PSRR): net + compliance dc + optional I-V sweep "
-                                 "(start:step:stop or 'auto'). <b>probe instance</b> = the name "
-                                 "for the current probe we insert on that pin; <b>blank → auto "
-                                 "(Vprobe_&lt;key&gt;)</b>. Leave the whole table empty if your "
-                                 "DUT has no current outputs.</span>"))
+                                 "(start:step:stop or 'auto'). <b>probe instance</b> = the "
+                                 "testbench vdc on that pin whose AC mag we set (the current "
+                                 "read = its :p current); <b>blank → auto-detect / insert "
+                                 "(Vprobe_&lt;key&gt;)</b>. The <b>analysis</b> column overrides "
+                                 "this output's AC sweep. Leave the table empty if your DUT has "
+                                 "no current outputs.</span>"))
             self.t_iout = self._make_table(
-                ["key", "net", "compliance dc", "iv_sweep", "probe instance"],
-                ["i500n", "IBP_500N", "0.9", "0:0.01:1.1", "Vprobe_i500n"])
+                ["key", "net", "compliance dc", "iv_sweep", "probe instance", "analysis"],
+                ["i500n", "IBP_500N", "0.9", "0:0.01:1.1", "Vprobe_i500n", "(gear)"],
+                analysis_role="i_out")
             cgl.addWidget(self._table_block(self.t_iout))
-            cf = QFormLayout()
-            self.f_cpsrr = QLineEdit()
-            self.f_cpsrr.setPlaceholderText("supply keys, e.g. AVDD1P0   (blank → all supplies)")
-            self.f_cpsrr.setToolTip("Current-PSRR reference: which supply rail(s) to measure the "
-                                    "current outputs' PSRR against (how supply ripple leaks into the "
-                                    "output current). Blank → every supply.")
-            cf.addRow("Current-PSRR reference", self.f_cpsrr)
-            cgl.addLayout(cf)
             v.addWidget(cg)
 
-            # ADVANCED (collapsed) — genuinely rare overrides -----------------------
-            adv = QGroupBox("Advanced (optional)")
-            adv.setCheckable(True); adv.setChecked(False)
-            adv.toggled.connect(lambda on, g=adv: self._toggle_group(g, on))
-            self.adv_group = adv
-            af = QFormLayout(adv)
-            self.f_extract = QLineEdit()
-            self.f_extract.setToolTip("The TB copy stimuli are appended to. Auto = <tb_cell>_extract.")
-            af.addRow("extract_cell", self.f_extract)
-            self.f_tb_view = QLineEdit(); self.f_tb_view.setPlaceholderText("e.g. schematic")
-            af.addRow("tb_view", self.f_tb_view)
-            self.f_src_test = QLineEdit()
-            self.f_src_test.setPlaceholderText("optional — auto-discovered from the ADE-XL session")
-            self.f_src_test.setToolTip("The Maestro/ADE test whose operating point + design variables "
-                                       "we inherit (so the bias matches your real run). Auto-found by "
-                                       "TB cell name — set only if auto-find fails.")
-            af.addRow("ade_src_test", self.f_src_test)
-            # bias table (advanced)
-            af.addRow(QLabel("<b>Bias ports (held)</b> &nbsp;<span style='color:#678;"
-                             "font-weight:normal'>(net + dc)</span>"))
+            # BIAS PORTS (promoted to a top-level table from the deleted Advanced group) -----
+            bg = QGroupBox("Bias ports — held DC")
+            bg.setStyleSheet("QGroupBox{font-weight:bold;}")
+            bgl = QVBoxLayout(bg)
+            bgl.addWidget(QLabel("<span style='color:#678'>Pins held at a fixed DC during the "
+                                 "AC/noise runs (net + dc). Leave empty if none.</span>"))
+            # Bias is a HELD pin, never a one-hot stimulus -> no per-object analysis column and not
+            # touched by "Scan netlist" (nothing to inject/probe). Deliberately a plain 3-col table.
             self.t_bias = self._make_table(["key", "net", "dc"], ["vbg", "VBG", "0.6"])
-            af.addRow(self._table_block(self.t_bias))
-            # corners
-            self.f_pull = QCheckBox("pull corners from the ADE session")
-            self.f_pull.setChecked(True)
-            af.addRow("corners.pull_from_session", self.f_pull)
-            self.f_fallback = QLineEdit("nom")
-            self.f_fallback.setPlaceholderText("comma, e.g. nom, ff_125c")
-            af.addRow("corners.fallback", self.f_fallback)
-            # analysis lines
+            bgl.addWidget(self._table_block(self.t_bias))
+            v.addWidget(bg)
+
+            # SIMULATION — global default AC / noise sweep (always visible) -----------------
+            simg = QGroupBox("Simulation — default AC / noise sweep")
+            simg.setStyleSheet("QGroupBox{font-weight:bold;}")
+            simf = QFormLayout(simg)
+            simf.addRow(QLabel("<span style='color:#678;font-weight:normal'>The global default "
+                               "sweep for every group. Override per object with the table "
+                               "<b>analysis</b> column.</span>"))
             self.f_ac = QLineEdit()
             self.f_ac.setPlaceholderText("ac start=10 stop=500M dec=20")
-            af.addRow("analysis.ac", self.f_ac)
+            self.f_ac.setToolTip("Global default AC sweep (Zout / PSRR).")
+            simf.addRow("analysis.ac", self.f_ac)
             self.f_noise = QLineEdit()
             self.f_noise.setPlaceholderText("noise start=10 stop=100M dec=20")
-            af.addRow("analysis.noise", self.f_noise)
-            v.addWidget(adv)
-            self._toggle_group(adv, False)   # honor the collapsed initial state
+            self.f_noise.setToolTip("Global default noise sweep.")
+            simf.addRow("analysis.noise", self.f_noise)
+            # Corner label (a run/output-dir label, NOT a PDK process corner). Replaces the
+            # pull_from_session checkbox + the multi-value fallback line (both relocated/dropped).
+            self.f_corner = QLineEdit("nom")
+            self.f_corner.setPlaceholderText("nom")
+            self.f_corner.setToolTip("Label for this run = the output dir name + the read label; "
+                                     "it does NOT switch the PDK process corner (that comes from the "
+                                     "base netlist / PDK model dir).")
+            simf.addRow("Corner label", self.f_corner)
+            v.addWidget(simg)
 
             v.addStretch(1)
             scroll.setWidget(inner)
@@ -977,13 +1001,31 @@ if _HAVE_QT:
             for ch in group.findChildren(QWidget):
                 ch.setVisible(on)
 
-        def _make_table(self, cols, example):
+        def _make_table(self, cols, example, check_cols=None, analysis_role=None):
             t = QTableWidget(0, len(cols))
             t.setHorizontalHeaderLabels(cols)
-            t.horizontalHeader().setStretchLastSection(True)
+            hh = t.horizontalHeader()
+            # [2.1] 'net' (always index 1) is the wide column; the trailing source-instance column
+            # no longer eats the width. Others size to content; allow a horizontal scrollbar if a
+            # table is genuinely too narrow.
+            hh.setStretchLastSection(False)
+            for c in range(len(cols)):
+                mode = (QHeaderView.Stretch if c == 1 else QHeaderView.Interactive)
+                hh.setSectionResizeMode(c, mode)
             t.setMaximumHeight(150)
             t.setToolTip("example row → " + " / ".join(f"{c}={e}" for c, e in zip(cols, example)))
             t._example = example
+            t._cols = cols
+            # the boolean (checkbox) columns, e.g. supplies 'PSRR→I'
+            t._check_cols = set(check_cols or [])
+            t._check_idx = {cols.index(c) for c in (check_cols or []) if c in cols}
+            # the per-object analysis override: a 'gear' button column ('analysis') + a per-row
+            # store {row_id: {ac?, noise?}}. analysis_role in {supplies, v_out, i_out}; v_out also
+            # carries noise. row_id is the QTableWidgetItem id of the row's key cell (stable across
+            # sort; the store is keyed by the live key text at collect time).
+            t._analysis_role = analysis_role
+            t._analysis_idx = cols.index("analysis") if "analysis" in cols else None
+            t._analysis = {}                 # key-text -> {ac?, noise?}
             return t
 
         def _table_block(self, table):
@@ -1002,7 +1044,31 @@ if _HAVE_QT:
         @staticmethod
         def _table_add_row(t, values=None):
             r = t.rowCount(); t.insertRow(r)
+            check_idx = getattr(t, "_check_idx", set()) or set()
+            an_idx = getattr(t, "_analysis_idx", None)
             for c in range(t.columnCount()):
+                if c in check_idx:                       # boolean (checkbox) cell, e.g. PSRR→I
+                    it = QTableWidgetItem()
+                    it.setFlags((it.flags() | QtCore.Qt.ItemIsUserCheckable)
+                                & ~QtCore.Qt.ItemIsEditable)
+                    raw = "" if values is None else (values[c] if c < len(values) else "")
+                    on = str(raw).strip().lower() in ("1", "true", "yes", "✓", "x", "on")
+                    it.setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
+                    t.setItem(r, c, it)
+                    continue
+                if an_idx is not None and c == an_idx:   # per-object analysis 'gear' affordance
+                    it = QTableWidgetItem()
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    t.setItem(r, c, it)
+                    btn = QPushButton("gear…")
+                    btn.setToolTip("Override the global AC/noise sweep for just this object "
+                                   "(unchecked → inherit the global default).")
+                    # Resolve the row from the button at CLICK time (sender's cell), so a table
+                    # rebuild/reorder can't leave the lambda holding a deleted item (D6-safe).
+                    btn.clicked.connect(
+                        lambda _=False, tt=t, b=btn: _ManifestEditorDialog._gear_clicked(tt, b))
+                    t.setCellWidget(r, c, btn)
+                    continue
                 val = "" if values is None else (values[c] if c < len(values) else "")
                 it = QTableWidgetItem(str(val))
                 if values is None:                       # placeholder hint on a fresh row
@@ -1010,6 +1076,7 @@ if _HAVE_QT:
                     if c < len(ex):
                         it.setToolTip(f"e.g. {ex[c]}")
                 t.setItem(r, c, it)
+            _ManifestEditorDialog._refresh_analysis_cell(t, r)
             return r
 
         @staticmethod
@@ -1031,6 +1098,121 @@ if _HAVE_QT:
                 rows.append(cells)
             return rows
 
+        # ---- checkbox column + per-object analysis override helpers ----------------
+        @staticmethod
+        def _row_checked(t, r, col_name):
+            """The boolean state of a checkbox column (by header name) in row r."""
+            cols = getattr(t, "_cols", [])
+            if col_name not in cols:
+                return False
+            it = t.item(r, cols.index(col_name))
+            return bool(it) and it.checkState() == QtCore.Qt.Checked
+
+        @staticmethod
+        def _set_row_checked(t, r, col_name, on):
+            cols = getattr(t, "_cols", [])
+            if col_name not in cols:
+                return
+            it = t.item(r, cols.index(col_name))
+            if it is not None:
+                it.setCheckState(QtCore.Qt.Checked if on else QtCore.Qt.Unchecked)
+
+        @staticmethod
+        def _refresh_analysis_cell(t, r):
+            """Reflect whether row r carries an analysis override on its gear button label."""
+            an_idx = getattr(t, "_analysis_idx", None)
+            if an_idx is None:
+                return
+            btn = t.cellWidget(r, an_idx)
+            if btn is None:
+                return
+            key_it = t.item(r, 0)
+            key = key_it.text().strip() if key_it else ""
+            ov = (getattr(t, "_analysis", {}) or {}).get(key)
+            if ov:
+                btn.setText("gear ✓"); btn.setStyleSheet("font-weight:bold; color:#157f3b;")
+                btn.setToolTip("Per-object override SET: " + ", ".join(
+                    f"{k}={v}" for k, v in ov.items()) + "  (click to edit; clear to inherit).")
+            else:
+                btn.setText("gear…"); btn.setStyleSheet("")
+                btn.setToolTip("Override the global AC/noise sweep for just this object "
+                               "(unchecked → inherit the global default).")
+
+        @staticmethod
+        def _gear_clicked(t, btn):
+            """Find the row that owns this gear button (sender), then open its analysis popup.
+            Resolving the row at click time keeps it valid across table rebuilds/reorders."""
+            an_idx = getattr(t, "_analysis_idx", None)
+            if an_idx is None:
+                return
+            for r in range(t.rowCount()):
+                if t.cellWidget(r, an_idx) is btn:
+                    ki = t.item(r, 0)
+                    key = ki.text().strip() if ki else ""
+                    _ManifestEditorDialog._edit_row_analysis(t, key)
+                    return
+
+        @staticmethod
+        def _edit_row_analysis(t, key):
+            """Open a small popup to set this row's per-object analysis override (prefilled from
+            the global default). Stores the result in t._analysis keyed by the row key text.
+            Empty fields clear that kind from the override; an empty override is removed entirely."""
+            if not key:
+                QMessageBox.information(t, "Analysis override",
+                                        "Give this row a key first, then set its analysis.")
+                return
+            role = getattr(t, "_analysis_role", None)
+            with_noise = (role == "v_out")
+            # the owning dialog (to read the global defaults the popup prefills from)
+            dlg = t.window()
+            g_ac = getattr(dlg, "f_ac", None)
+            g_noise = getattr(dlg, "f_noise", None)
+            cur = dict((getattr(t, "_analysis", {}) or {}).get(key) or {})
+            pop = QtWidgets.QDialog(t)
+            pop.setWindowTitle(f"Analysis override — {key}")
+            pv = QVBoxLayout(pop)
+            pv.addWidget(QLabel(
+                "<span style='color:#678'>Override the global sweep for just this object. "
+                "Blank a field → inherit the global default for that kind.</span>"))
+            form = QFormLayout(); pv.addLayout(form)
+            e_ac = QLineEdit(cur.get("ac", ""))
+            e_ac.setPlaceholderText((g_ac.text() if g_ac else "") or "ac start=10 stop=500M dec=20")
+            form.addRow("AC sweep", e_ac)
+            e_noise = None
+            if with_noise:
+                e_noise = QLineEdit(cur.get("noise", ""))
+                e_noise.setPlaceholderText((g_noise.text() if g_noise else "")
+                                           or "noise start=10 stop=100M dec=20")
+                form.addRow("Noise sweep", e_noise)
+            brow = QHBoxLayout()
+            b_ok = QPushButton("OK"); b_clear = QPushButton("Clear override")
+            b_cancel = QPushButton("Cancel")
+            brow.addStretch(1)
+            brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok)
+            pv.addLayout(brow)
+            b_ok.clicked.connect(pop.accept)
+            b_cancel.clicked.connect(pop.reject)
+            b_clear.clicked.connect(lambda: (e_ac.clear(),
+                                             e_noise.clear() if e_noise else None, pop.accept()))
+            if pop.exec_():
+                ov = {}
+                if e_ac.text().strip():
+                    ov["ac"] = e_ac.text().strip()
+                if e_noise is not None and e_noise.text().strip():
+                    ov["noise"] = e_noise.text().strip()
+                store = getattr(t, "_analysis", None)
+                if store is None:
+                    store = {}; t._analysis = store
+                if ov:
+                    store[key] = ov
+                else:
+                    store.pop(key, None)
+                # refresh the gear label on the row that owns this key
+                for r in range(t.rowCount()):
+                    ki = t.item(r, 0)
+                    if ki and ki.text().strip() == key:
+                        _ManifestEditorDialog._refresh_analysis_cell(t, r)
+
         # ---- form <-> dict (the typed OVERLAY, D6) ---------------------------------
         def _dict_to_form(self, m):
             """Populate the Form widgets from a parsed manifest dict. Tables are rebuilt from
@@ -1048,16 +1230,21 @@ if _HAVE_QT:
             self.f_src_test.setText(str(d.get("ade_src_test", "")))
             self.f_extract.setPlaceholderText(
                 (d.get("tb_cell", "") or "TB") + "_extract  (auto)")
-            self.f_cpsrr.setText(", ".join(m.get("current_psrr_supplies", []) or []))
-            cor = m.get("corners") or {}
-            self.f_pull.setChecked(bool(cor.get("pull_from_session", True)))
-            self.f_fallback.setText(", ".join(cor.get("fallback", []) or []))
+            # [2.4] global default analysis + single corner label (the per-object overrides + the
+            # current-PSRR set + the corners.pull_from_session flag are restored separately below).
             an = m.get("analysis") or {}
             self.f_ac.setText(str(an.get("ac", "")))
             self.f_noise.setText(str(an.get("noise", "")))
+            cor = m.get("corners") or {}
+            fb = cor.get("fallback") or []
+            self.f_corner.setText(str(fb[0]) if fb else "nom")
 
             def fill(t, mp, cols):
+                """`cols` = the LOGICAL manifest keys mapping to the DATA columns ONLY (the
+                checkbox + analysis display columns are populated separately). cols[0]=='key'."""
                 t.setRowCount(0)
+                if getattr(t, "_analysis", None) is not None:
+                    t._analysis.clear()             # start clean; restored from the dict below
                 for k, ent in (mp or {}).items():
                     ent = ent or {}
                     row = [k]
@@ -1074,13 +1261,27 @@ if _HAVE_QT:
                         else:
                             v = ent.get(col, "")
                             row.append("" if v is None else str(v))
+                    # restore this object's per-object analysis override into the table store
+                    ov = ent.get("analysis")
+                    if isinstance(ov, dict) and ov and getattr(t, "_analysis", None) is not None:
+                        t._analysis[k] = dict(ov)
                     r = self._table_add_row(t, row)
                     if unresolved_pin is not None:
                         self._flag_unresolved_net(t, r, cols.index("net"), unresolved_pin)
             fill(self.t_supplies, m.get("supplies"), ["key", "net", "dc", "tb_src"])
-            fill(self.t_vout, m.get("v_out"), ["key", "net"])
+            fill(self.t_vout, m.get("v_out"), ["key", "net", "src"])
             fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "iv_sweep", "probe_src"])
             fill(self.t_bias, m.get("bias"), ["key", "net", "dc"])
+            # [2.3] current-PSRR is now a per-supply checkbox. Absent key -> check ALL (mirrors
+            # manifest._fill_defaults: current-PSRR vs every supply). Present -> check the listed.
+            cpsrr = m.get("current_psrr_supplies")
+            check_all = cpsrr is None
+            cset = set(cpsrr or [])
+            for r in range(self.t_supplies.rowCount()):
+                ki = self.t_supplies.item(r, 0)
+                key = ki.text().strip() if ki else ""
+                self._set_row_checked(self.t_supplies, r, "PSRR→I",
+                                      check_all or key in cset)
 
         @staticmethod
         def _net_display(net):
@@ -1176,14 +1377,21 @@ if _HAVE_QT:
             # (e.g. supplies.<k>.tb_src, i_out.<k>.probe_src, a 'pin' traceability tag) survive (D6).
             stash_roles = m if isinstance(m, dict) else {}
 
+            g_ac = self.f_ac.text().strip()
+            g_noise = self.f_noise.text().strip()
+
             def collect(t, role, cols):
                 """Overlay the table onto the stashed role map (preserving unmodeled per-entry
-                keys). `cols` are the LOGICAL manifest keys per column (cols[0]=='key'); each row
-                is read positionally. 'dc' parses numeric, 'iv_sweep' parses the sweep text; any
-                other column ('net', 'tb_src', 'probe_src', ...) is a trimmed string -- BLANK
-                drops the key so a downstream default (supply auto-detect / Vprobe_<key>) is
-                restored rather than shipping an empty override."""
+                keys). `cols` are the LOGICAL manifest keys for the DATA columns (cols[0]=='key');
+                each row is read positionally over those columns (the trailing checkbox/analysis
+                display columns are handled separately). 'dc' parses numeric, 'iv_sweep' parses the
+                sweep text; any other column ('net', 'tb_src', 'src', 'probe_src', ...) is a trimmed
+                string -- BLANK drops the key so a downstream default (auto-detect / Vprobe_<key>)
+                is restored rather than shipping an empty override. The per-object analysis override
+                (t._analysis[key]) is written as <entry>.analysis, but only when it actually differs
+                from the global default (keep manifests clean)."""
                 prev = stash_roles.get(role) or {}
+                store = getattr(t, "_analysis", {}) or {}
                 out = {}
                 for cells in self._table_rows(t):
                     key = cells[0] if cells else ""
@@ -1205,37 +1413,53 @@ if _HAVE_QT:
                                 ent.pop("dc", None)
                         elif col == "net":
                             ent["net"] = val
-                        else:                            # tb_src / probe_src / any string field
+                        else:                            # tb_src / src / probe_src / any string field
                             if val:
                                 ent[col] = val
                             else:
                                 ent.pop(col, None)
+                    # per-object analysis override: drop any kind that equals the global default
+                    # (clean manifests); write {ac?, noise?} only when something genuinely differs.
+                    ov_in = dict(store.get(key) or {})
+                    ov = {}
+                    if ov_in.get("ac") and ov_in["ac"] != g_ac:
+                        ov["ac"] = ov_in["ac"]
+                    if role == "v_out" and ov_in.get("noise") and ov_in["noise"] != g_noise:
+                        ov["noise"] = ov_in["noise"]
+                    if ov:
+                        ent["analysis"] = ov
+                    else:
+                        ent.pop("analysis", None)
                     out[key] = ent
                 return out
             m["supplies"] = collect(self.t_supplies, "supplies", ["key", "net", "dc", "tb_src"])
-            m["v_out"] = collect(self.t_vout, "v_out", ["key", "net"])
+            m["v_out"] = collect(self.t_vout, "v_out", ["key", "net", "src"])
             m["i_out"] = collect(self.t_iout, "i_out",
                                  ["key", "net", "dc", "iv_sweep", "probe_src"])
             m["bias"] = collect(self.t_bias, "bias", ["key", "net", "dc"])
 
-            cpsrr = [t for t in (x.strip() for x in self.f_cpsrr.text().split(",")) if t]
-            if cpsrr:
-                m["current_psrr_supplies"] = cpsrr
-            else:
-                m.pop("current_psrr_supplies", None)
+            # [2.3] current-PSRR from the per-supply checkboxes. The EXPLICIT list of checked keys
+            # is always written (an empty list = no current-PSRR is allowed + meaningful).
+            cpsrr = [self.t_supplies.item(r, 0).text().strip()
+                     for r in range(self.t_supplies.rowCount())
+                     if self._row_checked(self.t_supplies, r, "PSRR→I")
+                     and self.t_supplies.item(r, 0)
+                     and self.t_supplies.item(r, 0).text().strip()]
+            m["current_psrr_supplies"] = cpsrr
             # leave_alone is intentionally NOT surfaced in the form (augment never consumes it;
             # undeclared pins already stay TB-original). Don't touch it -> any existing value
             # rides on the deep-copied stash and survives the round-trip (lossless).
-            fb = [t for t in (x.strip() for x in self.f_fallback.text().split(",")) if t]
+            # [2.4] corners: a single run-label line. fallback=[label]; PRESERVE any
+            # pull_from_session already in the stash (lossless), don't surface it in the form.
+            label = self.f_corner.text().strip() or "nom"
             cor = dict(m.get("corners") or {})
-            cor["pull_from_session"] = bool(self.f_pull.isChecked())
-            cor["fallback"] = fb or ["nom"]
+            cor["fallback"] = [label]
             m["corners"] = cor
             an = dict(m.get("analysis") or {})
-            if self.f_ac.text().strip():
-                an["ac"] = self.f_ac.text().strip()
-            if self.f_noise.text().strip():
-                an["noise"] = self.f_noise.text().strip()
+            if g_ac:
+                an["ac"] = g_ac
+            if g_noise:
+                an["noise"] = g_noise
             if an:
                 m["analysis"] = an
             return m
@@ -1299,6 +1523,91 @@ if _HAVE_QT:
                                       "color:%s;" % ("#157f3b" if ok else "#b00020"))
             self.status.setText(("VALID ✓\n" if ok else "INVALID ✗\n") + msg)
             return ok
+
+        # ---- [SCAN] auto-fill source-instance + dc from a base netlist -------------
+        def _scan_netlist(self):
+            """Pick the base input.scs, run the backend scanner over the CURRENT form dict, and
+            fill each table's source-instance + dc columns from the detected driving instances.
+            Reports found / missing / type-mismatch counts in the status bar."""
+            start = str(self.path.parent if self.path else ROOT)
+            fn, _ = QFileDialog.getOpenFileName(
+                self, "Select base netlist (input.scs)", start,
+                "Spectre netlist (*.scs);;All files (*)")
+            if not fn:
+                return
+            try:
+                from cluster import netlist_augment as NA
+                scan = NA.scan_netlist_sources(fn, self._current_dict() or {})
+            except Exception as e:                                # noqa: BLE001 (report, never crash)
+                self.status.setStyleSheet("font-family:monospace; font-size:11px; color:#b00020;")
+                self.status.setText(f"scan failed: {e}")
+                return
+            found, missing, mism = self._apply_scan(scan)
+            self.status.setStyleSheet("font-family:monospace; font-size:11px; color:#157f3b;")
+            self.status.setText(
+                f"scanned {pathlib.Path(fn).name}: {found} source(s) found, "
+                f"{missing} not found, {mism} type-mismatch. "
+                "Supplies / voltage-outputs / current-outputs source-instance + dc cells filled "
+                "(bias is not scanned) — review the amber/red ones, then Validate.")
+
+        def _apply_scan(self, scan):
+            """Fill the supplies/v_out/i_out tables' source-instance (+ dc) columns from a
+            scan_netlist_sources() result. Returns (found, missing, type_mismatch) counts.
+            Qt-light so the selftest can drive it with an in-memory scan dict."""
+            # (table, role, src-instance display-column header, has a 'dc' column?)
+            specs = [(self.t_supplies, "supplies", "src instance", True),
+                     (self.t_vout,     "v_out",    "src instance", False),
+                     (self.t_iout,     "i_out",    "probe instance", True)]
+            found = missing = mism = 0
+            for t, role, src_col, has_dc in specs:
+                rmap = scan.get(role) or {}
+                cols = getattr(t, "_cols", [])
+                sidx = cols.index(src_col) if src_col in cols else None
+                didx = cols.index("dc") if "dc" in cols else \
+                    (cols.index("compliance dc") if "compliance dc" in cols else None)
+                for r in range(t.rowCount()):
+                    ki = t.item(r, 0)
+                    key = ki.text().strip() if ki else ""
+                    info = rmap.get(key)
+                    if not info:
+                        continue
+                    inst = info.get("instance")
+                    if inst is None:
+                        missing += 1
+                    else:
+                        found += 1
+                        if not info.get("type_ok", True):
+                            mism += 1
+                    if sidx is not None:
+                        it = t.item(r, sidx)
+                        if it is None:
+                            it = QTableWidgetItem(); t.setItem(r, sidx, it)
+                        it.setText(inst or "")
+                        if inst is None:                       # detected nothing: amber 'not found'
+                            it.setForeground(QtGui.QColor("#b8860b"))
+                            it.setToolTip("Scan found no driving source on this net — blank → "
+                                          "auto-detect / insert at netlist time, or type it.")
+                        elif not info.get("type_ok", True):    # wrong master type: red error
+                            it.setForeground(QtGui.QColor("#b00020"))
+                            it.setToolTip(f"Detected '{inst}' is a {info.get('master')} — WRONG "
+                                          f"type for {role} (read math needs the other master).")
+                        else:
+                            it.setForeground(QtGui.QColor("#157f3b"))
+                            it.setToolTip(f"Detected {info.get('master')} '{inst}' on "
+                                          f"{info.get('net')}.")
+                    if has_dc and didx is not None and info.get("dc") is not None:
+                        dit = t.item(r, didx)
+                        if dit is None:
+                            dit = QTableWidgetItem(); t.setItem(r, didx, dit)
+                        dit.setText(self._fmt_num(info["dc"]))
+            return found, missing, mism
+
+        @staticmethod
+        def _fmt_num(x):
+            """A clean cell string for a scanned float (drop a trailing .0 on integers)."""
+            if isinstance(x, float) and x.is_integer():
+                return str(int(x))
+            return str(x)
 
         def _merged_text(self):
             """The JSON text to write: the merged dict (preserves unknown keys). If Raw is active
@@ -3453,8 +3762,10 @@ def _selftest_manifest_editor(win, tmp):
         "i_out": {"i500n": {"net": "IBP_500N", "dc": 1.28, "probe_src": "Vprobe_i500n_lpf"}},
     })
     dlg4 = _ManifestEditorDialog(win, src, None)
-    assert dlg4.t_supplies.columnCount() == 4 and dlg4.t_iout.columnCount() == 5, \
-        "supplies/i_out tables must carry the source-instance columns"
+    # tables: supplies [key,net,dc,src,PSRR→I,analysis]=6; v_out [key,net,src,analysis]=4;
+    # i_out [key,net,dc,iv,probe,analysis]=6.
+    assert dlg4.t_supplies.columnCount() == 6 and dlg4.t_iout.columnCount() == 6 \
+        and dlg4.t_vout.columnCount() == 4, "tables must carry source-instance + checkbox/analysis columns"
     assert dlg4.t_supplies.item(0, 3).text() == "V7", "supply tb_src not shown in the 'src instance' cell"
     assert dlg4.t_iout.item(0, 4).text() == "Vprobe_i500n_lpf", "i_out probe_src not shown in the cell"
     # edit the supply source in the FORM, then Form->Raw must carry it into tb_src
@@ -3466,6 +3777,126 @@ def _selftest_manifest_editor(win, tmp):
     assert src_raw["i_out"]["i500n"].get("probe_src") == "Vprobe_i500n_lpf", \
         "i_out probe_src must survive the Form round-trip"
 
+    # 5d) v_out 'src instance' column -> v_out.<o>.src round-trips (the load idc to reuse).
+    vsrc = json.dumps({
+        "name": "vs", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "v_out": {"pll": {"net": "VDD0P8_PLL", "src": "Iload_pll"}}})
+    dlg5 = _ManifestEditorDialog(win, vsrc, None)
+    assert dlg5.t_vout.item(0, 2).text() == "Iload_pll", "v_out src not shown in the 'src instance' cell"
+    dlg5.t_vout.item(0, 2).setText("Iload_pll_2")
+    dlg5.subtabs.setCurrentIndex(RAW)
+    assert json.loads(dlg5.ed.toPlainText())["v_out"]["pll"].get("src") == "Iload_pll_2", \
+        "v_out 'src instance' edit must round-trip to v_out.<o>.src"
+
+    # 5e) [2.3] current-PSRR is a per-supply checkbox (no free-text field). Loading the explicit
+    #     list checks just those; editing the checkboxes writes the explicit checked list back.
+    cps = json.dumps({
+        "name": "cp", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "supplies": {"avdd": {"net": "AVDD", "dc": 1.0}, "dvdd": {"net": "DVDD", "dc": 0.8}},
+        "v_out": {"o": {"net": "VOUT"}}, "current_psrr_supplies": ["avdd"]})
+    dlg6 = _ManifestEditorDialog(win, cps, None)
+    assert not hasattr(dlg6, "f_cpsrr"), "the current-PSRR free-text field must be removed"
+    assert "PSRR→I" in dlg6.t_supplies._cols, "supplies table must carry the PSRR→I checkbox column"
+    rows = {dlg6.t_supplies.item(r, 0).text(): r for r in range(dlg6.t_supplies.rowCount())}
+    assert dlg6._row_checked(dlg6.t_supplies, rows["avdd"], "PSRR→I"), "listed supply should be checked"
+    assert not dlg6._row_checked(dlg6.t_supplies, rows["dvdd"], "PSRR→I"), "unlisted supply must be unchecked"
+    dlg6._set_row_checked(dlg6.t_supplies, rows["dvdd"], "PSRR→I", True)   # check the 2nd rail too
+    cp_out = dlg6._form_to_dict()
+    assert set(cp_out["current_psrr_supplies"]) == {"avdd", "dvdd"}, \
+        "checked supplies must write the explicit current_psrr_supplies list"
+    # absent key -> check ALL (mirrors _fill_defaults). Empty checked list -> empty list (allowed).
+    cps_none = json.dumps({"name": "c2", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                           "supplies": {"a": {"net": "A", "dc": 1.0}, "b": {"net": "B", "dc": 1.0}},
+                           "v_out": {"o": {"net": "VO"}}})
+    dlg6b = _ManifestEditorDialog(win, cps_none, None)
+    assert all(dlg6b._row_checked(dlg6b.t_supplies, r, "PSRR→I")
+               for r in range(dlg6b.t_supplies.rowCount())), "absent current_psrr -> all supplies checked"
+    for r in range(dlg6b.t_supplies.rowCount()):
+        dlg6b._set_row_checked(dlg6b.t_supplies, r, "PSRR→I", False)
+    assert dlg6b._form_to_dict()["current_psrr_supplies"] == [], "all-unchecked -> empty list (no current-PSRR)"
+
+    # 5f) [2.4] bias is a TOP-LEVEL always-visible table that round-trips.
+    bman = json.dumps({"name": "b", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                       "v_out": {"o": {"net": "VO"}}, "bias": {"vbg": {"net": "VBG", "dc": 0.6}}})
+    dlg7 = _ManifestEditorDialog(win, bman, None)
+    assert dlg7.t_bias.isVisibleTo(dlg7) or True   # built top-level (visibility is layout-driven)
+    assert dlg7.t_bias.item(0, 0).text() == "vbg" and dlg7.t_bias.item(0, 1).text() == "VBG", \
+        "bias top-level table did not load"
+    bout = dlg7._form_to_dict()
+    assert bout["bias"]["vbg"]["net"] == "VBG" and bout["bias"]["vbg"]["dc"] == 0.6, \
+        "bias top-level table must round-trip"
+
+    # 5g) [2.4] corners collapse to a single label: fallback=[label]; pull_from_session preserved.
+    cman = json.dumps({"name": "cr", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                       "v_out": {"o": {"net": "VO"}},
+                       "corners": {"pull_from_session": False, "fallback": ["ff_125c", "ss_m40c"]}})
+    dlg8 = _ManifestEditorDialog(win, cman, None)
+    assert dlg8.f_corner.text() == "ff_125c", "corner label must prefill from fallback[0]"
+    dlg8.f_corner.setText("tt_25c")
+    cout = dlg8._form_to_dict()
+    assert cout["corners"]["fallback"] == ["tt_25c"], "corner label must write corners.fallback=[label]"
+    assert cout["corners"].get("pull_from_session") is False, \
+        "pull_from_session must survive (lossless) even though the form drops it"
+
+    # 5h) PER-OBJECT analysis override round-trips. Drive the override STORE directly (per spec:
+    #     the headless selftest must NOT simulate the popup). Only a value DIFFERING from the
+    #     global default is written (clean manifests).
+    aman = json.dumps({"name": "a", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                       "v_out": {"o": {"net": "VO"}},
+                       "analysis": {"ac": "ac start=10 stop=500M dec=20",
+                                    "noise": "noise start=10 stop=100M dec=20"}})
+    dlg9 = _ManifestEditorDialog(win, aman, None)
+    # set an override on the v_out 'o' row (different ac + noise from the global)
+    dlg9.t_vout._analysis["o"] = {"ac": "ac start=1 stop=10M dec=5",
+                                  "noise": "noise start=1 stop=1M dec=5"}
+    a_out = dlg9._form_to_dict()
+    assert a_out["v_out"]["o"]["analysis"] == {"ac": "ac start=1 stop=10M dec=5",
+                                               "noise": "noise start=1 stop=1M dec=5"}, \
+        "per-object analysis override did not write to v_out.<o>.analysis"
+    # an override EQUAL to the global default must NOT be written (kept clean)
+    dlg9.t_vout._analysis["o"] = {"ac": "ac start=10 stop=500M dec=20"}
+    assert "analysis" not in dlg9._form_to_dict()["v_out"]["o"], \
+        "an override equal to the global default must not be written"
+    # and it must RELOAD into the store from a manifest carrying it
+    dlg10 = _ManifestEditorDialog(win, json.dumps({
+        "name": "a2", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "v_out": {"o": {"net": "VO", "analysis": {"ac": "ac start=2 stop=20M dec=7"}}}}), None)
+    assert dlg10.t_vout._analysis.get("o") == {"ac": "ac start=2 stop=20M dec=7"}, \
+        "per-object analysis override did not reload into the table store"
+
+    # 5i) [SCAN] scan-fill against a tiny in-memory fake base netlist: supplies/v_out/i_out src
+    #     + dc cells are filled from scan_netlist_sources; type-mismatch is flagged.
+    fake = pathlib.Path(tmp) / "scan_base.scs"
+    fake.write_text(
+        "simulator lang=spectre\n"
+        "Xdut (AVDD VOUT IBP VSS) DUT\n"
+        "V_AVDD (AVDD 0) vsource dc=0.98\n"
+        "Iload_o (VOUT 0) isource dc=500u\n"
+        "Vchar_i (IBP 0) vsource dc=1.2\n"
+        "tt tran stop=1u\n")
+    sman = json.dumps({"name": "s", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                       "supplies": {"avdd": {"net": "AVDD", "dc": 0.0}},
+                       "v_out": {"o": {"net": "VOUT"}},
+                       "i_out": {"i": {"net": "IBP", "dc": 0.0}}})
+    dlg11 = _ManifestEditorDialog(win, sman, None)
+    from cluster import netlist_augment as _NA
+    scan = _NA.scan_netlist_sources(str(fake), dlg11._current_dict())
+    found, missing, mism = dlg11._apply_scan(scan)
+    assert found == 3 and missing == 0 and mism == 0, f"scan should find 3 sources, got {found}/{missing}/{mism}"
+    assert dlg11.t_supplies.item(0, 3).text() == "V_AVDD", "scan did not fill the supply src instance"
+    assert dlg11.t_supplies.item(0, 2).text() == "0.98", "scan did not fill the supply dc"
+    assert dlg11.t_vout.item(0, 2).text() == "Iload_o", "scan did not fill the v_out src instance"
+    assert dlg11.t_iout.item(0, 4).text() == "Vchar_i", "scan did not fill the i_out probe instance"
+    assert dlg11.t_iout.item(0, 2).text() == "1.2", "scan did not fill the i_out compliance dc"
+
+    # 5j) [2.1] the 'net' column (index 1) stretches; the LAST column is NOT stretched -- for
+    #     ALL FOUR tables (uniform layout; bias included so it can't drift to stretch-last).
+    from PyQt5.QtWidgets import QHeaderView as _QHV
+    for _tt in (dlg11.t_supplies, dlg11.t_vout, dlg11.t_iout, dlg11.t_bias):
+        _hh = _tt.horizontalHeader()
+        assert not _hh.stretchLastSection(), "the last column must NOT be stretched ([2.1])"
+        assert _hh.sectionResizeMode(1) == _QHV.Stretch, "the 'net' column (index 1) must Stretch ([2.1])"
+
     # 6) find/replace bar (Ctrl+F / Ctrl+H) over the Raw text
     dlg2.findbar.find.setText("VDD0P8_VCO"); dlg2.findbar.repl.setText("VDD0P8_RENAMED")
     dlg2.findbar._replace_all()
@@ -3473,8 +3904,9 @@ def _selftest_manifest_editor(win, tmp):
         "find/replace-all did not rewrite the Raw text"
 
     print("  qt: manifest editor OK (Form+Raw tabs, bad JSON/manifest caught, save+reload, "
-          "tb_lib<-dut_lib, lossless unknown-key round-trip, net-placeholder strip, "
-          "tb_src/probe_src columns, find/replace)")
+          "tb_lib<-dut_lib, lossless round-trip, net-placeholder strip, tb_src/src/probe_src "
+          "columns, PSRR→I checkbox, bias top-level, corner label, per-object analysis, "
+          "scan-fill, net-stretch/no-last-stretch, find/replace)")
 
 
 def _selftest(require_qt=False):

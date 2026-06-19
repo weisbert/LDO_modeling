@@ -300,6 +300,25 @@ def test_real_import_fit_emit_standin(tmp_path):
     assert "i1u" in ports and "i500n" in ports
 
 
+def test_importmp_reads_reused_probe_src_p():
+    """Read-side under REUSE: the y/pi derive reads <probe_src>:p where probe_src now names the
+    REUSED vdc. measurements() builds the save/reads from manifest._probe_name, so a named
+    probe_src points the save+read at the designer's real vsource (no derive-math change)."""
+    import numpy as np
+    # a resolved wur manifest names probe_src = the reused vdc (Vbias_*)
+    raw = re.sub(r"<net:([^>]+)>", r"\1", WUR_MANIFEST.read_text())
+    m = M.load(_write_json(json.loads(raw)))
+    probe = M._probe_name(m, "i500n_lpf")
+    assert probe == "Vbias_500n_lpf"                      # the reused vdc, not Vprobe_
+    # the y point reads ('i', <probe>) and saves <probe>:p -> the read targets the reused source
+    y_pt = next(pt for pt in M.measurements(m) if pt["tag"] == "y_i500n_lpf")
+    assert y_pt["reads"] == [("i", probe)] and y_pt["save"] == [("i", probe)]
+    # the derive reads <probe>:p from the PSF; Y = -I (no math change under reuse)
+    d = {"freq": np.array([1.0, 2.0]), f"{probe}:p": np.array([1+2j, 3+4j])}
+    arr = IMP._derive(y_pt, d)
+    assert np.allclose(arr[:, 1], [-1.0, -3.0]) and np.allclose(arr[:, 2], [-2.0, -4.0])
+
+
 # =====================================================================================
 # (C) DRY-RUN: per-group dsub commands assembled, NOTHING executes (Boom never fires)
 # =====================================================================================
@@ -421,8 +440,10 @@ def _write_json(obj):
 
 
 def _wur_base_dir(tmp_path):
-    """A synthetic base .tran TB matching the resolved wur nets: the DUT instance, a supply
-    vsource on AVDD1P0 (no tb_src -> auto-detect), an output load, and a .tran to be stripped."""
+    """A synthetic base .tran TB matching the resolved wur nets + the designer's OWN source on
+    EVERY tagged pin (the source-reuse model): the supply vsource, a load isource per v_out, a
+    compliance vdc vsource per i_out (the named *_src instances the manifest reuses), and a
+    .tran to be stripped."""
     d = tmp_path / "base"
     d.mkdir()
     (d / "input.scs").write_text(
@@ -432,6 +453,10 @@ def _wur_base_dir(tmp_path):
         "IBP_PTAT_TUNE_1P5U_VCO VSS) WuR_PMU_TOP\n"
         "V_AVDD (AVDD1P0 0) vsource dc=0.98\n"
         "Iload_pll (VDD0P8_PLL 0) isource dc=500u\n"
+        "Iload_vco (VDD0P8_VCO 0) isource dc=2m\n"
+        "Vbias_500n_lpf (IBP_POLY_500N_LPF 0) vsource dc=1.28\n"
+        "Vbias_3p6u_vco (IBP_POLY_3P6U_VCO 0) vsource dc=1.28\n"
+        "Vbias_1p5u_ptat (IBP_PTAT_TUNE_1P5U_VCO 0) vsource dc=0.667\n"
         "tt tran stop=1u\n")
     return d
 
@@ -530,14 +555,26 @@ def test_offline_sweep_real_runner_psf_map_by_all_14_tags(tmp_path):
         assert str(gdir).startswith(str(workarea)) and "/simulation/" not in str(gdir)
 
 
-def test_offline_sweep_guard_trips_on_unresolved_manifest(tmp_path):
-    """The shipped wur manifest carries '<net:...>' placeholders; building the offline factory
-    over it must refuse with an actionable error (resolve nets first)."""
+def test_offline_sweep_bplus_resolves_net_equals_pin(tmp_path):
+    """The shipped wur manifest carries '<net:PIN>' placeholders whose PIN IS a base net
+    (net==pin); B+ net resolution resolves them silently against the base netlist (no raise),
+    so net==pin needs zero hand-edits before the offline sweep."""
     m = M.load(str(WUR_MANIFEST))                       # placeholders intact
+    base = _wur_base_dir(tmp_path)
+    NA.make_offline_group_netlister(base, m, tmp_path / "out")   # no raise -- B+ resolves
+    assert m["supplies"]["avdd1p0"]["net"] == "AVDD1P0"          # resolved in place
+    assert m["v_out"]["pll"]["net"] == "VDD0P8_PLL"
+
+
+def test_offline_sweep_bplus_hard_stops_on_net_not_equal_pin(tmp_path):
+    """A placeholder PIN that is NOT a net in the base netlist (net!=pin) still hard-stops loudly
+    so the designer sets the real TB net."""
+    m = M.load(str(WUR_MANIFEST))
+    m["i_out"]["i500n_lpf"]["net"] = "<net:NOT_A_NET>"
     base = _wur_base_dir(tmp_path)
     with pytest.raises(NA.NetlistAugmentError) as ei:
         NA.make_offline_group_netlister(base, m, tmp_path / "out")
-    assert "resolve" in str(ei.value).lower()
+    assert "NOT_A_NET" in str(ei.value)
 
 
 def _seed_all_group_psf(dirs, grps):

@@ -115,10 +115,29 @@ def test_nets_from_resolver(built):
     assert built["i_out"]["i1p5u"]["net"] == "net_IBP_PTAT_TUNE_1P5U_VCO"
 
 
-def test_probe_sources_stable(built):
-    # importmp/augment both derive the probe name from the role key; check it's there
-    assert built["i_out"]["i500n"]["probe_src"] == "Vprobe_i500n"
-    assert built["i_out"]["i1p8u"]["probe_src"] == "Vprobe_i1p8u"
+def test_probe_src_absent_by_default(built):
+    # REUSE model: the builder no longer FABRICATES a probe_src (that would name a non-existent
+    # source). Absent -> the netlister auto-detects the vdc on the net or falls back to inserting
+    # Vprobe_<key>; the read derives the SAME name from the role key via manifest._probe_name.
+    for c in built["i_out"]:
+        assert "probe_src" not in built["i_out"][c]
+        assert M._probe_name(built, c) == f"Vprobe_{c}"          # the fallback-insert name
+
+
+def test_src_passthrough_when_gui_supplies_it():
+    # when the GUI names the existing TB sources to reuse, they pass through to src/probe_src
+    gui = dict(
+        tb_lib="L", tb_cell="TB", dut_lib="L", dut_cell="D", ground="VSS",
+        supply={"pin": "AVDD1P0", "dc": 1.0, "tb_src": "V_AVDD"},
+        v_outs=["VDD0P8_PLL"], i_outs=["IBP_POLY_500N"],
+        v_src={"VDD0P8_PLL": "Iload_pll"},
+        i_src={"IBP_POLY_500N": "Vbias_500n"},
+        vdc={"IBP_POLY_500N": 1.28})
+    netmap = {p: p for p in ["AVDD1P0", "VDD0P8_PLL", "IBP_POLY_500N"]}
+    m = B.build_manifest(gui, netmap)
+    assert m["supplies"]["avdd1p0"]["tb_src"] == "V_AVDD"
+    assert m["v_out"]["pll"]["src"] == "Iload_pll"
+    assert m["i_out"]["i500n"]["probe_src"] == "Vbias_500n"
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +352,49 @@ def test_explicit_tnom_overrides_middle():
                                   "IBP_PTAT_TUNE_1P5U_VCO"]}
     m = B.build_manifest(real_gui(temps=[-40, 27, 125], tnom_c=27), nm)
     assert m["tnom_c"] == 27.0
+
+
+# ---------------------------------------------------------------------------
+# per-object analysis override (OPTIONAL dict {ac?, noise?}) -- validated by manifest.validate
+# ---------------------------------------------------------------------------
+def _min_manifest():
+    return {"name": "t", "dut": {"lib": "L", "cell": "C", "tb_lib": "TB", "tb_cell": "TBC"},
+            "supplies": {"s": {"net": "VS", "dc": 1.0}},
+            "v_out": {"o": {"net": "VO"}}, "i_out": {"c": {"net": "VI", "dc": 0.5}}, "bias": {}}
+
+
+def test_per_object_analysis_valid_dict_passes():
+    m = M._fill_defaults(_min_manifest())
+    m["v_out"]["o"]["analysis"] = {"ac": "ac dec=10", "noise": "noise dec=10"}
+    m["supplies"]["s"]["analysis"] = {"ac": "ac dec=5"}
+    m["i_out"]["c"]["analysis"] = {"ac": "ac dec=5"}
+    assert M.validate(m) is True
+    assert M.analysis_line_for(m, "v_out", "o", "ac") == "ac dec=10"
+    assert M.analysis_line_for(m, "v_out", "o", "noise") == "noise dec=10"
+    # absent override -> global
+    assert M.analysis_override(m, "i_out", "c", "noise") is None
+    assert M.analysis_line_for(m, "i_out", "c", "ac") == "ac dec=5"
+
+
+def test_per_object_analysis_non_dict_raises():
+    m = M._fill_defaults(_min_manifest())
+    m["v_out"]["o"]["analysis"] = "ac dec=10"             # must be a dict
+    with pytest.raises(M.ManifestError):
+        M.validate(m)
+
+
+def test_per_object_analysis_unknown_key_raises():
+    m = M._fill_defaults(_min_manifest())
+    m["supplies"]["s"]["analysis"] = {"noise": "noise dec=10"}   # supply may carry only ac
+    with pytest.raises(M.ManifestError):
+        M.validate(m)
+
+
+def test_per_object_analysis_non_string_value_raises():
+    m = M._fill_defaults(_min_manifest())
+    m["v_out"]["o"]["analysis"] = {"ac": 123}            # value must be a string line
+    with pytest.raises(M.ManifestError):
+        M.validate(m)
 
 
 # ---------------------------------------------------------------------------

@@ -7,11 +7,26 @@ the per-group ac/noise extraction netlists the cluster sweep runs -- no live Vir
 
 It is the offline analogue of augment.build_plan(m): the SAME stimulus placement, expressed
 in Spectre netlist text instead of schematic ops, so the sign conventions feed importmp's
-derivations identically (mirror augment's node orders EXACTLY):
+derivations identically (mirror augment's node orders EXACTLY).
 
-  v_out  o -> APPEND  Iext_<o>  (<ground> <net>) isource mag=acm_v_out_<o>   [dc=0, AC only]
-  i_out  c -> APPEND  <probe>   (<net> <ground>) vsource dc=<i_out.dc> mag=acm_i_out_<c>
-  supply s -> MODIFY  the EXISTING supply source (tb_src OR auto-detect) -> mag=acm_supply_<s>
+UNIFIED SOURCE-REUSE MODEL: the designer's TB already places an idc/vdc on every v_out / i_out
+pin, so EVERY role REUSES that existing source (sets its mag=acm) rather than appending a 2nd
+driver (which would double-drive the node and contaminate the read). Per role:
+
+  supply s -> REUSE the VSOURCE on net (supplies.<s>.tb_src OR auto-detect) -> mag=acm_supply_<s>
+  v_out  o -> REUSE the ISOURCE on net (v_out.<o>.src   OR auto-detect) -> mag=acm_v_out_<o>
+              (read = node voltage -> needs current injection -> an isource)
+  i_out  c -> REUSE the VSOURCE on net (i_out.<c>.probe_src OR auto-detect) -> mag=acm_i_out_<c>
+              (read = <source>:p current under a voltage drive -> needs a vsource)
+
+FALLBACK (open pin): if NO source is named AND none auto-detected on a v_out/i_out net, fall
+back to the OLD insert -- append  Iext_<o> (<ground> <net>) isource mag=acm  for a v_out, or
+<probe> (<net> <ground>) vsource dc=<compliance> mag=acm  for an i_out -- so an open pin still
+works (the only place the old Iext/Vprobe strings survive). A clear "fallback-insert" note prints.
+
+TYPE GUARDRAIL: a named/detected role source's master must match the role (v_out->isource,
+i_out->vsource, supply->vsource); a wrong-master named source is a clear error (the read math
+depends on it).
 
 Per group we emit a `parameters` line declaring EVERY acm var (default 0) with THIS group's
 hot vars set to 1 -- AC superposition makes each saved port an identifiable transfer. The base
@@ -28,10 +43,16 @@ untouched -- it writes raw stimuli + targeted saves only; all ratios/PSRR stay i
 import pathlib
 
 # The net placeholder the resolver fills (insitu.resolve / the manifest templates emit
-# '<net:PIN>'); an unresolved manifest still carries it. The offline netlister CANNOT run
-# against placeholder nets (they would land in the netlist verbatim and mis-wire), so we
-# guard on this prefix before producing anything.
+# '<net:PIN>'); an unresolved manifest still carries it. B+ net resolution (below) resolves a
+# '<net:PIN>' against the base netlist: PIN that IS a real net -> PIN (the common net==pin case,
+# zero hand-edits); PIN that is NOT a net -> a hard error (net!=pin needs the real TB net).
 NET_PLACEHOLDER_PREFIX = "<net:"
+
+# The simulator master each role's REUSED/inserted source must be: a v_out reads a node
+# voltage (1 A AC injected) -> an isource; a supply / an i_out drive a voltage and read a node
+# V / a probe :p current -> a vsource. The type guardrail rejects a named source of the wrong
+# master, and auto-detect only matches the right master.
+ROLE_MASTER = {"supplies": "vsource", "v_out": "isource", "i_out": "vsource"}
 
 # The visible marker we prefix a stripped (commented-out) base analysis with, so the
 # designer can eyeball exactly what the offline netlister removed.
@@ -53,27 +74,9 @@ NOISE_NAME = "nz"
 
 
 class NetlistAugmentError(RuntimeError):
-    """The offline netlister cannot safely produce a netlist: an unresolved (placeholder)
-    net, or a supply source that cannot be located (zero or ambiguous auto-detect)."""
-
-
-# --------------------------------------------------------------------------- guards
-def _resolved_nets_guard(m):
-    """Require RESOLVED nets before producing anything. Scan supplies/v_out/i_out 'net'
-    values; if any still carries the '<net:' placeholder prefix, raise -- the designer must
-    resolve nets (Mode A in live Virtuoso) or hand-edit the manifest first."""
-    bad = []
-    for role in ("supplies", "v_out", "i_out"):
-        for key, v in (m.get(role) or {}).items():
-            net = str(v.get("net", ""))
-            if net.startswith(NET_PLACEHOLDER_PREFIX):
-                bad.append(f"{role}.{key}={net}")
-    if bad:
-        raise NetlistAugmentError(
-            "the manifest still has UNRESOLVED placeholder nets: " + ", ".join(bad) + ". "
-            "The offline netlister cannot run against '<net:...>' placeholders -- resolve the "
-            "nets (run Mode A in the live Virtuoso) or hand-edit the manifest's 'net' fields "
-            "to the real TB nets, then re-run.")
+    """The offline netlister cannot safely produce a netlist: an unresolvable placeholder net
+    (net!=pin), a role source that cannot be located (zero or ambiguous auto-detect), or a
+    named source of the wrong master type for its role."""
 
 
 # ----------------------------------------------------------------- base-netlist parsing
@@ -122,6 +125,63 @@ def _logical_lines(text):
     return units
 
 
+def _parse_instance(logical):
+    """Parse a LOGICAL netlist statement as an instance `<name> (<n0> <n1> ...) <master> <rest>`.
+    Returns (name, nodes, master, rest_tokens) or None when the line is not an instance (a
+    directive, an analysis, or a malformed node list). The single shared parser used by node-set
+    building, source auto-detect, and scan_netlist_sources -- so they never drift."""
+    toks = _statement_tokens(logical)
+    if len(toks) < 2 or not toks[1].startswith("("):
+        return None
+    name = toks[0]
+    joined = " ".join(toks[1:])
+    if ")" not in joined:
+        return None
+    node_blob, _, rest = joined.partition(")")
+    nodes = node_blob.lstrip("(").split()
+    rest_toks = rest.split()
+    master = rest_toks[0] if rest_toks else ""
+    return name, nodes, master, rest_toks
+
+
+def _base_nets(base_text):
+    """The SET of every net token present in the base netlist (every node of every instance
+    node-list). B+ net resolution checks a manifest pin against this set."""
+    nets = set()
+    for logical, _phys in _logical_lines(base_text):
+        inst = _parse_instance(logical)
+        if inst:
+            nets.update(inst[1])                          # the node list
+    return nets
+
+
+def _resolve_nets(m, base_text):
+    """B+ net resolution: turn each role net of the form '<net:PIN>' into a real net using the
+    base netlist. PIN that IS a net in the base -> PIN (the common net==pin case, resolved
+    silently, in place). PIN that is NOT a net -> collected; any unresolvable -> raise. Mutates
+    m's supplies/v_out/i_out/bias 'net' fields in place (the factory works on its own loaded m).
+    Returns the set of base nets (reused by the source pre-resolve)."""
+    nets = _base_nets(base_text)
+    unresolvable = []
+    for role in ("supplies", "v_out", "i_out", "bias"):
+        for key, v in (m.get(role) or {}).items():
+            net = str(v.get("net", ""))
+            if not net.startswith(NET_PLACEHOLDER_PREFIX):
+                continue
+            pin = net[len(NET_PLACEHOLDER_PREFIX):].rstrip(">")
+            if pin in nets:
+                v["net"] = pin                            # net==pin -> resolve silently
+            else:
+                unresolvable.append(f"{role}.{key} (<net:{pin}>)")
+    if unresolvable:
+        raise NetlistAugmentError(
+            "could not resolve placeholder net(s) against the base netlist: "
+            + ", ".join(unresolvable) + ". Each listed pin name is NOT a net in the base "
+            "netlist; set the real TB net in the manifest's 'net' field (run Mode A in the live "
+            "Virtuoso, or hand-edit) -- net==pin resolves automatically, net!=pin needs the net.")
+    return nets
+
+
 def _is_analysis_statement(line):
     """A top-level statement is an analysis when its SECOND whitespace token is a known
     Spectre analysis keyword. A 2nd token beginning with '(' is a node list -> an INSTANCE,
@@ -155,50 +215,93 @@ def _strip_analyses(base_text):
     return "\n".join(out), n
 
 
-def _detect_supply_src(base_text, supply_net):
-    """Auto-detect the vsource whose FIRST node == supply_net. A Spectre instance line reads
-    `<name> (<n0> <n1> ...) <master> ...`; we match `vsource` masters whose first node is the
-    supply net. Returns the instance NAME. Exactly one match -> use it; zero or >1 -> raise a
-    clear NetlistAugmentError listing candidates and asking for tb_src."""
-    matches, vsources = [], []
+# the manifest field naming the source-to-reuse, and the human label, per role
+_SRC_FIELD = {"supplies": "tb_src", "v_out": "src", "i_out": "probe_src"}
+
+
+def _find_instance(base_text, name):
+    """The (name, nodes, master, rest) of the first instance whose name == `name`, or None."""
     for logical, _phys in _logical_lines(base_text):
-        toks = _statement_tokens(logical)
-        if len(toks) < 2 or not toks[1].startswith("("):
+        inst = _parse_instance(logical)
+        if inst and inst[0] == name:
+            return inst
+    return None
+
+
+def _detect_src(base_text, net, master):
+    """Auto-detect the instance of master `master` whose FIRST node == `net`. Returns the
+    instance NAME, or None when NONE matches (the caller decides: fall back to insert for an
+    OPEN v_out/i_out pin, or -- for a supply -- raise). >1 match of the right master on the net
+    is AMBIGUOUS and always raises (the designer must name the source). The type guardrail lives
+    here too: we only ever match the role's expected master, so a wrong-master source on the net
+    is simply not detected (an OPEN pin) -- a WRONG-master *named* source is caught by the caller."""
+    matches = []
+    for logical, _phys in _logical_lines(base_text):
+        inst = _parse_instance(logical)
+        if not inst:
             continue
-        name = toks[0]
-        # gather the node list between the first '(' and the closing ')'
-        joined = " ".join(toks[1:])
-        if ")" not in joined:
-            continue
-        node_blob, _, rest = joined.partition(")")
-        nodes = node_blob.lstrip("(").split()
-        master = rest.split()[0] if rest.split() else ""
-        if master != "vsource":
-            continue
-        vsources.append(name)
-        if nodes and nodes[0] == supply_net:
+        name, nodes, m_master, _rest = inst
+        if m_master == master and nodes and nodes[0] == net:
             matches.append(name)
     if len(matches) == 1:
         return matches[0]
     if not matches:
+        return None
+    raise NetlistAugmentError(
+        f"AMBIGUOUS {master} on net '{net}': {matches} all have it as their first node. "
+        f"Disambiguate by naming the intended source in the manifest.")
+
+
+# back-compat alias: the old supply-only name still works (callers / tests may reference it).
+def _detect_supply_src(base_text, supply_net):
+    src = _detect_src(base_text, supply_net, "vsource")
+    if src is None:
         raise NetlistAugmentError(
             f"could not auto-detect a supply vsource driving net '{supply_net}' in the base "
-            f"netlist (found vsources: {vsources or 'none'}). Add the source instance name as "
-            f"supplies.<s>.tb_src in the manifest so the offline netlister knows which source "
-            f"carries the supply AC magnitude.")
-    raise NetlistAugmentError(
-        f"AMBIGUOUS supply source for net '{supply_net}': {matches} all have it as their first "
-        f"node. Disambiguate by setting supplies.<s>.tb_src to the intended source instance "
-        f"name in the manifest.")
+            f"netlist. Add the source instance name as supplies.<s>.tb_src in the manifest.")
+    return src
+
+
+def _resolve_role_src(base_text, role, key, v):
+    """Pre-resolve ONE role object's source. Returns (src_name, fallback) where:
+      * src_name is the instance to REUSE (set mag on), or None when no source -> fallback.
+      * fallback is True ONLY for an OPEN v_out/i_out pin (no named source, none auto-detected)
+        -- the caller then inserts the old Iext/Vprobe. A supply NEVER falls back (it has no
+        own-source to inject; a missing supply source is a hard error).
+    Type guardrail: a NAMED source must exist AND match the role's master; auto-detect only ever
+    matches the right master. Raised early (factory-build time), never mid-sweep."""
+    master = ROLE_MASTER[role]
+    field = _SRC_FIELD[role]
+    named = v.get(field)
+    if named:
+        inst = _find_instance(base_text, named)
+        if inst is None:
+            raise NetlistAugmentError(
+                f"{role}.{key}.{field}='{named}' is not an instance in the base netlist "
+                f"(named source not found). Check {role}.{key}.{field} against the base input.scs.")
+        if inst[2] != master:
+            raise NetlistAugmentError(
+                f"{role}.{key}.{field}='{named}' is a '{inst[2]}' but role {role} requires a "
+                f"'{master}' (the read math: a v_out injects current -> isource; a supply/i_out "
+                f"drives a voltage -> vsource). Name a {master} for {role}.{key}.")
+        return named, False
+    # no named source -> auto-detect the right master on the net
+    det = _detect_src(base_text, v["net"], master)
+    if det is not None:
+        return det, False
+    # nothing on the net: supplies hard-fail; v_out/i_out fall back to insert (open pin)
+    if role == "supplies":
+        raise NetlistAugmentError(
+            f"could not auto-detect a supply vsource driving net '{v['net']}' (supplies.{key}) "
+            f"in the base netlist. Add the source instance name as supplies.{key}.tb_src.")
+    return None, True
 
 
 def _resolve_supply_src(base_text, m, s, v):
-    """The supply source instance name: the manifest's tb_src override if present, else
-    auto-detect by first-node match (decision 2)."""
-    src = v.get("tb_src")
-    if src:
-        return src
-    return _detect_supply_src(base_text, v["net"])
+    """The supply source instance name: tb_src override if present, else auto-detect. Kept for
+    back-compat; the unified pre-resolve uses _resolve_role_src."""
+    src, _fb = _resolve_role_src(base_text, "supplies", s, v)
+    return src
 
 
 def _set_mag_on_line(line, mag_expr):
@@ -223,11 +326,12 @@ def _set_mag_on_line(line, mag_expr):
     return out
 
 
-def _modify_supply_mag(base_text, src_name, mag_expr):
-    """Find the supply source instance by NAME and set its mag=<mag_expr> in place. Returns
-    (new_text, found). The first node-list instance whose name == src_name wins. A multi-line
-    (backslash-continued) supply statement is collapsed to ONE clean line carrying the mag, so
-    `mag=` never lands mid-statement after a dangling backslash."""
+def _modify_mag(base_text, src_name, mag_expr):
+    """Find ANY source instance by NAME (name-based + type-agnostic: works for the reused
+    supply vsource, a v_out load isource, or an i_out vdc vsource alike) and set its
+    mag=<mag_expr> in place. Returns (new_text, found). The first node-list instance whose name
+    == src_name wins. A multi-line (backslash-continued) statement is collapsed to ONE clean
+    line carrying the mag, so `mag=` never lands mid-statement after a dangling backslash."""
     out, found = [], False
     for logical, phys in _logical_lines(base_text):
         toks = _statement_tokens(logical)
@@ -237,6 +341,10 @@ def _modify_supply_mag(base_text, src_name, mag_expr):
         else:
             out.extend(phys)                              # unmodified -> verbatim physical lines
     return "\n".join(out), found
+
+
+# back-compat alias (the old supply-specific name; same name-based, type-agnostic setter).
+_modify_supply_mag = _modify_mag
 
 
 # --------------------------------------------------------------------- acm parameters
@@ -277,14 +385,40 @@ def _save_line(m, group):
 
 
 # ----------------------------------------------------------------------- analysis line
+def _ac_owner(m, group):
+    """The (role, key) that OWNS an ac group's analysis line -- the one-hot stimulus mapped to
+    the manifest role name ('supply'->'supplies', else the kind). Returns None for a group with
+    no hot stimulus (the global ac line is used)."""
+    if not group["hot"]:
+        return None
+    kind, key = group["hot"][0]
+    role = "supplies" if kind == "supply" else kind     # 'v_out'/'i_out' map 1:1
+    return role, key
+
+
+def _noise_owner(m, group):
+    """The v_out key that OWNS a noise group -- identified by oprobe net == v_out[o].net."""
+    for o, v in m["v_out"].items():
+        if v["net"] == group.get("oprobe"):
+            return o
+    return None
+
+
 def _analysis_line(m, group):
-    """The group's analysis statement. ac group -> '<AC_NAME> <m.analysis.ac>'; noise group
-    -> '<NOISE_NAME> (<oprobe> <ground>) <m.analysis.noise>' (the output port Spectre emits
-    the 'out' signal for -- importmp's noise read needs it)."""
+    """The group's analysis statement, with the PER-OBJECT analysis override applied (keyed by
+    the group OWNER), falling back to the global m['analysis']. ac group -> '<AC_NAME> <ac>';
+    noise group -> '<NOISE_NAME> (<oprobe> <ground>) <noise>' (the output port Spectre emits the
+    'out' signal for -- importmp's noise read needs it)."""
+    from insitu import manifest as _manifest          # function-local: avoid circular import
     if group["analysis"] == "noise":
         ground = m["ground"]
-        return f"{NOISE_NAME} ({group['oprobe']} {ground}) {m['analysis']['noise']}"
-    return f"{AC_NAME} {m['analysis']['ac']}"
+        o = _noise_owner(m, group)
+        noise = _manifest.analysis_line_for(m, "v_out", o, "noise") if o else m["analysis"]["noise"]
+        return f"{NOISE_NAME} ({group['oprobe']} {ground}) {noise}"
+    owner = _ac_owner(m, group)
+    ac = (_manifest.analysis_line_for(m, owner[0], owner[1], "ac") if owner
+          else m["analysis"]["ac"])
+    return f"{AC_NAME} {ac}"
 
 
 # --------------------------------------------------------------------------- the factory
@@ -297,11 +431,11 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
     straight into insitu.pmu_corner.step_run's group_netlister seam.
 
     base_input_scs   path to the base input.scs (a dir holding it, or the file itself).
-    m                the loaded manifest dict (the single source of truth; nets MUST be
-                     resolved -- the placeholder guard trips otherwise).
+    m                the loaded manifest dict (the single source of truth). B+ net resolution
+                     runs here against the base netlist: a '<net:PIN>' where PIN is a real base
+                     net resolves silently to PIN (mutated in place); net!=pin hard-stops.
     out_base         dir under which each group's <tag>/input.scs is written.
     """
-    _resolved_nets_guard(m)                              # fail loud on '<net:...>' placeholders
     base_path = pathlib.Path(base_input_scs)
     if base_path.is_dir():
         base_path = base_path / "input.scs"
@@ -312,25 +446,47 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
     base_text = base_path.read_text()
     out_base = pathlib.Path(out_base)
 
-    # pre-resolve every supply source ONCE (auto-detect / tb_src) -- a missing/ambiguous
-    # source is an error we want to raise at factory-build time, not mid-sweep.
-    supply_srcs = {s: _resolve_supply_src(base_text, m, s, v)
-                   for s, v in m["supplies"].items()}
+    # B+ net resolution FIRST (needs the base_text): resolve '<net:PIN>' where PIN is a real
+    # base net (net==pin) in place; net!=pin raises. Subsequent measurements(m) see real nets.
+    _resolve_nets(m, base_text)
+
+    # pre-resolve every role's source ONCE -- (named tb_src/src/probe_src, else auto-detect by
+    # the role's master on the net). Errors early (missing/ambiguous/wrong-master) at factory
+    # build time, never mid-sweep. role_srcs[(role,key)] = (src_name|None, fallback_insert?).
+    role_srcs = {}
+    for role in ("supplies", "v_out", "i_out"):
+        for key, v in m[role].items():
+            src, fallback = role_srcs[(role, key)] = _resolve_role_src(base_text, role, key, v)
+            # i_out: pin the REUSED vsource name into probe_src so manifest._probe_name (the
+            # save token + the importmp :p read) targets the source we actually set mag on --
+            # when probe_src was auto-detected (not named), without this the read would look for
+            # the FALLBACK name Vprobe_<c>:p that the reused source does not emit.
+            if role == "i_out" and src and not fallback:
+                v["probe_src"] = src
 
     def _netlister(group):
         from insitu import manifest as _manifest      # function-local: avoid circular import
         ground = m["ground"]
         # 1) start from the base, strip its .tran TB analysis (commented, visibly marked)
         text, n_stripped = _strip_analyses(base_text)
-        # 2) modify the supply source(s) in place to carry the supply-AC magnitude
-        for s, v in m["supplies"].items():
-            acm = _manifest.acm_var("supply", s)
-            text, found = _modify_supply_mag(text, supply_srcs[s], acm)
-            if not found:
-                raise NetlistAugmentError(
-                    f"supply source '{supply_srcs[s]}' (supplies.{s}) is not an instance in the "
-                    f"base netlist -- tb_src/auto-detect named a source that does not exist. "
-                    f"Check supplies.{s}.tb_src against the base input.scs.")
+        # 2) REUSE every existing role source: set its mag=acm in place. supplies always reuse
+        #    (a missing supply source already errored at factory build); v_out/i_out reuse when a
+        #    source was found, else fall back to inserting Iext/Vprobe (the OPEN-pin path).
+        inserts = []                                   # (role, key) that fall back to insert
+        for role in ("supplies", "v_out", "i_out"):
+            kind = "supply" if role == "supplies" else role
+            for key, v in m[role].items():
+                acm = _manifest.acm_var(kind, key)
+                src, fallback = role_srcs[(role, key)]
+                if fallback:
+                    inserts.append((role, key))
+                    continue
+                text, found = _modify_mag(text, src, acm)
+                if not found:                          # pre-resolve named it but it vanished
+                    raise NetlistAugmentError(
+                        f"{role}.{key} source '{src}' is not an instance in the base netlist "
+                        f"-- named/auto-detect picked a source that does not exist. Check "
+                        f"{role}.{key}.{_SRC_FIELD[role]} against the base input.scs.")
 
         # 3) build the appended one-hot extraction block
         lines = [
@@ -343,15 +499,21 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
             "simulator lang=spectre",          # guard a trailing spice-lang section
             _params_line(m, group),
         ]
-        # v_out isources: PLUS=ground, MINUS=net (mirror augment: +1A into the out net)
-        for o, v in m["v_out"].items():
-            acm = _manifest.acm_var("v_out", o)
-            lines.append(f"Iext_{o} ({ground} {v['net']}) isource mag={acm}")
-        # i_out named probes: PLUS=net, MINUS=ground; dc=<compliance>; read <probe>:p
-        for c, v in m["i_out"].items():
-            probe = _manifest._probe_name(m, c)
-            acm = _manifest.acm_var("i_out", c)
-            lines.append(f"{probe} ({v['net']} {ground}) vsource dc={float(v['dc']):g} mag={acm}")
+        # FALLBACK-INSERT (open pin only): the old Iext/Vprobe strings -- the ONLY place they
+        # survive. v_out isource PLUS=ground MINUS=net (+1A into the out net, mirrors augment);
+        # i_out probe vsource PLUS=net MINUS=ground dc=<compliance>; read <probe>:p.
+        for role, key in inserts:
+            v = m[role][key]
+            if role == "v_out":
+                acm = _manifest.acm_var("v_out", key)
+                lines.append(f"Iext_{key} ({ground} {v['net']}) isource mag={acm}")
+            else:                                       # i_out
+                probe = _manifest._probe_name(m, key)
+                acm = _manifest.acm_var("i_out", key)
+                lines.append(f"{probe} ({v['net']} {ground}) vsource "
+                             f"dc={float(v['dc']):g} mag={acm}")
+            print(f"[netlist_augment] fallback-insert {role}.{key} "
+                  f"(open pin on net '{v['net']}' -- no TB source to reuse)")
         # the group's analysis (ac, or noise with its output port) + the targeted save union
         lines.append(_analysis_line(m, group))
         lines.append(_save_line(m, group))
@@ -365,3 +527,99 @@ def make_offline_group_netlister(base_input_scs, m, out_base):
         return str(netdir)
 
     return _netlister
+
+
+# ------------------------------------------------------------------------ scan (GUI)
+def _parse_dc(rest_tokens):
+    """The float value of a `dc=<x>` token in an instance's trailing parameter tokens, or None.
+    Tolerates SI suffixes Spectre accepts (500u, 1.28, 1p5) -- best-effort float() with a small
+    suffix map; an unparseable dc returns None (the GUI shows it raw / blank)."""
+    _SUF = {"f": 1e-15, "p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3,
+            "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9, "T": 1e12}
+    for t in rest_tokens:
+        if t.startswith("dc="):
+            raw = t[3:]
+            try:
+                return float(raw)
+            except ValueError:
+                if raw and raw[-1] in _SUF:
+                    try:
+                        return float(raw[:-1]) * _SUF[raw[-1]]
+                    except ValueError:
+                        return None
+                return None
+    return None
+
+
+def _detect_on_net(base_text, net, prefer_master=None):
+    """Scan for a source whose first node == net. Prefers a 2-terminal source master (vsource/
+    isource) -- so the DUT subckt instance (also first-node==net) never masquerades as the
+    driver -- and, among those, prefers `prefer_master` (the role's expected master). Returns
+    (name, master, dc, rest) for the chosen instance, or None when nothing drives the net.
+
+    Selection order: (1) an instance of prefer_master; else (2) any vsource/isource; else (3)
+    None. The GUI flags a (2)-only hit as type_ok=False (a wrong-master driver on the pin)."""
+    src_masters = {"vsource", "isource"}
+    preferred, any_src = None, None
+    for logical, _phys in _logical_lines(base_text):
+        inst = _parse_instance(logical)
+        if not inst:
+            continue
+        name, nodes, master, rest = inst
+        if not (nodes and nodes[0] == net and master in src_masters):
+            continue
+        hit = (name, master, _parse_dc(rest), rest)
+        if prefer_master is not None and master == prefer_master and preferred is None:
+            preferred = hit
+        if any_src is None:
+            any_src = hit
+    return preferred or any_src
+
+
+def scan_netlist_sources(base_input_scs, m):
+    """Scan the base netlist for the driving source of every role+key (the GUI 'detected source'
+    view). Applies B+ net resolution first (scans by resolved net; for an unresolvable <net:PIN>
+    it scans by PIN). NEVER raises on a missing source -- returns instance=None, type_ok=False so
+    the GUI can show 'not found'.
+
+    Returns: {"supplies":{s:{instance,master,dc,net,type_ok}}, "v_out":{...}, "i_out":{...},
+              "bias":{...}}. For each entry:
+      instance = the driving instance NAME (named tb_src/src/probe_src if it exists in the base,
+                 else the source auto-detected on the net), or None.
+      master   = its simulator master (vsource/isource/...), or None.
+      dc       = the float of its dc= token, or None.
+      net      = the resolved net it scanned (the PIN for an unresolvable placeholder).
+      type_ok  = master matches the role's expected master (bias has no expected master -> True
+                 when an instance was found)."""
+    base_path = pathlib.Path(base_input_scs)
+    if base_path.is_dir():
+        base_path = base_path / "input.scs"
+    base_text = base_path.read_text()
+
+    def _net_of(v):
+        net = str(v.get("net", ""))
+        if net.startswith(NET_PLACEHOLDER_PREFIX):       # B+: scan by the PIN (resolved or not)
+            return net[len(NET_PLACEHOLDER_PREFIX):].rstrip(">")
+        return net
+
+    out = {"supplies": {}, "v_out": {}, "i_out": {}, "bias": {}}
+    for role in ("supplies", "v_out", "i_out", "bias"):
+        want_master = ROLE_MASTER.get(role)              # None for bias (no driver constraint)
+        for key, v in (m.get(role) or {}).items():
+            net = _net_of(v)
+            named = v.get(_SRC_FIELD.get(role, "")) if role != "bias" else None
+            inst = _find_instance(base_text, named) if named else None
+            if inst is None:                             # named missing / no name -> detect on net
+                hit = _detect_on_net(base_text, net, prefer_master=want_master)
+            else:
+                name, nodes, master, rest = inst
+                hit = (name, master, _parse_dc(rest), rest)
+            if hit is None:
+                out[role][key] = dict(instance=None, master=None, dc=None,
+                                      net=net, type_ok=False)
+            else:
+                name, master, dc, _rest = hit
+                type_ok = True if want_master is None else (master == want_master)
+                out[role][key] = dict(instance=name, master=master, dc=dc,
+                                      net=net, type_ok=type_ok)
+    return out
