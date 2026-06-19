@@ -97,6 +97,18 @@ A second independent producer proves the binary grammar is read, not memorized. 
 struct-noise traces + ALPS quirks stay covered by the box fixture — complementary, not a replacement.)
 Suite `278 → 281`.
 
+## 4d. Noise + current-output model — also locked in Cadence (`281 → 284`)
+- **Cross-engine NOISE** (`cadence/test_va_noise_xengine.py`, needs BOTH engines): the emitted
+  model's output-noise spectrum is identical in the Verilog-A (Spectre `noise`) and the SPICE
+  subckt (ngspice `noise`) — worst rel `9e-6` over 10 Hz..1 MHz. The Norton noise core (a headline
+  LDO spec) reproduces in the Cadence engine. Skips unless both spectre AND ngspice are present.
+- **Current-output (bias) model in Spectre** (`cadence/test_isrc_model_spectre.py`, spectre-gated):
+  `cadence/isrc_spectre.py`'s self-consistent flow (char-in-Spectre → fit → emit VA → validate-in-
+  Spectre) for 2 archetypes — `v4_pmos_simple` (SOURCE, dId/dVdd `+56 nA/V`) and `v6_ptat` (SINK,
+  `-145 nA/V` + PTAT temp ratio). Pins both polarities, both PSRR signs, the I-V plateau, and the
+  PTAT temperature path (idc_err <0.4%, iv_rms <4%, ptat_err ~0.001). Self-contained: the borrowed
+  current-noise arrays are stubbed (they don't enter pass/fail), so no ngspice / committed npz needed.
+
 ## 5. Genuinely box-only (red zone) remaining
 A REAL Donau+ALPS sweep of the actual wur 2v+3i silicon DUT (vs my behavioral TB), and the **ALPS
 engine's OWN Verilog-A compiler** accepting the `.va` (Spectre's ahdlcmi has now accepted it locally
