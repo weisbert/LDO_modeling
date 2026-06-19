@@ -1,5 +1,38 @@
 # HANDOFF — complete the pure-CLI Donau+ALPS workflow (Path B, full sweep)
 
+> **▶ SESSION 2026-06-19 (all on `main`, pushed; needs ONE `bash apply` deploy to the box).**
+> Four shipped this session, on top of the GUI-wired sweep:
+> - `7e4b9f7` — manifest editor Form: show the **bare pin name**, not the `<net:PIN>` wrapper
+>   (the placeholder is an internal "unresolved" marker; designers were confused). Amber-italic
+>   + tooltip flags it as a default to confirm/edit; on save it's a normal resolved net.
+> - `ff521e1` — manifest editor Form: **`tb_src` / `probe_src` columns** ("src instance" on the
+>   Supplies table → the TB vsource on the rail; "probe instance" on Current-outputs). Blank =
+>   keep auto-detect / `Vprobe_<key>`. So a failed supply auto-detect is fixable IN THE FORM.
+> - `6f9ea80` — **JOBID parse**: the real Donau `dsub --json` returns `{"data":{"jobId":"…"}}`;
+>   parser now reads the JSON envelope (numeric-only, so `requestId` is ignored) + a widened regex.
+> - `7425fcd` — **PARALLEL sweep + GUI "Max parallel jobs"** (1-32, default 4): `step_run` gained
+>   `max_parallel=1` (default = old serial; all serial tests unchanged). Real path = a single-
+>   threaded bounded poll-scheduler (`donau.poll_once`, `run_corner.submit_corner`/`finalize_corner`).
+>   Cancel = drain (no dkill). 134 backend + GUI selftest green; built via ultracode (4 verify lenses).
+>
+> **BOX STATE (designer mid-bring-up):** dry-run PASSES (after the designer fixed a wrong base
+> netlist). On a REAL run the designer hit, in order: (1) supply auto-detect couldn't find a
+> vsource whose FIRST node == `AVDD1P0` among `[V11,V10,V9,V12,V6,V5,V2,V1]` → set
+> `supplies.avdd1p0.tb_src` (now a Form column) to the right source; **find it on the box** with
+> `grep -niE 'vsource' <base input.scs> | grep -i AVDD1P0`. (2) the JOBID parse error — FIXED by
+> `6f9ea80`. **NEXT on box:** `bash apply` (ships all 4), set tb_src, re-run; try Max parallel = 4.
+>
+> **PENDING (offered, awaiting designer's grep output):** if the supply vsource wires `AVDD1P0` as
+> a NON-first node (e.g. `V7 (0 AVDD1P0)`), harden `_detect_supply_src` (cluster/netlist_augment.py)
+> to match EITHER node + list each vsource's nodes in the error. Needs the grep output to confirm.
+>
+> **NEXT TASK (user, post-compact): a MANIFEST CHANGE REQUIREMENT** — the designer has an edit they
+> want to the manifest (details to come). Likely touches manifest schema (`insitu/manifest.py`),
+> the build/validate (`build_manifest.py`), the offline netlister (`cluster/netlist_augment.py`),
+> and/or the editor Form (`gui/ldo_modeler.py` `_dict_to_form`/`_form_to_dict`/`collect`).
+>
+> ---
+>
 > **✅ GUI-WIRED 2026-06-18 (commit `052cf5b`, main).** The full sweep now RUNS from the GUI
 > (no CLI). Extract tab: Run-on=cluster + **Build & Run** → `_ClusterSweepWorker` (QThread) →
 > `ExtractCore.run_cluster_sweep` (offline factory → `step_run` real Donau → `step_import` →
