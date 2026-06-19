@@ -45,6 +45,8 @@ import fit_model as FM                                                      # no
 
 VARIANT = "v2_capless"          # the SAME model harness/test_coverage_ngspice.py fits
 NGSPICE_ZOUT = 23.2301          # the LF |Zout| ngspice measured for this model (both slew_en)
+HIGH_LOAD = 6e-3                # well above the OP -> capless-rail dropout regime
+NGSPICE_DROPOUT_VOUT = -0.215   # ngspice V(vout) @ 6 mA, slew_en=1 (capless-rail collapse)
 
 
 # ----------------------------------------------------------------- skip guard
@@ -94,6 +96,21 @@ def _zout_lf(va, op_amps, vdd, slew, tag):
     return float(f[0]), float(z[0])
 
 
+def _vout_at_load(va, op_amps, vdd, slew, load, tag):
+    """DC-sweep the load isource and read Vout at `load` -- the dropout curve. (A bare dc
+    op-point does not write the node to PSF; a sweep does, and gives the whole curve.)"""
+    scs = (f"// dropout sweep slew_en={slew}\nsimulator lang=spectre\n"
+           f'ahdl_include "{va.resolve()}"\n'
+           f"Vin (vin 0) vsource dc={vdd:g}\n"
+           f"Ild (vout 0) isource dc=1e-4\n"
+           f"Xdut (vin vout 0) ldo_model iload={op_amps:.6e} slew_en={slew} vdd={vdd:g}\n"
+           f"save vout\nswp dc dev=Ild param=dc start=1e-4 stop={load*1.15:.6e} lin=40\n")
+    d = sr.run(scs, tag)
+    il = np.asarray(d["swp"]["dc"]).real
+    vo = np.asarray(d["swp"]["vout"]).real
+    return float(np.interp(load, il, vo))
+
+
 # ============================================================ (1) compiles + simulates
 def test_emitted_va_compiles_and_simulates_in_spectre(model):
     """ahdlcmi -64 compiles module ldo_model and the AC op converges to a real, finite LF Zout.
@@ -129,3 +146,22 @@ def test_va_zout_matches_ra_and_ngspice(model):
     assert rel_ng < 0.02, f"Spectre VA Zout {z0} != ngspice {NGSPICE_ZOUT} (rel {rel_ng:.2e})"
     print(f"CROSS-ENGINE: Spectre-VA Zout={z0:.6f}  fit R_a={r_a:.6f}  "
           f"ngspice={NGSPICE_ZOUT}  (rel_ra={rel_ra:.2e} rel_ng={rel_ng:.2e})")
+
+
+# ============================================================ (4) GUARDRAIL-1b in Cadence engine
+def test_va_dropout_only_with_slew_in_spectre(model):
+    """GUARDRAIL-1b in the CADENCE engine: at a high load (>>OP) slew_en=0 stays the pure
+    linear R_a extrapolation while slew_en=1 adds the genuine characterized dropout, so its
+    Vout sits FAR below. Cross-engine: the slew_en=1 collapse matches the ngspice value
+    (capless rail -> ~ -0.215 V at 6 mA)."""
+    va, op_amps, vdd, _r_a = model
+    v_lin = _vout_at_load(va, op_amps, vdd, 0, HIGH_LOAD, "va_drp_slew0")
+    v_drp = _vout_at_load(va, op_amps, vdd, 1, HIGH_LOAD, "va_drp_slew1")
+    assert v_drp < v_lin - 0.05, (f"slew_en=1 must drop below the linear value at {HIGH_LOAD} A: "
+                                  f"linear={v_lin:.6f} dropout={v_drp:.6f}")
+    assert 0.7 < v_lin < 0.8, f"slew_en=0 should be the linear R_a value near nominal, got {v_lin}"
+    # cross-engine: the capless-rail collapse matches what ngspice measured at the same load
+    assert abs(v_drp - NGSPICE_DROPOUT_VOUT) < 0.03, (
+        f"Spectre VA dropout {v_drp:.6f} != ngspice {NGSPICE_DROPOUT_VOUT} at {HIGH_LOAD} A")
+    print(f"GUARDRAIL-1b (Spectre) Vout @ {HIGH_LOAD} A: slew0(linear)={v_lin:.6f} "
+          f"slew1(dropout)={v_drp:.6f}  delta={v_lin - v_drp:.6f}  (ngspice {NGSPICE_DROPOUT_VOUT})")

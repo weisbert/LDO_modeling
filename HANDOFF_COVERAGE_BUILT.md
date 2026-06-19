@@ -83,7 +83,19 @@ shelved as box-only before. A 3rd SPECTRE-gated test (skip-guarded, env-overrida
 - (3) **cross-engine**: Spectre-VA LF Zout `23.230100 Ω` == the fit's `R_a` (rel `2e-6`) ==
   the ngspice SPICE-subckt measurement `23.2301 Ω` (rel `9e-13`). Same physics, two engines.
 
-The mechanism is exactly `cadence/isrc_spectre.py`'s (`ahdl_include` + ahdlcmi -64). Suite `275 → 278`.
+The mechanism is exactly `cadence/isrc_spectre.py`'s (`ahdl_include` + ahdlcmi -64). A 4th case in
+the same file pins **GUARDRAIL-1b in Spectre**: at 6 mA `slew_en=0` stays the linear R_a value
+(`0.7648 V`) while `slew_en=1` collapses to the real capless-rail dropout (`-0.2153 V`) — matching
+the ngspice `-0.215 V` cross-engine.
+
+## 4c. Binary-PSF reader — also validated on a LOCAL producer (`cadence/test_binpsf_local_spectre.py`)
+`cadence/binpsf.py` (the cluster/ALPS binary-PSF read path) was validated only against ONE box-captured
+Maestro fixture (`cadence/test_binpsf.py`). Local Spectre 18.1 emits binary PSF too (`-format psfbin`),
+so a 2nd SPECTRE-gated test now round-trips a **locally-produced** binary PSF against `-format psfascii`
+of the same deck: AC sweep (78 pts, worst rel `6.3e-7`) and noise output PSD (worst rel `5.8e-17`).
+A second independent producer proves the binary grammar is read, not memorized. (Per-contributor
+struct-noise traces + ALPS quirks stay covered by the box fixture — complementary, not a replacement.)
+Suite `278 → 281`.
 
 ## 5. Genuinely box-only (red zone) remaining
 A REAL Donau+ALPS sweep of the actual wur 2v+3i silicon DUT (vs my behavioral TB), and the **ALPS
