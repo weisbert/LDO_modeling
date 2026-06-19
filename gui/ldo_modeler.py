@@ -895,6 +895,52 @@ if _HAVE_QT:
             idf.addRow("ade_src_test", self.f_src_test)
             v.addWidget(idg)
 
+            # COVERAGE — the §2 tier ladder + the global coverage knobs (always visible) -----
+            # Placed right after Identity so the user picks WHAT to characterize before filling
+            # the per-rail sweep cells (which live in the Voltage/Current output tables below).
+            cov = QGroupBox("Coverage — what to characterize")
+            cov.setStyleSheet("QGroupBox{font-weight:bold;}")
+            covf = QFormLayout(cov)
+            self.f_cov_tier = QComboBox()
+            self.f_cov_tier.addItems(["T0", "T1", "T2", "T3", "T4"])
+            self.f_cov_tier.setCurrentText("T4")             # default = FULL tier ladder
+            self.f_cov_tier.setToolTip(
+                "The coverage tier — a NESTED ADDITIVE ladder (each tier adds its sims on top of "
+                "every lower one):\n"
+                "  T0  LTI AC + .noise at the OP (Zout/PSRR/Y/pi/noise)\n"
+                "  T1  + transient slew/recovery steps\n"
+                "  T2  + DC I-V (current sinks) + dropout/load-reg (rails)\n"
+                "  T3  + the per-rail load schedule (AC/noise repeated at each iload)\n"
+                "  T4  + temperature corners\n"
+                "DEFAULT = T4 (full). NB: a tier alone adds ZERO points until you DECLARE the "
+                "matching per-rail sweep (iload/trans/iv/temps) — a tier with no declared params "
+                "reproduces the identical T0 matrix.")
+            covf.addRow("tier", self.f_cov_tier)
+            self.f_cov_temps = QLineEdit()
+            self.f_cov_temps.setPlaceholderText("blank → single (session) temp; e.g. -40,55,125")
+            self.f_cov_temps.setToolTip(
+                "Temperature corners in °C, comma-separated → coverage.temps. Blank → [] (a single "
+                "session temp, no temp sweep). e.g. -40,55,125 (middle = nominal/model-bake temp).")
+            covf.addRow("temperature corners [°C]", self.f_cov_temps)
+            self.f_cov_slew = QCheckBox("emit slew_en core (default off = model runs LTI)")
+            self.f_cov_slew.setToolTip(
+                "Sets the emitted VA param coverage.slew_en (0/1). Even when T1 is extracted (the "
+                "model CARRIES the slew core), the model runs LTI until slew_en=1. Default OFF.")
+            covf.addRow("slew_en", self.f_cov_slew)
+            self.f_cov_lin = QCheckBox("2× amplitude linearity self-check (guardrail 4)")
+            self.f_cov_lin.setToolTip(
+                "coverage.lin_gate: rerun one AC point at 2× drive amplitude; ratio-invariance "
+                "certifies the OP is linear (the one-hot superposition assumption holds). Default OFF.")
+            covf.addRow("lin_gate", self.f_cov_lin)
+            cov_help = QLabel(
+                "<span style='color:#678'>Per-rail load sweeps live in the Voltage-outputs "
+                "<b>“iload sweep”</b> + <b>“trans”</b> columns; per-sink I-V lives in the "
+                "Current-outputs <b>“iv_sweep”</b> column (all below). A tier only EMITS a point "
+                "where its matching cell is filled.</span>")
+            cov_help.setWordWrap(True)                        # [C2] word-wrap the rich-text help
+            covf.addRow(cov_help)
+            v.addWidget(cov)
+
             # SUPPLIES (always visible) ---------------------------------------------
             sg = QGroupBox("Supplies — rails to PSRR")
             sg.setStyleSheet("QGroupBox{font-weight:bold;}")
@@ -921,10 +967,17 @@ if _HAVE_QT:
                                  "(Zout / PSRR / noise). &nbsp;<b>≥1 voltage OR current output "
                                  "required.</b> <b>src instance</b> = the load idc on this rail "
                                  "(we set its AC mag to inject the Zout test current); blank → "
-                                 "auto-detect / insert. The <b>analysis</b> column overrides this "
-                                 "output's AC (Zout) and noise sweeps.</span>"))
+                                 "auto-detect / insert. <b>iload sweep</b> (T3 loads) = "
+                                 "“&lt;type&gt; &lt;start&gt; &lt;stop&gt; &lt;n&gt;” + optional "
+                                 "“+ p1,p2” extra points (SI suffixes ok), e.g. "
+                                 "“log 50u 2m 4 + 300u”; blank → single OP. <b>trans</b> (T1 slew) "
+                                 "= “&lt;from&gt;:&lt;to&gt;[:label] , …” + optional trailing "
+                                 "“@edge=1n,tstop=1u”, e.g. “0:2m:slew , 450u:550u:lin”. The "
+                                 "<b>analysis</b> column overrides this output's AC (Zout) and "
+                                 "noise sweeps.</span>"))
             self.t_vout = self._make_table(
-                ["key", "net", "src instance", "analysis"], ["vco", "VDD0P8_VCO", "I_load", "(gear)"],
+                ["key", "net", "src instance", "iload sweep", "trans", "analysis"],
+                ["vco", "VDD0P8_VCO", "I_load", "log 200u 6m 4 + 3m", "0:6m:slew", "(gear)"],
                 analysis_role="v_out")
             vgl.addWidget(self._table_block(self.t_vout))
             v.addWidget(vg)
@@ -934,8 +987,10 @@ if _HAVE_QT:
             cg.setStyleSheet("QGroupBox{font-weight:bold;}")
             cgl = QVBoxLayout(cg)
             cgl.addWidget(QLabel("<span style='color:#678'>Current-output pins (admittance / "
-                                 "current-PSRR): net + compliance dc + optional I-V sweep "
-                                 "(start:step:stop or 'auto'). <b>probe instance</b> = the "
+                                 "current-PSRR): net + compliance dc + optional <b>iv_sweep</b> "
+                                 "(T2 I-V → coverage.iv): “&lt;type&gt; &lt;start&gt; "
+                                 "&lt;stop&gt; &lt;n&gt;” (e.g. “lin 0 1.1 12”), or the legacy "
+                                 "“start:step:stop” / “auto”. <b>probe instance</b> = the "
                                  "testbench vdc on that pin whose AC mag we set (the current "
                                  "read = its :p current); <b>blank → auto-detect / insert "
                                  "(Vprobe_&lt;key&gt;)</b>. The <b>analysis</b> column overrides "
@@ -1020,7 +1075,8 @@ if _HAVE_QT:
             # narrow, instead of forcing the dialog wide. 'net' is just a bit wider than the rest.
             hh.setStretchLastSection(False)
             _WIDS = {"key": 92, "net": 168, "dc": 78, "compliance dc": 104, "src instance": 116,
-                     "probe instance": 122, "iv_sweep": 94, "PSRR→I": 60, "analysis": 72}
+                     "probe instance": 122, "iv_sweep": 94, "iload sweep": 132, "trans": 122,
+                     "PSRR→I": 60, "analysis": 72}
             for c, name in enumerate(cols):
                 hh.setSectionResizeMode(c, QHeaderView.Interactive)
                 t.setColumnWidth(c, _WIDS.get(name, 96))
@@ -1251,25 +1307,42 @@ if _HAVE_QT:
             fb = cor.get("fallback") or []
             self.f_corner.setText(str(fb[0]) if fb else "nom")
 
+            # the per-rail/per-sink COVERAGE display cells are populated from m['coverage'] in a
+            # dedicated post-pass (below), not from the role-entry dicts -- `fill` leaves them blank.
+            _COV_COLS = {"iload sweep", "trans", "iv_sweep"}
+
             def fill(t, mp, cols):
                 """`cols` = the LOGICAL manifest keys mapping to the DATA columns ONLY (the
-                checkbox + analysis display columns are populated separately). cols[0]=='key'."""
+                checkbox + analysis + coverage display columns are populated separately).
+                cols[0]=='key'. The row is built ALIGNED to the table's physical column order, so
+                a coverage display column is emitted as a blank placeholder here."""
                 t.setRowCount(0)
                 if getattr(t, "_analysis", None) is not None:
                     t._analysis.clear()             # start clean; restored from the dict below
+                tcols = getattr(t, "_cols", cols)
+                # physical columns the row builder must SKIP (emit a blank placeholder): the gear
+                # 'analysis' column, the checkbox columns (set separately), and the coverage cells.
+                skip = set(_COV_COLS) | set(getattr(t, "_check_cols", set())) | {"analysis"}
                 for k, ent in (mp or {}).items():
                     ent = ent or {}
+                    # walk the table's PHYSICAL columns, consuming the LOGICAL data columns in
+                    # order; skip columns blank so a coverage/checkbox/gear cell stays untouched.
+                    li = 1
                     row = [k]
                     unresolved_pin = None        # set if the 'net' cell is a placeholder default
-                    for col in cols[1:]:
-                        if col == "iv_sweep":
-                            iv = ent.get("iv_sweep")
-                            row.append(self._iv_to_text(iv))
-                        elif col == "net":
+                    for pc in tcols[1:]:
+                        if pc in skip:
+                            row.append("")                 # filled by a dedicated pass / widget
+                            continue
+                        col = cols[li] if li < len(cols) else None
+                        li += 1
+                        if col == "net":
                             disp, is_ph = self._net_display(ent.get("net"))
                             row.append(disp)
                             if is_ph:
                                 unresolved_pin = ent.get("pin") or k
+                        elif col is None:
+                            row.append("")
                         else:
                             v = ent.get(col, "")
                             row.append("" if v is None else str(v))
@@ -1279,11 +1352,13 @@ if _HAVE_QT:
                         t._analysis[k] = dict(ov)
                     r = self._table_add_row(t, row)
                     if unresolved_pin is not None:
-                        self._flag_unresolved_net(t, r, cols.index("net"), unresolved_pin)
+                        self._flag_unresolved_net(t, r, tcols.index("net"), unresolved_pin)
             fill(self.t_supplies, m.get("supplies"), ["key", "net", "dc", "tb_src"])
             fill(self.t_vout, m.get("v_out"), ["key", "net", "src"])
-            fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "iv_sweep", "probe_src"])
+            fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "probe_src"])
             fill(self.t_bias, m.get("bias"), ["key", "net", "dc"])
+            # COVERAGE post-pass: tier/temps/slew_en/lin_gate globals + the per-rail/per-sink cells.
+            self._dict_to_coverage(m)
             # [2.3] current-PSRR is now a per-supply checkbox. Absent key -> check ALL (mirrors
             # manifest._fill_defaults: current-PSRR vs every supply). Present -> check the listed.
             cpsrr = m.get("current_psrr_supplies")
@@ -1294,6 +1369,51 @@ if _HAVE_QT:
                 key = ki.text().strip() if ki else ""
                 self._set_row_checked(self.t_supplies, r, "PSRR→I",
                                       check_all or key in cset)
+
+        def _dict_to_coverage(self, m):
+            """Populate the Coverage widgets + the per-rail/per-sink coverage table cells from
+            m['coverage']. ABSENT coverage -> tier=T4 defaults + empty cells (a no-coverage
+            manifest opens clean). The role tables must already be filled (the cells key by row)."""
+            cov = m.get("coverage") or {}
+            tier = cov.get("tier", "T4")
+            self.f_cov_tier.setCurrentText(tier if tier in
+                                           ("T0", "T1", "T2", "T3", "T4") else "T4")
+            tps = cov.get("temps") or []
+            self.f_cov_temps.setText(", ".join(self._fmt_num(t) for t in tps))
+            self.f_cov_slew.setChecked(bool(int(cov.get("slew_en", 0) or 0)))
+            self.f_cov_lin.setChecked(bool(cov.get("lin_gate", False)))
+            # per-rail / per-sink cells -- keyed by the row's key text.
+            loads = cov.get("loads") or {}
+            trans = cov.get("transient") or {}
+            ivs = cov.get("iv") or {}
+            self._set_cov_cells(self.t_vout, "iload sweep",
+                                {k: self._loads_to_text(v) for k, v in loads.items()})
+            self._set_cov_cells(self.t_vout, "trans",
+                                {k: self._trans_to_text(v) for k, v in trans.items()})
+            # i_out iv_sweep: prefer the wired coverage.iv; legacy fall-back to the per-entry
+            # i_out.<c>.iv_sweep (old manifests) so an existing knee still shows + round-trips.
+            ivtext = {k: self._ivcov_to_text(v) for k, v in ivs.items()}
+            for k, ent in (m.get("i_out") or {}).items():
+                if k not in ivtext and (ent or {}).get("iv_sweep") is not None:
+                    ivtext[k] = self._iv_to_text(ent["iv_sweep"])
+            self._set_cov_cells(self.t_iout, "iv_sweep", ivtext)
+
+        @staticmethod
+        def _set_cov_cells(t, col_name, by_key):
+            """Write a {row-key -> cell text} map into table `t`'s `col_name` column, matching on
+            the row's key cell. Missing keys leave the cell blank (the default)."""
+            cols = getattr(t, "_cols", [])
+            if col_name not in cols:
+                return
+            ci = cols.index(col_name)
+            for r in range(t.rowCount()):
+                ki = t.item(r, 0)
+                key = ki.text().strip() if ki else ""
+                txt = by_key.get(key, "")
+                it = t.item(r, ci)
+                if it is None:
+                    it = QTableWidgetItem(); t.setItem(r, ci, it)
+                it.setText(txt or "")
 
         @staticmethod
         def _net_display(net):
@@ -1346,6 +1466,205 @@ if _HAVE_QT:
                 return [start, stop, step]
             return nums
 
+        # ---- coverage compact-string parsers / renderers (§2 the GUI side) ----------
+        # The per-rail/per-sink coverage cells are terse strings the designer types; these turn
+        # them into the manifest's coverage.{loads,transient,iv} sub-dicts and back, byte-clean
+        # (an empty cell emits no sub-dict). SI suffixes (f/p/n/u/m/k/M/G) are honored both ways.
+        _SI = {"f": 1e-15, "p": 1e-12, "n": 1e-9, "u": 1e-6, "m": 1e-3,
+               "k": 1e3, "K": 1e3, "M": 1e6, "G": 1e9}
+
+        @staticmethod
+        def _si_to_float(tok):
+            """Parse a number with an optional SI suffix ('50u' -> 5e-5). Raises ValueError on
+            garbage so the caller can keep the raw string / skip the cell."""
+            tok = tok.strip()
+            if not tok:
+                raise ValueError("empty")
+            mul = _ManifestEditorDialog._SI.get(tok[-1])
+            if mul is not None and not tok[-1].isdigit():
+                return float(tok[:-1]) * mul
+            return float(tok)
+
+        @staticmethod
+        def _float_to_si(x):
+            """Render a float back to a compact SI string ('5e-5' -> '50u'). Picks the suffix that
+            keeps the mantissa in [1,1000); falls back to '%g' for 0 / out-of-range values."""
+            try:
+                v = float(x)
+            except (TypeError, ValueError):
+                return str(x)
+            if v == 0:
+                return "0"
+            for suf, mul in (("G", 1e9), ("M", 1e6), ("k", 1e3), ("", 1.0),
+                             ("m", 1e-3), ("u", 1e-6), ("n", 1e-9), ("p", 1e-12), ("f", 1e-15)):
+                scaled = v / mul
+                if 1.0 <= abs(scaled) < 1000.0:
+                    return f"{scaled:g}{suf}"
+            return f"{v:g}"
+
+        @staticmethod
+        def _loads_to_text(spec):
+            """coverage.loads[<o>] dict -> the compact 'iload sweep' cell. Sweep first
+            ('<type> <start> <stop> <n>'), then any extra points as '+ p1,p2'. None/{} -> ''."""
+            spec = spec or {}
+            sw = spec.get("sweep")
+            pts = spec.get("points") or []
+            parts = []
+            if sw:
+                parts.append("{} {} {} {}".format(
+                    sw.get("type", "lin"),
+                    _ManifestEditorDialog._float_to_si(sw["start"]),
+                    _ManifestEditorDialog._float_to_si(sw["stop"]),
+                    int(sw.get("n", 0) or 0)))
+            if pts:
+                ptxt = ",".join(_ManifestEditorDialog._float_to_si(p) for p in pts)
+                parts.append(f"+ {ptxt}" if parts else ptxt)
+            return " ".join(parts)
+
+        @staticmethod
+        def _loads_from_text(s):
+            """The 'iload sweep' cell -> coverage.loads[<o>] dict (or None when blank). Formats:
+              '<type> <start> <stop> <n>'              -> {sweep:{...}}
+              '<type> <start> <stop> <n> + p1,p2'      -> {sweep, points}
+              '+ p1,p2'  or  'p1,p2'  (no type token)  -> {points} only
+            SI suffixes are parsed; an unparseable cell returns None (no coverage emitted)."""
+            s = (s or "").strip()
+            if not s:
+                return None
+            sweep_part, _, pts_part = s.partition("+")
+            sweep_part, pts_part = sweep_part.strip(), pts_part.strip()
+            out = {}
+            toks = sweep_part.split()
+            # a leading sweep needs a non-numeric type token + 3 numbers; otherwise the whole
+            # head is points (handles '50u,170u' with NO '+').
+            if len(toks) >= 4 and toks[0] in ("lin", "log"):
+                try:
+                    out["sweep"] = {"type": toks[0],
+                                    "start": _ManifestEditorDialog._si_to_float(toks[1]),
+                                    "stop": _ManifestEditorDialog._si_to_float(toks[2]),
+                                    "n": int(float(toks[3]))}
+                except (ValueError, IndexError):
+                    return None
+            elif sweep_part and "+" not in s:
+                # no '+' separator and not a recognized sweep head -> treat the head as points
+                pts_part = (sweep_part + "," + pts_part).strip(",") if pts_part else sweep_part
+                sweep_part = ""
+            pts = []
+            for p in pts_part.replace(" ", "").split(","):
+                if not p:
+                    continue
+                try:
+                    pts.append(_ManifestEditorDialog._si_to_float(p))
+                except ValueError:
+                    pass
+            if pts:
+                out["points"] = pts
+            return out or None
+
+        @staticmethod
+        def _trans_to_text(spec):
+            """coverage.transient[<o>] dict -> the compact 'trans' cell. Steps as
+            '<from>:<to>[:label] , ...' then an optional '@edge=..,tstop=..' tail. None/{} -> ''."""
+            spec = spec or {}
+            steps = spec.get("steps") or []
+            if not steps:
+                return ""
+            f2 = _ManifestEditorDialog._float_to_si
+            chunks = []
+            for st in steps:
+                base = f"{f2(st.get('from'))}:{f2(st.get('to'))}"
+                lbl = st.get("label")
+                chunks.append(f"{base}:{lbl}" if lbl else base)
+            txt = " , ".join(chunks)
+            tail = []
+            for k in ("edge", "tstop", "tstep"):
+                if spec.get(k) is not None:
+                    tail.append(f"{k}={f2(spec[k])}")
+            if tail:
+                txt += " @" + ",".join(tail)
+            return txt
+
+        @staticmethod
+        def _trans_from_text(s):
+            """The 'trans' cell -> coverage.transient[<o>] dict (or None when blank). Format:
+              '<from>:<to>[:label] , ...'  with an optional trailing '@edge=1n,tstop=1u,tstep=..'.
+            SI suffixes parsed. An unparseable step is skipped; no steps -> None."""
+            s = (s or "").strip()
+            if not s:
+                return None
+            body, _, tail = s.partition("@")
+            steps = []
+            for chunk in body.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                bits = chunk.split(":")
+                if len(bits) < 2:
+                    continue
+                try:
+                    st = {"from": _ManifestEditorDialog._si_to_float(bits[0]),
+                          "to": _ManifestEditorDialog._si_to_float(bits[1])}
+                except ValueError:
+                    continue
+                if len(bits) >= 3 and bits[2].strip():
+                    st["label"] = bits[2].strip()
+                steps.append(st)
+            if not steps:
+                return None
+            out = {"steps": steps}
+            for kv in tail.replace(" ", "").split(","):
+                if "=" not in kv:
+                    continue
+                k, v = kv.split("=", 1)
+                if k in ("edge", "tstop", "tstep"):
+                    try:
+                        out[k] = _ManifestEditorDialog._si_to_float(v)
+                    except ValueError:
+                        pass
+            return out
+
+        @staticmethod
+        def _ivcov_to_text(spec):
+            """coverage.iv[<c>] dict -> the 'iv_sweep' cell '<type> <start> <stop> <n>'. None -> ''."""
+            sw = (spec or {}).get("sweep")
+            if not sw:
+                return ""
+            return "{} {} {} {}".format(sw.get("type", "lin"),
+                                        _ManifestEditorDialog._float_to_si(sw["start"]),
+                                        _ManifestEditorDialog._float_to_si(sw["stop"]),
+                                        int(sw.get("n", 0) or 0))
+
+        @staticmethod
+        def _ivcov_from_text(s):
+            """The 'iv_sweep' cell -> coverage.iv[<c>] dict (or None). Accepted forms:
+              '<type> <start> <stop> <n>'   e.g. 'lin 0 1.1 12'  -> {sweep:{type,start,stop,n}}
+              legacy 'start:step:stop'      e.g. '0:0.01:1.1'    -> {sweep:{type:lin,start,stop,n}}
+              legacy 'auto'                                       -> None (no explicit sweep)
+            SI suffixes parsed. Unparseable -> None."""
+            s = (s or "").strip()
+            if not s or s.lower() == "auto":
+                return None
+            toks = s.split()
+            if len(toks) >= 4 and toks[0] in ("lin", "log"):
+                try:
+                    return {"sweep": {"type": toks[0],
+                                      "start": _ManifestEditorDialog._si_to_float(toks[1]),
+                                      "stop": _ManifestEditorDialog._si_to_float(toks[2]),
+                                      "n": int(float(toks[3]))}}
+                except (ValueError, IndexError):
+                    return None
+            if ":" in s:                                     # legacy start:step:stop -> lin sweep + n
+                try:
+                    nums = [_ManifestEditorDialog._si_to_float(x) for x in s.split(":")]
+                except ValueError:
+                    return None
+                if len(nums) == 3:
+                    start, step, stop = nums
+                    n = int(round((stop - start) / step)) + 1 if step else 2
+                    return {"sweep": {"type": "lin", "start": start, "stop": stop,
+                                      "n": max(n, 2)}}
+            return None
+
         @staticmethod
         def _num(s):
             """Parse a numeric cell to int/float when it looks numeric, else keep the string."""
@@ -1392,33 +1711,40 @@ if _HAVE_QT:
             g_ac = self.f_ac.text().strip()
             g_noise = self.f_noise.text().strip()
 
+            # physical columns the role collector must SKIP (handled elsewhere): the coverage
+            # cells (-> coverage.*), the checkbox columns (-> current_psrr_supplies), the gear.
+            _cov_cols = {"iload sweep", "trans", "iv_sweep"}
+
             def collect(t, role, cols):
                 """Overlay the table onto the stashed role map (preserving unmodeled per-entry
-                keys). `cols` are the LOGICAL manifest keys for the DATA columns (cols[0]=='key');
-                each row is read positionally over those columns (the trailing checkbox/analysis
-                display columns are handled separately). 'dc' parses numeric, 'iv_sweep' parses the
-                sweep text; any other column ('net', 'tb_src', 'src', 'probe_src', ...) is a trimmed
+                keys). `cols` are the LOGICAL manifest keys for the DATA columns (cols[0]=='key'),
+                consumed IN ORDER as we walk the table's PHYSICAL columns -- a coverage/checkbox/
+                gear column is skipped (it does not map to a per-entry role key). 'dc' parses
+                numeric; any other column ('net', 'tb_src', 'src', 'probe_src', ...) is a trimmed
                 string -- BLANK drops the key so a downstream default (auto-detect / Vprobe_<key>)
                 is restored rather than shipping an empty override. The per-object analysis override
                 (t._analysis[key]) is written as <entry>.analysis, but only when it actually differs
                 from the global default (keep manifests clean)."""
                 prev = stash_roles.get(role) or {}
                 store = getattr(t, "_analysis", {}) or {}
+                tcols = getattr(t, "_cols", cols)
+                skip = _cov_cols | set(getattr(t, "_check_cols", set())) | {"analysis"}
                 out = {}
                 for cells in self._table_rows(t):
                     key = cells[0] if cells else ""
                     if not key:
                         continue
                     ent = dict(prev.get(key) or {})      # preserve this entry's unmodeled keys
-                    for i, col in enumerate(cols[1:], start=1):
-                        val = (cells[i] if i < len(cells) else "").strip()
-                        if col == "iv_sweep":
-                            iv = self._iv_from_text(val) if val else None
-                            if iv is not None:
-                                ent["iv_sweep"] = iv
-                            else:
-                                ent.pop("iv_sweep", None)
-                        elif col == "dc":
+                    li = 1
+                    for pc_idx, pc in enumerate(tcols[1:], start=1):
+                        if pc in skip:
+                            continue                     # coverage / checkbox / gear: not a role key
+                        col = cols[li] if li < len(cols) else None
+                        li += 1
+                        if col is None:
+                            continue
+                        val = (cells[pc_idx] if pc_idx < len(cells) else "").strip()
+                        if col == "dc":
                             if val != "":
                                 ent["dc"] = self._num(val)
                             else:
@@ -1430,6 +1756,9 @@ if _HAVE_QT:
                                 ent[col] = val
                             else:
                                 ent.pop(col, None)
+                    # the wired iv_sweep column now feeds coverage.iv -- so DROP any legacy
+                    # i_out.<c>.iv_sweep per-entry key (it migrates to coverage.iv on save).
+                    ent.pop("iv_sweep", None)
                     # per-object analysis override: drop any kind that equals the global default
                     # (clean manifests); write {ac?, noise?} only when something genuinely differs.
                     ov_in = dict(store.get(key) or {})
@@ -1446,9 +1775,15 @@ if _HAVE_QT:
                 return out
             m["supplies"] = collect(self.t_supplies, "supplies", ["key", "net", "dc", "tb_src"])
             m["v_out"] = collect(self.t_vout, "v_out", ["key", "net", "src"])
-            m["i_out"] = collect(self.t_iout, "i_out",
-                                 ["key", "net", "dc", "iv_sweep", "probe_src"])
+            m["i_out"] = collect(self.t_iout, "i_out", ["key", "net", "dc", "probe_src"])
             m["bias"] = collect(self.t_bias, "bias", ["key", "net", "dc"])
+            # COVERAGE: the tier/temps/slew/lin globals + the per-rail/per-sink sweep cells. Overlay
+            # onto the stashed coverage (preserving enable/dropout/nominal/holdout + any unmodeled
+            # key the form does not surface); OMIT every empty sub-dict so a no-coverage manifest
+            # stays byte-clean (no `coverage` key at all unless something non-default is set).
+            m["coverage"] = self._coverage_to_dict(m.get("coverage"))
+            if not m["coverage"]:
+                m.pop("coverage", None)
 
             # [2.3] current-PSRR from the per-supply checkboxes. The EXPLICIT list of checked keys
             # is always written (an empty list = no current-PSRR is allowed + meaningful).
@@ -1475,6 +1810,75 @@ if _HAVE_QT:
             if an:
                 m["analysis"] = an
             return m
+
+        def _coverage_to_dict(self, prev):
+            """Build coverage from the Coverage widgets + the per-rail/per-sink cells, OVERLAID on
+            the stashed coverage `prev` (so enable/dropout/nominal/holdout + any unmodeled key
+            survive the round-trip, D6). Returns {} when NOTHING non-default is set so the caller
+            can drop the whole section -> a no-coverage manifest stays byte-clean. The rule for a
+            byte-clean drop: tier==T4 (the default), no temps, slew_en off, lin_gate off, and every
+            loads/transient/iv sub-dict empty AND nothing was carried in `prev`."""
+            import copy
+            cov = copy.deepcopy(prev) if isinstance(prev, dict) else {}
+
+            tier = self.f_cov_tier.currentText().strip() or "T4"
+            cov["tier"] = tier
+            temps = []
+            for tok in self.f_cov_temps.text().split(","):
+                tok = tok.strip()
+                if tok:
+                    try:
+                        temps.append(self._num(tok))
+                    except ValueError:
+                        pass
+            if temps:
+                cov["temps"] = temps
+            else:
+                cov.pop("temps", None)
+            if self.f_cov_slew.isChecked():
+                cov["slew_en"] = 1
+            else:
+                cov.pop("slew_en", None)
+            if self.f_cov_lin.isChecked():
+                cov["lin_gate"] = True
+            else:
+                cov.pop("lin_gate", None)
+
+            # per-rail / per-sink cells overlay their sub-dicts; a blank cell DROPS that key so the
+            # sub-dict shrinks (and disappears when empty) -- no stale {} survives a cleared cell.
+            def overlay(section, table, col_name, parse):
+                sub = dict(cov.get(section) or {})
+                cols = getattr(table, "_cols", [])
+                ci = cols.index(col_name) if col_name in cols else None
+                if ci is not None:
+                    for cells in self._table_rows(table):
+                        key = cells[0] if cells else ""
+                        if not key:
+                            continue
+                        txt = (cells[ci] if ci < len(cells) else "").strip()
+                        parsed = parse(txt) if txt else None
+                        if parsed:
+                            # preserve any unmodeled sub-keys the form does not surface
+                            merged = dict(sub.get(key) or {})
+                            merged.update(parsed)
+                            sub[key] = merged
+                        else:
+                            sub.pop(key, None)
+                if sub:
+                    cov[section] = sub
+                else:
+                    cov.pop(section, None)
+            overlay("loads", self.t_vout, "iload sweep", self._loads_from_text)
+            overlay("transient", self.t_vout, "trans", self._trans_from_text)
+            overlay("iv", self.t_iout, "iv_sweep", self._ivcov_from_text)
+
+            # byte-clean drop: only the default tier + nothing else set + nothing inherited.
+            non_default = (tier != "T4" or "temps" in cov or "slew_en" in cov or "lin_gate" in cov
+                           or cov.get("loads") or cov.get("transient") or cov.get("iv")
+                           or cov.get("dropout") or cov.get("enable"))
+            if not non_default:
+                return {}
+            return cov
 
         # ---- Form <-> Raw sync (merge-overlay both ways) ---------------------------
         def _on_subtab_changed(self, idx):
@@ -1537,16 +1941,36 @@ if _HAVE_QT:
             return ok
 
         # ---- [SCAN] auto-fill source-instance + dc from a base netlist -------------
+        @staticmethod
+        def _mw_netlist_path(mw):
+            """The MainWindow's base-netlist path -> a usable input.scs file, or None. The main
+            window's xb_netlist is a DIR picker (the work dir holding input.scs), but tolerate a
+            direct file too. Returns the resolved .scs path string, or None if absent/missing."""
+            edit = getattr(mw, "xb_netlist", None)
+            txt = edit["edit"].text().strip() if isinstance(edit, dict) and "edit" in edit else ""
+            if not txt:
+                return None
+            p = pathlib.Path(txt)
+            if p.is_dir():
+                cand = p / "input.scs"
+                return str(cand) if cand.exists() else None
+            return str(p) if p.exists() else None
+
         def _scan_netlist(self):
-            """Pick the base input.scs, run the backend scanner over the CURRENT form dict, and
-            fill each table's source-instance + dc columns from the detected driving instances.
-            Reports found / missing / type-mismatch counts in the status bar."""
-            start = str(self.path.parent if self.path else ROOT)
-            fn, _ = QFileDialog.getOpenFileName(
-                self, "Select base netlist (input.scs)", start,
-                "Spectre netlist (*.scs);;All files (*)")
-            if not fn:
-                return
+            """Scan the base input.scs and fill each table's source-instance + dc columns from the
+            detected driving instances. [Fix B] FIRST try the main-window base-netlist path (the
+            Mode-B 'Netlist dir' field) -- if it resolves to an input.scs, scan it WITHOUT a dialog;
+            only fall back to QFileDialog when the main-window path is empty/missing. Reports
+            found / missing / type-mismatch in the status bar."""
+            fn = self._mw_netlist_path(self.parent())            # main-window xb_netlist (no dialog)
+            from_mw = fn is not None
+            if not from_mw:
+                start = str(self.path.parent if self.path else ROOT)
+                fn, _ = QFileDialog.getOpenFileName(
+                    self, "Select base netlist (input.scs)", start,
+                    "Spectre netlist (*.scs);;All files (*)")
+                if not fn:
+                    return
             try:
                 from cluster import netlist_augment as NA
                 scan = NA.scan_netlist_sources(fn, self._current_dict() or {})
@@ -1556,8 +1980,9 @@ if _HAVE_QT:
                 return
             found, missing, mism = self._apply_scan(scan)
             self.status.setStyleSheet("font-family:monospace; font-size:11px; color:#157f3b;")
+            src = "main-window netlist dir" if from_mw else "picked file"
             self.status.setText(
-                f"scanned {pathlib.Path(fn).name}: {found} source(s) found, "
+                f"scanned {pathlib.Path(fn).name} ({src}): {found} source(s) found, "
                 f"{missing} not found, {mism} type-mismatch. "
                 "Supplies / voltage-outputs / current-outputs source-instance + dc cells filled "
                 "(bias is not scanned) — review the amber/red ones, then Validate.")
@@ -1921,6 +2346,12 @@ if _HAVE_QT:
 
         # --- Tab 0: Extract (in-situ, Mechanism A) -------------------------------
         def _tab_extract(self):
+            # [Fix C] wrap the tab content in a QScrollArea (mirror _build_form_tab's idiom):
+            # outer widget -> QScrollArea(setWidgetResizable) -> inner content widget. When the
+            # window is short the tab now SCROLLS vertically instead of squashing the blocks.
+            tab = QWidget(); tabv = QVBoxLayout(tab); tabv.setContentsMargins(0, 0, 0, 0)
+            scroll = QScrollArea(); scroll.setWidgetResizable(True)
+            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
             w = QWidget(); outer = QVBoxLayout(w)
             help_ = QLabel(
                 "<b>In-situ PMU LDO modeling — one corner, end to end.</b> Fill the form with your "
@@ -2256,7 +2687,14 @@ if _HAVE_QT:
             outer.addLayout(srow2)
             self._x_mode_changed(); self._x_location_changed()   # set initial group visibility
             self._sb_initial()                                   # skillbridge indicator (import-only)
-            return w
+            # [Fix C] give the major blocks a sensible minimum height so they don't collapse to
+            # nothing when the tab is short -- the QScrollArea below provides the vertical scroll.
+            self.x_grp_pinform.setMinimumHeight(360)
+            self.x_grp_modeb.setMinimumHeight(150)
+            self.x_report.setMinimumHeight(140)
+            scroll.setWidget(w)                                  # [Fix C] content -> scroll -> tab
+            tabv.addWidget(scroll)
+            return tab
 
         def _form_gui(self):
             """Assemble the build_manifest `gui` dict from the pin-form widgets. Comma lists ->
@@ -3678,6 +4116,54 @@ def _selftest_cluster_sweep(win, tmp, app):
           f"+ max-parallel plumbing OK")
 
 
+def _render_coverage_shots(win, dlg):
+    """[STAGE 3] Render the mandatory offscreen PNGs to /tmp/ldo_gui_shots/: the populated
+    manifest-editor Form (top = Identity+Coverage+Supplies; tall grab = the Voltage/Current
+    tables with the new iload/trans/iv_sweep columns) and a SHORT Tab-0 proving the new vertical
+    scrollbar. A QWidget/QDialog .grab()s directly under QT_QPA_PLATFORM=offscreen even unshown."""
+    shotdir = pathlib.Path("/tmp/ldo_gui_shots"); shotdir.mkdir(parents=True, exist_ok=True)
+    saved = []
+    # land on the Form sub-tab + give it a sensible size, then grab. Scroll the inner QScrollArea
+    # down a touch so Identity + COVERAGE + Supplies are all in frame for the 'top' shot.
+    dlg.subtabs.setCurrentIndex(0)
+    dlg.resize(560, 900)
+    dlg.show(); QtWidgets.QApplication.processEvents()
+    _form_scroll = dlg.subtabs.widget(0).findChild(QtWidgets.QScrollArea)
+    if _form_scroll is not None:
+        _form_scroll.verticalScrollBar().setValue(430)     # past Identity -> Coverage controls
+        QtWidgets.QApplication.processEvents()
+    p_top = shotdir / "editor_form_top.png"
+    if dlg.grab().save(str(p_top)):
+        saved.append(str(p_top))
+    # a TALL + WIDE grab so the Voltage-outputs (iload sweep + trans) + Current-outputs (iv_sweep)
+    # tables show their POPULATED cells -- widen the dialog so the role tables reveal the new
+    # coverage columns without their own horizontal scrollbar, then grab the inner content widget
+    # (its full natural height), not just the viewport.
+    if _form_scroll is not None:
+        _form_scroll.verticalScrollBar().setValue(0)
+    dlg.resize(900, 1500); QtWidgets.QApplication.processEvents()
+    # widen the role tables so the iload-sweep / trans / iv_sweep cells are flush in frame.
+    for _t in (dlg.t_vout, dlg.t_iout):
+        _t.setMinimumWidth(820)
+    QtWidgets.QApplication.processEvents()
+    inner = _form_scroll.widget() if _form_scroll is not None else dlg.subtabs.widget(0)
+    p_tab = shotdir / "editor_form_tables.png"
+    if inner.grab().save(str(p_tab)):
+        saved.append(str(p_tab))
+    dlg.hide()
+    # Tab-0 at a SHORT window height so the QScrollArea's vertical scrollbar appears (Fix C proof).
+    win.tabs.setCurrentIndex(0)
+    _saved_geo = (win.width(), win.height())
+    win.resize(800, 520); win.show(); QtWidgets.QApplication.processEvents()
+    p_t0 = shotdir / "tab0_extract.png"
+    if win.grab().save(str(p_t0)):
+        saved.append(str(p_t0))
+    win.resize(*_saved_geo); QtWidgets.QApplication.processEvents()
+    for s in saved:
+        print(f"  qt: coverage screenshot saved -> {s}")
+    return saved
+
+
 def _selftest_manifest_editor(win, tmp):
     """Headless smoke of the in-GUI manifest editor (#1): the structured Form + Raw-JSON sub-tabs.
     Asserts: template validates, a broken/invalid edit is caught (Raw tab), a valid edit Saves +
@@ -3776,8 +4262,9 @@ def _selftest_manifest_editor(win, tmp):
     dlg4 = _ManifestEditorDialog(win, src, None)
     # tables: supplies [key,net,dc,src,PSRR→I,analysis]=6; v_out [key,net,src,analysis]=4;
     # i_out [key,net,dc,iv,probe,analysis]=6.
+    # v_out now carries two coverage columns (iload sweep + trans) so its count is 6, not 4.
     assert dlg4.t_supplies.columnCount() == 6 and dlg4.t_iout.columnCount() == 6 \
-        and dlg4.t_vout.columnCount() == 4, "tables must carry source-instance + checkbox/analysis columns"
+        and dlg4.t_vout.columnCount() == 6, "tables must carry source-instance + checkbox/analysis/coverage columns"
     assert dlg4.t_supplies.item(0, 3).text() == "V7", "supply tb_src not shown in the 'src instance' cell"
     assert dlg4.t_iout.item(0, 4).text() == "Vprobe_i500n_lpf", "i_out probe_src not shown in the cell"
     # edit the supply source in the FORM, then Form->Raw must carry it into tb_src
@@ -3913,16 +4400,99 @@ def _selftest_manifest_editor(win, tmp):
                 "no column may Stretch -- it balloons the dialog width ([2.1/2.5])"
         assert _tt.columnWidth(1) <= 220, "the 'net' column must keep a compact fixed width ([2.5])"
 
+    # 5k) [STAGE 3] COVERAGE controls + per-rail/per-sink cells round-trip. Take the resolved
+    #     wur_pmu_top manifest, INJECT coverage (loads on a rail, transient on a rail, iv on a
+    #     sink, temps, tier=T2), open the editor, assert the widgets/cells populate, then
+    #     _form_to_dict and assert the coverage section ROUND-TRIPS byte-for-byte (modulo float).
+    from insitu import manifest as _M
+    base = _M.load("wur_pmu_top")                                # resolved real manifest
+    base.pop("_path", None)
+    base["coverage"] = {
+        "tier": "T2",
+        "temps": [-40, 55, 125],
+        "slew_en": 1,
+        "lin_gate": True,
+        "loads": {"vco": {"sweep": {"type": "log", "start": 200e-6, "stop": 6e-3, "n": 4},
+                          "points": [3e-3]}},
+        "transient": {"vco": {"steps": [{"from": 0.0, "to": 6e-3, "label": "slew"},
+                                        {"from": 450e-6, "to": 550e-6, "label": "lin"}],
+                              "edge": 1e-9, "tstop": 1e-6}},
+        "iv": {"i3p6u_vco": {"sweep": {"type": "lin", "start": 0.0, "stop": 1.1, "n": 12}}},
+    }
+    dlgc = _ManifestEditorDialog(win, json.dumps(base), None)
+    # the global coverage widgets populate
+    assert dlgc.f_cov_tier.currentText() == "T2", "coverage tier did not populate the combo"
+    assert dlgc.f_cov_slew.isChecked(), "slew_en did not populate the checkbox"
+    assert dlgc.f_cov_lin.isChecked(), "lin_gate did not populate the checkbox"
+    assert [s.strip() for s in dlgc.f_cov_temps.text().split(",")] == ["-40", "55", "125"], \
+        f"temps did not populate, got {dlgc.f_cov_temps.text()!r}"
+    # the per-rail / per-sink CELLS populate (compact strings) -- find the vco / i3p6u_vco rows
+    vrows = {dlgc.t_vout.item(r, 0).text(): r for r in range(dlgc.t_vout.rowCount())}
+    irows = {dlgc.t_iout.item(r, 0).text(): r for r in range(dlgc.t_iout.rowCount())}
+    _vc = dlgc.t_vout._cols
+    il_txt = dlgc.t_vout.item(vrows["vco"], _vc.index("iload sweep")).text()
+    tr_txt = dlgc.t_vout.item(vrows["vco"], _vc.index("trans")).text()
+    iv_txt = dlgc.t_iout.item(irows["i3p6u_vco"], dlgc.t_iout._cols.index("iv_sweep")).text()
+    assert il_txt.startswith("log ") and "+" in il_txt, f"iload sweep cell not rendered: {il_txt!r}"
+    assert "slew" in tr_txt and "lin" in tr_txt, f"trans cell not rendered: {tr_txt!r}"
+    assert iv_txt.startswith("lin "), f"iv_sweep cell not rendered: {iv_txt!r}"
+    # ROUND-TRIP: _form_to_dict must rebuild the same coverage section
+    cd = dlgc._form_to_dict()["coverage"]
+    assert cd["tier"] == "T2" and cd["slew_en"] == 1 and cd["lin_gate"] is True
+    assert cd["temps"] == [-40, 55, 125], f"temps did not round-trip: {cd.get('temps')}"
+    lsw = cd["loads"]["vco"]["sweep"]
+    assert lsw["type"] == "log" and abs(lsw["start"] - 200e-6) < 1e-12 \
+        and abs(lsw["stop"] - 6e-3) < 1e-12 and lsw["n"] == 4, f"loads sweep lost: {lsw}"
+    assert [round(p, 12) for p in cd["loads"]["vco"]["points"]] == [3e-3], "loads points lost"
+    tsteps = cd["transient"]["vco"]["steps"]
+    assert len(tsteps) == 2 and tsteps[0]["label"] == "slew" and tsteps[1]["label"] == "lin", \
+        f"transient steps lost: {tsteps}"
+    assert abs(cd["transient"]["vco"]["edge"] - 1e-9) < 1e-15 \
+        and abs(cd["transient"]["vco"]["tstop"] - 1e-6) < 1e-12, "transient edge/tstop lost"
+    ivsw = cd["iv"]["i3p6u_vco"]["sweep"]
+    assert ivsw["type"] == "lin" and ivsw["n"] == 12 and abs(ivsw["stop"] - 1.1) < 1e-9, \
+        f"iv sweep lost: {ivsw}"
+    # the merged manifest still validates end-to-end (the coverage validator)
+    okc, msgc = dlgc._check()
+    assert okc, f"coverage-carrying manifest must validate, got: {msgc}"
+    # an empty CELL drops just that key (clear the iload-sweep cell -> loads.vco gone, others stay)
+    dlgc.t_vout.item(vrows["vco"], _vc.index("iload sweep")).setText("")
+    cd2 = dlgc._form_to_dict()["coverage"]
+    assert "loads" not in cd2, "cleared iload cell must drop the (now empty) loads sub-dict"
+    assert "transient" in cd2 and "iv" in cd2, "clearing one cell must not drop the others"
+
+    # 5l) NO-COVERAGE manifest stays BYTE-CLEAN: a manifest with tier=T4 default + no temps/slew/
+    #     lin + no per-rail cells must NOT emit a `coverage` key at all (no empty sub-dicts).
+    nocov = json.dumps({"name": "nc", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                        "v_out": {"o": {"net": "VO"}}, "i_out": {"c": {"net": "IC", "dc": 0.9}}})
+    dlgn = _ManifestEditorDialog(win, nocov, None)
+    assert dlgn.f_cov_tier.currentText() == "T4", "no-coverage manifest must default the tier to T4"
+    assert dlgn.f_cov_temps.text() == "" and not dlgn.f_cov_slew.isChecked() \
+        and not dlgn.f_cov_lin.isChecked(), "no-coverage manifest must open with empty coverage knobs"
+    n_out = dlgn._form_to_dict()
+    assert "coverage" not in n_out, "a no-coverage manifest must NOT emit a coverage key (byte-clean)"
+    # ... but flipping ONE knob (tier T4->T1) does emit a minimal, valid coverage section.
+    dlgn.f_cov_tier.setCurrentText("T1")
+    n_out2 = dlgn._form_to_dict()
+    assert n_out2.get("coverage", {}).get("tier") == "T1", "a non-default tier must emit coverage.tier"
+    assert "loads" not in n_out2["coverage"] and "temps" not in n_out2["coverage"], \
+        "an otherwise-empty coverage must not carry empty sub-dicts"
+
     # 6) find/replace bar (Ctrl+F / Ctrl+H) over the Raw text
     dlg2.findbar.find.setText("VDD0P8_VCO"); dlg2.findbar.repl.setText("VDD0P8_RENAMED")
     dlg2.findbar._replace_all()
     assert "VDD0P8_RENAMED" in dlg2.ed.toPlainText() and "VDD0P8_VCO" not in dlg2.ed.toPlainText(), \
         "find/replace-all did not rewrite the Raw text"
 
+    # 7) SCREENSHOTS (mandatory): render the populated coverage-carrying editor + a SHORT Tab-0 so
+    #    the new vertical scrollbar is visible. .grab() works offscreen even on an unshown widget.
+    _render_coverage_shots(win, dlgc)
+
     print("  qt: manifest editor OK (Form+Raw tabs, bad JSON/manifest caught, save+reload, "
           "tb_lib<-dut_lib, lossless round-trip, net-placeholder strip, tb_src/src/probe_src "
           "columns, PSRR→I checkbox, bias top-level, corner label, per-object analysis, "
-          "scan-fill, net-stretch/no-last-stretch, find/replace)")
+          "scan-fill, net-stretch/no-last-stretch, COVERAGE tier/temps/slew/lin + iload/trans/iv "
+          "cells round-trip + byte-clean drop, find/replace)")
 
 
 def _selftest(require_qt=False):
