@@ -868,10 +868,13 @@ if _HAVE_QT:
             sg = QGroupBox("Supplies — rails to PSRR")
             sg.setStyleSheet("QGroupBox{font-weight:bold;}")
             sgl = QVBoxLayout(sg)
-            sgl.addWidget(QLabel("<span style='color:#678'>Each supply needs a net + its DC "
-                                 "operating value.</span>"))
-            self.t_supplies = self._make_table(["key", "net", "dc"],
-                                               ["AVDD1P0", "VDD1P0", "1.0"])
+            sgl.addWidget(QLabel(
+                "<span style='color:#678'>Each supply needs a net + its DC operating value. "
+                "<b>src instance</b> = the testbench voltage source on that rail (the one we put "
+                "the PSRR AC ripple on); <b>leave blank to auto-detect</b> — fill it only if "
+                "auto-detect can't find / picks the wrong one.</span>"))
+            self.t_supplies = self._make_table(["key", "net", "dc", "src instance"],
+                                               ["AVDD1P0", "VDD1P0", "1.0", "V_AVDD"])
             sgl.addWidget(self._table_block(self.t_supplies))
             v.addWidget(sg)
 
@@ -892,10 +895,13 @@ if _HAVE_QT:
             cgl = QVBoxLayout(cg)
             cgl.addWidget(QLabel("<span style='color:#678'>Current-output pins (admittance / "
                                  "current-PSRR): net + compliance dc + optional I-V sweep "
-                                 "(start:step:stop or 'auto'). Leave empty if your DUT has none."
-                                 "</span>"))
-            self.t_iout = self._make_table(["key", "net", "compliance dc", "iv_sweep"],
-                                           ["i500n", "IBP_500N", "0.9", "0:0.01:1.1"])
+                                 "(start:step:stop or 'auto'). <b>probe instance</b> = the name "
+                                 "for the current probe we insert on that pin; <b>blank → auto "
+                                 "(Vprobe_&lt;key&gt;)</b>. Leave the whole table empty if your "
+                                 "DUT has no current outputs.</span>"))
+            self.t_iout = self._make_table(
+                ["key", "net", "compliance dc", "iv_sweep", "probe instance"],
+                ["i500n", "IBP_500N", "0.9", "0:0.01:1.1", "Vprobe_i500n"])
             cgl.addWidget(self._table_block(self.t_iout))
             cf = QFormLayout()
             self.f_cpsrr = QLineEdit()
@@ -1062,9 +1068,9 @@ if _HAVE_QT:
                     r = self._table_add_row(t, row)
                     if unresolved_pin is not None:
                         self._flag_unresolved_net(t, r, cols.index("net"), unresolved_pin)
-            fill(self.t_supplies, m.get("supplies"), ["key", "net", "dc"])
+            fill(self.t_supplies, m.get("supplies"), ["key", "net", "dc", "tb_src"])
             fill(self.t_vout, m.get("v_out"), ["key", "net"])
-            fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "iv_sweep"])
+            fill(self.t_iout, m.get("i_out"), ["key", "net", "dc", "iv_sweep", "probe_src"])
             fill(self.t_bias, m.get("bias"), ["key", "net", "dc"])
 
         @staticmethod
@@ -1161,38 +1167,47 @@ if _HAVE_QT:
             # (e.g. supplies.<k>.tb_src, i_out.<k>.probe_src, a 'pin' traceability tag) survive (D6).
             stash_roles = m if isinstance(m, dict) else {}
 
-            def collect(t, role, has_dc=False, is_iout=False):
+            def collect(t, role, cols):
+                """Overlay the table onto the stashed role map (preserving unmodeled per-entry
+                keys). `cols` are the LOGICAL manifest keys per column (cols[0]=='key'); each row
+                is read positionally. 'dc' parses numeric, 'iv_sweep' parses the sweep text; any
+                other column ('net', 'tb_src', 'probe_src', ...) is a trimmed string -- BLANK
+                drops the key so a downstream default (supply auto-detect / Vprobe_<key>) is
+                restored rather than shipping an empty override."""
                 prev = stash_roles.get(role) or {}
                 out = {}
                 for cells in self._table_rows(t):
-                    key = cells[0]
-                    net = cells[1] if len(cells) > 1 else ""
+                    key = cells[0] if cells else ""
                     if not key:
                         continue
                     ent = dict(prev.get(key) or {})      # preserve this entry's unmodeled keys
-                    ent["net"] = net
-                    if is_iout:
-                        if len(cells) > 2 and cells[2] != "":
-                            ent["dc"] = self._num(cells[2])
-                        else:
-                            ent.pop("dc", None)
-                        if len(cells) > 3 and cells[3].strip():
-                            iv = self._iv_from_text(cells[3])
+                    for i, col in enumerate(cols[1:], start=1):
+                        val = (cells[i] if i < len(cells) else "").strip()
+                        if col == "iv_sweep":
+                            iv = self._iv_from_text(val) if val else None
                             if iv is not None:
                                 ent["iv_sweep"] = iv
-                        else:
-                            ent.pop("iv_sweep", None)
-                    elif has_dc:
-                        if len(cells) > 2 and cells[2] != "":
-                            ent["dc"] = self._num(cells[2])
-                        else:
-                            ent.pop("dc", None)
+                            else:
+                                ent.pop("iv_sweep", None)
+                        elif col == "dc":
+                            if val != "":
+                                ent["dc"] = self._num(val)
+                            else:
+                                ent.pop("dc", None)
+                        elif col == "net":
+                            ent["net"] = val
+                        else:                            # tb_src / probe_src / any string field
+                            if val:
+                                ent[col] = val
+                            else:
+                                ent.pop(col, None)
                     out[key] = ent
                 return out
-            m["supplies"] = collect(self.t_supplies, "supplies", has_dc=True)
-            m["v_out"] = collect(self.t_vout, "v_out")
-            m["i_out"] = collect(self.t_iout, "i_out", is_iout=True)
-            m["bias"] = collect(self.t_bias, "bias", has_dc=True)
+            m["supplies"] = collect(self.t_supplies, "supplies", ["key", "net", "dc", "tb_src"])
+            m["v_out"] = collect(self.t_vout, "v_out", ["key", "net"])
+            m["i_out"] = collect(self.t_iout, "i_out",
+                                 ["key", "net", "dc", "iv_sweep", "probe_src"])
+            m["bias"] = collect(self.t_bias, "bias", ["key", "net", "dc"])
 
             cpsrr = [t for t in (x.strip() for x in self.f_cpsrr.text().split(",")) if t]
             if cpsrr:
@@ -3361,7 +3376,7 @@ def _selftest_manifest_editor(win, tmp):
     #    both unknown keys MUST survive (D6).
     raw["_designer_note"] = "keep me"                            # unknown top-level key
     raw["dut"]["_secret_view"] = "layout"                       # unmodeled NESTED key under dut
-    raw["supplies"]["AVDD1P0"]["tb_src"] = "V_AVDD"             # unmodeled nested key under a supply
+    raw["supplies"]["AVDD1P0"]["_supply_note"] = "external rail"  # truly-unmodeled nested supply key
     dlg2.ed.setPlainText(json.dumps(raw, indent=2))
     dlg2.subtabs.setCurrentIndex(0)                             # Raw->Form re-parses into the stash
     assert dlg2.f_name.text() == "wur_pmu_top", "Raw->Form did not repopulate the form"
@@ -3369,7 +3384,8 @@ def _selftest_manifest_editor(win, tmp):
     merged = json.loads(dlg2.ed.toPlainText())
     assert merged.get("_designer_note") == "keep me", "unknown top-level key lost in round-trip"
     assert merged["dut"].get("_secret_view") == "layout", "unmodeled nested dut key lost"
-    assert merged["supplies"]["AVDD1P0"].get("tb_src") == "V_AVDD", "unmodeled supply key lost"
+    assert merged["supplies"]["AVDD1P0"].get("_supply_note") == "external rail", \
+        "unmodeled supply key lost"
     out2 = pathlib.Path(tmp) / "roundtrip_manifest.json"
     assert dlg2._write(out2), "round-trip save failed"
     on_disk = json.loads(out2.read_text())
@@ -3397,6 +3413,29 @@ def _selftest_manifest_editor(win, tmp):
     assert ph_raw["v_out"]["pll"]["net"] == "VDD0P8_PLL", "Form->Raw must write the bare resolved net"
     assert ph_raw["v_out"]["pll"]["pin"] == "VDD0P8_PLL", "pin tag must survive the placeholder strip"
 
+    # 5c) SOURCE-INSTANCE columns are surfaced in the Form: supplies 'src instance' -> tb_src,
+    #     i_out 'probe instance' -> probe_src. They must display from a loaded manifest AND
+    #     round-trip Form->Raw (so the designer fixes a failed supply auto-detect without
+    #     dropping to Raw JSON).
+    src = json.dumps({
+        "name": "src", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "supplies": {"avdd1p0": {"net": "AVDD1P0", "dc": 0.98, "tb_src": "V7"}},
+        "i_out": {"i500n": {"net": "IBP_500N", "dc": 1.28, "probe_src": "Vprobe_i500n_lpf"}},
+    })
+    dlg4 = _ManifestEditorDialog(win, src, None)
+    assert dlg4.t_supplies.columnCount() == 4 and dlg4.t_iout.columnCount() == 5, \
+        "supplies/i_out tables must carry the source-instance columns"
+    assert dlg4.t_supplies.item(0, 3).text() == "V7", "supply tb_src not shown in the 'src instance' cell"
+    assert dlg4.t_iout.item(0, 4).text() == "Vprobe_i500n_lpf", "i_out probe_src not shown in the cell"
+    # edit the supply source in the FORM, then Form->Raw must carry it into tb_src
+    dlg4.t_supplies.item(0, 3).setText("V_AVDD_FORCE")
+    dlg4.subtabs.setCurrentIndex(RAW)
+    src_raw = json.loads(dlg4.ed.toPlainText())
+    assert src_raw["supplies"]["avdd1p0"].get("tb_src") == "V_AVDD_FORCE", \
+        "Form 'src instance' edit must round-trip to supplies.<s>.tb_src"
+    assert src_raw["i_out"]["i500n"].get("probe_src") == "Vprobe_i500n_lpf", \
+        "i_out probe_src must survive the Form round-trip"
+
     # 6) find/replace bar (Ctrl+F / Ctrl+H) over the Raw text
     dlg2.findbar.find.setText("VDD0P8_VCO"); dlg2.findbar.repl.setText("VDD0P8_RENAMED")
     dlg2.findbar._replace_all()
@@ -3404,7 +3443,8 @@ def _selftest_manifest_editor(win, tmp):
         "find/replace-all did not rewrite the Raw text"
 
     print("  qt: manifest editor OK (Form+Raw tabs, bad JSON/manifest caught, save+reload, "
-          "tb_lib<-dut_lib, lossless unknown-key round-trip, find/replace)")
+          "tb_lib<-dut_lib, lossless unknown-key round-trip, net-placeholder strip, "
+          "tb_src/probe_src columns, find/replace)")
 
 
 def _selftest(require_qt=False):
