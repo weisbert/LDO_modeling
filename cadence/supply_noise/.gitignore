@@ -3,3 +3,7 @@ ldo_model.va
 ldo_model_dropout.tbl
 flat_nf.dat
 avdd_nf.dat
+# generalization sweep scratch (regenerable by generalization_spur_noise.py)
+_gen_*.lib
+_gen_*.va
+_gen_run.log
