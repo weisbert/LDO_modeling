@@ -37,7 +37,13 @@ _TRAP = getattr(np, "trapezoid", None) or np.trapz
 #         (v7 inductive tail / v8 notch used to be invisible here).
 W = dict(zrms=1.0, zband=3.0, zphase=0.04, pkdb=1.0, pband=2.0,
          pphase=0.03, trms=0.2, noise=0.5, spur=0.5, spurph=0.03,
-         zhf=0.5, phf=0.5, sspur=0.5)
+         zhf=0.5, phf=0.5, sspur=0.5, npk=0.1, nir_lf=0.01)
+# npk/nir_lf: noise-resonance matched-freq error (dB) + LF (10Hz-100kHz, datasheet uVrms
+#        window) integrated-RMS error (%), folded into the composite at LOW weight with
+#        saturation (NPK_CAP/NIR_LF_CAP) so a DESIGNED order-limit (v8_dlc/v10_3lc In-notch)
+#        nudges the score but never dominates it. The full-band ir_pct stays diagnostic-only.
+NPK_CAP = 6.0      # dB saturation on the folded noise-resonance term
+NIR_LF_CAP = 50.0  # % saturation on the folded LF integrated-RMS term
 # sspur: SUPPLY-spur rejection error (dB) at the AVDD aggressor tones (DC-DC comb + ref
 #        clock). Folds into the composite ONLY when the ref carries the collected
 #        supply_spur_* arrays (regenerate the reference to enable); legacy refs still get
@@ -99,16 +105,63 @@ def _trans_metrics(t, vg, vm):
                 wrms=wrms, ringg=bench.ring_freq(t, vg), ringm=bench.ring_freq(t, vm))
 
 
-def _noise_metrics(fn, Sg, fm, Sm):
+def _noise_metrics(fn, Sg, fm, Sm, fres=None):
     Smi = _interp_mag(fn, fm, Sm)
     db = 20 * np.log10((Smi + 1e-18) / (Sg + 1e-18))
     band = (fn >= 10) & (fn <= 100e6)
-    res = (fn > 0.5e6) & (fn < 3e6)
+    # R1: GT-PSD-ENERGY-WEIGHTED log-RMS. The flat unweighted average over 7 decades let a
+    # deep post-rolloff numerical-floor tail (~0.3% of the integrated noise energy) dominate
+    # the headline and over-penalize a fine in-band model ~6x. Weighting by Sg^2 suppresses
+    # that tail (THE win) -- measured, the Sg^2 weight sits ~entirely in the LF energy-bearing
+    # decades, so psd_rms becomes an LF-energy-dominated dB metric. The FULL band is kept (not
+    # capped at 1MHz) only because the weighting already starves the HF floor so a cap buys
+    # nothing; resonance sensitivity is INTENTIONALLY delegated to the npk term below, not here.
+    w = Sg[band] ** 2
+    w = w / (w.sum() + 1e-300)
+    psd_rms = float(np.sqrt(np.sum(w * db[band] ** 2)))
+    # R2: FREQUENCY-AWARE resonance metric, ANCHORED TO THE GT Zout-PEAK FREQUENCY fres (the
+    # LC resonance location). This replaces the fixed 0.5-3MHz window (v2_capless's 4-8MHz
+    # resonance fell outside it). The Zout anchor is robust where an argmax(Sv) anchor is not:
+    # when the 1/f tail dominates Sv, argmax(Sv) latches the band bottom, not the resonance.
+    # pkdb = MATCHED-FREQUENCY model-vs-GT Sv error at fres, so a correct-height peak at the
+    # WRONG frequency no longer scores ~0 dB. On v8_dlc the anchor lands on the dominant LC
+    # resonance PEAK (~0.75MHz) and pkdb measures reproduction of that peak HEIGHT (bounded by
+    # NPK_CAP); the 9.4MHz anti-resonance notch is a separate Zout feature (zrms/zband/zhf), not
+    # this term. npkf = model Sv-peak freq within +-half-decade of fres, over fres (1.0 =
+    # aligned OR no resolvable peak), mirroring the Zout pkfratio; diagnostic-only (never in the
+    # composite). fres=None -> fall back to the in-band Sv local peak (callers with no Zout grid).
+    if fres is not None and np.isfinite(fres) and fres > 0:
+        i0 = int(np.argmin(np.abs(fn - fres)))
+    else:
+        sb = np.where((fn >= 2e5) & (fn <= 5e7))[0]
+        i0 = int(sb[int(np.argmax(Sg[sb]))]) if sb.size else int(np.argmax(Sg))
+    f0 = float(fn[i0])
+    pkdb = float(20 * np.log10((Smi[i0] + 1e-18) / (Sg[i0] + 1e-18)))
+    jdx = np.where((fn >= f0 / 3.1623) & (fn <= f0 * 3.1623))[0]   # +-half decade around fres
+    if jdx.size >= 3:
+        a = int(np.argmax(Smi[jdx]))
+        # an INTERIOR max is a genuine resonance; a max pinned to the window edge means Sv is
+        # monotone across the window (no resolvable peak) -> report 1.0 (diagnostic, never scored).
+        npkf = float(fn[int(jdx[a])] / f0) if 0 < a < jdx.size - 1 else 1.0
+    else:
+        npkf = 1.0
     irg = np.sqrt(_TRAP(Sg[band] ** 2, fn[band]))
     irm = np.sqrt(_TRAP(Smi[band] ** 2, fn[band]))
-    return dict(psd_rms=float(np.sqrt(np.mean(db[band] ** 2))),
-                pkdb=float(20 * np.log10(Smi[res].max() / Sg[res].max())),
-                ir_pct=float((irm / irg - 1) * 100), Smi=Smi, fn=fn, Sg=Sg)
+    # R3 input: integrated-RMS over the LF datasheet window (10Hz-100kHz, the uVrms a designer
+    # signs off on) -- folded into the composite at low weight. It adds an integrated-uVrms
+    # (linear) flavor over a band that overlaps the (now LF-dominated) psd_rms near-totally, so
+    # its weight is kept tiny. The full-band ir_pct stays diagnostic-only (blind to localized
+    # errors; redundant with psd_rms).
+    lf = (fn >= 10) & (fn <= 1e5)
+    irg_lf = float(np.sqrt(_TRAP(Sg[lf] ** 2, fn[lf]))) if lf.any() else 0.0
+    if irg_lf > 0:
+        irm_lf = float(np.sqrt(_TRAP(Smi[lf] ** 2, fn[lf])))
+        ir_lf = float((irm_lf / irg_lf - 1) * 100)
+    else:
+        ir_lf = 0.0
+    return dict(psd_rms=psd_rms, pkdb=pkdb, npkf=npkf,
+                ir_pct=float((irm / irg - 1) * 100), ir_lf=ir_lf,
+                Smi=Smi, fn=fn, Sg=Sg)
 
 
 def score(lib, subckt, xp="", refpath=None):
@@ -141,7 +194,8 @@ def score(lib, subckt, xp="", refpath=None):
         # ---- Noise ----
         gn = ref[f"noise_{il}"]
         fnm, Sm = bench.measure_noise(lib, subckt, il, xparams=xpil)
-        nm = _noise_metrics(gn[:, 0], gn[:, 1], fnm, Sm)
+        # anchor the resonance metric to the GT Zout-peak freq (ipg, computed above)
+        nm = _noise_metrics(gn[:, 0], gn[:, 1], fnm, Sm, fres=float(fz[ipg]))
         # ---- Transient (linear step, proportional to bias) ----
         tg = ref[f"trans_lin_{il}"]
         t, vg = tg[:, 0], tg[:, 1]
@@ -209,6 +263,11 @@ def score(lib, subckt, xp="", refpath=None):
         comp += W["zhf"] * hfm["zhf"] + W["phf"] * hfm.get("phf", 0.0)
     if ssm and ssm["explicit"]:              # supply-spur fidelity (refs with supply_spur_* arrays)
         comp += W["sspur"] * ssm["mean_db"]
+    # R3: matched-frequency noise-resonance error + LF (datasheet uVrms window) integrated-RMS
+    # error, low weight + saturation (noise ref is always present, so no gating needed; the
+    # caps keep a designed v8/v10 In-notch from dominating). Mirrors the zband/pband pattern.
+    comp += W["npk"] * float(np.nanmean([float(np.minimum(np.abs(r["nm"]["pkdb"]), NPK_CAP)) for r in rows]))
+    comp += W["nir_lf"] * float(np.nanmean([float(np.minimum(np.abs(r["nm"]["ir_lf"]), NIR_LF_CAP)) for r in rows]))
     print(f"\n>>> composite error score (lower=better): {comp:.1f}")
     summary = dict(
         composite=float(comp),
@@ -216,7 +275,8 @@ def score(lib, subckt, xp="", refpath=None):
                   zphase=float(r["zphase"]), pkf=float(r["pkfratio"]), pkdb=float(r["pkdb"]),
                   pband=float(r["pband"]), pphase=float(r["pphase"]),
                   wrms=float(r["tm"]["wrms"]), npsd=float(r["nm"]["psd_rms"]),
-                  npk=float(r["nm"]["pkdb"]), nir=float(r["nm"]["ir_pct"])) for r in rows],
+                  npk=float(r["nm"]["pkdb"]), npkf=float(r["nm"]["npkf"]),
+                  nir=float(r["nm"]["ir_pct"]), nir_lf=float(r["nm"]["ir_lf"])) for r in rows],
         spur16=float(spur_dbc[16e6]), spur24=float(spur_dbc[24e6]),
         big_wrms=float(extra["big"]["wrms"]) if "big" in extra else None,
         slew_wrms=float(extra["slew"]["wrms"]) if "slew" in extra else None,
@@ -338,12 +398,14 @@ def _supply_spur_metrics(ref, lib, subckt, xp, loads):
 def _print(rows, extra, spur, spm=None, hfm=None, ssm=None):
     print(f"\n{'='*92}\nSCORECARD  (errors in dB unless noted; band = 8/16/24MHz spur offsets)\n{'='*92}")
     print(f"{'load':>5} | {'Zrms':>5} {'Zband':>6} {'Zdeg':>5} {'pk_df':>5} {'pk_dB':>6}"
-          f" | {'Pband':>6} {'Pdeg':>5} | {'Twrms%':>6} {'Tdroop':>7} | {'Npsd':>5} {'Npk':>5} {'Nrms%':>6}")
+          f" | {'Pband':>6} {'Pdeg':>5} | {'Twrms%':>6} {'Tdroop':>7} | "
+          f"{'Npsd':>5} {'Npk':>5} {'Npkf':>5} {'Nrms%':>6} {'Nlf%':>6}")
     for r in rows:
         t, n = r["tm"], r["nm"]
         print(f"{r['il']:>5} | {r['zrms']:5.2f} {r['zband']:6.2f} {r['zphase']:5.1f} "
               f"{r['pkfratio']:5.2f} {r['pkdb']:6.1f} | {r['pband']:6.2f} {r['pphase']:5.1f} | "
-              f"{t['wrms']:6.1f} {t['drerr']:+6.2f}m | {n['psd_rms']:5.1f} {n['pkdb']:+5.1f} {n['ir_pct']:+6.0f}")
+              f"{t['wrms']:6.1f} {t['drerr']:+6.2f}m | {n['psd_rms']:5.1f} {n['pkdb']:+5.1f} "
+              f"{n['npkf']:5.2f} {n['ir_pct']:+6.0f} {n['ir_lf']:+6.0f}")
     print(f"\nZout band @121u: " + "  ".join(f"{fb/1e6:.0f}M:{rows[1]['zb'][fb]:+.2f}" for fb in BANDS) +
           f"   PSRR band @121u: " + "  ".join(f"{fb/1e6:.0f}M:{rows[1]['pb'][fb]:+.2f}" for fb in BANDS))
     print(f"Transient @121u(lin +50uA): GT droop={rows[1]['tm']['droopg']:.3f}mV "
@@ -352,8 +414,9 @@ def _print(rows, extra, spur, spm=None, hfm=None, ssm=None):
     for tag, t in extra.items():
         print(f"Transient @121u({tag:>4}): GT droop={t['droopg']:.2f}mV model={t['droopm']:.2f}mV "
               f"(err {t['drerr']:+.2f}mV, wrms {t['wrms']:.0f}%)")
-    print(f"Noise @121u: PSD log-RMS={rows[1]['nm']['psd_rms']:.1f}dB  "
-          f"peak err={rows[1]['nm']['pkdb']:+.1f}dB  integrated-rms err={rows[1]['nm']['ir_pct']:+.0f}%")
+    print(f"Noise @121u: PSD log-RMS(Sg-wtd)={rows[1]['nm']['psd_rms']:.2f}dB  "
+          f"resonance: height err={rows[1]['nm']['pkdb']:+.1f}dB freq ratio={rows[1]['nm']['npkf']:.2f}  "
+          f"int-rms err full={rows[1]['nm']['ir_pct']:+.0f}% LF={rows[1]['nm']['ir_lf']:+.0f}%")
     # passivity: synth must be passive (HB guardrail); GT may be actively non-passive
     synth_ok = all(r["zpass_m"][0] for r in rows)
     smin = min(r["zpass_m"][1] for r in rows); gmin = min(r["zpass_g"][1] for r in rows)
