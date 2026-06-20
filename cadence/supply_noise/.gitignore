@@ -1,0 +1,4 @@
+# regenerable artifacts (produced by the scripts here)
+ldo_model.va
+ldo_model_dropout.tbl
+flat_nf.dat
