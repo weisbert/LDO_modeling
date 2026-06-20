@@ -38,13 +38,34 @@ Physics the model reproduces: PSRR rolls off (40 dB @ 100 kHz → 16.8 dB @ 2 MH
 @ 6 MHz on this capless rail), so HF spurs survive better at the output even though the
 input is largest at 2 MHz. Locked by `cadence/test_supply_noise_prop_spectre.py`.
 
+> ⚠️ **This `inject_supply_noise.py` check is SELF-CONSISTENT, not independent.** It confirms
+> the model's `.noise` output == input × the model's OWN measured PSRR — a tautology about
+> Spectre (noise vs AC agree on one model), NOT evidence the model behaves like a real LDO.
+> Its 0.02 % is a simulator-consistency number, not an accuracy number. The real validation is
+> below.
+
+## The NON-CIRCULAR validation — vs the transistor GT (`gt_vs_model_supply_noise.py`)
+Inject the **same** spurry AVDD onto BOTH the **independent transistor-level** GT
+(`ground_truth/ldo_v2_capless.lib`: PMOS pass + 5T-OTA + feedback, run in Spectre via
+`spectre_bench.spice_dut`) and the behavioral model, in the same engine, and compare their
+**output** noise. This is the honest number — bounded by PSRR fit quality, not self-consistency.
+
+Result: the model reproduces the real LDO's supply-noise→output to **1–3 % typical, ~12 % worst**
+(at the 8 MHz harmonic, which sits on the steep recovery after the ~7 MHz PSRR notch where PSRR
+is only ~3 dB and hardest to fit — a ~1 dB PSRR error → ~12 % output error, fully explained). The
+GT and model PSRR curves overlay to ~1 dB across the band, notch included. Locked (2-spur, fast)
+by `cadence/test_supply_noise_gt_vs_model_spectre.py` (GT-vs-model output <10 %, PSRR <2 dB).
+
 ## Run
 ```
-python3 cadence/supply_noise/avdd_spectrum.py          # draw the stimulus
-python3 cadence/supply_noise/inject_supply_noise.py    # inject + verify + plot
-python3 -m pytest cadence/test_noisefile_units_spectre.py cadence/test_supply_noise_prop_spectre.py -q
+python3 cadence/supply_noise/avdd_spectrum.py             # draw the stimulus
+python3 cadence/supply_noise/inject_supply_noise.py       # self-consistency (model vs itself)
+python3 cadence/supply_noise/gt_vs_model_supply_noise.py  # NON-CIRCULAR: model vs transistor GT
+python3 -m pytest cadence/test_noisefile_units_spectre.py \
+    cadence/test_supply_noise_prop_spectre.py \
+    cadence/test_supply_noise_gt_vs_model_spectre.py -q
 ```
-Both tests are spectre-gated (skip cleanly when Spectre is absent, env-overridable guard).
+All tests are spectre-gated (skip cleanly when Spectre is absent, env-overridable guard).
 
 ## ⚠️ Spur sampling rule (mandatory — or the spur "doesn't simulate")
 A `.noise` (or AC) analysis evaluates ONLY at the frequencies you request, reading the supply
