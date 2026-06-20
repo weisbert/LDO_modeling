@@ -94,6 +94,17 @@ def main(vkey="base"):
         print(f"  off-corner {il:>5}: noise wht@200k={np.interp(2e5,fn,Sv)*1e9:5.1f}nV "
               f"int={nrms*1e6:.1f}uVrms  (HELD-OUT, not fitted)")
 
+    # R5: held-out off-nominal TEMPERATURE noise (nominal load) -- GT noise at hot/cold corners.
+    # The model scales all noise as pure kT; BSIM3 flicker is ~T-independent, so this bounds the
+    # model's T-law over-scaling. VALIDATION-only (never fitted; emit T-law untouched).
+    nomT = "121u" if "121u" in bench.LOADS else bench.LOADS[len(bench.LOADS) // 2]
+    for T in bench.HELDOUT_NOISE_TEMPS:
+        fn, Sv = bench.measure_noise(libs, sub, nomT, xparams=xp, temp=T)
+        ref[f"noise_temp_{bench.temp_label(T)}_{nomT}"] = np.c_[fn, Sv]
+        band = (fn >= 100) & (fn <= 100e6)
+        nrms = np.sqrt(_trap(Sv[band] ** 2, fn[band]))
+        print(f"  T={T:+4d}C {nomT}: noise int={nrms*1e6:.1f}uVrms  (HELD-OUT, not fitted)")
+
     # *_hf ceiling is a per-variant characterization-recipe param (default 500MHz; a GHz part
     # overrides it via variants[..]["hf_stop"]). The array NAMES keep the nominal "121u" token
     # (de-hardcoding the nominal corner is the separate deferred R1 item).

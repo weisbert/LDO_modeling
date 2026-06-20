@@ -23,6 +23,24 @@ LOADS = ["20u", "121u", "250u"]      # op-point corners (nominal 121u)
 # held-out gate. crossval.offgrid() uses the runtime geo-mean of the same corners (numerically ==);
 # if LOADS ever changes, update these and regenerate refs (the arrays are keyed by the load token).
 OFFGRID_NOISE_LOADS = ["49u", "174u"]
+# R5 held-out off-nominal TEMPERATURE noise corners (degC). Noise is fit at the nominal temperature;
+# the emitted model scales EVERY noise section as pure resistor-thermal kT (VA white_noise(4kT*
+# $temperature); SPICE Johnson noise of the Rn* nodes), while BSIM3 GT flicker is ~T-independent -- so
+# the model can OVER-predict at hot / under-predict at cold. Collected at the nominal load as a
+# VALIDATION-only held-out gate (never fitted; the emit T-law is NOT touched).
+HELDOUT_NOISE_TEMPS = [-40, 125]
+
+
+def temp_label(T):
+    """Sign-safe key token for a temperature: 125 -> '125', -40 -> 'm40'."""
+    return f"m{abs(int(T))}" if T < 0 else f"{int(T)}"
+
+
+def temp_from_label(s):
+    """Inverse of temp_label: 'm40' -> -40, '125' -> 125."""
+    return -int(s[1:]) if s.startswith("m") else int(s)
+
+
 SPUR_BANDS = [8e6, 16e6, 24e6]       # user's spur offsets of interest
 AC = "ac dec 40 10 100meg"
 
@@ -164,12 +182,15 @@ quit
     return ng.complex_col(_run(tb, lib, "p"))
 
 
-def measure_noise(lib, subckt, iload, xparams=""):
+def measure_noise(lib, subckt, iload, xparams="", temp=None):
     """Output noise PSD at vout via .noise. Returns (f, Sv[V/sqrt(Hz)]). The
     intrinsic LDO self-noise (Vin is an ideal DC source -> contributes no noise),
-    so this is exactly the target a Norton output-noise source must reproduce."""
+    so this is exactly the target a Norton output-noise source must reproduce.
+    When `temp` (degC) is set the sim runs at that temperature (resistor thermal
+    noise + any device T-params scale with it) -- the R5 held-out temperature gate."""
+    topt = f".options temp={float(temp):g}\n" if temp is not None else ""
     tb = f"""* output noise PSD
-{xline(lib, subckt, xparams)}
+{topt}{xline(lib, subckt, xparams)}
 Vin vin 0 DC 1.05 AC 1
 Iload vout 0 DC {iload}
 .control

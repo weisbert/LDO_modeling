@@ -248,7 +248,10 @@ def score(lib, subckt, xp="", refpath=None):
     # HELD-OUT off-corner-LOAD noise (R4): model's interpolated noise vs GT between the fit corners
     ogn = _offgrid_noise_metrics(ref, lib, subckt, xp)
 
-    _print(rows, extra, spur_dbc, spm, hfm, ssm, ogn)
+    # HELD-OUT off-nominal-TEMPERATURE noise (R5): model kT-law noise vs GT at hot/cold corners
+    tnm = _temp_noise_metrics(ref, lib, subckt, xp)
+
+    _print(rows, extra, spur_dbc, spm, hfm, ssm, ogn, tnm)
     _plots(rows, lib, subckt, refpath)
     comp = (W["zrms"]*np.mean([r["zrms"] for r in rows])
             + W["zband"]*np.mean([r["zband"] for r in rows])
@@ -266,7 +269,7 @@ def score(lib, subckt, xp="", refpath=None):
         comp += W["zhf"] * hfm["zhf"] + W["phf"] * hfm.get("phf", 0.0)
     if ssm and ssm["explicit"]:              # supply-spur fidelity (refs with supply_spur_* arrays)
         comp += W["sspur"] * ssm["mean_db"]
-    # R4 held-out off-corner-load noise is OBSERVABILITY-ONLY -> deliberately NOT added to comp.
+    # R4 off-corner-load + R5 off-nominal-temperature held-out noise are OBSERVABILITY-ONLY -> NOT in comp.
     # R3: matched-frequency noise-resonance error + LF (datasheet uVrms window) integrated-RMS
     # error, low weight + saturation (noise ref is always present, so no gating needed; the
     # caps keep a designed v8/v10 In-notch from dominating). Mirrors the zband/pband pattern.
@@ -300,6 +303,10 @@ def score(lib, subckt, xp="", refpath=None):
                        if ogn else None),
         offgrid_noise_worst_db=(float(ogn["worst_db"]) if ogn else None),
         offgrid_noise_worst_il=(ogn["worst_il"] if ogn else None),
+        temp_noise=([dict(T=int(r["T"]), il=r["il"], psd_rms=float(r["psd_rms"]),
+                          ir_lf=float(r["ir_lf"])) for r in tnm["rows"]] if tnm else None),
+        temp_noise_worst_db=(float(tnm["worst_db"]) if tnm else None),
+        temp_noise_worst_T=(int(tnm["worst_T"]) if tnm else None),
         zhf=(hfm["zhf"] if hfm else None),
         zhf_phase=(hfm["zhf_phase"] if hfm else None),
         phf=(hfm.get("phf") if hfm else None),
@@ -432,7 +439,31 @@ def _offgrid_noise_metrics(ref, lib, subckt, xp):
     return dict(rows=out, worst_db=float(worst["psd_rms"]), worst_il=worst["il"])
 
 
-def _print(rows, extra, spur, spm=None, hfm=None, ssm=None, ogn=None):
+def _temp_noise_metrics(ref, lib, subckt, xp):
+    """HELD-OUT off-nominal TEMPERATURE noise (R5). Noise is fit at the nominal temperature, but the
+    emitted model scales EVERY noise section as pure resistor-thermal kT (white_noise(4kT*$temperature)
+    / Johnson noise of the Rn* nodes), while BSIM3 GT flicker is ~T-independent -- so the model can
+    OVER-predict at hot / under-predict at cold. This measures the model's noise at the GT-collected
+    hot/cold corners (nominal load, keys `noise_temp_<Tlabel>_<il>`) and reports psd_rms + the SIGNED
+    LF bias (ir_lf, +%=model over-predicts the flicker band). VALIDATION-ONLY: never fitted, the emit
+    T-law is NOT touched, never folded into the composite. Returns None on legacy refs."""
+    keys = sorted((k for k in ref.files if k.startswith("noise_temp_")),
+                  key=lambda k: bench.temp_from_label(k[len("noise_temp_"):].split("_", 1)[0]))
+    if not keys:
+        return None
+    out = []
+    for k in keys:
+        tlabel, il = k[len("noise_temp_"):].split("_", 1)
+        T = bench.temp_from_label(tlabel)
+        gn = ref[k]
+        fnm, Sm = bench.measure_noise(lib, subckt, il, xparams=(xp + f" iload={il}").strip(), temp=T)
+        nm = _noise_metrics(gn[:, 0], gn[:, 1], fnm, Sm)
+        out.append(dict(T=T, il=il, psd_rms=nm["psd_rms"], ir_lf=nm["ir_lf"], pkdb=nm["pkdb"]))
+    worst = max(out, key=lambda r: r["psd_rms"])
+    return dict(rows=out, worst_db=float(worst["psd_rms"]), worst_T=worst["T"])
+
+
+def _print(rows, extra, spur, spm=None, hfm=None, ssm=None, ogn=None, tnm=None):
     print(f"\n{'='*92}\nSCORECARD  (errors in dB unless noted; band = 8/16/24MHz spur offsets)\n{'='*92}")
     print(f"{'load':>5} | {'Zrms':>5} {'Zband':>6} {'Zdeg':>5} {'pk_df':>5} {'pk_dB':>6}"
           f" | {'Pband':>6} {'Pdeg':>5} | {'Twrms%':>6} {'Tdroop':>7} | "
@@ -487,6 +518,10 @@ def _print(rows, extra, spur, spm=None, hfm=None, ssm=None, ogn=None):
         det = "  ".join(f"{r['il']}: psd={r['psd_rms']:.2f}dB pk(unanch)={r['pkdb']:+.1f}dB" for r in ogn["rows"])
         print(f"HELD-OUT off-corner-LOAD noise (model interp vs GT, psd-only headline, NOT in "
               f"composite; worst {ogn['worst_db']:.2f}dB @{ogn['worst_il']}): {det}")
+    if tnm:
+        det = "  ".join(f"{r['T']:+d}C: psd={r['psd_rms']:.2f}dB LFbias={r['ir_lf']:+.0f}%" for r in tnm["rows"])
+        print(f"HELD-OUT TEMPERATURE noise (model kT-law vs GT, NOT in composite; worst "
+              f"{tnm['worst_db']:.2f}dB @{tnm['worst_T']:+d}C): {det}")
 
 
 def _plots(rows, lib, subckt, refpath=None):

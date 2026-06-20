@@ -52,6 +52,15 @@ def extract(dut, name, cout=np.nan, esr=np.nan):
         nrms = np.sqrt(_trap(Sv[band] ** 2, fn[band]))
         print(f"  off-corner {il:>5}: noise int={nrms*1e6:.2f}uVrms  (HELD-OUT, not fitted)")
 
+    # R5: held-out off-nominal TEMPERATURE noise (nominal load) -- model kT-law T-scaling validation.
+    nomT = "121u" if "121u" in bench.LOADS else bench.LOADS[len(bench.LOADS) // 2]
+    for T in bench.HELDOUT_NOISE_TEMPS:
+        fn, Sv = sb.measure_noise(dut, nomT, tag=f"nt{bench.temp_label(T)}", temp=T)
+        ref[f"noise_temp_{bench.temp_label(T)}_{nomT}"] = np.c_[fn, Sv]
+        band = (fn >= 100) & (fn <= 100e6)
+        nrms = np.sqrt(_trap(Sv[band] ** 2, fn[band]))
+        print(f"  T={T:+4d}C {nomT}: noise int={nrms*1e6:.2f}uVrms  (HELD-OUT, not fitted)")
+
     print("=== HF extension (121u -> 500MHz) ===")
     fzh, Zh = sb.measure_zout(dut, "121u", accmd=sb.AC_HF, tag="zhf")
     fph, Hh = sb.measure_psrr(dut, "121u", accmd=sb.AC_HF, tag="phf")

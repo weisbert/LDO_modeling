@@ -128,11 +128,12 @@ acP {accmd}
     return f, H
 
 
-def measure_noise(dut, iload, tag="n"):
+def measure_noise(dut, iload, tag="n", temp=None):
     il = float(iload.replace("u", "e-6")) if isinstance(iload, str) else float(iload)
+    topt = f"tnopt options temp={float(temp):g}\n" if temp is not None else ""   # R5 held-out temp gate
     scs = f"""// output noise PSD at out, ideal (noiseless) supply
 simulator lang=spectre
-{dut.block(il)}
+{topt}{dut.block(il)}
 Vsup ({dut.supply} 0) vsource dc={VIN_DC} mag=0
 Ild  ({dut.out} 0)    isource dc={il:g}
 nz ({dut.out} 0) {NOISE}
