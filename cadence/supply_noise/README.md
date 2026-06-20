@@ -46,6 +46,20 @@ python3 -m pytest cadence/test_noisefile_units_spectre.py cadence/test_supply_no
 ```
 Both tests are spectre-gated (skip cleanly when Spectre is absent, env-overridable guard).
 
+## ⚠️ Spur sampling rule (mandatory — or the spur "doesn't simulate")
+A `.noise` (or AC) analysis evaluates ONLY at the frequencies you request, reading the supply
+PSD by PWL-interpolating the noisefile there. A spur is sub-kHz wide (HWHM ≈ f0/(2Q): ~833 Hz
+for a 2 MHz / Q1200 spur). A coarse log/dec sweep has MHz-band point spacing of many kHz, so it
+**steps clean over the spur**, samples the floor, and the spur never appears in the result — it
+looks like it "didn't simulate".
+
+So every noise/AC sweep must include **the spur center f0 + very-short-step points around it**
+(in HWHM units). `avdd_spectrum.spur_brackets(f0, q)` / `analysis_freqs()` build this (steps at
+0.05 … 4 × HWHM, Q-aware so it auto-narrows for higher-Q spurs). Negative control
+(`test_supply_noise_prop_spectre.py::test_coarse_sweep_misses_the_spur`): in one run the
+bracketed f0 shows a **353 nV** output spur while coarse neighbours ≥10·HWHM away read **6.5 nV**
+(floor) — a **54×** miss. Never hand a Cadence noise sweep a bare log grid when spurs matter.
+
 ## Note: noise vs deterministic spurs
 A `.noise` analysis treats the supply spectrum as random noise; because the small-signal
 model is LTI, output PSD = input PSD · |Hsup|² regardless, so the spurs are shaped correctly

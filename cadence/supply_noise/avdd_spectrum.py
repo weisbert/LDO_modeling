@@ -53,8 +53,43 @@ def total(f):
     return np.sqrt(floor(f) ** 2 + spur_psd2(f))
 
 
+# ------------------------------------------------------------------ spur sampling RULE
+# Multiples of the spur HWHM (=f0/(2Q)) to sample either side of a spur center. The tightest
+# steps (0.05..0.25 HWHM) sit right on the peak; the wider ones trace the skirt.
+SPUR_MULTS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
+
+
+def spur_brackets(f0, q, mults=SPUR_MULTS):
+    """Frequencies that BRACKET a spur for a Cadence `.noise` (or AC) sweep: the center
+    f0 plus very-short-step points either side, in units of the HWHM = f0/(2Q).
+
+    THIS IS MANDATORY, NOT cosmetic. `.noise` evaluates only AT the frequencies you
+    request and reads the supply PSD by PWL-interpolating the noisefile there. A spur is
+    sub-kHz wide (HWHM ~ f0/2Q), so a coarse log/dec sweep steps clean OVER it, samples the
+    floor, and the spur simply does not appear in the result ("doesn't simulate"). Sampling
+    f0 itself + tight (0.05..0.25 HWHM) steps captures the peak amplitude AND resolves the
+    narrow shape. Q-aware: the bracket auto-narrows for higher-Q (narrower) spurs."""
+    h = f0 / (2.0 * q)
+    pts = [f0]
+    for m in mults:
+        pts += [f0 - m * h, f0 + m * h]
+    return sorted(p for p in pts if p > 0)
+
+
+def analysis_freqs(n_floor=160, fmin=10.0, fmax=1e8, spurs=None):
+    """A full Cadence noise/AC sweep frequency list: a log floor grid PLUS each spur's
+    mandatory bracket (see spur_brackets). Use this for `noise values=[...]` / `ac values=[...]`
+    so every spur is actually sampled."""
+    g = list(np.logspace(np.log10(fmin), np.log10(fmax), n_floor))
+    for _, f0, _, q in (spurs or SPURS):
+        g += spur_brackets(f0, q)
+    return np.array(sorted(x for x in set(g) if fmin <= x <= fmax))
+
+
 # ------------------------------------------------------------------ freq grid
-# log grid + a fine linear cluster around each spur so the Lorentzians render clean
+# log grid + a fine linear cluster around each spur so the Lorentzians render clean. NOTE:
+# this is for REPRESENTING the spectrum (plot + the noisefile PWL table), a different need
+# from analysis_freqs() above which is for SAMPLING the spectrum in a Spectre sweep.
 def build_grid():
     g = list(np.logspace(np.log10(10.0), np.log10(1e8), 4000))
     for _, f0, _, q in SPURS:

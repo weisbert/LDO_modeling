@@ -61,12 +61,21 @@ def _psd(f):
     return s
 
 
+# MANDATORY spur sampling for a `.noise` sweep: include each spur center + very-short-step
+# points either side (in HWHM=f0/(2Q) units). A coarse log sweep steps over the sub-kHz spur
+# and Spectre returns the floor -- the spur "doesn't simulate". The tightest steps sit on the
+# peak; the wider ones trace the skirt. Q-aware so it auto-narrows for higher-Q spurs.
+SPUR_MULTS = (0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 4.0)
+
+
 def _eval_freqs():
     g = list(np.logspace(np.log10(100.0), np.log10(5e7), 80))
     for f0, _, q in SPURS:
         h = f0 / (2.0 * q)
-        g += [f0 - h, f0, f0 + h]
-    return np.array(sorted(x for x in g if 100.0 <= x <= 5e7))
+        g.append(f0)
+        for m in SPUR_MULTS:
+            g += [f0 - m * h, f0 + m * h]
+    return np.array(sorted(x for x in set(g) if 100.0 <= x <= 5e7))
 
 
 def _vlist(fs):
@@ -145,3 +154,48 @@ def test_supply_noise_propagates_as_input_times_psrr(model):
     psrr_db = -20 * np.log10(max(Hsup[i2], 1e-30))
     assert 0.0 < psrr_db < 80.0, f"implausible PSRR @2MHz: {psrr_db:.1f} dB"
     print(f"supply-noise propagation: worst rel {worst:.2%} over spurs; PSRR@2MHz {psrr_db:.1f} dB")
+
+
+def test_coarse_sweep_misses_the_spur(model):
+    """NEGATIVE CONTROL — the spur-sampling rule, locked: in ONE noise run that contains both
+    a coarse log grid AND the f0=2 MHz bracket, the bracketed points reveal the spur while the
+    neighbouring coarse points (kept >=20*HWHM away) sit at the floor. Drop the bracket from a
+    real sweep and the sub-kHz spur is stepped over -- it 'doesn't simulate'."""
+    va, tbl, op, vdd, _ = model
+    tmp = tbl.parent
+    f0, _, q = SPURS[0]                      # the 2 MHz spur
+    h = f0 / (2.0 * q)
+
+    # coarse log grid with a guard band: NO coarse point within 20*HWHM of the spur
+    coarse = [x for x in np.logspace(np.log10(1e5), np.log10(1e7), 15)
+              if abs(x - f0) > 20 * h]
+    bracket = [f0 - h, f0, f0 + h]          # the mandatory on-spur samples
+    fs = np.array(sorted(set(coarse) | set(bracket)))
+    vl = _vlist(fs)
+    head = (f'simulator lang=spectre\nahdl_include "{va.resolve()}"\n'
+            f"Ild (vout 0) isource dc={op:.6e}\n"
+            f"Xdut (vin vout 0) ldo_model iload={op:.6e} slew_en=0 vdd={vdd:g}\nsave vout\n")
+
+    d = _run_noise(head + f'Vsup (vin 0) vsource dc={vdd:g} noisefile="{tbl.resolve()}"\n'
+                   f"nz (vout 0) noise values={vl}\n", "sn_coarse_on", tmp)
+    fn = np.asarray(d["nz"]["freq"]).real
+    out_with = np.asarray(d["nz"]["out"]).real
+    d = _run_noise(head + f"Vsup (vin 0) vsource dc={vdd:g}\nnz (vout 0) noise values={vl}\n",
+                   "sn_coarse_off", tmp)
+    out_intr = np.asarray(d["nz"]["out"]).real
+    supply_out = np.sqrt(np.clip(out_with**2 - out_intr**2, 0.0, None))
+
+    i_peak = int(np.argmin(np.abs(fn - f0)))                       # the bracketed peak
+    peak = supply_out[i_peak]
+    # coarse neighbours: the two coarse points straddling the spur
+    below = [j for j, x in enumerate(fn) if x < f0 - 10 * h]
+    above = [j for j, x in enumerate(fn) if x > f0 + 10 * h]
+    neigh = max(supply_out[below[-1]], supply_out[above[0]])
+
+    # the bracketed peak must tower over the coarse neighbours -> the spur lives ONLY at f0
+    assert peak > 5.0 * neigh, (
+        f"spur not resolved by the bracket: peak {peak:.2e} vs coarse-neighbour {neigh:.2e}")
+    # and the input at f0 really is a spur (peak) vs floor at the neighbours
+    assert np.sqrt(_psd(np.array([f0]))[0]) > 5.0 * np.sqrt(SW), "test spur too weak vs floor"
+    print(f"coarse-sweep miss check: on-spur peak {peak*1e9:.1f} n vs coarse-neighbour "
+          f"{neigh*1e9:.1f} n (ratio {peak/max(neigh,1e-30):.1f}x) -> spur lives only at f0")

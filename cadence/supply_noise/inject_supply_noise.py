@@ -30,13 +30,11 @@ TBL = HERE / "avdd_noise_table.dat"            # V^2/Hz, written by avdd_spectru
 
 
 # ----------------------------------------------------------------- freq eval list
+# MANDATORY spur sampling: a `.noise` sweep must land ON each spur center + very-short-step
+# points around it, else the sub-kHz spur is stepped over and never appears (see
+# avdd_spectrum.spur_brackets). We reuse the shared rule so this can't drift.
 def eval_freqs():
-    """Log floor grid + a small cluster at each spur so the narrow Lorentzians are sampled."""
-    g = list(np.logspace(np.log10(10.0), np.log10(1e8), 160))
-    for _, f0, _, q in AV.SPURS:
-        h = f0 / (2.0 * q)
-        g += [f0 - 2 * h, f0 - h, f0, f0 + h, f0 + 2 * h]
-    return np.array(sorted(x for x in g if 10.0 <= x <= 1e8))
+    return AV.analysis_freqs()
 
 
 def _vlist(fs):
