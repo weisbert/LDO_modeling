@@ -17,6 +17,17 @@ LOADS = ["20u", "121u", "250u"]      # op-point corners (nominal 121u)
 SPUR_BANDS = [8e6, 16e6, 24e6]       # user's spur offsets of interest
 AC = "ac dec 40 10 100meg"
 
+# --- SUPPLY-spur AGGRESSOR tones --------------------------------------------------------
+# Discrete tones that ride the SUPPLY (AVDD) through PSRR to the output: a DC-DC switcher
+# comb (fundamental + harmonics) + a reference-clock comb. DISTINCT from SPUR_BANDS (those
+# are load-tone harmonic offsets) and from intrinsic on-chip tones (spur_F). gen_reference /
+# extract_ref collect the GT's supply->output attenuation at these tones (supply_spur_{il});
+# score compares the model's attenuation here -> the supply-spur difference metric. The
+# supply-noise output a spur causes = input_PSD * |PSRR(f0)|, so this attenuation error IS
+# the supply-spur output error (input cancels); validated == real noisefile .noise injection
+# to <0.4 pp (cadence/supply_noise/gt_vs_model_supply_noise.py).
+SUPPLY_SPURS = [2.0e6, 4.0e6, 6.0e6, 8.0e6, 19.2e6, 38.4e6, 76.8e6]
+
 # --- nonlinearity / spur probe params (coherent sampling) ---
 FTONE, DT, TSTOP, TWIN = 8e6, 1e-9, 40e-6, (24e-6, 40e-6)
 
@@ -263,3 +274,14 @@ quit
 
 def level_at(f, A, ftarget):
     return float(A[np.argmin(np.abs(f - ftarget))])
+
+
+def supply_spur_atten(f, H, spurs=None):
+    """Supply->output attenuation [dB] at each aggressor tone: -20*log10|PSRR(f0)|.
+    H is the supply->output transfer (vout/vsupply) from measure_psrr; the attenuation is
+    log-interpolated onto the spur freqs (PSRR is smooth, so the dec=40 grid resolves it).
+    Returns (spur_freqs, atten_dB). Used by gen_reference/extract_ref to COLLECT the GT's
+    supply-spur rejection and by score to compare the model's."""
+    sp = np.asarray(SUPPLY_SPURS if spurs is None else spurs, float)
+    logmag = np.interp(np.log(sp), np.log(f), np.log(np.abs(H) + 1e-30))
+    return sp, -20.0 * logmag / np.log(10.0)

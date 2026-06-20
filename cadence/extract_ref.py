@@ -33,6 +33,9 @@ def extract(dut, name, cout=np.nan, esr=np.nan):
         ref[f"z_{il}"] = np.c_[fz, Z.real, Z.imag]
         ref[f"p_{il}"] = np.c_[fp, H.real, H.imag]
         ref[f"noise_{il}"] = np.c_[fn, Sv]
+        # supply-spur rejection: GT supply->output attenuation at the AVDD aggressor tones
+        ssf, ssat = bench.supply_spur_atten(fp, H)
+        ref[f"supply_spur_{il}"] = np.c_[ssf, ssat]
         zmag = np.abs(Z); ipk = int(np.argmax(zmag))
         band = (fn >= 100) & (fn <= 100e6)
         nrms = np.sqrt(_trap(Sv[band] ** 2, fn[band]))

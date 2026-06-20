@@ -51,8 +51,11 @@ def va_dut(va_path, module="ldo_model", extra="slew_en=0", tbl=None):
     (only needed when extra contains slew_en=1 / large-signal steps)."""
     va_abs = str(pathlib.Path(va_path).resolve())     # ahdl_include resolves vs run dir
     def block(il):
+        # the emitted model is 3-port `module ldo_model(vin, vout, gnd)`; tie gnd to 0.
+        # (was 2-port `(vin vout)` -- stale since emit_va gained the explicit gnd port;
+        # Spectre rejected it with "Xdut: Too few terminals given (2 < 3)").
         return (f'ahdl_include "{va_abs}"\n'
-                f'Xdut (vin vout) {module} iload={il:g} {extra}\n')
+                f'Xdut (vin vout 0) {module} iload={il:g} {extra}\n')
     aux = [(str(pathlib.Path(tbl).resolve()), "ldo_model_dropout.tbl")] if tbl else []
     return DutSpec(block, aux=aux)
 

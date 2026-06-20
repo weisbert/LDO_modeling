@@ -65,6 +65,9 @@ def main(vkey="base"):
         ref[f"z_{il}"] = np.c_[fz, Z.real, Z.imag]
         ref[f"p_{il}"] = np.c_[fp, H.real, H.imag]
         ref[f"noise_{il}"] = np.c_[fn, Sv]
+        # supply-spur rejection: GT supply->output attenuation at the AVDD aggressor tones
+        ssf, ssat = bench.supply_spur_atten(fp, H)
+        ref[f"supply_spur_{il}"] = np.c_[ssf, ssat]
         if bias:
             fi, Zi = _ibp_xfer(libs, sub, il, xp, bias)
             ref[f"ibp_xfer_{il}"] = np.c_[fi, Zi.real, Zi.imag]

@@ -21,6 +21,8 @@ STEP_DI = _b.STEP_DI
 STEP_BASE = _b.STEP_BASE
 ring_freq = _b.ring_freq
 level_at = _b.level_at
+SUPPLY_SPURS = _b.SUPPLY_SPURS
+supply_spur_atten = _b.supply_spur_atten
 
 
 def _slew(xparams):
@@ -37,12 +39,19 @@ def _dut(lib, subckt, xparams):
                      tbl=str(tbl) if tbl.exists() else None)
 
 
-def measure_zout(lib, subckt, iload, xparams=""):
-    return sb.measure_zout(_dut(lib, subckt, xparams), iload)
+def ac_hf_cmd(fmax=500e6):
+    """HF AC sweep command, SPECTRE syntax (bench.ac_hf_cmd is ngspice syntax -> can't be
+    re-exported; score._hf_metrics builds the command via bench.ac_hf_cmd and passes it to
+    measure_zout/psrr, so the Spectre backend must produce a Spectre-lang command)."""
+    return f"ac start=10 stop={fmax:g} dec=40"
 
 
-def measure_psrr(lib, subckt, iload, xparams=""):
-    return sb.measure_psrr(_dut(lib, subckt, xparams), iload)
+def measure_zout(lib, subckt, iload, xparams="", accmd=None):
+    return sb.measure_zout(_dut(lib, subckt, xparams), iload, accmd=accmd or sb.AC)
+
+
+def measure_psrr(lib, subckt, iload, xparams="", accmd=None):
+    return sb.measure_psrr(_dut(lib, subckt, xparams), iload, accmd=accmd or sb.AC)
 
 
 def measure_noise(lib, subckt, iload, xparams=""):

@@ -37,7 +37,11 @@ _TRAP = getattr(np, "trapezoid", None) or np.trapz
 #         (v7 inductive tail / v8 notch used to be invisible here).
 W = dict(zrms=1.0, zband=3.0, zphase=0.04, pkdb=1.0, pband=2.0,
          pphase=0.03, trms=0.2, noise=0.5, spur=0.5, spurph=0.03,
-         zhf=0.5, phf=0.5)
+         zhf=0.5, phf=0.5, sspur=0.5)
+# sspur: SUPPLY-spur rejection error (dB) at the AVDD aggressor tones (DC-DC comb + ref
+#        clock). Folds into the composite ONLY when the ref carries the collected
+#        supply_spur_* arrays (regenerate the reference to enable); legacy refs still get
+#        the scorecard line, derived from p_* -- see _supply_spur_metrics.
 
 
 def _interp_mag(f_to, f_from, mag):
@@ -184,7 +188,10 @@ def score(lib, subckt, xp="", refpath=None):
     # HF extension block: model vs the *_hf wideband reference above the in-band AC top
     hfm = _hf_metrics(ref, lib, subckt, xp, loads)
 
-    _print(rows, extra, spur_dbc, spm, hfm)
+    # SUPPLY-spur block: model vs GT supply->output rejection at the AVDD aggressor tones
+    ssm = _supply_spur_metrics(ref, lib, subckt, xp, loads)
+
+    _print(rows, extra, spur_dbc, spm, hfm, ssm)
     _plots(rows, lib, subckt, refpath)
     comp = (W["zrms"]*np.mean([r["zrms"] for r in rows])
             + W["zband"]*np.mean([r["zband"] for r in rows])
@@ -200,6 +207,8 @@ def score(lib, subckt, xp="", refpath=None):
             comp += W["spurph"] * spm["mean_ph_deg"]
     if hfm:                                  # HF extension fidelity (refs with *_hf arrays)
         comp += W["zhf"] * hfm["zhf"] + W["phf"] * hfm.get("phf", 0.0)
+    if ssm and ssm["explicit"]:              # supply-spur fidelity (refs with supply_spur_* arrays)
+        comp += W["sspur"] * ssm["mean_db"]
     print(f"\n>>> composite error score (lower=better): {comp:.1f}")
     summary = dict(
         composite=float(comp),
@@ -218,6 +227,10 @@ def score(lib, subckt, xp="", refpath=None):
         spur_false=(spm["n_false"] if spm else None),
         spur_worst_ph_deg=(spm.get("worst_ph_deg") if spm else None),
         spur_mean_ph_deg=(spm.get("mean_ph_deg") if spm else None),
+        sspur_worst_db=(ssm["worst_db"] if ssm else None),
+        sspur_mean_db=(ssm["mean_db"] if ssm else None),
+        sspur_worst_f=(ssm["worst_f"] if ssm else None),
+        sspur_scored=(bool(ssm["explicit"]) if ssm else False),
         zhf=(hfm["zhf"] if hfm else None),
         zhf_phase=(hfm["zhf_phase"] if hfm else None),
         phf=(hfm.get("phf") if hfm else None),
@@ -290,7 +303,39 @@ def _hf_metrics(ref, lib, subckt, xp, loads):
     return out
 
 
-def _print(rows, extra, spur, spm=None, hfm=None):
+def _supply_spur_metrics(ref, lib, subckt, xp, loads):
+    """SUPPLY-spur rejection fidelity: model-vs-GT supply->output attenuation [dB] at the
+    AVDD aggressor tones (DC-DC comb + ref clock). Because the supply-noise output a spur
+    causes = input_PSD * |PSRR(f0)|, this attenuation error IS the supply-spur OUTPUT error
+    (the input PSD cancels in the ratio) -- validated == a real `noisefile` .noise injection
+    to <0.4 pp (cadence/supply_noise/gt_vs_model_supply_noise.py).
+
+    GT attenuation comes from the COLLECTED `supply_spur_{il}` array when present (regenerate
+    the reference to enable composite scoring); else it is derived from the stored PSRR
+    `p_{il}` so the scorecard line still prints on legacy refs. `explicit` flags which path.
+    Returns None only if neither array exists."""
+    nom = "121u" if "121u" in loads else loads[len(loads) // 2]
+    explicit = f"supply_spur_{nom}" in ref.files
+    if explicit:
+        arr = ref[f"supply_spur_{nom}"]
+        sf, gat = arr[:, 0], arr[:, 1]
+    elif f"p_{nom}" in ref.files:
+        gp = ref[f"p_{nom}"]
+        sf, gat = bench.supply_spur_atten(gp[:, 0], gp[:, 1] + 1j * gp[:, 2])
+    else:
+        return None
+    fpm, Hm = bench.measure_psrr(lib, subckt, nom, xparams=(xp + f" iload={nom}").strip())
+    _, mat = bench.supply_spur_atten(fpm, Hm, spurs=sf)
+    err = mat - gat                          # +dB => model OVER-rejects (under-predicts the spur)
+    rows = [dict(f=float(f0), gt_db=float(g), md_db=float(m), err=float(e))
+            for f0, g, m, e in zip(sf, gat, mat, err)]
+    iw = int(np.argmax(np.abs(err)))
+    return dict(il=nom, rows=rows, explicit=bool(explicit),
+                worst_db=float(np.abs(err[iw])), worst_f=float(sf[iw]),
+                mean_db=float(np.mean(np.abs(err))))
+
+
+def _print(rows, extra, spur, spm=None, hfm=None, ssm=None):
     print(f"\n{'='*92}\nSCORECARD  (errors in dB unless noted; band = 8/16/24MHz spur offsets)\n{'='*92}")
     print(f"{'load':>5} | {'Zrms':>5} {'Zband':>6} {'Zdeg':>5} {'pk_df':>5} {'pk_dB':>6}"
           f" | {'Pband':>6} {'Pdeg':>5} | {'Twrms%':>6} {'Tdroop':>7} | {'Npsd':>5} {'Npk':>5} {'Nrms%':>6}")
@@ -332,6 +377,12 @@ def _print(rows, extra, spur, spm=None, hfm=None):
               f"phase {hfm['zhf_phase']:.1f}deg"
               + (f" | PSRR rms {hfm['phf']:.2f}dB phase {hfm['phf_phase']:.1f}deg"
                  if "phf" in hfm else ""))
+    if ssm:
+        det = "  ".join(f"{r['f']/1e6:.1f}M:{r['err']:+.2f}" for r in ssm["rows"])
+        tag = "" if ssm["explicit"] else "  [derived from PSRR; regen ref to score]"
+        print(f"SUPPLY-spur rejection @{ssm['il']} (atten err dB vs GT, worst "
+              f"{ssm['worst_db']:.2f}dB @{ssm['worst_f']/1e6:.1f}MHz, mean {ssm['mean_db']:.2f}dB): "
+              f"{det}{tag}")
 
 
 def _plots(rows, lib, subckt, refpath=None):
