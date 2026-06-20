@@ -6,4 +6,5 @@ avdd_nf.dat
 # generalization sweep scratch (regenerable by generalization_spur_noise.py)
 _gen_*.lib
 _gen_*.va
+_gen_*.json
 _gen_run.log
