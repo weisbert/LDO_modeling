@@ -245,7 +245,10 @@ def score(lib, subckt, xp="", refpath=None):
     # SUPPLY-spur block: model vs GT supply->output rejection at the AVDD aggressor tones
     ssm = _supply_spur_metrics(ref, lib, subckt, xp, loads)
 
-    _print(rows, extra, spur_dbc, spm, hfm, ssm)
+    # HELD-OUT off-corner-LOAD noise (R4): model's interpolated noise vs GT between the fit corners
+    ogn = _offgrid_noise_metrics(ref, lib, subckt, xp)
+
+    _print(rows, extra, spur_dbc, spm, hfm, ssm, ogn)
     _plots(rows, lib, subckt, refpath)
     comp = (W["zrms"]*np.mean([r["zrms"] for r in rows])
             + W["zband"]*np.mean([r["zband"] for r in rows])
@@ -263,6 +266,7 @@ def score(lib, subckt, xp="", refpath=None):
         comp += W["zhf"] * hfm["zhf"] + W["phf"] * hfm.get("phf", 0.0)
     if ssm and ssm["explicit"]:              # supply-spur fidelity (refs with supply_spur_* arrays)
         comp += W["sspur"] * ssm["mean_db"]
+    # R4 held-out off-corner-load noise is OBSERVABILITY-ONLY -> deliberately NOT added to comp.
     # R3: matched-frequency noise-resonance error + LF (datasheet uVrms window) integrated-RMS
     # error, low weight + saturation (noise ref is always present, so no gating needed; the
     # caps keep a designed v8/v10 In-notch from dominating). Mirrors the zband/pband pattern.
@@ -291,6 +295,11 @@ def score(lib, subckt, xp="", refpath=None):
         sspur_mean_db=(ssm["mean_db"] if ssm else None),
         sspur_worst_f=(ssm["worst_f"] if ssm else None),
         sspur_scored=(bool(ssm["explicit"]) if ssm else False),
+        offgrid_noise=([dict(il=r["il"], psd_rms=float(r["psd_rms"]), pkdb=float(r["pkdb"]),
+                             npkf=float(r["npkf"]), ir_lf=float(r["ir_lf"])) for r in ogn["rows"]]
+                       if ogn else None),
+        offgrid_noise_worst_db=(float(ogn["worst_db"]) if ogn else None),
+        offgrid_noise_worst_il=(ogn["worst_il"] if ogn else None),
         zhf=(hfm["zhf"] if hfm else None),
         zhf_phase=(hfm["zhf_phase"] if hfm else None),
         phf=(hfm.get("phf") if hfm else None),
@@ -395,7 +404,35 @@ def _supply_spur_metrics(ref, lib, subckt, xp, loads):
                 mean_db=float(np.mean(np.abs(err))))
 
 
-def _print(rows, extra, spur, spm=None, hfm=None, ssm=None):
+def _offgrid_noise_metrics(ref, lib, subckt, xp):
+    """HELD-OUT off-corner LOAD noise (R4). The model is fit AND graded only at the 3 load corners,
+    but its emitted noise interpolates each section amplitude quadratic-in-ln(iload) over FROZEN
+    poles, so the spectrum at an INTERMEDIATE load is an untested 3-point extrapolant -- on the
+    MOST-exercised axis (PMU load lines sweep current continuously). This measures the model's
+    interpolated noise at the GT-collected off-corner loads (`noise_offgrid_<il>`, the ln-midpoints
+    of adjacent corners) and reports psd_rms vs GT. VALIDATION-ONLY: never fitted, never folded into
+    the composite (an observability gate). fres=None -> the Sv-peak fallback anchor (no off-corner
+    Zout is stored, so the off-corner pkdb is UNANCHORED -- a soft diagnostic; psd_rms is the
+    headline). Off-corner Zout/PSRR interpolation is deliberately delegated to crossval.offgrid()
+    (same midpoints, with a held<=2x gate) -- R4 productionizes ONLY the noise part into the
+    committed both-engine scorecard. Returns None on legacy refs without the arrays."""
+    keys = sorted((k for k in ref.files if k.startswith("noise_offgrid_")),
+                  key=lambda k: ng.amps(k[len("noise_offgrid_"):]))   # ASCENDING current, not lexical
+    if not keys:
+        return None
+    out = []
+    for k in keys:
+        il = k[len("noise_offgrid_"):]
+        gn = ref[k]
+        fnm, Sm = bench.measure_noise(lib, subckt, il, xparams=(xp + f" iload={il}").strip())
+        nm = _noise_metrics(gn[:, 0], gn[:, 1], fnm, Sm)
+        out.append(dict(il=il, psd_rms=nm["psd_rms"], pkdb=nm["pkdb"],
+                        npkf=nm["npkf"], ir_lf=nm["ir_lf"]))
+    worst = max(out, key=lambda r: r["psd_rms"])
+    return dict(rows=out, worst_db=float(worst["psd_rms"]), worst_il=worst["il"])
+
+
+def _print(rows, extra, spur, spm=None, hfm=None, ssm=None, ogn=None):
     print(f"\n{'='*92}\nSCORECARD  (errors in dB unless noted; band = 8/16/24MHz spur offsets)\n{'='*92}")
     print(f"{'load':>5} | {'Zrms':>5} {'Zband':>6} {'Zdeg':>5} {'pk_df':>5} {'pk_dB':>6}"
           f" | {'Pband':>6} {'Pdeg':>5} | {'Twrms%':>6} {'Tdroop':>7} | "
@@ -446,6 +483,10 @@ def _print(rows, extra, spur, spm=None, hfm=None, ssm=None):
         print(f"SUPPLY-spur rejection @{ssm['il']} (atten err dB vs GT, worst "
               f"{ssm['worst_db']:.2f}dB @{ssm['worst_f']/1e6:.1f}MHz, mean {ssm['mean_db']:.2f}dB): "
               f"{det}{tag}")
+    if ogn:
+        det = "  ".join(f"{r['il']}: psd={r['psd_rms']:.2f}dB pk(unanch)={r['pkdb']:+.1f}dB" for r in ogn["rows"])
+        print(f"HELD-OUT off-corner-LOAD noise (model interp vs GT, psd-only headline, NOT in "
+              f"composite; worst {ogn['worst_db']:.2f}dB @{ogn['worst_il']}): {det}")
 
 
 def _plots(rows, lib, subckt, refpath=None):

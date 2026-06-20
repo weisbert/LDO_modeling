@@ -43,6 +43,15 @@ def extract(dut, name, cout=np.nan, esr=np.nan):
               f"| PSRR LF={-20*np.log10(abs(H[0])):4.1f} worst={(-20*np.log10(np.abs(H))).min():4.1f}dB "
               f"| noise int={nrms*1e6:.2f}uVrms")
 
+    # R4: held-out off-corner LOAD noise (ln-midpoints of the fit corners) -- the model's
+    # interpolated noise is graded here as a VALIDATION-only held-out gate, never fitted/composited.
+    for il in bench.OFFGRID_NOISE_LOADS:
+        fn, Sv = sb.measure_noise(dut, il, tag=f"nog{il}")
+        ref[f"noise_offgrid_{il}"] = np.c_[fn, Sv]
+        band = (fn >= 100) & (fn <= 100e6)
+        nrms = np.sqrt(_trap(Sv[band] ** 2, fn[band]))
+        print(f"  off-corner {il:>5}: noise int={nrms*1e6:.2f}uVrms  (HELD-OUT, not fitted)")
+
     print("=== HF extension (121u -> 500MHz) ===")
     fzh, Zh = sb.measure_zout(dut, "121u", accmd=sb.AC_HF, tag="zhf")
     fph, Hh = sb.measure_psrr(dut, "121u", accmd=sb.AC_HF, tag="phf")

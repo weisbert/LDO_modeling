@@ -81,6 +81,19 @@ def main(vkey="base"):
               f"PSRR LF={-20*np.log10(np.abs(H[0])):4.1f} worst={(-20*np.log10(np.abs(H))).min():4.1f}dB | "
               f"noise wht@200k={np.interp(2e5,fn,Sv)*1e9:5.1f} pk={npk*1e9:6.1f} int={nrms*1e6:.1f}uVrms")
 
+    # R4: held-out off-corner LOAD noise -- GT noise at currents BETWEEN the fit corners (the
+    # ln-midpoints, worst-case for the model's quad-in-ln amplitude interpolation over frozen
+    # poles). VALIDATION-only: never fitted, never in the composite; score grades the model's
+    # interpolated noise here against this GT (the most-exercised axis: PMU load lines sweep
+    # current continuously, yet the off-corner spectrum is otherwise unobserved).
+    for il in bench.OFFGRID_NOISE_LOADS:
+        fn, Sv = bench.measure_noise(libs, sub, il, xparams=xp)
+        ref[f"noise_offgrid_{il}"] = np.c_[fn, Sv]
+        band = (fn >= 100) & (fn <= 100e6)
+        nrms = np.sqrt(_trap(Sv[band] ** 2, fn[band]))
+        print(f"  off-corner {il:>5}: noise wht@200k={np.interp(2e5,fn,Sv)*1e9:5.1f}nV "
+              f"int={nrms*1e6:.1f}uVrms  (HELD-OUT, not fitted)")
+
     # *_hf ceiling is a per-variant characterization-recipe param (default 500MHz; a GHz part
     # overrides it via variants[..]["hf_stop"]). The array NAMES keep the nominal "121u" token
     # (de-hardcoding the nominal corner is the separate deferred R1 item).

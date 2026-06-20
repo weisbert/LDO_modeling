@@ -191,5 +191,39 @@ def test_guardrail1b_slew0_is_pure_linear_Ra(model):
     print(f"slew_en=0 dV/dI = {slope:.4f} ohm  (model R_a={ra_top:.4f} ohm)")
 
 
+# ============================================================ R4 held-out off-corner-LOAD noise
+class _Ref:
+    """Dict-backed stand-in for the np.load ref object (.files + __getitem__)."""
+    def __init__(self, d):
+        self._d = d
+        self.files = list(d)
+
+    def __getitem__(self, k):
+        return self._d[k]
+
+
+def test_offgrid_noise_gate_end_to_end(model):
+    """END-TO-END (real ngspice): the held-out off-corner-load noise gate measures the EMITTED
+    model's INTERPOLATED noise at an off-corner current (the iload param driving the quad-in-ln
+    interpolation) and grades it vs a REAL GT off-corner spectrum (transistor ground truth). This
+    covers what the pure-logic monkeypatched tests cannot: the interpolation actually running and the
+    fres=None Sv-peak fallback on a real spectrum."""
+    import bench
+    import score
+    import variants
+    lib, op_amps, vdd, tmp = model
+    il = bench.OFFGRID_NOISE_LOADS[0]                       # 49u: strictly interior, iload-clamp inactive
+    v = variants.VARIANTS[VARIANT]
+    fg, Sg = bench.measure_noise(v["libs"], v["subckt"], il, xparams=v.get("xparams", ""))   # real GT
+    ref = _Ref({f"noise_offgrid_{il}": np.c_[fg, Sg]})
+    m = score._offgrid_noise_metrics(ref, str(lib), "ldo_model", "")
+    assert m is not None and len(m["rows"]) == 1 and m["rows"][0]["il"] == il
+    assert np.isfinite(m["worst_db"]) and m["worst_db"] >= 0
+    # the interpolated off-corner noise tracks GT (observed <0.5dB across all variants); a gross
+    # interpolation blow-up would trip this loose bound
+    assert m["worst_db"] < 3.0, f"off-corner noise interp psd_rms {m['worst_db']:.2f}dB too high"
+    print(f"R4 off-corner {il}: held-out noise psd_rms={m['worst_db']:.3f}dB (model interpolated vs GT)")
+
+
 if __name__ == "__main__":
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))

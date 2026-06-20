@@ -14,6 +14,15 @@ import ng
 
 WORK = ng.ROOT / os.environ.get("LDO_WORK", "work")   # per-process workdir for safe parallel runs
 LOADS = ["20u", "121u", "250u"]      # op-point corners (nominal 121u)
+# R4 held-out off-corner LOAD validation: GT noise is also collected at currents BETWEEN the fit
+# corners -- the ln-MIDPOINTS of adjacent corners (exp(mean(ln)) ~= 49u, 174u), NEAR-worst-case for
+# the model's quad-in-ln(iload) amplitude interpolation over FROZEN noise poles. (Exact worst only
+# for LOG-EQUISPACED corners; LOADS is not -- ln-gaps 1.80 vs 0.73 -- so the true |w|-argmax is
+# ~40u/~179u; 49u/174u sit at ~94%/~99% of it, close enough to not warrant an off-grid-load change.)
+# These are NEVER fitted; score grades the model's interpolated noise here as an observability-only
+# held-out gate. crossval.offgrid() uses the runtime geo-mean of the same corners (numerically ==);
+# if LOADS ever changes, update these and regenerate refs (the arrays are keyed by the load token).
+OFFGRID_NOISE_LOADS = ["49u", "174u"]
 SPUR_BANDS = [8e6, 16e6, 24e6]       # user's spur offsets of interest
 AC = "ac dec 40 10 100meg"
 
