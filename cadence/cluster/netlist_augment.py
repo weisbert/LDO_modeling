@@ -128,6 +128,45 @@ def _logical_lines(text):
     return units
 
 
+def _subckt_delta(logical):
+    """The subckt-nesting change a LOGICAL statement makes: +1 for a subckt HEADER, -1 for an
+    `ends`, 0 otherwise. Handles BOTH Spectre (`subckt`/`inline subckt`/`ends [name]`) and
+    spice-lang (`.subckt`/`.ends [name]`); case-insensitive (spice directives may be upper-cased).
+    A comment line (`//`/`*`/`;`) or any other statement is 0, so commented-out subckt text never
+    perturbs the depth count. `simulator lang=...` is a plain statement here -> 0."""
+    s = logical.strip()
+    if not s:
+        return 0
+    toks = s.lower().split()
+    first = toks[0]
+    if first in ("subckt", ".subckt"):
+        return +1
+    if first == "inline" and len(toks) >= 2 and toks[1] == "subckt":
+        return +1
+    if first in ("ends", ".ends"):
+        return -1
+    return 0
+
+
+def _scoped_logical_lines(text):
+    """Like _logical_lines but also yields each statement's subckt-nesting DEPTH:
+    (logical_text, physical_lines, depth), depth==0 == top level. A subckt HEADER is reported at
+    the OUTER depth it opens from and its body at depth>=1; the matching `ends` is reported at the
+    outer depth it closes back to. Every by-NAME resolver / rewriter iterates this and matches
+    ONLY at depth==0, so a subckt-internal instance (e.g. a DUT pass device named `I1`) can never
+    shadow a top-level TB source of the same name. A dangling/unclosed subckt simply leaves the
+    tail at depth>0 (skipped by depth==0 matchers -- the safe behaviour)."""
+    depth = 0
+    for logical, phys in _logical_lines(text):
+        delta = _subckt_delta(logical)
+        if delta < 0:
+            depth = max(0, depth + delta)                 # `ends`: report AT the outer depth
+            yield logical, phys, depth
+        else:
+            yield logical, phys, depth                    # header reported at the outer depth...
+            depth += delta                                # ...then descend into its body
+
+
 def _parse_instance(logical):
     """Parse a LOGICAL netlist statement as an instance `<name> (<n0> <n1> ...) <master> <rest>`.
     Returns (name, nodes, master, rest_tokens) or None when the line is not an instance (a
@@ -148,10 +187,14 @@ def _parse_instance(logical):
 
 
 def _base_nets(base_text):
-    """The SET of every net token present in the base netlist (every node of every instance
-    node-list). B+ net resolution checks a manifest pin against this set."""
+    """The SET of every TOP-LEVEL net token in the base netlist (every node of every depth-0
+    instance node-list). B+ net resolution checks a manifest pin against this set -- a manifest
+    pin is always a top-level TB net, so a subckt-internal net of the same name must NOT count
+    (it would falsely 'resolve' a pin that is not the real top-level net)."""
     nets = set()
-    for logical, _phys in _logical_lines(base_text):
+    for logical, _phys, depth in _scoped_logical_lines(base_text):
+        if depth != 0:
+            continue
         inst = _parse_instance(logical)
         if inst:
             nets.update(inst[1])                          # the node list
@@ -223,8 +266,12 @@ _SRC_FIELD = {"supplies": "tb_src", "v_out": "src", "i_out": "probe_src"}
 
 
 def _find_instance(base_text, name):
-    """The (name, nodes, master, rest) of the first instance whose name == `name`, or None."""
-    for logical, _phys in _logical_lines(base_text):
+    """The (name, nodes, master, rest) of the first TOP-LEVEL instance whose name == `name`, or
+    None. Subckt-internal instances are skipped (depth>0) -- a DUT pass device named `I1` must
+    never be returned for a manifest source named `I1`; the real source is the top-level one."""
+    for logical, _phys, depth in _scoped_logical_lines(base_text):
+        if depth != 0:
+            continue
         inst = _parse_instance(logical)
         if inst and inst[0] == name:
             return inst
@@ -239,7 +286,9 @@ def _detect_src(base_text, net, master):
     here too: we only ever match the role's expected master, so a wrong-master source on the net
     is simply not detected (an OPEN pin) -- a WRONG-master *named* source is caught by the caller."""
     matches = []
-    for logical, _phys in _logical_lines(base_text):
+    for logical, _phys, depth in _scoped_logical_lines(base_text):
+        if depth != 0:
+            continue
         inst = _parse_instance(logical)
         if not inst:
             continue
@@ -336,9 +385,10 @@ def _modify_mag(base_text, src_name, mag_expr):
     == src_name wins. A multi-line (backslash-continued) statement is collapsed to ONE clean
     line carrying the mag, so `mag=` never lands mid-statement after a dangling backslash."""
     out, found = [], False
-    for logical, phys in _logical_lines(base_text):
+    for logical, phys, depth in _scoped_logical_lines(base_text):
         toks = _statement_tokens(logical)
-        if not found and len(toks) >= 2 and toks[0] == src_name and toks[1].startswith("("):
+        if (not found and depth == 0 and len(toks) >= 2
+                and toks[0] == src_name and toks[1].startswith("(")):
             out.append(_set_mag_on_line(logical, mag_expr))
             found = True
         else:
@@ -378,9 +428,10 @@ def _modify_dc(base_text, src_name, value):
     `dc=` never lands mid-statement after a dangling backslash. Used to set a rail's load per
     sweep point (op_loads)."""
     out, found = [], False
-    for logical, phys in _logical_lines(base_text):
+    for logical, phys, depth in _scoped_logical_lines(base_text):
         toks = _statement_tokens(logical)
-        if not found and len(toks) >= 2 and toks[0] == src_name and toks[1].startswith("("):
+        if (not found and depth == 0 and len(toks) >= 2
+                and toks[0] == src_name and toks[1].startswith("(")):
             out.append(_set_dc_on_line(logical, value))
             found = True
         else:
@@ -410,9 +461,10 @@ def _modify_to_pwl(base_text, src_name, wave_tokens):
     multi-line statement is collapsed to ONE clean line. Used to drive the transient stepped
     source (the reused v_out load isource)."""
     out, found = [], False
-    for logical, phys in _logical_lines(base_text):
+    for logical, phys, depth in _scoped_logical_lines(base_text):
         toks = _statement_tokens(logical)
-        if not found and len(toks) >= 2 and toks[0] == src_name and toks[1].startswith("("):
+        if (not found and depth == 0 and len(toks) >= 2
+                and toks[0] == src_name and toks[1].startswith("(")):
             out.append(_set_pwl_on_line(logical, wave_tokens))
             found = True
         else:
@@ -764,7 +816,9 @@ def _detect_on_net(base_text, net, prefer_master=None):
     None. The GUI flags a (2)-only hit as type_ok=False (a wrong-master driver on the pin)."""
     src_masters = {"vsource", "isource"}
     preferred, any_src = None, None
-    for logical, _phys in _logical_lines(base_text):
+    for logical, _phys, depth in _scoped_logical_lines(base_text):
+        if depth != 0:
+            continue
         inst = _parse_instance(logical)
         if not inst:
             continue

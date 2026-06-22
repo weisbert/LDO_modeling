@@ -788,5 +788,136 @@ def test_coverage_free_text_unchanged_by_new_kwargs_defaults(tmp_path):
         assert NA.COVTEMP_NAME not in a                  # no temp line on a coverage-free run
 
 
+# =====================================================================================
+# (9) subckt SCOPE awareness -- by-name resolvers/rewriters match ONLY at depth 0
+#     (regression for the real bug: a DUT subckt pass device named the same as a top-level
+#      TB source the manifest reuses, e.g. both `I1`; the scope-blind first-match grabbed the
+#      subckt device -> wrong-master raise / mag landed on the wrong instance.)
+# =====================================================================================
+_COLLIDE = (
+    "simulator lang=spectre\n"
+    "subckt PMU_top (vout avdd nbias gnd)\n"
+    "  I1 (vout avdd nbias gnd) pmos_18_1umL w=1u l=180n\n"     # subckt pass device named I1
+    "  R1 (vout gnd) resistor r=1meg\n"
+    "ends PMU_top\n"
+    "Xdut (VDD0P8_PLL AVDD1P0 nbias 0) PMU_top\n"
+    "I1 (VDD0P8_PLL 0) isource dc=500u\n"                       # top-level load idc, ALSO I1
+)
+
+
+def test_subckt_delta_classifies_headers_and_ends():
+    assert NA._subckt_delta("subckt foo a b c") == +1
+    assert NA._subckt_delta("subckt foo (a b c)") == +1
+    assert NA._subckt_delta("inline subckt foo a b") == +1
+    assert NA._subckt_delta(".subckt foo a b") == +1
+    assert NA._subckt_delta(".SUBCKT FOO A B") == +1            # spice directives case-insensitive
+    assert NA._subckt_delta("ends foo") == -1
+    assert NA._subckt_delta("ends") == -1
+    assert NA._subckt_delta(".ends") == -1
+    assert NA._subckt_delta("// subckt in a comment") == 0      # commented text never counts
+    assert NA._subckt_delta("I1 (a b) isource dc=1") == 0       # a plain instance
+    assert NA._subckt_delta("simulator lang=spectre") == 0      # lang switch is not a delimiter
+
+
+def test_find_instance_skips_subckt_internal():
+    inst = NA._find_instance(_COLLIDE, "I1")
+    assert inst is not None and inst[2] == "isource"            # the TOP-LEVEL isource, not the pmos
+    assert inst[1] == ["VDD0P8_PLL", "0"]
+
+
+def test_detect_on_net_skips_subckt_internal():
+    hit = NA._detect_on_net(_COLLIDE, "VDD0P8_PLL", prefer_master="isource")
+    assert hit is not None and hit[0] == "I1" and hit[1] == "isource"
+
+
+def test_modify_mag_lands_on_top_level_not_subckt():
+    new, found = NA._modify_mag(_COLLIDE, "I1", "acm_x")
+    assert found
+    pmos = next(l for l in new.splitlines() if "pmos_18_1umL" in l)
+    assert "mag=" not in pmos                                   # subckt pass device untouched
+    top = next(l for l in new.splitlines()
+               if l.strip().startswith("I1 (VDD0P8_PLL 0) isource"))
+    assert "mag=acm_x" in top
+
+
+def test_base_nets_excludes_subckt_internal_nets():
+    nets = NA._base_nets(_COLLIDE)
+    assert "VDD0P8_PLL" in nets and "AVDD1P0" in nets          # top-level (Xdut nodes + sources)
+    assert "nbias" in nets                                     # also top-level (in the Xdut node list)
+    assert "vout" not in nets and "gnd" not in nets           # subckt-internal-only formal nodes excluded
+
+
+def test_nested_subckt_depth_tracking():
+    txt = (
+        "subckt outer (a b)\n"
+        "  subckt inner (c d)\n"
+        "    I1 (c d) isource dc=1\n"                          # depth 2
+        "  ends inner\n"
+        "  I1 (a b) isource dc=2\n"                            # depth 1 -> still NOT top level
+        "ends outer\n"
+        "I1 (top 0) isource dc=3\n"                            # depth 0
+    )
+    inst = NA._find_instance(txt, "I1")
+    assert inst[1] == ["top", "0"]                             # only the depth-0 one matches
+    new, found = NA._modify_mag(txt, "I1", "acm_x")
+    hot = [l for l in new.splitlines() if "mag=acm_x" in l]
+    assert len(hot) == 1 and hot[0].strip().startswith("I1 (top 0)")
+
+
+def test_inline_subckt_scope():
+    txt = (
+        "inline subckt buf (i o)\n"
+        "  I1 (i o) isource dc=1\n"
+        "ends buf\n"
+        "I1 (net 0) isource dc=2\n"
+    )
+    assert NA._find_instance(txt, "I1")[1] == ["net", "0"]
+
+
+def test_spice_lang_subckt_scope():
+    # `.subckt`/`.ends` must delimit scope too (parens kept so _parse_instance would otherwise
+    # see the inner line as a matching instance -- proving the depth guard, not the parser, skips it)
+    txt = (
+        "simulator lang=spice\n"
+        ".subckt buf i o\n"
+        "I1 (i o) isource dc=1\n"
+        ".ends\n"
+        "I1 (net 0) isource dc=2\n"
+    )
+    assert NA._find_instance(txt, "I1")[1] == ["net", "0"]
+
+
+def test_subckt_collision_full_build_resolves_top_level(tmp_path):
+    # END-TO-END: the user's exact failure -- a reused v_out source (Iload_pll) collides by name
+    # with a DUT subckt pass device. Build must NOT raise and the mag must land on the top-level
+    # isource, never the subckt pmos.
+    base = (
+        "simulator lang=spectre\n"
+        'include "models.scs"\n'
+        "inline subckt WuR_PMU_TOP (AVDD1P0 VDD0P8_PLL VDD0P8_VCO IBP_POLY_500N_LPF "
+        "IBP_POLY_3P6U_VCO IBP_PTAT_TUNE_1P5U_VCO VSS)\n"
+        "  Iload_pll (VDD0P8_PLL AVDD1P0 nbias VSS) pmos_18_1umL w=1u l=180n\n"   # subckt pass dev
+        "  R_int (VDD0P8_PLL VSS) resistor r=1meg\n"
+        "ends WuR_PMU_TOP\n"
+        "Xdut (AVDD1P0 VDD0P8_PLL VDD0P8_VCO IBP_POLY_500N_LPF IBP_POLY_3P6U_VCO "
+        "IBP_PTAT_TUNE_1P5U_VCO VSS) WuR_PMU_TOP\n"
+        "V_AVDD (AVDD1P0 0) vsource dc=0.98\n"
+        "Iload_pll (VDD0P8_PLL 0) isource dc=500u\n"                              # top-level load idc
+        "Iload_vco (VDD0P8_VCO 0) isource dc=2m\n"
+        "Vbias_500n_lpf (IBP_POLY_500N_LPF 0) vsource dc=1.28\n"
+        "Vbias_3p6u_vco (IBP_POLY_3P6U_VCO 0) vsource dc=1.28\n"
+        "Vbias_1p5u_ptat (IBP_PTAT_TUNE_1P5U_VCO 0) vsource dc=0.667\n"
+        "tt tran stop=1u\n"
+    )
+    m = _resolved_manifest()
+    txt = _netlist_text(tmp_path, m, "g_v_out_pll", base_text=base)              # must not raise
+    top = next(l for l in txt.splitlines()
+               if l.strip().startswith("Iload_pll (VDD0P8_PLL 0) isource"))
+    assert "mag=acm_v_out_pll" in top                                            # top-level got mag
+    pmos = next(l for l in txt.splitlines()
+                if "pmos_18_1umL" in l and "Iload_pll" in l)
+    assert "mag=" not in pmos                                                    # subckt dev untouched
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
