@@ -451,19 +451,26 @@ def test_run_corner_failed_job_surfaces_error_with_tail(tmp_path):
     assert runner.cmds("dpeek")
 
 
-def test_run_corner_missing_simdone_surfaces_error(tmp_path):
-    # job reports done but the -ade sentinel never appeared -> error (incomplete ALPS run)
+def test_run_corner_missing_simdone_but_output_accepts(tmp_path):
+    # job DONE, PSF output present (ac.ac) but the -ade sentinel missing -> ACCEPT (some ALPS
+    # builds don't drop .simDone). The non-empty dir is the real success signal; .simDone is soft.
     netdir = tmp_path / "netlist"; netdir.mkdir()
-    psfdir = _fake_psf(tmp_path, with_simdone=False)
-    runner = FakeRunner({
-        "dsub": DSUB_OK,
-        "djob": [DJOB_DONE],
-        "dpeek": ok("...some log tail..."),
-    })
+    psfdir = _fake_psf(tmp_path, with_simdone=False)      # has ac.ac, no .simDone
+    runner = FakeRunner({"dsub": DSUB_OK, "djob": [DJOB_DONE]})
+    out = rc.run_corner(str(netdir), "/pdk", "/ahdl", str(psfdir),
+                        engine="alps", runner=runner, sleep=lambda s: None, poll_interval=0.0)
+    assert out == str(psfdir)                              # accepted, no raise
+
+
+def test_run_corner_alps_empty_dir_still_fails(tmp_path):
+    # the HARD gate remains: an alps job that wrote NOTHING (empty dir, no .simDone) fails clearly
+    netdir = tmp_path / "netlist"; netdir.mkdir()
+    psfdir = tmp_path / "psf"; psfdir.mkdir()              # exists but EMPTY
+    runner = FakeRunner({"dsub": DSUB_OK, "djob": [DJOB_DONE], "dpeek": ok("log tail")})
     with pytest.raises(rc.RunCornerError) as ei:
         rc.run_corner(str(netdir), "/pdk", "/ahdl", str(psfdir),
                       engine="alps", runner=runner, sleep=lambda s: None, poll_interval=0.0)
-    assert ".simDone" in str(ei.value)
+    assert "empty" in str(ei.value).lower()
 
 
 def test_run_corner_empty_psf_dir_surfaces_error(tmp_path):

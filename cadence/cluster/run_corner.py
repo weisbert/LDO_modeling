@@ -150,27 +150,29 @@ def finalize_corner(out_abs, *, require_simdone, job_id, runner):
 
 
 def _verify_psf(out_dir, require_simdone, job_id, runner):
-    """Confirm the engine actually produced output in out_dir. Surfaces the dpeek tail on a
-    missing-output failure (a 'done' job that wrote nothing -> usually a netlist/model error
-    the sim log explains)."""
+    """Confirm the engine actually produced output in out_dir. The HARD gate is a non-empty PSF
+    dir (a 'done' job that wrote nothing -> usually a netlist/model error the ALPS log explains).
+    The -ade `.simDone` sentinel is a SOFT signal: some ALPS builds/flags do not drop it (or drop
+    it elsewhere), so its absence on a job that DID write output is a WARNING, not a failure -- a
+    genuinely truncated/partial PSF still surfaces later in binpsf. Surfaces the dpeek tail + dir
+    listing on a hard failure."""
     d = pathlib.Path(out_dir)
     if not d.is_dir():
         tail = _donau.peek_tail(job_id, runner)
         raise RunCornerError(
             f"job {job_id} reported done but PSF dir {d} does not exist."
             + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
-    if require_simdone and not (d / SIMDONE).exists():
+    names = [p.name for p in d.iterdir()]
+    if not names:                                    # the real 'wrote nothing' guard (HARD)
         tail = _donau.peek_tail(job_id, runner)
         raise RunCornerError(
-            f"job {job_id} done but no {SIMDONE} sentinel in {d} -- the ALPS run did not "
-            f"complete cleanly (or -ade was not passed)."
+            f"job {job_id} done but PSF dir {d} is empty (no results written) -- the sim produced "
+            f"no output; check the ALPS log in the netlist dir."
             + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
-    # a non-empty PSF dir is the minimal sign of real output (binpsf reads the files later)
-    if not any(d.iterdir()):
-        tail = _donau.peek_tail(job_id, runner)
-        raise RunCornerError(
-            f"job {job_id} done but PSF dir {d} is empty (no results written)."
-            + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
+    if require_simdone and not (d / SIMDONE).exists():   # SOFT: warn, do not fail
+        print(f"[run_corner] warn: job {job_id} produced output in {d} ({names[:10]}) but no "
+              f"{SIMDONE} sentinel -- accepting (this ALPS may not emit it). If the PSF read "
+              f"later fails, check the ALPS log in the netlist dir.")
 
 
 def _relpath(target, start):
