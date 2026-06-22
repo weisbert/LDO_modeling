@@ -11,7 +11,7 @@
     "tb_view": "schematic",
     "extract_view": "schematic"
   },
-  "ground": "VSS",
+  "ground": "VSS_PLL",
   "supplies": {
     "avdd1p0": {"net": "<net:AVDD1P0>", "dc": 1.0, "pin": "AVDD1P0"}
   },

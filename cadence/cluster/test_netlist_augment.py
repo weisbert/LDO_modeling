@@ -919,5 +919,42 @@ def test_subckt_collision_full_build_resolves_top_level(tmp_path):
     assert "mag=" not in pmos                                                    # subckt dev untouched
 
 
+# =====================================================================================
+# (10) iv coverage with SPECIFIC POINTS -> the dc analysis folds sweep+points into one
+#      `values=[...]` value list; sweep-only stays the proven start=/stop=/lin= form.
+# =====================================================================================
+def _iv_cov_manifest(iv_spec):
+    raw = re.sub(r"<net:([^>]+)>", r"\1", WUR.read_text())
+    d = json.loads(raw)
+    d["coverage"] = {"tier": "T4", "iv": {"i500n_lpf": iv_spec}}
+    return M.load(_write_tmp(d))
+
+
+def _dc_line(txt):
+    return next(l for l in txt.splitlines() if l.strip().startswith(NA.DC_NAME + " dc"))
+
+
+def test_iv_sweep_only_emits_classic_clause(tmp_path):
+    m = _iv_cov_manifest({"sweep": {"type": "lin", "start": 0.0, "stop": 0.8, "n": 5}})
+    dc = _dc_line(_netlist_text(tmp_path, m, "g_iv_i500n_lpf"))
+    assert "lin=5" in dc and "start=0" in dc and "stop=0.8" in dc
+    assert "values=[" not in dc                          # no-points path unchanged
+
+
+def test_iv_sweep_with_points_emits_union_values_list(tmp_path):
+    m = _iv_cov_manifest({"sweep": {"type": "lin", "start": 0.0, "stop": 0.8, "n": 5},
+                          "points": [0.05, 0.42]})
+    dc = _dc_line(_netlist_text(tmp_path, m, "g_iv_i500n_lpf"))
+    # grid 0,0.2,0.4,0.6,0.8 UNION points 0.05,0.42 -> sorted dedup value list
+    assert "values=[0 0.05 0.2 0.4 0.42 0.6 0.8]" in dc
+    assert "lin=" not in dc
+
+
+def test_iv_points_only_emits_values_list(tmp_path):
+    m = _iv_cov_manifest({"points": [0.1, 0.3, 0.5]})
+    dc = _dc_line(_netlist_text(tmp_path, m, "g_iv_i500n_lpf"))
+    assert "values=[0.1 0.3 0.5]" in dc
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

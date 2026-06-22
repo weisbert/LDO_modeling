@@ -30,7 +30,7 @@ _CLI_PROBE_ALIASES = {"i500n": "Vb500:p", "i1u": "Vb1u:p"}
 
 # the extra per-point keys the coverage kinds carry (1b's netlister reads these off the group);
 # copied verbatim from the single member onto its (always size-1) group dict when present.
-_CARRY_KEYS = ("sweep", "step", "edge", "tstop", "tstep", "amp")
+_CARRY_KEYS = ("sweep", "step", "edge", "tstop", "tstep", "amp", "points")
 
 
 def groups(m):

@@ -380,12 +380,15 @@ def measurements(m):
     if coverage_enabled(m, "iv"):
         for c in sinks:
             spec = (cov.get("iv") or {}).get(c)
-            if not spec:
+            if not spec or not (spec.get("sweep") or spec.get("points")):
                 continue
             probe = _probe_name(m, c)
+            # iv carries an optional 'points' (specific compliance/I-V voltages added to the
+            # swept grid); the netlister folds sweep+points into one dc value list.
             M.append(dict(tag=f"iv_{c}", analysis="dc", hot=[("i_out", c)],
                           reads=[("i", probe)], derive="iv", key=f"iv_{c}",
-                          save=[("i", probe)], sweep=spec["sweep"]))
+                          save=[("i", probe)], sweep=spec.get("sweep"),
+                          points=spec.get("points")))
 
     # T2: v_out DC iload sweep -> dropout / load-reg (analysis 'dc') -- sweep the reused load
     #     isource, read Vout. Uses coverage.dropout[o].sweep, else coverage.loads[o].sweep.

@@ -979,6 +979,16 @@ if _HAVE_QT:
                 ["key", "net", "src instance", "iload sweep", "trans", "analysis"],
                 ["vco", "VDD0P8_VCO", "I_load", "log 200u 6m 4 + 3m", "0:6m:slew", "(gear)"],
                 analysis_role="v_out")
+            self._set_header_tip(self.t_vout, "iload sweep",
+                "STATIC / DC load axis (amps). DOUBLE-CLICK for the Cadence-style editor. The "
+                "small-signal AC + noise are RE-RUN at each load point, and (with a range) a "
+                "dropout / load-regulation DC sweep is produced. Forms: '<type> start stop n' "
+                "(e.g. 'log 200u 6m 4'), '+ p1,p2' added points, or bare 'p1,p2'. Blank → single OP.\n"
+                "This is the STATIC dimension; for a load STEP (slew) use the 'trans' column.")
+            self._set_header_tip(self.t_vout, "trans",
+                "DYNAMIC / transient load STEP (slew, overshoot, settling) — a DIFFERENT axis from "
+                "'iload sweep'. Form: '<from>:<to>[:label] , …' + optional '@edge=1n,tstop=1u,tstep=…', "
+                "e.g. '20u:3m:slew'. Each step is one transient run. Blank → no slew.")
             vgl.addWidget(self._table_block(self.t_vout))
             v.addWidget(vg)
 
@@ -1007,10 +1017,13 @@ if _HAVE_QT:
                 "I-V / compliance-knee VOLTAGE sweep for this current-output pin (a T2 coverage "
                 "point → coverage.iv). The pin's probe vsource is stepped across this voltage "
                 "range and the pin CURRENT (<probe>:p) is recorded → the output's I-V curve "
-                "(Spectre `dc dev=<probe> param=dc`). UNITS = volts. Two accepted forms:\n"
-                "  • start:step:stop   e.g. 0:0.01:0.8\n"
-                "  • <type> start stop n   e.g. 'lin 0 0.8 80'  or  'log 1m 1 30'\n"
-                "BLANK (or 'auto') → NO I-V sweep for this pin; give an explicit range to sweep it. "
+                "(Spectre `dc dev=<probe> param=dc`). UNITS = volts. DOUBLE-CLICK the cell for the "
+                "Cadence-style editor (linear/log + range + points). Accepted text forms:\n"
+                "  • <type> start stop n            e.g. 'lin 0 0.8 80'  or  'log 1m 1 30'\n"
+                "  • <type> start stop n + p1,p2    add specific I-V points, e.g. 'lin 0 1 11 + 0.45,0.9'\n"
+                "  • p1,p2                          specific points only\n"
+                "  • start:step:stop                legacy, e.g. 0:0.01:0.8\n"
+                "BLANK (or 'auto') → NO I-V sweep for this pin; give a range/points to sweep it. "
                 "This is NOT 'compliance dc' (that is the single DC voltage held during AC/noise). "
                 "Needs a vsource probe on the pin — leave 'probe instance' blank to auto-insert one.")
             self._set_header_tip(self.t_iout, "compliance dc",
@@ -1117,10 +1130,16 @@ if _HAVE_QT:
             t._analysis_role = analysis_role
             t._analysis_idx = cols.index("analysis") if "analysis" in cols else None
             t._analysis = {}                 # key-text -> {ac?, noise?}
+            # coverage-sweep columns are EDITED VIA A DIALOG (double-click), not inline -- so the
+            # cell is made non-editable (no inline editor races the dialog write-back).
+            _COV_SWEEP_COLS = {"iload sweep", "iv_sweep"}
+            t._dialog_cols = {i for i, c in enumerate(cols) if c in _COV_SWEEP_COLS}
             # [B4] live type-validation: re-colour a typed src/probe-instance name vs the base
             # netlist when its cell is edited. Guarded (reentrancy + role/column filtered) so it
             # is a no-op for every other column and when no base netlist is loaded.
             t.cellChanged.connect(lambda r, c, _t=t: self._on_src_cell_changed(_t, r, c))
+            # [C2] double-click a coverage-sweep cell -> the Cadence-style coverage sweep editor.
+            t.cellDoubleClicked.connect(lambda r, c, _t=t: self._on_cov_cell_dblclick(_t, r, c))
             return t
 
         @staticmethod
@@ -1177,7 +1196,10 @@ if _HAVE_QT:
                     continue
                 val = "" if values is None else (values[c] if c < len(values) else "")
                 it = QTableWidgetItem(str(val))
-                if values is None:                       # placeholder hint on a fresh row
+                if c in getattr(t, "_dialog_cols", set()):    # coverage-sweep: dialog-only cell
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    it.setToolTip("Double-click to edit (linear/log sweep + specific points).")
+                elif values is None:                          # placeholder hint on a fresh row
                     ex = getattr(t, "_example", [])
                     if c < len(ex):
                         it.setToolTip(f"e.g. {ex[c]}")
@@ -1454,6 +1476,10 @@ if _HAVE_QT:
                 if it is None:
                     it = QTableWidgetItem(); t.setItem(r, ci, it)
                 it.setText(txt or "")
+                if ci in getattr(t, "_dialog_cols", set()):   # coverage-sweep: dialog-only cell
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    if not it.toolTip():
+                        it.setToolTip("Double-click to edit (linear/log sweep + specific points).")
 
         @staticmethod
         def _net_display(net):
@@ -1715,6 +1741,106 @@ if _HAVE_QT:
                     "values": pts, "extra": f.get("extra") or []}
             edit.setText(self._sweep_render(newf))
 
+        # ----------------- coverage-cell sweep editor (iload sweep / iv_sweep), double-click
+        @staticmethod
+        def _covsweep_parse(text):
+            """Parse a coverage-sweep CELL ('<type> start stop n [+ p1,p2]', bare 'p1,p2', legacy
+            'start:step:stop', or '' / 'auto') into editor fields {type,start,stop,n,points:[str]}.
+            String-preserving (keeps the user's SI text, unlike the float-valued manifest dict)."""
+            s = (text or "").strip()
+            f = {"type": "lin", "start": "", "stop": "", "n": "", "points": []}
+            if not s or s.lower() == "auto":
+                return f
+            sweep_part, _, pts_part = s.partition("+")
+            sweep_part, pts_part = sweep_part.strip(), pts_part.strip()
+            toks = sweep_part.split()
+            if len(toks) >= 4 and toks[0] in ("lin", "log"):
+                f["type"], f["start"], f["stop"], f["n"] = toks[0], toks[1], toks[2], toks[3]
+            elif ":" in sweep_part and "+" not in s:
+                bits = sweep_part.split(":")
+                if len(bits) == 3:
+                    try:
+                        a, step, b = (_ManifestEditorDialog._si_to_float(x) for x in bits)
+                        n = int(round((b - a) / step)) + 1 if step else 2
+                        f["type"], f["start"], f["stop"], f["n"] = "lin", bits[0], bits[2], str(max(n, 2))
+                    except ValueError:
+                        pass
+            elif sweep_part and "+" not in s:                 # bare points head ('p1,p2')
+                pts_part = sweep_part
+            f["points"] = [p for p in pts_part.replace(" ", "").split(",") if p]
+            return f
+
+        @staticmethod
+        def _covsweep_render(f):
+            """Editor fields -> a coverage-sweep cell string. '<type> start stop n' when a full
+            range is given; specific points appended as '+ p1,p2' (or bare 'p1,p2' with no range);
+            '' for empty (= no sweep)."""
+            typ = f.get("type") or "lin"
+            a, b, n = (str(f.get(k) or "").strip() for k in ("start", "stop", "n"))
+            pts = [str(p).strip() for p in (f.get("points") or []) if str(p).strip()]
+            head = f"{typ} {a} {b} {n}" if (a and b and n) else ""
+            tail = ",".join(pts)
+            if head and tail:
+                return f"{head} + {tail}"
+            return head or tail                              # range-only, points-only, or ''
+
+        def _on_cov_cell_dblclick(self, t, row, col):
+            """Double-click handler: open the coverage sweep editor on a coverage-sweep cell
+            (iload sweep / iv_sweep); no-op for any other cell."""
+            if col not in getattr(t, "_dialog_cols", set()):
+                return
+            item = t.item(row, col)
+            if item is None:
+                item = QTableWidgetItem(); t.setItem(row, col, item)
+                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            cols = getattr(t, "_cols", [])
+            kind = "iv" if (col < len(cols) and cols[col] == "iv_sweep") else "iload"
+            self._open_cov_sweep_editor(item, kind)
+
+        def _open_cov_sweep_editor(self, item, kind="iload"):
+            """The Cadence-style coverage sweep editor (linear/log + range + number of points +
+            specific points). Parses the cell text, lets the user edit, writes the rebuilt cell
+            text back on OK. `kind` ('iv'/'iload') only tunes the labels/units."""
+            if item is None:
+                return
+            f = self._covsweep_parse(item.text())
+            unit = "V" if kind == "iv" else "A"
+            title = {"iv": "I-V voltage sweep", "iload": "Load (iload) sweep"}.get(kind, "Coverage sweep")
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle(title)
+            v = QVBoxLayout(dlg)
+            v.addWidget(QLabel(f"<span style='color:#678'>Cadence-style {title.lower()} ({unit}). "
+                               f"Linear/log range + number of points, plus optional specific points "
+                               f"(land exactly on a knee/compliance value). Leave the range blank "
+                               f"for points-only; Clear for no sweep.</span>"))
+            form = QFormLayout(); v.addLayout(form)
+            c_type = QComboBox(); c_type.addItem("Linear", "lin"); c_type.addItem("Logarithmic", "log")
+            c_type.setCurrentIndex(0 if (f["type"] or "lin") == "lin" else 1)
+            form.addRow("Sweep type", c_type)
+            e_start = QLineEdit(f["start"]); e_start.setPlaceholderText("e.g. 0")
+            form.addRow(f"Start ({unit})", e_start)
+            e_stop = QLineEdit(f["stop"]); e_stop.setPlaceholderText("e.g. 0.8" if kind == "iv" else "e.g. 2m")
+            form.addRow(f"Stop ({unit})", e_stop)
+            e_n = QLineEdit(f["n"]); e_n.setPlaceholderText("e.g. 12")
+            form.addRow("Number of points", e_n)
+            e_pts = QLineEdit(", ".join(f["points"]))
+            e_pts.setPlaceholderText("optional, comma/space-separated")
+            e_pts.setToolTip("Specific values to ADD to the swept grid (folded into one Spectre dc "
+                             "value list). Useful to land exactly on a knee / compliance point.")
+            form.addRow("Add specific points", e_pts)
+            brow = QHBoxLayout(); brow.addStretch(1)
+            b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
+            brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
+            b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
+            b_clear.clicked.connect(lambda: (e_start.clear(), e_stop.clear(), e_n.clear(),
+                                             e_pts.clear(), dlg.accept()))
+            if not dlg.exec_():
+                return
+            pts = [p for p in e_pts.text().replace(",", " ").split() if p]
+            newf = {"type": c_type.currentData(), "start": e_start.text().strip(),
+                    "stop": e_stop.text().strip(), "n": e_n.text().strip(), "points": pts}
+            item.setText(self._covsweep_render(newf))
+
         @staticmethod
         def _loads_to_text(spec):
             """coverage.loads[<o>] dict -> the compact 'iload sweep' cell. Sweep first
@@ -1838,45 +1964,65 @@ if _HAVE_QT:
 
         @staticmethod
         def _ivcov_to_text(spec):
-            """coverage.iv[<c>] dict -> the 'iv_sweep' cell '<type> <start> <stop> <n>'. None -> ''."""
-            sw = (spec or {}).get("sweep")
-            if not sw:
-                return ""
-            return "{} {} {} {}".format(sw.get("type", "lin"),
-                                        _ManifestEditorDialog._float_to_si(sw["start"]),
-                                        _ManifestEditorDialog._float_to_si(sw["stop"]),
-                                        int(sw.get("n", 0) or 0))
+            """coverage.iv[<c>] dict -> the 'iv_sweep' cell. Sweep first ('<type> <start> <stop>
+            <n>'), then any specific added points as '+ p1,p2'; points-only -> 'p1,p2'. None -> ''."""
+            spec = spec or {}
+            sw = spec.get("sweep")
+            pts = spec.get("points") or []
+            f2 = _ManifestEditorDialog._float_to_si
+            head = ("{} {} {} {}".format(sw.get("type", "lin"), f2(sw["start"]), f2(sw["stop"]),
+                                         int(sw.get("n", 0) or 0)) if sw else "")
+            tail = ",".join(f2(p) for p in pts)
+            if head and tail:
+                return f"{head} + {tail}"
+            return head or tail            # sweep-only, or points-only (bare), or '' for neither
 
         @staticmethod
         def _ivcov_from_text(s):
             """The 'iv_sweep' cell -> coverage.iv[<c>] dict (or None). Accepted forms:
-              '<type> <start> <stop> <n>'   e.g. 'lin 0 1.1 12'  -> {sweep:{type,start,stop,n}}
-              legacy 'start:step:stop'      e.g. '0:0.01:1.1'    -> {sweep:{type:lin,start,stop,n}}
-              legacy 'auto'                                       -> None (no explicit sweep)
+              '<type> <start> <stop> <n>'          e.g. 'lin 0 1.1 12'  -> {sweep:{...}}
+              '<type> <start> <stop> <n> + p1,p2'  e.g. 'lin 0 1.1 12 + 0.5,0.9' -> {sweep,points}
+              'p1,p2' or '+ p1,p2'                 specific I-V points only       -> {points}
+              legacy 'start:step:stop'             e.g. '0:0.01:1.1'    -> {sweep:{type:lin,...}}
+              blank / 'auto'                                                       -> None (no sweep)
             SI suffixes parsed. Unparseable -> None."""
             s = (s or "").strip()
             if not s or s.lower() == "auto":
                 return None
-            toks = s.split()
+            sweep_part, _, pts_part = s.partition("+")
+            sweep_part, pts_part = sweep_part.strip(), pts_part.strip()
+            out = {}
+            toks = sweep_part.split()
             if len(toks) >= 4 and toks[0] in ("lin", "log"):
                 try:
-                    return {"sweep": {"type": toks[0],
-                                      "start": _ManifestEditorDialog._si_to_float(toks[1]),
-                                      "stop": _ManifestEditorDialog._si_to_float(toks[2]),
-                                      "n": int(float(toks[3]))}}
+                    out["sweep"] = {"type": toks[0],
+                                    "start": _ManifestEditorDialog._si_to_float(toks[1]),
+                                    "stop": _ManifestEditorDialog._si_to_float(toks[2]),
+                                    "n": int(float(toks[3]))}
                 except (ValueError, IndexError):
                     return None
-            if ":" in s:                                     # legacy start:step:stop -> lin sweep + n
+            elif ":" in sweep_part and "+" not in s:         # legacy start:step:stop -> lin sweep
                 try:
-                    nums = [_ManifestEditorDialog._si_to_float(x) for x in s.split(":")]
+                    nums = [_ManifestEditorDialog._si_to_float(x) for x in sweep_part.split(":")]
                 except ValueError:
                     return None
                 if len(nums) == 3:
                     start, step, stop = nums
                     n = int(round((stop - start) / step)) + 1 if step else 2
-                    return {"sweep": {"type": "lin", "start": start, "stop": stop,
-                                      "n": max(n, 2)}}
-            return None
+                    out["sweep"] = {"type": "lin", "start": start, "stop": stop, "n": max(n, 2)}
+            elif sweep_part and "+" not in s:                # bare points head (no '+'): 'p1,p2'
+                pts_part = sweep_part
+            pts = []
+            for p in pts_part.replace(" ", "").split(","):
+                if not p:
+                    continue
+                try:
+                    pts.append(_ManifestEditorDialog._si_to_float(p))
+                except ValueError:
+                    pass
+            if pts:
+                out["points"] = pts
+            return out or None
 
         @staticmethod
         def _num(s):
@@ -4813,6 +4959,22 @@ def _selftest_manifest_editor(win, tmp):
     _IVC = _ManifestEditorDialog._ivcov_from_text
     assert _IVC("") is None and _IVC("auto") is None and _IVC("AUTO") is None
     assert _IVC("lin 0 0.8 80") == {"sweep": {"type": "lin", "start": 0.0, "stop": 0.8, "n": 80}}
+    # [Q2/Q5] coverage-cell sweep editor parse<->render (iload sweep / iv_sweep), incl. points
+    _CP = _ManifestEditorDialog._covsweep_parse
+    _CR = _ManifestEditorDialog._covsweep_render
+    g = _CP("log 200u 6m 4 + 3m,5m")
+    assert g["type"] == "log" and g["start"] == "200u" and g["stop"] == "6m" and g["n"] == "4"
+    assert g["points"] == ["3m", "5m"] and _CR(g) == "log 200u 6m 4 + 3m,5m"
+    assert _CR(_CP("lin 0 0.8 12")) == "lin 0 0.8 12"            # range-only round-trip
+    assert _CR(_CP("100u,200u,300u")) == "100u,200u,300u"        # points-only round-trip
+    assert _CR(_CP("")) == "" and _CR(_CP("auto")) == ""         # empty/auto -> no sweep
+    # [Q5] iv_sweep cell now carries specific points end to end (cell <-> coverage.iv dict)
+    _IVT = _ManifestEditorDialog._ivcov_to_text
+    d = _IVC("lin 0 1 11 + 0.45,0.9")
+    assert d["sweep"] == {"type": "lin", "start": 0.0, "stop": 1.0, "n": 11}
+    assert d["points"] == [0.45, 0.9]
+    assert _IVC(_IVT(d)) == d                                    # dict -> cell -> dict round-trip
+    assert _IVC("0.3,0.6,0.9") == {"points": [0.3, 0.6, 0.9]}    # iv points-only
 
     # 5j) [2.1/2.5] NO column stretches (a Stretch column swallows the viewport and balloons the
     #     dialog ~3400px wide); every column is Interactive with a compact fixed width, for ALL

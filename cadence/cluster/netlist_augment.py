@@ -543,10 +543,20 @@ def _noise_owner(m, group):
     return None
 
 
-def _sweep_clause(sweep):
-    """The Spectre DC-sweep clause for a coverage sweep dict: 'start=<a> stop=<b> lin=<n>' for a
-    lin sweep, 'start=<a> stop=<b> log=<n>' for a log sweep (n = points). Mirrors _expand_sweep's
-    type/start/stop/n contract so the offline sweep matches the manifest's intended grid."""
+def _sweep_clause(sweep, points=None):
+    """The Spectre DC-sweep clause for a coverage sweep. With NO added points: 'start=<a> stop=<b>
+    lin=<n>' (or log=<n>) -- byte-identical to before. With added `points` (the iv editor's
+    specific compliance/I-V points): emit the UNION of the expanded sweep grid + the points as a
+    single 'values=[v1 v2 ...]' list (a Spectre dc param sweep accepts an explicit value list), so
+    the curve lands EXACTLY on those points. The no-points path (the default, incl. dropout) is
+    unchanged + proven; the `values=[...]` dc form is box-validate-pending like the ac values path
+    -- TODO(box-validate): confirm `dc param=dc values=[...]` on the box / ALPS."""
+    pts = [float(p) for p in (points or [])]
+    if pts:
+        from insitu import manifest as _manifest      # function-local: avoid circular import
+        grid = list(_manifest._expand_sweep(sweep)) if sweep else []
+        allv = sorted({round(v, 18) for v in (grid + pts)})
+        return "values=[" + " ".join(f"{v:g}" for v in allv) + "]"
     a = float(sweep["start"]); b = float(sweep["stop"]); n = int(sweep.get("n", 0) or 0)
     kw = "log" if sweep.get("type") == "log" else "lin"
     return f"start={a:g} stop={b:g} {kw}={n}"
@@ -566,8 +576,8 @@ def _analysis_line(m, group, hot_src=None):
     from insitu import manifest as _manifest          # function-local: avoid circular import
     analysis = group["analysis"]
     if analysis == "dc":
-        sweep = group["sweep"]
-        return f"{DC_NAME} dc dev={hot_src} param=dc {_sweep_clause(sweep)}"
+        return (f"{DC_NAME} dc dev={hot_src} param=dc "
+                f"{_sweep_clause(group.get('sweep'), group.get('points'))}")
     if analysis == "tran":
         e = group.get("edge") or 1e-9
         stop = group.get("tstop") or (e * 1000)
