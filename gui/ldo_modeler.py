@@ -987,19 +987,40 @@ if _HAVE_QT:
             cg.setStyleSheet("QGroupBox{font-weight:bold;}")
             cgl = QVBoxLayout(cg)
             cgl.addWidget(QLabel("<span style='color:#678'>Current-output pins (admittance / "
-                                 "current-PSRR): net + compliance dc + optional <b>iv_sweep</b> "
-                                 "(T2 I-V → coverage.iv): “&lt;type&gt; &lt;start&gt; "
-                                 "&lt;stop&gt; &lt;n&gt;” (e.g. “lin 0 1.1 12”), or the legacy "
-                                 "“start:step:stop” / “auto”. <b>probe instance</b> = the "
+                                 "current-PSRR): <b>net</b> + <b>compliance dc</b> (the single DC "
+                                 "voltage held during AC/noise) + optional <b>iv_sweep</b> — a "
+                                 "VOLTAGE sweep that traces the pin's I-V / compliance knee "
+                                 "(T2 coverage → coverage.iv). <b>probe instance</b> = the "
                                  "testbench vdc on that pin whose AC mag we set (the current "
                                  "read = its :p current); <b>blank → auto-detect / insert "
                                  "(Vprobe_&lt;key&gt;)</b>. The <b>analysis</b> column overrides "
-                                 "this output's AC sweep. Leave the table empty if your DUT has "
-                                 "no current outputs.</span>"))
+                                 "this output's AC sweep. Hover any column header for details. "
+                                 "Leave the table empty if your DUT has no current outputs.</span>"))
             self.t_iout = self._make_table(
                 ["key", "net", "compliance dc", "iv_sweep", "probe instance", "analysis"],
                 ["i500n", "IBP_500N", "0.9", "0:0.01:1.1", "Vprobe_i500n", "(gear)"],
                 analysis_role="i_out")
+            # per-column header tooltips: iv_sweep is the most-confused column (the user asked
+            # "what IS iv_sweep / how do I fill it?") -- spell out that it is a VOLTAGE sweep, its
+            # three accepted forms, and that it is NOT the 'compliance dc' single point.
+            self._set_header_tip(self.t_iout, "iv_sweep",
+                "I-V / compliance-knee VOLTAGE sweep for this current-output pin (a T2 coverage "
+                "point → coverage.iv). The pin's probe vsource is stepped across this voltage "
+                "range and the pin CURRENT (<probe>:p) is recorded → the output's I-V curve "
+                "(Spectre `dc dev=<probe> param=dc`). UNITS = volts. Three accepted forms:\n"
+                "  • start:step:stop   e.g. 0:0.01:0.8\n"
+                "  • <type> start stop n   e.g. 'lin 0 0.8 80'  or  'log 1m 1 30'\n"
+                "  • auto   (0 → supply + margin)\n"
+                "This is NOT 'compliance dc' (that is the single DC voltage held during AC/noise). "
+                "Needs a vsource probe on the pin — leave 'probe instance' blank to auto-insert one.")
+            self._set_header_tip(self.t_iout, "compliance dc",
+                "The single DC voltage held on this pin during the AC / noise analyses (the probe "
+                "vsource's dc=). A scalar voltage, e.g. 0.9. For the swept I-V curve use 'iv_sweep'.")
+            self._set_header_tip(self.t_iout, "probe instance",
+                "The testbench vsource on this pin whose AC mag we set; the current read is its "
+                ":p current. Blank → the build auto-detects a vsource on the net, else inserts "
+                "Vprobe_<key> (the normal case when the pin carries only the characterized "
+                "current source).")
             cgl.addWidget(self._table_block(self.t_iout))
             v.addWidget(cg)
 
@@ -1094,7 +1115,22 @@ if _HAVE_QT:
             t._analysis_role = analysis_role
             t._analysis_idx = cols.index("analysis") if "analysis" in cols else None
             t._analysis = {}                 # key-text -> {ac?, noise?}
+            # [B4] live type-validation: re-colour a typed src/probe-instance name vs the base
+            # netlist when its cell is edited. Guarded (reentrancy + role/column filtered) so it
+            # is a no-op for every other column and when no base netlist is loaded.
+            t.cellChanged.connect(lambda r, c, _t=t: self._on_src_cell_changed(_t, r, c))
             return t
+
+        @staticmethod
+        def _set_header_tip(t, col_name, tip):
+            """Set a per-column HEADER tooltip (hover the column title). No-op if the column or its
+            header item is absent (Qt may not have materialised the header item in a headless run)."""
+            cols = getattr(t, "_cols", [])
+            if col_name not in cols:
+                return
+            hi = t.horizontalHeaderItem(cols.index(col_name))
+            if hi is not None:
+                hi.setToolTip(tip)
 
         def _table_block(self, table):
             """A table + Add/Remove buttons in one container widget (for QFormLayout.addRow)."""
@@ -1978,30 +2014,44 @@ if _HAVE_QT:
                 self.status.setStyleSheet("font-family:monospace; font-size:11px; color:#b00020;")
                 self.status.setText(f"scan failed: {e}")
                 return
-            found, missing, mism = self._apply_scan(scan)
-            self.status.setStyleSheet("font-family:monospace; font-size:11px; color:#157f3b;")
+            found, insertable, error = self._apply_scan(scan)
+            # green unless a SUPPLY error (no insert fallback) needs attention -> red
+            self.status.setStyleSheet("font-family:monospace; font-size:11px; "
+                                      + ("color:#b00020;" if error else "color:#157f3b;"))
             src = "main-window netlist dir" if from_mw else "picked file"
             self.status.setText(
-                f"scanned {pathlib.Path(fn).name} ({src}): {found} source(s) found, "
-                f"{missing} not found, {mism} type-mismatch. "
-                "Supplies / voltage-outputs / current-outputs source-instance + dc cells filled "
-                "(bias is not scanned) — review the amber/red ones, then Validate.")
+                f"scanned {pathlib.Path(fn).name} ({src}): {found} reusable source(s), "
+                f"{insertable} open pin(s) → auto-insert Iext_/Vprobe_ at build (normal, amber), "
+                f"{error} supply error(s) (red). "
+                "Source-instance + dc cells filled where reusable (bias is not scanned) — "
+                "review the amber/red ones, then Validate.")
 
         def _apply_scan(self, scan):
             """Fill the supplies/v_out/i_out tables' source-instance (+ dc) columns from a
-            scan_netlist_sources() result. Returns (found, missing, type_mismatch) counts.
+            scan_netlist_sources() result. Returns (found, insertable, error) counts:
+              found      = a CORRECT-master reusable source on the net (green; cell + dc filled).
+              insertable = a v_out/i_out pin with NO reusable source -- nothing on the net, OR only
+                           the other-role source (e.g. an isource on a current-output net: that is
+                           the bias current being characterized, not a reusable vsource probe).
+                           This is the NORMAL open-pin case: the build inserts Iext_<key>/Vprobe_<key>
+                           at netlist time. The cell is left BLANK (so the build takes that path) and
+                           the compliance dc is NOT filled from a wrong-master source (B2 fix: an
+                           isource's current must never land in a voltage 'compliance dc').
+              error      = a SUPPLY with no vsource (or a wrong-master source) on its net: supplies
+                           have no insert fallback, so this is a real red error.
             Qt-light so the selftest can drive it with an in-memory scan dict."""
-            # (table, role, src-instance display-column header, has a 'dc' column?)
-            specs = [(self.t_supplies, "supplies", "src instance", True),
-                     (self.t_vout,     "v_out",    "src instance", False),
-                     (self.t_iout,     "i_out",    "probe instance", True)]
-            found = missing = mism = 0
-            for t, role, src_col, has_dc in specs:
+            # (table, role, src-instance display-column header, has a 'dc' column?, insert template)
+            specs = [(self.t_supplies, "supplies", "src instance",   True,  None),
+                     (self.t_vout,     "v_out",    "src instance",   False, "Iext_{}"),
+                     (self.t_iout,     "i_out",    "probe instance", True,  "Vprobe_{}")]
+            found = insertable = error = 0
+            for t, role, src_col, has_dc, insert_tmpl in specs:
                 rmap = scan.get(role) or {}
                 cols = getattr(t, "_cols", [])
                 sidx = cols.index(src_col) if src_col in cols else None
                 didx = cols.index("dc") if "dc" in cols else \
                     (cols.index("compliance dc") if "compliance dc" in cols else None)
+                companion = "load" if role == "v_out" else "source"   # the other-role source on net
                 for r in range(t.rowCount()):
                     ki = t.item(r, 0)
                     key = ki.text().strip() if ki else ""
@@ -2009,35 +2059,59 @@ if _HAVE_QT:
                     if not info:
                         continue
                     inst = info.get("instance")
-                    if inst is None:
-                        missing += 1
-                    else:
+                    reusable = inst is not None and bool(info.get("type_ok", True))
+                    can_insert = insert_tmpl is not None                # v_out / i_out fall back
+                    if reusable:
                         found += 1
-                        if not info.get("type_ok", True):
-                            mism += 1
+                    elif can_insert:
+                        insertable += 1
+                    else:
+                        error += 1                                      # supply: no fallback
                     if sidx is not None:
                         it = t.item(r, sidx)
                         if it is None:
                             it = QTableWidgetItem(); t.setItem(r, sidx, it)
-                        it.setText(inst or "")
-                        if inst is None:                       # detected nothing: amber 'not found'
-                            it.setForeground(QtGui.QColor("#b8860b"))
-                            it.setToolTip("Scan found no driving source on this net — blank → "
-                                          "auto-detect / insert at netlist time, or type it.")
-                        elif not info.get("type_ok", True):    # wrong master type: red error
-                            it.setForeground(QtGui.QColor("#b00020"))
-                            it.setToolTip(f"Detected '{inst}' is a {info.get('master')} — WRONG "
-                                          f"type for {role} (read math needs the other master).")
-                        else:
+                        if reusable:
+                            it.setText(inst)
                             it.setForeground(QtGui.QColor("#157f3b"))
                             it.setToolTip(f"Detected {info.get('master')} '{inst}' on "
                                           f"{info.get('net')}.")
-                    if has_dc and didx is not None and info.get("dc") is not None:
+                        elif can_insert:
+                            # NORMAL open / other-type pin: leave BLANK so the build inserts the
+                            # probe/load; never put a wrong-master name in the reuse cell.
+                            it.setText("")
+                            it.setForeground(QtGui.QColor("#b8860b"))
+                            ins = insert_tmpl.format(key)
+                            if inst is None:
+                                it.setToolTip(
+                                    f"No reusable source on '{info.get('net')}' — blank → the build "
+                                    f"inserts {ins} at netlist time (normal for this output). Type a "
+                                    f"name only to reuse a specific source.")
+                            else:
+                                it.setToolTip(
+                                    f"'{inst}' on '{info.get('net')}' is a {info.get('master')} (the "
+                                    f"characterized {companion}, not a reusable probe) — blank → the "
+                                    f"build inserts {ins} (normal). Type a name only to reuse a "
+                                    f"specific source.")
+                        else:                                           # supply: real error
+                            it.setText(inst or "")
+                            it.setForeground(QtGui.QColor("#b00020"))
+                            if inst is None:
+                                it.setToolTip(
+                                    f"No vsource drives '{info.get('net')}' — a supply has no insert "
+                                    f"fallback; place the source or name supplies.{key}.tb_src.")
+                            else:
+                                it.setToolTip(
+                                    f"Detected '{inst}' is a {info.get('master')} — a supply needs a "
+                                    f"vsource (the read math depends on it).")
+                    # the dc cell: ONLY from a correct-master reusable source (B2: never leak a
+                    # wrong-master value, e.g. an isource's current, into a voltage 'compliance dc')
+                    if has_dc and didx is not None and reusable and info.get("dc") is not None:
                         dit = t.item(r, didx)
                         if dit is None:
                             dit = QTableWidgetItem(); t.setItem(r, didx, dit)
                         dit.setText(self._fmt_num(info["dc"]))
-            return found, missing, mism
+            return found, insertable, error
 
         @staticmethod
         def _fmt_num(x):
@@ -2045,6 +2119,98 @@ if _HAVE_QT:
             if isinstance(x, float) and x.is_integer():
                 return str(int(x))
             return str(x)
+
+        def _base_netlist_text(self):
+            """The base input.scs TEXT from the main-window 'Netlist dir' field, or None. Cached on
+            the resolved path so per-keystroke re-validation does not re-read the file each time."""
+            try:
+                fn = self._mw_netlist_path(self.parent())
+            except Exception:                                    # noqa: BLE001 (never crash on edit)
+                return None
+            if not fn:
+                return None
+            cache = getattr(self, "_base_text_cache", None)
+            if cache and cache[0] == fn:
+                return cache[1]
+            try:
+                txt = pathlib.Path(fn).read_text()
+            except Exception:                                    # noqa: BLE001
+                return None
+            self._base_text_cache = (fn, txt)
+            return txt
+
+        def _on_src_cell_changed(self, t, row, col):
+            """[B4] cellChanged handler: validate ONLY the src/probe-instance column of a
+            supplies/v_out/i_out table; no-op for every other cell. Reentrancy-guarded because the
+            validator re-colours the same item (which would re-emit cellChanged)."""
+            if getattr(self, "_in_src_validate", False):
+                return
+            role = getattr(t, "_analysis_role", None)
+            cols = getattr(t, "_cols", [])
+            if role not in ("supplies", "v_out", "i_out") or not cols:
+                return
+            col_name = "probe instance" if role == "i_out" else "src instance"
+            if col_name not in cols or col != cols.index(col_name):
+                return
+            self._in_src_validate = True
+            try:
+                self._validate_src_cell(t, row)
+            finally:
+                self._in_src_validate = False
+
+        def _validate_src_cell(self, t, row, base_text=None):
+            """[B4] Colour a typed src/probe-instance name against the base netlist's TOP-LEVEL
+            instances (scope-aware via NA._find_instance): green = correct master, red = wrong
+            master (with the blank→auto-insert hint for v_out/i_out), amber = not a top-level
+            instance. A BLANK cell clears the colour (the build auto-detects/inserts). Qt-light:
+            pass base_text in the selftest; in the GUI it reads the cached main-window netlist.
+            No-op when no base netlist is available (nothing to validate against). Returns the
+            verdict string ('ok'/'wrong'/'absent'/'blank'/'no-base') for the selftest."""
+            from cluster import netlist_augment as NA
+            role = getattr(t, "_analysis_role", None)
+            if role not in ("supplies", "v_out", "i_out"):
+                return "no-base"
+            cols = getattr(t, "_cols", [])
+            col_name = "probe instance" if role == "i_out" else "src instance"
+            if col_name not in cols:
+                return "no-base"
+            it = t.item(row, cols.index(col_name))
+            if it is None:
+                return "no-base"
+
+            def _paint(color, tip):
+                # re-colour with the table's signals blocked so the resulting itemChanged never
+                # re-enters this validator (belt-and-suspenders with the _in_src_validate guard).
+                prev = t.signalsBlocked()
+                t.blockSignals(True)
+                try:
+                    it.setForeground(QtGui.QColor(color))
+                    it.setToolTip(tip)
+                finally:
+                    t.blockSignals(prev)
+
+            name = it.text().strip()
+            if not name:                                         # blank -> auto-detect/insert
+                _paint("#222222", "Blank → the build auto-detects a source on the net, else "
+                                  "inserts one (Iext_/Vprobe_).")
+                return "blank"
+            if base_text is None:
+                base_text = self._base_netlist_text()
+            if base_text is None:                                # nothing to validate against
+                return "no-base"
+            inst = NA._find_instance(base_text, name)
+            master = NA.ROLE_MASTER[role]
+            if inst is None:
+                _paint("#b8860b", f"'{name}' is not a top-level instance in the base netlist — "
+                                  f"check the name, or leave blank to auto-detect/insert.")
+                return "absent"
+            if inst[2] != master:
+                esc = "" if role == "supplies" else " — or leave blank to auto-insert one"
+                _paint("#b00020", f"'{name}' is a {inst[2]} but {role} needs a {master} (the read "
+                                  f"math depends on the master type){esc}.")
+                return "wrong"
+            _paint("#157f3b", f"OK: '{name}' is a {master} at top level.")
+            return "ok"
 
         def _merged_text(self):
             """The JSON text to write: the merged dict (preserves unknown keys). If Raw is active
@@ -4380,13 +4546,57 @@ def _selftest_manifest_editor(win, tmp):
     dlg11 = _ManifestEditorDialog(win, sman, None)
     from cluster import netlist_augment as _NA
     scan = _NA.scan_netlist_sources(str(fake), dlg11._current_dict())
-    found, missing, mism = dlg11._apply_scan(scan)
-    assert found == 3 and missing == 0 and mism == 0, f"scan should find 3 sources, got {found}/{missing}/{mism}"
+    found, insertable, error = dlg11._apply_scan(scan)
+    assert found == 3 and insertable == 0 and error == 0, \
+        f"scan should find 3 reusable sources, got {found}/{insertable}/{error}"
     assert dlg11.t_supplies.item(0, 3).text() == "V_AVDD", "scan did not fill the supply src instance"
     assert dlg11.t_supplies.item(0, 2).text() == "0.98", "scan did not fill the supply dc"
     assert dlg11.t_vout.item(0, 2).text() == "Iload_o", "scan did not fill the v_out src instance"
     assert dlg11.t_iout.item(0, 4).text() == "Vchar_i", "scan did not fill the i_out probe instance"
     assert dlg11.t_iout.item(0, 2).text() == "1.2", "scan did not fill the i_out compliance dc"
+
+    # 5i-bis) [B1/B2] a current-output pin whose net carries ONLY an isource (the characterised
+    #     bias current, NOT a reusable vsource probe). The probe cell must be left BLANK (so the
+    #     build inserts Vprobe_<key>), the compliance-dc must NOT be filled from the isource's
+    #     current, and it is counted as 'insertable' (normal), not an error.
+    fake2 = pathlib.Path(tmp) / "scan_iout_isource.scs"
+    fake2.write_text(
+        "simulator lang=spectre\n"
+        "Xdut (AVDD IBP VSS) DUT\n"
+        "V_AVDD (AVDD 0) vsource dc=0.98\n"
+        "Ibias_i (IBP 0) isource dc=500u\n"             # an isource on the current-output net
+        "tt tran stop=1u\n")
+    sman2 = json.dumps({"name": "s2", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+                        "supplies": {"avdd": {"net": "AVDD", "dc": 0.0}},
+                        "i_out": {"i": {"net": "IBP", "dc": 0.0}}})
+    dlg11b = _ManifestEditorDialog(win, sman2, None)
+    scan2 = _NA.scan_netlist_sources(str(fake2), dlg11b._current_dict())
+    f2, ins2, err2 = dlg11b._apply_scan(scan2)
+    assert f2 == 1 and ins2 == 1 and err2 == 0, \
+        f"i_out-with-isource: expect 1 reusable supply + 1 insertable i_out, got {f2}/{ins2}/{err2}"
+    pcell = dlg11b.t_iout.item(0, 4)
+    assert (pcell is None or pcell.text() == ""), \
+        f"[B1] i_out probe cell must stay BLANK (no wrong-master name), got {pcell.text()!r}"
+    dccell = dlg11b.t_iout.item(0, 2)
+    assert (dccell is None or dccell.text() in ("", "0.0", "0")), \
+        f"[B2] i_out compliance-dc must NOT be filled from the isource current, got {dccell.text()!r}"
+
+    # 5i-ter) [B4] live src/probe-instance type validation against the base netlist (scope-aware).
+    #     Use fake (V_AVDD vsource / Iload_o isource / Vchar_i vsource). A correct master -> 'ok';
+    #     a wrong master -> 'wrong'; an unknown name -> 'absent'; blank -> 'blank'.
+    base_txt = fake.read_text()
+    dlg11.t_supplies.item(0, 3).setText("V_AVDD")               # supply wants a vsource
+    assert dlg11._validate_src_cell(dlg11.t_supplies, 0, base_text=base_txt) == "ok"
+    dlg11.t_supplies.item(0, 3).setText("Iload_o")             # an isource named for a supply
+    assert dlg11._validate_src_cell(dlg11.t_supplies, 0, base_text=base_txt) == "wrong"
+    dlg11.t_vout.item(0, 2).setText("Iload_o")                 # v_out wants an isource -> ok
+    assert dlg11._validate_src_cell(dlg11.t_vout, 0, base_text=base_txt) == "ok"
+    dlg11.t_vout.item(0, 2).setText("V_AVDD")                  # a vsource named for a v_out
+    assert dlg11._validate_src_cell(dlg11.t_vout, 0, base_text=base_txt) == "wrong"
+    dlg11.t_vout.item(0, 2).setText("NOPE")                    # not a top-level instance
+    assert dlg11._validate_src_cell(dlg11.t_vout, 0, base_text=base_txt) == "absent"
+    dlg11.t_vout.item(0, 2).setText("")                        # blank -> auto-insert
+    assert dlg11._validate_src_cell(dlg11.t_vout, 0, base_text=base_txt) == "blank"
 
     # 5j) [2.1/2.5] NO column stretches (a Stretch column swallows the viewport and balloons the
     #     dialog ~3400px wide); every column is Interactive with a compact fixed width, for ALL

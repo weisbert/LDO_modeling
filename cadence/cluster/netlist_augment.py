@@ -332,10 +332,13 @@ def _resolve_role_src(base_text, role, key, v):
                 f"{role}.{key}.{field}='{named}' is not an instance in the base netlist "
                 f"(named source not found). Check {role}.{key}.{field} against the base input.scs.")
         if inst[2] != master:
+            # v_out/i_out can fall back to an inserted Iext_/Vprobe_; supplies cannot.
+            escape = ("" if role == "supplies" else
+                      f", or leave {role}.{key}.{field} blank to auto-insert a {master}")
             raise NetlistAugmentError(
                 f"{role}.{key}.{field}='{named}' is a '{inst[2]}' but role {role} requires a "
                 f"'{master}' (the read math: a v_out injects current -> isource; a supply/i_out "
-                f"drives a voltage -> vsource). Name a {master} for {role}.{key}.")
+                f"drives a voltage -> vsource). Name a {master} for {role}.{key}{escape}.")
         return named, False
     # no named source -> auto-detect the right master on the net
     det = _detect_src(base_text, v["net"], master)
