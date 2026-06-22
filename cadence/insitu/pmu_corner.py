@@ -315,6 +315,10 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
         return dict(psf_map=psf_map, dsub_cmds=dsub_cmds, ran=False)
 
     # ---- real path: a single-threaded BOUNDED poll-scheduler --------------------------------
+    # default a REAL runner ONCE here: submit_corner self-defaults its own, but poll_once does
+    # NOT -- so a None runner (the GUI/default) used to submit fine then crash at the first
+    # djob poll ('NoneType' object is not callable). Both halves must share a real runner.
+    runner = runner or _donau.SubprocessRunner()
     pending = list(enumerate(grps))                    # FIFO of (i, g)
     inflight = {}                                      # job_id -> ctx dict
     cancelling = False

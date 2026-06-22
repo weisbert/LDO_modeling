@@ -1,0 +1,166 @@
+{
+  "name": "wur_pmu_real",
+  "_note": "Red-zone manifest for the WuR PMU. Identity + pin roles are REAL (designer-supplied): TB sim_1108_yusheng/sim_LDO; DUT Hi1108_WuR_PMU/WuR_PMU_TOP instantiated as PMU_TOP. Each port's 'pin' is the symbol PIN name; the '<net:PIN>' nets are RESOLVER-FILLED (B+: a placeholder whose PIN IS a real base net resolves automatically; net!=pin needs the real TB net hand-set). UNIFIED SOURCE-REUSE: every role REUSES the designer's existing TB source on its pin (set its mag=acm) -- supplies.tb_src = the supply vsource; v_out.src = the load isource; i_out.probe_src = the compliance vdc vsource. Omit a *_src to auto-detect the source on the net; an OPEN v_out/i_out pin with no source falls back to inserting Iext/Vprobe. v_out 'iload' is pure metadata. i_out 'dc' is the pin's compliance/operating node voltage.",
+  "dut": {
+    "lib": "Hi1108_WuR_PMU",
+    "cell": "WuR_PMU_TOP",
+    "tb_lib": "sim_1108_yusheng",
+    "tb_cell": "sim_LDO",
+    "tb_inst": "PMU_TOP",
+    "extract_cell": "sim_LDO_extract",
+    "tb_view": "schematic",
+    "extract_view": "schematic"
+  },
+  "ground": "VSS_PLL",
+  "supplies": {
+    "avdd1p0": {
+      "net": "<net:AVDD1P0>",
+      "dc": 0.98,
+      "pin": "AVDD1P0",
+      "tb_src": "V_AVDD"
+    }
+  },
+  "v_out": {
+    "pll": {
+      "net": "<net:VDD0P8_PLL>",
+      "pin": "VDD0P8_PLL",
+      "iload": 0.0005,
+      "src": "Iload_pll"
+    },
+    "vco": {
+      "net": "<net:VDD0P8_VCO>",
+      "pin": "VDD0P8_VCO",
+      "iload": 0.002,
+      "src": "Iload_vco"
+    }
+  },
+  "i_out": {
+    "i500n_lpf": {
+      "net": "<net:IBP_POLY_500N_LPF>",
+      "pin": "IBP_POLY_500N_LPF",
+      "dc": 1.28,
+      "probe_src": "Vbias_500n_lpf"
+    },
+    "i3p6u_vco": {
+      "net": "<net:IBP_POLY_3P6U_VCO>",
+      "pin": "IBP_POLY_3P6U_VCO",
+      "dc": 1.28,
+      "probe_src": "Vbias_3p6u_vco"
+    },
+    "i1p5u_ptat": {
+      "net": "<net:IBP_PTAT_TUNE_1P5U_VCO>",
+      "pin": "IBP_PTAT_TUNE_1P5U_VCO",
+      "dc": 0.667,
+      "probe_src": "Vbias_1p5u_ptat"
+    }
+  },
+  "bias": {},
+  "leave_alone": [],
+  "corners": {
+    "pull_from_session": true,
+    "fallback": [
+      "tt_25c"
+    ]
+  },
+  "current_psrr_supplies": [
+    "avdd1p0"
+  ],
+  "analysis": {
+    "ac": "ac start=10 stop=500M dec=20",
+    "noise": "noise start=10 stop=100M dec=20"
+  },
+  "coverage": {
+    "tier": "T4",
+    "loads": {
+      "pll": {
+        "points": [
+          0.0001,
+          0.0002,
+          0.0003,
+          0.0005,
+          0.001
+        ]
+      },
+      "vco": {
+        "points": [
+          0.0001,
+          0.0005,
+          0.001,
+          0.002,
+          0.003,
+          0.004
+        ]
+      }
+    },
+    "transient": {
+      "pll": {
+        "steps": [
+          {
+            "from": 0.0001,
+            "to": 0.002,
+            "label": "2m"
+          },
+          {
+            "from": 0.0001,
+            "to": 0.003,
+            "label": "3m"
+          },
+          {
+            "from": 0.0001,
+            "to": 0.004,
+            "label": "4m"
+          }
+        ],
+        "edge": 1e-09,
+        "tstop": 1e-05
+      },
+      "vco": {
+        "steps": [
+          {
+            "from": 0.0001,
+            "to": 0.004,
+            "label": "4m"
+          },
+          {
+            "from": 0.0001,
+            "to": 0.005,
+            "label": "5m"
+          },
+          {
+            "from": 0.0001,
+            "to": 0.006,
+            "label": "6m"
+          }
+        ],
+        "edge": 1e-09,
+        "tstop": 1e-05
+      }
+    },
+    "iv": {
+      "i500n_lpf": {
+        "sweep": {
+          "type": "lin",
+          "start": 0.0,
+          "stop": 1.8,
+          "n": 19
+        }
+      },
+      "i3p6u_vco": {
+        "sweep": {
+          "type": "lin",
+          "start": 0.0,
+          "stop": 1.8,
+          "n": 19
+        }
+      },
+      "i1p5u_ptat": {
+        "sweep": {
+          "type": "lin",
+          "start": 0.0,
+          "stop": 0.8,
+          "n": 9
+        }
+      }
+    }
+  }
+}

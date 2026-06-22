@@ -615,6 +615,29 @@ def test_step_run_group_status_streams_states(tmp_path):
     assert runres["ran"] is True
 
 
+def test_step_run_defaults_runner_when_none(tmp_path, monkeypatch):
+    """REGRESSION: the GUI calls step_run with NO runner. submit_corner self-defaults a runner,
+    but poll_once does NOT -- so a None runner used to submit fine then crash at the first djob
+    poll with "'NoneType' object is not callable". step_run must default ONE real runner so BOTH
+    submit and poll use it. Monkeypatch SubprocessRunner -> FakeRunner so the default path runs
+    without a real dsub."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+    _seed_all_group_psf(dirs, grps)
+    netinfo = PC.step_netlist(dirs, netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"))
+    monkeypatch.setattr(PC._donau, "SubprocessRunner", FakeRunner)
+    # runner OMITTED (None) -> must NOT raise TypeError; the defaulted runner drives submit + poll
+    runres = PC.step_run(netinfo, dirs["psf"], m, engine="alps",
+                         group_netlister=gnl, sleep=lambda *_: None)
+    assert runres["ran"] is True
+    assert len(runres["dsub_cmds"]) == len(grps)
+
+
 def test_step_run_cancel_between_groups(tmp_path):
     """A cancel() that turns True after the first group stops the sweep with CancelledError
     BETWEEN groups (a submitted group is never interrupted mid-poll)."""

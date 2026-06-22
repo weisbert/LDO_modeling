@@ -571,12 +571,13 @@ if _HAVE_QT:
         cancelled = QtCore.pyqtSignal()
 
         def __init__(self, extract, *, netlistdir, pdk, ahdl, engine, donau_cfg, dry_run,
-                     max_parallel=1):
+                     max_parallel=1, work_root=None):
             super().__init__()
             self.extract = extract
             self.netlistdir, self.pdk, self.ahdl = netlistdir, pdk, ahdl
             self.engine, self.donau_cfg, self.dry_run = engine, donau_cfg, dry_run
             self.max_parallel = max_parallel
+            self.work_root = work_root
             self._done_groups = set()                 # indices whose PSF has landed (bar driver)
             self._cancel = False
 
@@ -600,7 +601,7 @@ if _HAVE_QT:
                 out = self.extract.run_cluster_sweep(
                     netlistdir=self.netlistdir, pdk_model_dir=self.pdk or None,
                     ahdllibdir=self.ahdl or None, engine=self.engine, donau=self.donau_cfg,
-                    dry_run=self.dry_run, group_status=self._gs,
+                    dry_run=self.dry_run, group_status=self._gs, work_root=self.work_root,
                     log=lambda m: self.progressed.emit(-1.0, m),
                     cancel=lambda: self._cancel, max_parallel=self.max_parallel)
                 self.done.emit(out)
@@ -987,8 +988,9 @@ if _HAVE_QT:
                 "This is the STATIC dimension; for a load STEP (slew) use the 'trans' column.")
             self._set_header_tip(self.t_vout, "trans",
                 "DYNAMIC / transient load STEP (slew, overshoot, settling) — a DIFFERENT axis from "
-                "'iload sweep'. Form: '<from>:<to>[:label] , …' + optional '@edge=1n,tstop=1u,tstep=…', "
-                "e.g. '20u:3m:slew'. Each step is one transient run. Blank → no slew.")
+                "'iload sweep'. Double-click '…' for the editor: a BASELINE (light) load + TARGET "
+                "(heavy) loads → one baseline→target slew run each, with edge time + sim time. "
+                "Cell form: '<from>:<to>[:label] , …' + optional '@edge=1n,tstop=10u'. Blank → no slew.")
             vgl.addWidget(self._table_block(self.t_vout))
             v.addWidget(vg)
 
@@ -1956,56 +1958,50 @@ if _HAVE_QT:
             return txt
 
         def _open_trans_editor(self, le):
-            """The transient load-STEP editor for a v_out 'trans' cell: a small table of
-            from/to/label steps (slew events) + edge / tstop / tstep timing. Writes the rebuilt
-            cell text back on OK."""
+            """The transient load-STEP editor for a v_out 'trans' cell, in designer terms: a
+            BASELINE (light) load + a list of TARGET (heavy) loads -- each target becomes one
+            baseline→target slew step -- plus the edge time and sim duration. Maps to/from the
+            cell's from:to step format. Writes the rebuilt cell text back on OK."""
             if le is None:
                 return
             f = self._trans_parse_cell(le.text())
+            steps = f["steps"]
+            froms = {s["from"] for s in steps if s.get("from")}
+            baseline = next(iter(froms)) if len(froms) == 1 else (steps[0]["from"] if steps else "")
+            targets = [s["to"] for s in steps if s.get("to")]
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle("Transient load steps (slew)")
             v = QVBoxLayout(dlg)
-            v.addWidget(QLabel("<span style='color:#678'>Each row is a load STEP (slew event): from "
-                               "an initial load to a final load, with an optional label. SI suffixes "
-                               "ok (e.g. 20u → 3m). The timing (edge / tstop / tstep) applies to all "
-                               "steps. This is the DYNAMIC axis; for static DC loads use 'iload "
-                               "sweep'.</span>"))
-            tbl = QTableWidget(0, 3)
-            tbl.setHorizontalHeaderLabels(["from", "to", "label"])
-            tbl.setMaximumHeight(150)
-            for st in f["steps"]:
-                r = tbl.rowCount(); tbl.insertRow(r)
-                tbl.setItem(r, 0, QTableWidgetItem(st.get("from", "")))
-                tbl.setItem(r, 1, QTableWidgetItem(st.get("to", "")))
-                tbl.setItem(r, 2, QTableWidgetItem(st.get("label", "")))
-            v.addWidget(tbl)
-            hb = QHBoxLayout()
-            b_add = QPushButton("+ step"); b_del = QPushButton("− step")
-            b_add.clicked.connect(lambda: tbl.insertRow(tbl.rowCount()))
-            b_del.clicked.connect(lambda: tbl.removeRow(tbl.currentRow() if tbl.currentRow() >= 0
-                                                        else tbl.rowCount() - 1)
-                                  if tbl.rowCount() else None)
-            hb.addWidget(b_add); hb.addWidget(b_del); hb.addStretch(1); v.addLayout(hb)
+            v.addWidget(QLabel("<span style='color:#678'>Load-transient (slew) test: from a "
+                               "<b>baseline</b> (light) load, step up to each <b>target</b> (heavy) "
+                               "load and watch Vout droop &amp; recovery. One run per target. SI "
+                               "suffixes ok. <b>edge</b> = how fast the current switches; <b>tstop</b> "
+                               "= how long to simulate (long enough to see recovery). This is the "
+                               "DYNAMIC axis; static DC loads go in 'iload sweep'.</span>"))
             form = QFormLayout(); v.addLayout(form)
+            e_base = QLineEdit(baseline); e_base.setPlaceholderText("e.g. 100u")
+            e_base.setToolTip("The light/initial load every step starts from.")
+            form.addRow("Baseline (light) load", e_base)
+            e_tg = QLineEdit(", ".join(targets)); e_tg.setPlaceholderText("e.g. 2m, 3m, 4m")
+            e_tg.setToolTip("Heavy loads to step to — one baseline→target slew run per value.")
+            form.addRow("Step to (targets)", e_tg)
             e_edge = QLineEdit(f["edge"]); e_edge.setPlaceholderText("e.g. 1n")
             e_tstop = QLineEdit(f["tstop"]); e_tstop.setPlaceholderText("e.g. 10u")
             e_tstep = QLineEdit(f["tstep"]); e_tstep.setPlaceholderText("optional, e.g. 10n")
-            form.addRow("edge", e_edge); form.addRow("tstop", e_tstop); form.addRow("tstep", e_tstep)
+            form.addRow("Edge time", e_edge); form.addRow("Sim time (tstop)", e_tstop)
+            form.addRow("tstep (optional)", e_tstep)
             brow = QHBoxLayout(); brow.addStretch(1)
             b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
             brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
             b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
-            b_clear.clicked.connect(lambda: (tbl.setRowCount(0), e_edge.clear(), e_tstop.clear(),
-                                             e_tstep.clear(), dlg.accept()))
+            b_clear.clicked.connect(lambda: (e_base.clear(), e_tg.clear(), e_edge.clear(),
+                                             e_tstop.clear(), e_tstep.clear(), dlg.accept()))
             if not dlg.exec_():
                 return
-
-            def _cell(r, c):
-                it = tbl.item(r, c)
-                return it.text().strip() if it else ""
-            steps = [{"from": _cell(r, 0), "to": _cell(r, 1), "label": _cell(r, 2)}
-                     for r in range(tbl.rowCount())]
-            newf = {"steps": steps, "edge": e_edge.text().strip(),
+            base = e_base.text().strip()
+            tgs = [t for t in e_tg.text().replace(",", " ").split() if t]
+            steps2 = [{"from": base, "to": t, "label": t} for t in tgs]  # label = target (nice tag)
+            newf = {"steps": steps2, "edge": e_edge.text().strip(),
                     "tstop": e_tstop.text().strip(), "tstep": e_tstep.text().strip()}
             le.setText(self._trans_render_cell(newf))
 
@@ -3227,6 +3223,21 @@ if _HAVE_QT:
                 "VA itself. Provide a dir only to REUSE a pre-compiled cache (skip per-run/per-node "
                 "recompile on the cluster). Blank ⇒ the simulator compiles from the netlist.")
             bf.addRow("ahdllibdir (optional)", self.xb_ahdl["w"])
+            # Output / work dir: where the sweep writes netlist/psf/npz/model. Prefilled with the
+            # resolved default ($WORK_ROOT env, else ~/ldo_workarea) so the user always sees + can
+            # change where results land, instead of it being an invisible env-only default.
+            self.xb_workdir = self._path_row("xb_workdir", dir_only=True)
+            try:
+                from insitu import pmu_corner as _PCwd
+                self.xb_workdir["edit"].setText(str(_PCwd.resolve_work_root()))
+            except Exception:                                # noqa: BLE001 (never block UI build)
+                pass
+            self.xb_workdir["edit"].setToolTip(
+                "Where this run's simulation outputs are written. Results land under\n"
+                "  <this dir>/ldo_modeling/<tb_lib>__<tb_cell>/<corner>/{netlist,psf,npz,model}\n"
+                "Prefilled with the default ($WORK_ROOT env, else ~/ldo_workarea). Change it to put "
+                "this run's PSF/npz wherever you want.")
+            bf.addRow("Output / work dir", self.xb_workdir["w"])
             _mbhint = QLabel("Only the netlist dir is required — the simulator reads VA + model "
                              "locations from the netlist's own ahdl_include/include lines. A SINGLE "
                              "input.scs is dry/plan-only; a real multi-measurement sweep needs one "
@@ -3650,7 +3661,8 @@ if _HAVE_QT:
                 f"measurement group(s), engine={eng}…")
             self._xw = _ClusterSweepWorker(self.extract, netlistdir=netdir, pdk=pdk, ahdl=ahdl,
                                            engine=eng, donau_cfg=cfg, dry_run=dry,
-                                           max_parallel=self.xd_maxjobs.value())
+                                           max_parallel=self.xd_maxjobs.value(),
+                                           work_root=self.xb_workdir["edit"].text().strip() or None)
             self._xw.group_state.connect(self._x_status_set)
             self._xw.progressed.connect(self._x_progress)
             self._xw.done.connect(self._x_cluster_done)
