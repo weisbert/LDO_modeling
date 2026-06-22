@@ -1130,16 +1130,15 @@ if _HAVE_QT:
             t._analysis_role = analysis_role
             t._analysis_idx = cols.index("analysis") if "analysis" in cols else None
             t._analysis = {}                 # key-text -> {ac?, noise?}
-            # coverage-sweep columns are EDITED VIA A DIALOG (double-click), not inline -- so the
-            # cell is made non-editable (no inline editor races the dialog write-back).
-            _COV_SWEEP_COLS = {"iload sweep", "iv_sweep"}
+            # coverage-sweep columns get a composite cell: an editable QLineEdit (type directly)
+            # PLUS a '…' button that opens the Cadence-style editor. _dialog_cols marks them so the
+            # row builder installs the widget and the readers/writers route through it.
+            _COV_SWEEP_COLS = {"iload sweep", "trans", "iv_sweep"}
             t._dialog_cols = {i for i, c in enumerate(cols) if c in _COV_SWEEP_COLS}
             # [B4] live type-validation: re-colour a typed src/probe-instance name vs the base
             # netlist when its cell is edited. Guarded (reentrancy + role/column filtered) so it
             # is a no-op for every other column and when no base netlist is loaded.
             t.cellChanged.connect(lambda r, c, _t=t: self._on_src_cell_changed(_t, r, c))
-            # [C2] double-click a coverage-sweep cell -> the Cadence-style coverage sweep editor.
-            t.cellDoubleClicked.connect(lambda r, c, _t=t: self._on_cov_cell_dblclick(_t, r, c))
             return t
 
         @staticmethod
@@ -1195,17 +1194,63 @@ if _HAVE_QT:
                     t.setCellWidget(r, c, btn)
                     continue
                 val = "" if values is None else (values[c] if c < len(values) else "")
-                it = QTableWidgetItem(str(val))
-                if c in getattr(t, "_dialog_cols", set()):    # coverage-sweep: dialog-only cell
+                if c in getattr(t, "_dialog_cols", set()):    # coverage-sweep: QLineEdit + '…' button
+                    it = QTableWidgetItem()                    # placeholder item (keeps selection sane)
                     it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
-                    it.setToolTip("Double-click to edit (linear/log sweep + specific points).")
-                elif values is None:                          # placeholder hint on a fresh row
+                    t.setItem(r, c, it)
+                    t.setCellWidget(r, c, _ManifestEditorDialog._make_cov_cell_widget(t, c, str(val)))
+                    continue
+                it = QTableWidgetItem(str(val))
+                if values is None:                            # placeholder hint on a fresh row
                     ex = getattr(t, "_example", [])
                     if c < len(ex):
                         it.setToolTip(f"e.g. {ex[c]}")
                 t.setItem(r, c, it)
             _ManifestEditorDialog._refresh_analysis_cell(t, r)
             return r
+
+        @staticmethod
+        def _make_cov_cell_widget(t, c, text=""):
+            """The composite coverage-sweep cell: an editable QLineEdit (type a sweep directly) +
+            a small '…' button that opens the Cadence-style editor. The QLineEdit is the cell's
+            canonical store (read/written via _cov_edit). `kind` (iload/trans/iv) picks the editor."""
+            cols = getattr(t, "_cols", [])
+            name = cols[c] if c < len(cols) else ""
+            kind = "trans" if name == "trans" else ("iv" if name == "iv_sweep" else "iload")
+            w = QWidget(); h = QHBoxLayout(w); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(1)
+            le = QLineEdit(text); le.setFrame(False)
+            le.setToolTip("Type a sweep directly, or click '…' for the editor.")
+            h.addWidget(le, 1)
+            b = QPushButton("…"); b.setMaximumWidth(22); b.setFocusPolicy(QtCore.Qt.NoFocus)
+            b.setToolTip("Open the sweep/step editor (type / range / step-or-points / specific points).")
+            h.addWidget(b)
+            w._edit = le; w._kind = kind
+            b.clicked.connect(lambda _=False, tt=t, ww=w: _ManifestEditorDialog._cov_edit_clicked(tt, ww))
+            return w
+
+        @staticmethod
+        def _cov_edit(t, r, c):
+            """The QLineEdit of a composite coverage-sweep cell at (r,c), or None for a plain cell.
+            The single accessor every reader/writer uses so a coverage cell is widget- or item-
+            backed transparently."""
+            if c not in getattr(t, "_dialog_cols", set()):
+                return None
+            w = t.cellWidget(r, c)
+            return getattr(w, "_edit", None) if w is not None else None
+
+        @staticmethod
+        def _cov_edit_clicked(t, w):
+            """The '…' button handler: open the right editor for this composite cell's kind,
+            editing its QLineEdit in place. Resolves the owning dialog via t.window()."""
+            dlg = t.window()
+            le = getattr(w, "_edit", None)
+            kind = getattr(w, "_kind", "iload")
+            if le is None:
+                return
+            if kind == "trans" and hasattr(dlg, "_open_trans_editor"):
+                dlg._open_trans_editor(le)
+            elif hasattr(dlg, "_open_cov_sweep_editor"):
+                dlg._open_cov_sweep_editor(le, kind)
 
         @staticmethod
         def _table_del_row(t):
@@ -1221,8 +1266,12 @@ if _HAVE_QT:
             for r in range(t.rowCount()):
                 cells = []
                 for c in range(t.columnCount()):
-                    it = t.item(r, c)
-                    cells.append(it.text().strip() if it else "")
+                    le = _ManifestEditorDialog._cov_edit(t, r, c)   # composite coverage cell?
+                    if le is not None:
+                        cells.append(le.text().strip())
+                    else:
+                        it = t.item(r, c)
+                        cells.append(it.text().strip() if it else "")
                 rows.append(cells)
             return rows
 
@@ -1472,14 +1521,14 @@ if _HAVE_QT:
                 ki = t.item(r, 0)
                 key = ki.text().strip() if ki else ""
                 txt = by_key.get(key, "")
+                le = _ManifestEditorDialog._cov_edit(t, r, ci)    # composite coverage cell?
+                if le is not None:
+                    le.setText(txt or "")
+                    continue
                 it = t.item(r, ci)
                 if it is None:
                     it = QTableWidgetItem(); t.setItem(r, ci, it)
                 it.setText(txt or "")
-                if ci in getattr(t, "_dialog_cols", set()):   # coverage-sweep: dialog-only cell
-                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
-                    if not it.toolTip():
-                        it.setToolTip("Double-click to edit (linear/log sweep + specific points).")
 
         @staticmethod
         def _net_display(net):
@@ -1784,35 +1833,31 @@ if _HAVE_QT:
                 return f"{head} + {tail}"
             return head or tail                              # range-only, points-only, or ''
 
-        def _on_cov_cell_dblclick(self, t, row, col):
-            """Double-click handler: open the coverage sweep editor on a coverage-sweep cell
-            (iload sweep / iv_sweep); no-op for any other cell."""
-            if col not in getattr(t, "_dialog_cols", set()):
-                return
-            item = t.item(row, col)
-            if item is None:
-                item = QTableWidgetItem(); t.setItem(row, col, item)
-                item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
-            cols = getattr(t, "_cols", [])
-            kind = "iv" if (col < len(cols) and cols[col] == "iv_sweep") else "iload"
-            self._open_cov_sweep_editor(item, kind)
+        @staticmethod
+        def _cov_spec_items(swtype):
+            """'Specify by' choices for a coverage sweep: linear -> number of points / step size;
+            log -> number of points only (a log grid is defined by total point count)."""
+            if swtype == "lin":
+                return [("Number of points", "points"), ("Step size", "step")]
+            return [("Number of points", "points")]
 
-        def _open_cov_sweep_editor(self, item, kind="iload"):
-            """The Cadence-style coverage sweep editor (linear/log + range + number of points +
-            specific points). Parses the cell text, lets the user edit, writes the rebuilt cell
-            text back on OK. `kind` ('iv'/'iload') only tunes the labels/units."""
-            if item is None:
+        def _open_cov_sweep_editor(self, le, kind="iload"):
+            """The Cadence-style coverage sweep editor (linear/log + range + number-of-points OR
+            step-size + optional specific points). Parses the cell QLineEdit `le`, lets the user
+            edit, writes the rebuilt cell text back on OK. `kind` ('iv'/'iload') tunes labels/units.
+            The cell stores a point COUNT, so a step size is converted to a count on OK."""
+            if le is None:
                 return
-            f = self._covsweep_parse(item.text())
+            f = self._covsweep_parse(le.text())
             unit = "V" if kind == "iv" else "A"
             title = {"iv": "I-V voltage sweep", "iload": "Load (iload) sweep"}.get(kind, "Coverage sweep")
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle(title)
             v = QVBoxLayout(dlg)
             v.addWidget(QLabel(f"<span style='color:#678'>Cadence-style {title.lower()} ({unit}). "
-                               f"Linear/log range + number of points, plus optional specific points "
-                               f"(land exactly on a knee/compliance value). Leave the range blank "
-                               f"for points-only; Clear for no sweep.</span>"))
+                               f"Linear/log range by point count or step size, plus optional specific "
+                               f"points (land exactly on a knee/compliance value). Leave the range "
+                               f"blank for points-only; Clear for no sweep.</span>"))
             form = QFormLayout(); v.addLayout(form)
             c_type = QComboBox(); c_type.addItem("Linear", "lin"); c_type.addItem("Logarithmic", "log")
             c_type.setCurrentIndex(0 if (f["type"] or "lin") == "lin" else 1)
@@ -1821,25 +1866,148 @@ if _HAVE_QT:
             form.addRow(f"Start ({unit})", e_start)
             e_stop = QLineEdit(f["stop"]); e_stop.setPlaceholderText("e.g. 0.8" if kind == "iv" else "e.g. 2m")
             form.addRow(f"Stop ({unit})", e_stop)
-            e_n = QLineEdit(f["n"]); e_n.setPlaceholderText("e.g. 12")
-            form.addRow("Number of points", e_n)
+            c_spec = QComboBox()
+            e_specv = QLineEdit(f["n"]); e_specv.setPlaceholderText("e.g. 12")
+            form.addRow("Specify by", c_spec)
+            form.addRow("  value", e_specv)
             e_pts = QLineEdit(", ".join(f["points"]))
             e_pts.setPlaceholderText("optional, comma/space-separated")
             e_pts.setToolTip("Specific values to ADD to the swept grid (folded into one Spectre dc "
                              "value list). Useful to land exactly on a knee / compliance point.")
             form.addRow("Add specific points", e_pts)
+
+            def _fill_cov_spec():
+                items = self._cov_spec_items(c_type.currentData())
+                cur = c_spec.currentData()
+                c_spec.blockSignals(True); c_spec.clear()
+                for label, k in items:
+                    c_spec.addItem(label, k)
+                idx = next((i for i, (_l, k) in enumerate(items) if k == cur), 0)
+                c_spec.setCurrentIndex(idx); c_spec.blockSignals(False)
+            _fill_cov_spec()
+            c_type.currentIndexChanged.connect(lambda _i: _fill_cov_spec())
+
             brow = QHBoxLayout(); brow.addStretch(1)
             b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
             brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
             b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
-            b_clear.clicked.connect(lambda: (e_start.clear(), e_stop.clear(), e_n.clear(),
+            b_clear.clicked.connect(lambda: (e_start.clear(), e_stop.clear(), e_specv.clear(),
                                              e_pts.clear(), dlg.accept()))
             if not dlg.exec_():
                 return
             pts = [p for p in e_pts.text().replace(",", " ").split() if p]
-            newf = {"type": c_type.currentData(), "start": e_start.text().strip(),
-                    "stop": e_stop.text().strip(), "n": e_n.text().strip(), "points": pts}
-            item.setText(self._covsweep_render(newf))
+            a, b = e_start.text().strip(), e_stop.text().strip()
+            n_str = ""
+            if c_spec.currentData() == "step":               # step size -> convert to a point count
+                try:
+                    av = self._si_to_float(a); bv = self._si_to_float(b)
+                    step = self._si_to_float(e_specv.text())
+                    if step:
+                        n_str = str(max(int(round((bv - av) / step)) + 1, 2))
+                except ValueError:
+                    n_str = ""
+            else:
+                n_str = e_specv.text().strip()
+            newf = {"type": c_type.currentData(), "start": a, "stop": b, "n": n_str, "points": pts}
+            le.setText(self._covsweep_render(newf))
+
+        # ----------------- transient-step editor (the v_out 'trans' cell)
+        @staticmethod
+        def _trans_parse_cell(text):
+            """Parse a 'trans' cell ('<from>:<to>[:label] , … @edge=…,tstop=…,tstep=…') into editor
+            fields {steps:[{from,to,label}], edge, tstop, tstep} (string-preserving)."""
+            s = (text or "").strip()
+            out = {"steps": [], "edge": "", "tstop": "", "tstep": ""}
+            if not s:
+                return out
+            body, _, tail = s.partition("@")
+            for chunk in body.split(","):
+                chunk = chunk.strip()
+                if not chunk:
+                    continue
+                bits = chunk.split(":")
+                if len(bits) < 2:
+                    continue
+                out["steps"].append({"from": bits[0].strip(), "to": bits[1].strip(),
+                                     "label": bits[2].strip() if len(bits) >= 3 else ""})
+            for kv in tail.replace(" ", "").split(","):
+                if "=" in kv:
+                    k, val = kv.split("=", 1)
+                    if k in ("edge", "tstop", "tstep"):
+                        out[k] = val
+            return out
+
+        @staticmethod
+        def _trans_render_cell(f):
+            """Editor fields -> a 'trans' cell string (matches _trans_to_text's format so it
+            round-trips through _trans_from_text)."""
+            chunks = []
+            for st in f.get("steps", []):
+                a = str(st.get("from", "")).strip(); b = str(st.get("to", "")).strip()
+                lbl = str(st.get("label", "")).strip()
+                if not (a and b):
+                    continue
+                chunks.append(f"{a}:{b}:{lbl}" if lbl else f"{a}:{b}")
+            txt = " , ".join(chunks)
+            tail = [f"{k}={str(f.get(k)).strip()}" for k in ("edge", "tstop", "tstep")
+                    if str(f.get(k) or "").strip()]
+            if tail:
+                txt = (txt + " @" + ",".join(tail)) if txt else ("@" + ",".join(tail))
+            return txt
+
+        def _open_trans_editor(self, le):
+            """The transient load-STEP editor for a v_out 'trans' cell: a small table of
+            from/to/label steps (slew events) + edge / tstop / tstep timing. Writes the rebuilt
+            cell text back on OK."""
+            if le is None:
+                return
+            f = self._trans_parse_cell(le.text())
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Transient load steps (slew)")
+            v = QVBoxLayout(dlg)
+            v.addWidget(QLabel("<span style='color:#678'>Each row is a load STEP (slew event): from "
+                               "an initial load to a final load, with an optional label. SI suffixes "
+                               "ok (e.g. 20u → 3m). The timing (edge / tstop / tstep) applies to all "
+                               "steps. This is the DYNAMIC axis; for static DC loads use 'iload "
+                               "sweep'.</span>"))
+            tbl = QTableWidget(0, 3)
+            tbl.setHorizontalHeaderLabels(["from", "to", "label"])
+            tbl.setMaximumHeight(150)
+            for st in f["steps"]:
+                r = tbl.rowCount(); tbl.insertRow(r)
+                tbl.setItem(r, 0, QTableWidgetItem(st.get("from", "")))
+                tbl.setItem(r, 1, QTableWidgetItem(st.get("to", "")))
+                tbl.setItem(r, 2, QTableWidgetItem(st.get("label", "")))
+            v.addWidget(tbl)
+            hb = QHBoxLayout()
+            b_add = QPushButton("+ step"); b_del = QPushButton("− step")
+            b_add.clicked.connect(lambda: tbl.insertRow(tbl.rowCount()))
+            b_del.clicked.connect(lambda: tbl.removeRow(tbl.currentRow() if tbl.currentRow() >= 0
+                                                        else tbl.rowCount() - 1)
+                                  if tbl.rowCount() else None)
+            hb.addWidget(b_add); hb.addWidget(b_del); hb.addStretch(1); v.addLayout(hb)
+            form = QFormLayout(); v.addLayout(form)
+            e_edge = QLineEdit(f["edge"]); e_edge.setPlaceholderText("e.g. 1n")
+            e_tstop = QLineEdit(f["tstop"]); e_tstop.setPlaceholderText("e.g. 10u")
+            e_tstep = QLineEdit(f["tstep"]); e_tstep.setPlaceholderText("optional, e.g. 10n")
+            form.addRow("edge", e_edge); form.addRow("tstop", e_tstop); form.addRow("tstep", e_tstep)
+            brow = QHBoxLayout(); brow.addStretch(1)
+            b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
+            brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
+            b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
+            b_clear.clicked.connect(lambda: (tbl.setRowCount(0), e_edge.clear(), e_tstop.clear(),
+                                             e_tstep.clear(), dlg.accept()))
+            if not dlg.exec_():
+                return
+
+            def _cell(r, c):
+                it = tbl.item(r, c)
+                return it.text().strip() if it else ""
+            steps = [{"from": _cell(r, 0), "to": _cell(r, 1), "label": _cell(r, 2)}
+                     for r in range(tbl.rowCount())]
+            newf = {"steps": steps, "edge": e_edge.text().strip(),
+                    "tstop": e_tstop.text().strip(), "tstep": e_tstep.text().strip()}
+            le.setText(self._trans_render_cell(newf))
 
         @staticmethod
         def _loads_to_text(spec):
@@ -4975,6 +5143,21 @@ def _selftest_manifest_editor(win, tmp):
     assert d["points"] == [0.45, 0.9]
     assert _IVC(_IVT(d)) == d                                    # dict -> cell -> dict round-trip
     assert _IVC("0.3,0.6,0.9") == {"points": [0.3, 0.6, 0.9]}    # iv points-only
+    # [#3] coverage sweep editor 'Specify by': linear offers points+step, log offers points only
+    assert [k for _l, k in _ManifestEditorDialog._cov_spec_items("lin")] == ["points", "step"]
+    assert [k for _l, k in _ManifestEditorDialog._cov_spec_items("log")] == ["points"]
+    # [#1] transient-step editor cell parse<->render (steps + edge/tstop/tstep), round-trips
+    _TP = _ManifestEditorDialog._trans_parse_cell
+    _TR = _ManifestEditorDialog._trans_render_cell
+    tf = _TP("20u:3m:slew , 0:6m @edge=1n,tstop=10u")
+    assert tf["steps"] == [{"from": "20u", "to": "3m", "label": "slew"},
+                           {"from": "0", "to": "6m", "label": ""}]
+    assert tf["edge"] == "1n" and tf["tstop"] == "10u" and tf["tstep"] == ""
+    assert _TR(tf) == "20u:3m:slew , 0:6m @edge=1n,tstop=10u"
+    assert _TR(_TP("2m:3m , 3m:4m")) == "2m:3m , 3m:4m"          # labelless steps round-trip
+    assert _TR(_TP("")) == ""                                    # empty -> empty
+    # the editor cell text still parses to the canonical coverage.transient dict
+    assert _ManifestEditorDialog._trans_from_text("2m:3m:s @edge=1n")["steps"][0]["to"] == 3e-3
 
     # 5j) [2.1/2.5] NO column stretches (a Stretch column swallows the viewport and balloons the
     #     dialog ~3400px wide); every column is Interactive with a compact fixed width, for ALL
@@ -5018,9 +5201,11 @@ def _selftest_manifest_editor(win, tmp):
     vrows = {dlgc.t_vout.item(r, 0).text(): r for r in range(dlgc.t_vout.rowCount())}
     irows = {dlgc.t_iout.item(r, 0).text(): r for r in range(dlgc.t_iout.rowCount())}
     _vc = dlgc.t_vout._cols
-    il_txt = dlgc.t_vout.item(vrows["vco"], _vc.index("iload sweep")).text()
-    tr_txt = dlgc.t_vout.item(vrows["vco"], _vc.index("trans")).text()
-    iv_txt = dlgc.t_iout.item(irows["i3p6u_vco"], dlgc.t_iout._cols.index("iv_sweep")).text()
+    # coverage-sweep cells are composite widgets now (QLineEdit + '…' button) -> read via _cov_edit
+    il_txt = _ManifestEditorDialog._cov_edit(dlgc.t_vout, vrows["vco"], _vc.index("iload sweep")).text()
+    tr_txt = _ManifestEditorDialog._cov_edit(dlgc.t_vout, vrows["vco"], _vc.index("trans")).text()
+    iv_txt = _ManifestEditorDialog._cov_edit(dlgc.t_iout, irows["i3p6u_vco"],
+                                             dlgc.t_iout._cols.index("iv_sweep")).text()
     assert il_txt.startswith("log ") and "+" in il_txt, f"iload sweep cell not rendered: {il_txt!r}"
     assert "slew" in tr_txt and "lin" in tr_txt, f"trans cell not rendered: {tr_txt!r}"
     assert iv_txt.startswith("lin "), f"iv_sweep cell not rendered: {iv_txt!r}"
@@ -5044,7 +5229,7 @@ def _selftest_manifest_editor(win, tmp):
     okc, msgc = dlgc._check()
     assert okc, f"coverage-carrying manifest must validate, got: {msgc}"
     # an empty CELL drops just that key (clear the iload-sweep cell -> loads.vco gone, others stay)
-    dlgc.t_vout.item(vrows["vco"], _vc.index("iload sweep")).setText("")
+    _ManifestEditorDialog._cov_edit(dlgc.t_vout, vrows["vco"], _vc.index("iload sweep")).setText("")
     cd2 = dlgc._form_to_dict()["coverage"]
     assert "loads" not in cd2, "cleared iload cell must drop the (now empty) loads sub-dict"
     assert "transient" in cd2 and "iv" in cd2, "clearing one cell must not drop the others"
