@@ -1045,12 +1045,14 @@ if _HAVE_QT:
                                "<b>analysis</b> column.</span>"))
             self.f_ac = QLineEdit()
             self.f_ac.setPlaceholderText("ac start=10 stop=500M dec=20")
-            self.f_ac.setToolTip("Global default AC sweep (Zout / PSRR).")
-            simf.addRow("analysis.ac", self.f_ac)
+            self.f_ac.setToolTip("Global default AC sweep (Zout / PSRR). Use Edit… for the "
+                                 "Cadence-style sweep dialog.")
+            simf.addRow("analysis.ac", self._with_sweep_editor(self.f_ac, "ac"))
             self.f_noise = QLineEdit()
             self.f_noise.setPlaceholderText("noise start=10 stop=100M dec=20")
-            self.f_noise.setToolTip("Global default noise sweep.")
-            simf.addRow("analysis.noise", self.f_noise)
+            self.f_noise.setToolTip("Global default noise sweep. Use Edit… for the Cadence-style "
+                                    "sweep dialog.")
+            simf.addRow("analysis.noise", self._with_sweep_editor(self.f_noise, "noise"))
             # Corner label (a run/output-dir label, NOT a PDK process corner). Replaces the
             # pull_from_session checkbox + the multi-value fallback line (both relocated/dropped).
             self.f_corner = QLineEdit("nom")
@@ -1281,13 +1283,15 @@ if _HAVE_QT:
             form = QFormLayout(); pv.addLayout(form)
             e_ac = QLineEdit(cur.get("ac", ""))
             e_ac.setPlaceholderText((g_ac.text() if g_ac else "") or "ac start=10 stop=500M dec=20")
-            form.addRow("AC sweep", e_ac)
+            form.addRow("AC sweep", dlg._with_sweep_editor(e_ac, "ac")
+                        if hasattr(dlg, "_with_sweep_editor") else e_ac)
             e_noise = None
             if with_noise:
                 e_noise = QLineEdit(cur.get("noise", ""))
                 e_noise.setPlaceholderText((g_noise.text() if g_noise else "")
                                            or "noise start=10 stop=100M dec=20")
-                form.addRow("Noise sweep", e_noise)
+                form.addRow("Noise sweep", dlg._with_sweep_editor(e_noise, "noise")
+                            if hasattr(dlg, "_with_sweep_editor") else e_noise)
             brow = QHBoxLayout()
             b_ok = QPushButton("OK"); b_clear = QPushButton("Clear override")
             b_cancel = QPushButton("Cancel")
@@ -1537,6 +1541,156 @@ if _HAVE_QT:
                 if 1.0 <= abs(scaled) < 1000.0:
                     return f"{scaled:g}{suf}"
             return f"{v:g}"
+
+        # ------------------------------------------------ Cadence-style sweep editor (Block C)
+        @staticmethod
+        def _split_brackets(s):
+            """Whitespace-split a sweep string but keep a [...] group (Spectre `values=[a b c]`,
+            which may contain spaces) as ONE token, so a bracketed list is never shattered."""
+            toks, buf, depth = [], [], 0
+            for ch in str(s):
+                if ch == "[":
+                    depth += 1; buf.append(ch)
+                elif ch == "]":
+                    depth = max(0, depth - 1); buf.append(ch)
+                elif ch.isspace() and depth == 0:
+                    if buf:
+                        toks.append("".join(buf)); buf = []
+                else:
+                    buf.append(ch)
+            if buf:
+                toks.append("".join(buf))
+            return toks
+
+        @staticmethod
+        def _sweep_parse(s):
+            """Parse a sweep string ('ac start=10 stop=500M dec=20 values=[1 2 3]') into the dict
+            the sweep editor edits. The sweep token (lin/step/dec/log) sets both the TYPE (lin/step
+            -> linear; dec/log -> log) and the spec-kind. Unrecognised key=val / bare tokens are
+            preserved verbatim in 'extra' so a round-trip never drops them. Returns dict:
+              {name, type:'lin'|'log', start, stop, spec_kind:'lin'|'step'|'dec'|'log'|'',
+               spec_val, values:[str,...], extra:[str,...]}  (start/stop/spec_val/values raw)."""
+            toks = _ManifestEditorDialog._split_brackets((s or "").strip())
+            f = {"name": "", "type": "log", "start": "", "stop": "",
+                 "spec_kind": "", "spec_val": "", "values": [], "extra": []}
+            if toks and "=" not in toks[0]:
+                f["name"] = toks[0]; toks = toks[1:]
+            for t in toks:
+                if "=" not in t:
+                    f["extra"].append(t); continue
+                k, v = t.split("=", 1)
+                if k in ("lin", "step", "dec", "log"):
+                    f["spec_kind"] = k; f["spec_val"] = v
+                    f["type"] = "log" if k in ("dec", "log") else "lin"
+                elif k == "start":
+                    f["start"] = v
+                elif k == "stop":
+                    f["stop"] = v
+                elif k == "values":
+                    inner = v.strip().lstrip("[").rstrip("]")
+                    f["values"] = [p for p in inner.replace(",", " ").split() if p]
+                else:
+                    f["extra"].append(t)
+            return f
+
+        @staticmethod
+        def _sweep_render(f):
+            """Render a sweep-editor dict back to a canonical sweep string. Emits
+            '<name> start=<a> stop=<b> <spec_kind>=<spec_val> values=[p1 p2 ...] <extra...>',
+            dropping any empty piece. Spectre's `values=[...]` uses space separation."""
+            parts = [f.get("name") or "ac"]
+            if f.get("start"):
+                parts.append(f"start={f['start']}")
+            if f.get("stop"):
+                parts.append(f"stop={f['stop']}")
+            sk, sv = f.get("spec_kind"), f.get("spec_val")
+            if sk and sv:
+                parts.append(f"{sk}={sv}")
+            vals = f.get("values") or []
+            if vals:
+                parts.append("values=[" + " ".join(str(p) for p in vals) + "]")
+            parts.extend(f.get("extra") or [])
+            return " ".join(parts)
+
+        def _with_sweep_editor(self, edit, default_name):
+            """Wrap a sweep QLineEdit + an 'Edit…' button in one widget (for QFormLayout.addRow).
+            The QLineEdit stays the canonical string store; the button opens the Cadence-style
+            editor, which parses the current string and writes the rebuilt string back."""
+            cont = QWidget(); h = QHBoxLayout(cont)
+            h.setContentsMargins(0, 0, 0, 0); h.setSpacing(4)
+            h.addWidget(edit, 1)
+            b = QPushButton("Edit…"); b.setMaximumWidth(58)
+            b.setToolTip("Open the Cadence-style sweep editor: linear/log, range, step-or-points, "
+                         "plus optional specific added points.")
+            b.clicked.connect(lambda _=False, e=edit, n=default_name: self._open_sweep_editor(e, n))
+            h.addWidget(b)
+            return cont
+
+        @staticmethod
+        def _spec_items(swtype):
+            """The 'Specify by' choices for a sweep type: [(label, kind), ...]. Linear -> number of
+            points (lin) / step size (step); Log -> points per decade (dec) / number of steps (log)."""
+            if swtype == "lin":
+                return [("Number of points", "lin"), ("Step size", "step")]
+            return [("Points per decade", "dec"), ("Number of steps", "log")]
+
+        def _open_sweep_editor(self, edit, default_name="ac"):
+            """The Cadence-style sweep editor dialog. Parses edit's current string, lets the user
+            set type / start / stop / specify-by / specific points, and writes the rebuilt string
+            back into edit on OK. edit (a QLineEdit) remains the single source of truth."""
+            f = self._sweep_parse(edit.text())
+            if not f.get("name"):
+                f["name"] = default_name
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle(f"Sweep editor — {f['name']}")
+            v = QVBoxLayout(dlg)
+            v.addWidget(QLabel("<span style='color:#678'>Cadence-style sweep. The result is written "
+                               "back as a Spectre sweep string. SI suffixes ok (10, 500M, 1k).</span>"))
+            form = QFormLayout(); v.addLayout(form)
+
+            c_type = QComboBox(); c_type.addItem("Linear", "lin"); c_type.addItem("Logarithmic", "log")
+            c_type.setCurrentIndex(0 if f["type"] == "lin" else 1)
+            form.addRow("Sweep type", c_type)
+            e_start = QLineEdit(f["start"]); e_start.setPlaceholderText("e.g. 10")
+            form.addRow("Start", e_start)
+            e_stop = QLineEdit(f["stop"]); e_stop.setPlaceholderText("e.g. 500M")
+            form.addRow("Stop", e_stop)
+            c_spec = QComboBox()
+            e_specv = QLineEdit(f["spec_val"]); e_specv.setPlaceholderText("e.g. 20")
+            form.addRow("Specify by", c_spec)
+            form.addRow("  value", e_specv)
+            e_points = QLineEdit(", ".join(f["values"]))
+            e_points.setPlaceholderText("optional, comma/space-separated, e.g. 304M, 1.2G")
+            e_points.setToolTip("Specific frequencies to ADD to the swept grid (Spectre "
+                                "values=[...]). Useful to land exactly on a known resonance/spur.")
+            form.addRow("Add specific points", e_points)
+
+            def _fill_spec(want_kind):
+                items = self._spec_items("lin" if c_type.currentData() == "lin" else "log")
+                c_spec.blockSignals(True); c_spec.clear()
+                for label, kind in items:
+                    c_spec.addItem(label, kind)
+                idx = next((i for i, (_l, k) in enumerate(items) if k == want_kind), 0)
+                c_spec.setCurrentIndex(idx)
+                c_spec.blockSignals(False)
+
+            _fill_spec(f["spec_kind"])
+            # switching type re-populates the specify-by choices (keeping the kind if still valid)
+            c_type.currentIndexChanged.connect(lambda _i: _fill_spec(c_spec.currentData()))
+
+            brow = QHBoxLayout(); brow.addStretch(1)
+            b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
+            brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
+            b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
+            if not dlg.exec_():
+                return
+            pts = [p for p in e_points.text().replace(",", " ").split() if p]
+            newf = {"name": f["name"],
+                    "type": "lin" if c_type.currentData() == "lin" else "log",
+                    "start": e_start.text().strip(), "stop": e_stop.text().strip(),
+                    "spec_kind": c_spec.currentData(), "spec_val": e_specv.text().strip(),
+                    "values": pts, "extra": f.get("extra") or []}
+            edit.setText(self._sweep_render(newf))
 
         @staticmethod
         def _loads_to_text(spec):
@@ -4597,6 +4751,32 @@ def _selftest_manifest_editor(win, tmp):
     assert dlg11._validate_src_cell(dlg11.t_vout, 0, base_text=base_txt) == "absent"
     dlg11.t_vout.item(0, 2).setText("")                        # blank -> auto-insert
     assert dlg11._validate_src_cell(dlg11.t_vout, 0, base_text=base_txt) == "blank"
+
+    # 5i-quater) [C] Cadence-style sweep editor parse<->render round-trips. The QLineEdit string
+    #     stays the canonical store; the editor only re-parses then re-renders it. The sweep token
+    #     (lin/step/dec/log) carries BOTH the type and the specify-by kind.
+    _SP = _ManifestEditorDialog._sweep_parse
+    _SR = _ManifestEditorDialog._sweep_render
+    f = _SP("ac start=10 stop=500M lin=20")                     # linear by number of points
+    assert f["type"] == "lin" and f["spec_kind"] == "lin" and f["spec_val"] == "20"
+    assert f["start"] == "10" and f["stop"] == "500M" and f["name"] == "ac"
+    assert _SR(f) == "ac start=10 stop=500M lin=20"
+    f = _SP("ac start=0 stop=1 step=0.01")                      # linear by step size
+    assert f["type"] == "lin" and f["spec_kind"] == "step" and _SR(f) == "ac start=0 stop=1 step=0.01"
+    f = _SP("ac start=10 stop=1G dec=20")                       # log by points-per-decade
+    assert f["type"] == "log" and f["spec_kind"] == "dec" and _SR(f) == "ac start=10 stop=1G dec=20"
+    f = _SP("noise start=1 stop=1M log=50")                     # log by number of steps
+    assert f["type"] == "log" and f["spec_kind"] == "log" and f["name"] == "noise"
+    assert _SR(f) == "noise start=1 stop=1M log=50"
+    f = _SP("ac start=10 stop=1G dec=20 values=[304M 1.2G]")    # specific points survive (C2)
+    assert f["values"] == ["304M", "1.2G"]
+    assert _SR(f) == "ac start=10 stop=1G dec=20 values=[304M 1.2G]"
+    f = _SP("ac start=10 stop=1G dec=20 values=[1,2,3]")        # comma list normalises to spaces
+    assert f["values"] == ["1", "2", "3"] and "values=[1 2 3]" in _SR(f)
+    f = _SP("ac start=10 stop=1G dec=20 errpreset=conservative")  # unknown tokens preserved
+    assert "errpreset=conservative" in f["extra"]
+    assert _SR(f).endswith("errpreset=conservative")
+    assert _ManifestEditorDialog._split_brackets("a b=[1 2] c") == ["a", "b=[1 2]", "c"]
 
     # 5j) [2.1/2.5] NO column stretches (a Stretch column swallows the viewport and balloons the
     #     dialog ~3400px wide); every column is Interactive with a compact fixed width, for ALL

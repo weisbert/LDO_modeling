@@ -33,7 +33,32 @@ other insitu modules (run/augment/resolve/probe_ade) that local-import it on dem
 # on the designer's test: asiGetAnalysisFieldVal returns '' for a valid-but-empty field and
 # nil for a non-field). We only push manifest tokens whose key is one of these.
 _ANALYSIS_KEYS = ("start", "stop", "dec", "lin", "log", "step", "center", "span", "freq",
-                  "oprobe", "iprobe", "p", "n", "outType", "inType", "sweeptype", "noisetype")
+                  "oprobe", "iprobe", "p", "n", "outType", "inType", "sweeptype", "noisetype",
+                  # `values=[...]` = specific added sweep points (Cadence-style sweep editor). The
+                  # CLI/ALPS path emits this token verbatim into the Spectre netlist (native). For
+                  # the ADE-live path the sev FIELD NAME for added points is NOT confirmed offline
+                  # -- TODO(box-validate): on the box, read the real ac/noise form field via
+                  # asiGetAnalysisFieldVal and rename here if it is not literally 'values'.
+                  "values")
+
+
+def _split_brackets(line):
+    """Whitespace-split an analysis line but keep a [...] group (Spectre `values=[a b c]`, which
+    may contain spaces) as ONE token, so a bracketed list is not shattered by the plain split."""
+    toks, buf, depth = [], [], 0
+    for ch in str(line):
+        if ch == "[":
+            depth += 1; buf.append(ch)
+        elif ch == "]":
+            depth = max(0, depth - 1); buf.append(ch)
+        elif ch.isspace() and depth == 0:
+            if buf:
+                toks.append("".join(buf)); buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        toks.append("".join(buf))
+    return toks
 
 
 def _ts(ws, sess, test):
@@ -59,8 +84,9 @@ def inherit_vars(ws, sess, src_test, dst_test):
 
 def parse_analysis(line):
     """'ac start=10 stop=500M dec=20' -> ('ac', {'start':'10','stop':'500M','dec':'20'}).
-    Keeps only key=val tokens whose key is a real sev field (drops anything else)."""
-    toks = str(line).split()
+    Keeps only key=val tokens whose key is a real sev field (drops anything else). Bracket-aware,
+    so `values=[10 20 30]` (spaces inside the list) stays one field instead of shattering."""
+    toks = _split_brackets(line)
     name = toks[0]
     fields = {}
     for t in toks[1:]:
