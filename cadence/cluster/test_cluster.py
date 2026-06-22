@@ -121,6 +121,28 @@ def test_mt_matches_cpu_count():
     assert "-mt" in cmd and cmd[cmd.index("-mt") + 1] == "16"
 
 
+def test_model_tree_root_appends_engine():
+    # a model ROOT -> the engine subtree is appended
+    assert alps_cli._engine_model_tree("/pdk/c1x", "alps") == "/pdk/c1x/alps"
+    assert alps_cli._engine_model_tree("/pdk/c1x/", "spectre") == "/pdk/c1x/spectre"
+
+
+def test_model_tree_engine_leaf_used_as_is():
+    # already the engine leaf tree -> NOT doubled
+    assert alps_cli._engine_model_tree("/pdk/c1x/alps", "alps") == "/pdk/c1x/alps"
+
+
+def test_model_tree_scs_file_uses_its_dir_not_double_append():
+    # REGRESSION (designer report): pasting the toplevel .scs FILE must use its DIRECTORY, never
+    # append '/<engine>' onto the file path ('$MODEL_ROOT/alps/toplevel.scs/alps' was the bug).
+    assert alps_cli._engine_model_tree("/m/alps/toplevel.scs", "alps") == "/m/alps"
+    assert alps_cli._engine_model_tree("/m/spectre/toplevel.scs", "spectre") == "/m/spectre"
+    # and end to end through build_sim_cmd: the -I is the dir, no stray /alps after the file
+    s = _join(alps_cli.build_sim_cmd("alps", "input.scs", "../psf",
+                                     "/m/alps/toplevel.scs", mt=8))
+    assert "-I /m/alps " in s + " " and "toplevel.scs/alps" not in s
+
+
 def test_alps_wrapper_normalisation():
     # root, .../bin and .../bin/alps all normalise to the wrapper launcher
     for w in ("/x/alps/2026.03.hf1", "/x/alps/2026.03.hf1/", "/x/alps/2026.03.hf1/bin",

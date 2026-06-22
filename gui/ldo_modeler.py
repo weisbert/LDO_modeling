@@ -3207,11 +3207,14 @@ if _HAVE_QT:
             bf.addRow("Netlist dir (input.scs) *", self.xb_netlist["w"])
             self.xb_pdk = self._path_row("xb_pdk", dir_only=True)
             self.xb_pdk["edit"].setToolTip(
-                "OPTIONAL. The PDK model ROOT (its {alps,spectre} subtree is added to the sim's "
-                "-I). Leave BLANK if the netlist's own `include` lines already point at the models "
-                "(self-contained). Fill it only when the netlist uses a bare include that needs -I.\n"
-                "Default: when $MODEL_ROOT is set and this is blank, the engine picks the subtree "
-                "($MODEL_ROOT/spectre for Spectre, $MODEL_ROOT/alps for ALPS). Overridable.")
+                "OPTIONAL. An include SEARCH DIRECTORY (the sim's -I), NOT the toplevel.scs file. "
+                "It's where `include \"toplevel.scs\"` is resolved. Give either the model ROOT "
+                "($MODEL_ROOT — the {alps,spectre} subtree is appended) or the engine dir itself "
+                "($MODEL_ROOT/alps), used as-is. If you paste the toplevel.scs FILE path, its "
+                "containing directory is used (no '/alps' is tacked onto a file).\n"
+                "Leave BLANK if the netlist's own `include` lines already point at the models "
+                "(self-contained). Default: when $MODEL_ROOT is set and this is blank, the engine "
+                "picks the subtree ($MODEL_ROOT/spectre for Spectre, $MODEL_ROOT/alps for ALPS).")
             self.xb_pdk["edit"].setPlaceholderText(self._pdk_default_for(self.x_backend.currentData())
                                                    or "optional — only if the netlist needs an -I model tree")
             bf.addRow("PDK model dir (optional)", self.xb_pdk["w"])

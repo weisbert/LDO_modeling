@@ -97,9 +97,16 @@ def build_sim_cmd(engine, input_scs, out_psf, model_dir=None, ahdllibdir=None, m
 
 
 def _engine_model_tree(model_dir, engine):
-    """Append the engine's PDK subtree ({alps,spectre}) to the model ROOT, unless the caller
-    already passed the leaf tree (path ends in the engine name)."""
+    """The `-I` include SEARCH DIRECTORY for the engine's PDK subtree. `-I` is a DIRECTORY (where
+    `include "toplevel.scs"` is resolved), never a file. Rules, in order:
+      * a path pointing at a `.scs` FILE -> its containing directory, used as-is (the common
+        footgun: pasting the model FILE, e.g. $MODEL_ROOT/alps/toplevel.scs -- we must NOT then
+        append '/<engine>' onto a file path, which produced '.../toplevel.scs/alps');
+      * a path whose leaf already IS the engine name ('.../alps') -> used as-is;
+      * otherwise treat it as the model ROOT and append the engine subtree ('.../<engine>')."""
     d = str(model_dir).rstrip("/")
-    if d.rsplit("/", 1)[-1] == engine:
+    if d.lower().endswith(".scs"):                 # the model FILE -> its directory (no append)
+        return d.rsplit("/", 1)[0] if "/" in d else "."
+    if d.rsplit("/", 1)[-1] == engine:             # already the engine leaf tree
         return d
-    return f"{d}/{engine}"
+    return f"{d}/{engine}"                          # model ROOT -> append the engine subtree
