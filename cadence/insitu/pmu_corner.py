@@ -322,6 +322,18 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
     pending = list(enumerate(grps))                    # FIFO of (i, g)
     inflight = {}                                      # job_id -> ctx dict
     cancelling = False
+    failures = []                                      # (tag, reason) -- groups that errored
+
+    def _fail_group(i, g, reason):
+        """Mark ONE group failed and keep going (RESILIENCE): a single group's submit/job/verify
+        error must NOT abort the whole sweep and leave the other groups' rows frozen. Every group
+        gets a terminal status; the summary is raised AFTER the loop drains."""
+        if group_status:
+            group_status(i, n, g, "failed")
+        failures.append((g["tag"], str(reason)))
+        _progress(progress, "run",
+                  f"group {i+1}/{n} {g['tag']}: FAILED -- {str(reason).splitlines()[0]}")
+
     while pending or inflight:
         # (1) launch up to the cap (unless cancelling)
         while (not cancelling) and pending and len(inflight) < max(1, max_parallel):
@@ -332,10 +344,14 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
             tag = g["tag"]
             if group_status:
                 group_status(i, n, g, "pending")       # emit BEFORE netlist/submit
-            netdir = group_netlister(g)                # the seam -> this group's netlist dir
-            sub = _runc.submit_corner(
-                netdir, netinfo["pdk_model_dir"], netinfo["ahdllibdir"],
-                str(psf_root / tag), engine=engine, donau=cfg, runner=runner)
+            try:
+                netdir = group_netlister(g)            # the seam -> this group's netlist dir
+                sub = _runc.submit_corner(
+                    netdir, netinfo["pdk_model_dir"], netinfo["ahdllibdir"],
+                    str(psf_root / tag), engine=engine, donau=cfg, runner=runner)
+            except Exception as e:                     # noqa: BLE001 netlist/submit error
+                _fail_group(i, g, f"netlist/submit error: {e}")
+                continue                               # next pending group, do not abort the sweep
             dsub_cmds.append(sub["dsub_cmd"])          # one per launched group, in group order
             _progress(progress, "run", f"group {i+1}/{n} {tag}: submitting")
             inflight[sub["job_id"]] = dict(i=i, g=g, out_abs=sub["out_abs"],
@@ -362,16 +378,20 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
                 _progress(progress, "run",
                           f"group {i+1}/{n} {tag}: Donau job {state.upper()}")
             if state == "failed":
-                if group_status:
-                    group_status(ctx["i"], n, ctx["g"], "failed")
                 tail = _donau.peek_tail(job_id, runner)
-                raise _runc.RunCornerError(
-                    f"group {ctx['g']['tag']} (job {job_id}) FAILED"
-                    + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
+                _fail_group(ctx["i"], ctx["g"], f"Donau job {job_id} FAILED"
+                            + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
+                del inflight[job_id]
+                continue
             if state == "done":
-                out = _runc.finalize_corner(ctx["out_abs"],
-                                            require_simdone=ctx["require_simdone"],
-                                            job_id=job_id, runner=runner)
+                try:
+                    out = _runc.finalize_corner(ctx["out_abs"],
+                                                require_simdone=ctx["require_simdone"],
+                                                job_id=job_id, runner=runner)
+                except _runc.RunCornerError as e:      # PSF verify failed -> fail THIS group only
+                    _fail_group(ctx["i"], ctx["g"], e)
+                    del inflight[job_id]
+                    continue
                 _progress(progress, "run",
                           f"group {ctx['i']+1}/{n} {ctx['g']['tag']}: PSF landed: {out}")
                 for pt in ctx["g"]["members"]:         # map EVERY member tag at this group PSF
@@ -382,9 +402,11 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
                 continue
             ctx["waited"] += poll_interval
             if ctx["waited"] >= poll_timeout:
-                raise _runc.RunCornerError(
-                    f"job {job_id} (group {ctx['g']['tag']}) did not finish within "
-                    f"{poll_timeout:.0f}s. Check djob/dpeek; the cluster job may be hung.")
+                _fail_group(ctx["i"], ctx["g"],
+                            f"job {job_id} did not finish within {poll_timeout:.0f}s "
+                            f"(check djob/dpeek; the cluster job may be hung)")
+                del inflight[job_id]
+                continue
         # (3) a cancel stops launching NEW groups; the in-flight ones above already drained
         if cancel and cancel():
             cancelling = True
@@ -395,6 +417,15 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
     if cancelling and pending:
         raise _run.CancelledError(
             f"cluster sweep cancelled ({len(pending)} group(s) not started)")
+    if failures:
+        # ALL groups reached a terminal state (no frozen rows); now report the failures together.
+        # Raising keeps the contract (a partial sweep can't feed import/fit); the per-group table
+        # already shows which succeeded vs failed.
+        head = "; ".join(f"{tag}: {reason.splitlines()[0]}" for tag, reason in failures)
+        body = "\n\n".join(f"[{tag}]\n{reason}" for tag, reason in failures)
+        raise _runc.RunCornerError(
+            f"{len(failures)}/{n} group(s) FAILED (the other {n - len(failures)} completed): "
+            f"{head}\n\n{body}")
     return dict(psf_map=psf_map, dsub_cmds=dsub_cmds, ran=True)
 
 

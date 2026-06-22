@@ -638,6 +638,36 @@ def test_step_run_defaults_runner_when_none(tmp_path, monkeypatch):
     assert len(runres["dsub_cmds"]) == len(grps)
 
 
+def test_step_run_resilient_one_group_fails_others_finish(tmp_path):
+    """RESILIENCE (designer report): one group's PSF verify failing used to ABORT the whole sweep,
+    freezing every other group's row forever. Now each group reaches a terminal state and the
+    failures are summarised at the END. Sabotage one group's PSF (empty dir -> hard verify fail);
+    assert every group ends done/failed (no freeze) and the summary names the failed one."""
+    m = _resolved_wur_manifest()
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    grps = RUN.groups(m)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    gnl = NA.make_offline_group_netlister(base, m, dirs["netlist"])
+    _seed_all_group_psf(dirs, grps)
+    victim = grps[0]["tag"]
+    for f in (dirs["psf"] / victim).iterdir():        # empty ONE group's PSF -> finalize fails
+        f.unlink()
+    netinfo = PC.step_netlist(dirs, netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"))
+    events = []
+    with pytest.raises(PC._runc.RunCornerError) as ei:
+        PC.step_run(netinfo, dirs["psf"], m, engine="alps", runner=FakeRunner(),
+                    group_netlister=gnl, sleep=lambda *_: None,
+                    group_status=lambda i, n, g, st: events.append((g["tag"], st)))
+    terminal = {tag: st for tag, st in events if st in ("done", "failed")}
+    assert set(terminal) == {g["tag"] for g in grps}, "every group must end done/failed (no freeze)"
+    assert terminal[victim] == "failed"
+    assert all(st == "done" for t, st in terminal.items() if t != victim)
+    msg = str(ei.value)
+    assert victim in msg and "FAILED" in msg and "completed" in msg   # full summary, not bail-on-1
+
+
 def test_step_run_cancel_between_groups(tmp_path):
     """A cancel() that turns True after the first group stops the sweep with CancelledError
     BETWEEN groups (a submitted group is never interrupted mid-poll)."""
