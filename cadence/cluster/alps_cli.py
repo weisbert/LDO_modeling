@@ -53,10 +53,11 @@ def build_sim_cmd(engine, input_scs, out_psf, model_dir=None, ahdllibdir=None, m
     input_scs     the Spectre-syntax netlist (positional first arg, e.g. 'input.scs')
     out_psf       output dir (alps: -o ; spectre: -raw). Relative is fine -- it is resolved
                   against the node cwd (dsub -EP <netlistdir>), matching ADE's `-o ../psf`.
-    model_dir     OPTIONAL PDK model ROOT containing the per-engine subtree {alps,spectre};
-                  the engine's own subtree is appended to -I (§1d). If model_dir already ends in
-                  the engine name it is used as-is. Omit (None) when the netlist's own `include`
-                  paths are self-contained -> no -I is added.
+    model_dir     OPTIONAL PDK model. Accepts (see _engine_model_tree): the model FILE the
+                  IC-standard way (e.g. $MODEL_ROOT/alps/toplevel.scs) -> -I = its directory; the
+                  model ROOT -> the per-engine subtree {alps,spectre} is appended to -I (§1d); or
+                  the engine dir itself (ends in the engine name) -> used as-is. Omit (None) when
+                  the netlist's own `include` paths are self-contained -> no -I is added.
     ahdllibdir    OPTIONAL compiled AHDL/VA model DB (-ahdllibdir), e.g. .../input.ahdlSimDB.
                   Omit (None) and the simulator AUTO-COMPILES the Verilog-A from the netlist's
                   own `ahdl_include` lines (default cache next to the netlist). Provide it only

@@ -3207,17 +3207,18 @@ if _HAVE_QT:
             bf.addRow("Netlist dir (input.scs) *", self.xb_netlist["w"])
             self.xb_pdk = self._path_row("xb_pdk", dir_only=True)
             self.xb_pdk["edit"].setToolTip(
-                "OPTIONAL. An include SEARCH DIRECTORY (the sim's -I), NOT the toplevel.scs file. "
-                "It's where `include \"toplevel.scs\"` is resolved. Give either the model ROOT "
-                "($MODEL_ROOT — the {alps,spectre} subtree is appended) or the engine dir itself "
-                "($MODEL_ROOT/alps), used as-is. If you paste the toplevel.scs FILE path, its "
-                "containing directory is used (no '/alps' is tacked onto a file).\n"
+                "OPTIONAL. The PDK model. Point at the model FILE the IC-standard way, e.g.\n"
+                "  $MODEL_ROOT/alps/toplevel.scs\n"
+                "— the tool sets the sim's include path (-I) to that file's directory so the "
+                "netlist's `include \"toplevel.scs\"` resolves. You may also give a directory: the "
+                "model ROOT ($MODEL_ROOT — the {alps,spectre} subtree is appended) or the engine "
+                "dir itself ($MODEL_ROOT/alps), used as-is.\n"
                 "Leave BLANK if the netlist's own `include` lines already point at the models "
                 "(self-contained). Default: when $MODEL_ROOT is set and this is blank, the engine "
                 "picks the subtree ($MODEL_ROOT/spectre for Spectre, $MODEL_ROOT/alps for ALPS).")
             self.xb_pdk["edit"].setPlaceholderText(self._pdk_default_for(self.x_backend.currentData())
                                                    or "optional — only if the netlist needs an -I model tree")
-            bf.addRow("PDK model dir (optional)", self.xb_pdk["w"])
+            bf.addRow("PDK model file/dir (optional)", self.xb_pdk["w"])
             self.xb_ahdl = self._path_row("xb_ahdl", dir_only=True)
             self.xb_ahdl["edit"].setPlaceholderText("optional — blank ⇒ simulator compiles VA from the netlist")
             self.xb_ahdl["edit"].setToolTip(
