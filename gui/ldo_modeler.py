@@ -1007,10 +1007,10 @@ if _HAVE_QT:
                 "I-V / compliance-knee VOLTAGE sweep for this current-output pin (a T2 coverage "
                 "point → coverage.iv). The pin's probe vsource is stepped across this voltage "
                 "range and the pin CURRENT (<probe>:p) is recorded → the output's I-V curve "
-                "(Spectre `dc dev=<probe> param=dc`). UNITS = volts. Three accepted forms:\n"
+                "(Spectre `dc dev=<probe> param=dc`). UNITS = volts. Two accepted forms:\n"
                 "  • start:step:stop   e.g. 0:0.01:0.8\n"
                 "  • <type> start stop n   e.g. 'lin 0 0.8 80'  or  'log 1m 1 30'\n"
-                "  • auto   (0 → supply + margin)\n"
+                "BLANK (or 'auto') → NO I-V sweep for this pin; give an explicit range to sweep it. "
                 "This is NOT 'compliance dc' (that is the single DC voltage held during AC/noise). "
                 "Needs a vsource probe on the pin — leave 'probe instance' blank to auto-insert one.")
             self._set_header_tip(self.t_iout, "compliance dc",
@@ -1612,6 +1612,31 @@ if _HAVE_QT:
             parts.extend(f.get("extra") or [])
             return " ".join(parts)
 
+        @staticmethod
+        def _default_sweep_fields(name):
+            """The standard default sweep fields for a fresh ac/noise editor -- MIRRORS the backend
+            manifest.load() defaults: log, 20 points/decade, 10 Hz -> 500 MHz (ac) / 100 MHz
+            (noise). So opening the editor on a blank field and clicking OK yields the SAME sweep
+            the backend would have defaulted to, never a bare param-less name."""
+            stop = "100M" if name == "noise" else "500M"
+            return {"name": name, "type": "log", "start": "10", "stop": stop,
+                    "spec_kind": "dec", "spec_val": "20", "values": [], "extra": []}
+
+        @staticmethod
+        def _sweep_editor_initial(text, default_name):
+            """The fields the sweep editor opens with. Parse `text`; but when it carries NO sweep
+            params (a fresh/empty field, or a bare 'ac' with only extra tokens) seed the standard
+            defaults for default_name -- so 'open + OK' produces a sensible sweep, not a bare name.
+            Any present name + extra tokens are preserved."""
+            f = _ManifestEditorDialog._sweep_parse(text)
+            name = f.get("name") or default_name
+            if f.get("start") or f.get("stop") or f.get("spec_val") or f.get("values"):
+                f["name"] = name
+                return f
+            d = _ManifestEditorDialog._default_sweep_fields(name)
+            d["extra"] = f.get("extra") or []
+            return d
+
         def _with_sweep_editor(self, edit, default_name):
             """Wrap a sweep QLineEdit + an 'Edit…' button in one widget (for QFormLayout.addRow).
             The QLineEdit stays the canonical string store; the button opens the Cadence-style
@@ -1638,9 +1663,7 @@ if _HAVE_QT:
             """The Cadence-style sweep editor dialog. Parses edit's current string, lets the user
             set type / start / stop / specify-by / specific points, and writes the rebuilt string
             back into edit on OK. edit (a QLineEdit) remains the single source of truth."""
-            f = self._sweep_parse(edit.text())
-            if not f.get("name"):
-                f["name"] = default_name
+            f = self._sweep_editor_initial(edit.text(), default_name)
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle(f"Sweep editor — {f['name']}")
             v = QVBoxLayout(dlg)
@@ -4777,6 +4800,19 @@ def _selftest_manifest_editor(win, tmp):
     assert "errpreset=conservative" in f["extra"]
     assert _SR(f).endswith("errpreset=conservative")
     assert _ManifestEditorDialog._split_brackets("a b=[1 2] c") == ["a", "b=[1 2]", "c"]
+    # [Fix 1] a FRESH/empty field seeds the standard defaults (mirrors backend manifest.load),
+    # so 'open editor + OK' yields a real sweep, never a bare param-less 'ac'/'noise'.
+    _INIT = _ManifestEditorDialog._sweep_editor_initial
+    assert _SR(_INIT("", "ac")) == "ac start=10 stop=500M dec=20"
+    assert _SR(_INIT("", "noise")) == "noise start=10 stop=100M dec=20"
+    assert _SR(_INIT("ac errpreset=conservative", "ac")) == \
+        "ac start=10 stop=500M dec=20 errpreset=conservative"     # bare-name state also seeded
+    assert _SR(_INIT("ac start=5 stop=20M lin=7", "ac")) == "ac start=5 stop=20M lin=7"  # real -> kept
+    # [Fix 2] iv_sweep: BLANK and 'auto' BOTH mean "no I-V sweep for this pin" (no coverage.iv);
+    # an explicit range produces the sweep dict (locks what the corrected tooltip now states).
+    _IVC = _ManifestEditorDialog._ivcov_from_text
+    assert _IVC("") is None and _IVC("auto") is None and _IVC("AUTO") is None
+    assert _IVC("lin 0 0.8 80") == {"sweep": {"type": "lin", "start": 0.0, "stop": 0.8, "n": 80}}
 
     # 5j) [2.1/2.5] NO column stretches (a Stretch column swallows the viewport and balloons the
     #     dialog ~3400px wide); every column is Interactive with a compact fixed width, for ALL
