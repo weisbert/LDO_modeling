@@ -504,6 +504,13 @@ class ExtractCore:
         # the SAME by-tag mapping step_run produces: each group's PSF dir = <root>/<group.tag>;
         # every member measurement of that group reads from it.
         grps = _run.groups(m)
+        # FORGIVING root: accept either the per-corner 'psf/' dir (whose children ARE the group
+        # subdirs) OR the corner run dir itself -- auto-descend into its 'psf/' (so the user can
+        # point at .../<corner> or .../<corner>/psf interchangeably).
+        def _has_groups(d):
+            return any((d / g["tag"]).is_dir() for g in grps)
+        if not _has_groups(root) and (root / "psf").is_dir() and _has_groups(root / "psf"):
+            root = root / "psf"
         psf_map, missing = {}, []
         for g in grps:
             gdir = root / g["tag"]
@@ -515,8 +522,8 @@ class ExtractCore:
         if not psf_map:
             raise FileNotFoundError(
                 f"no per-group PSF subdir under {root} -- expected <root>/<group.tag>/ for "
-                f"group(s) {[g['tag'] for g in grps]}. Point at the per-corner 'psf/' dir that "
-                f"holds the group subdirs (e.g. .../<corner>/psf/).")
+                f"group(s) {[g['tag'] for g in grps]}. Point at ONE corner's run dir or its 'psf/' "
+                f"subdir (e.g. .../<corner> or .../<corner>/psf/).")
         if missing:
             # fail LOUD rather than import a partial set + fit a silently-incomplete model. (The
             # strict step_import would otherwise raise a cryptic 'psf_map has no entry for point'.)
@@ -3445,13 +3452,17 @@ if _HAVE_QT:
             gi = QFormLayout(self.x_grp_import)
             self.x_import_root = self._path_row("x_import_root", dir_only=True)
             self.x_import_root["edit"].setPlaceholderText(
-                "the per-corner psf/ dir holding per-group subdirs (…/<corner>/psf/)")
+                "ONE corner's run dir or its psf/ subdir (…/<corner> or …/<corner>/psf/)")
             self.x_import_root["edit"].setToolTip(
-                "An ALREADY-FINISHED simulation's PSF root: the per-corner 'psf/' directory holding "
-                "one subdir per measurement GROUP (…/<corner>/psf/<group.tag>/). The tool assembles "
-                "the by-tag PSF map from the loaded manifest, reads the PSF, fits, and lets you Create "
-                "the model cell — NO netlist / dsub / ALPS. Use this to recover a run whose import "
-                "crashed, or when you simulated outside the tool.")
+                "An ALREADY-FINISHED simulation, ONE corner at a time (it matches the loaded "
+                "manifest's corner). Point at that corner's run dir (…/<corner>) or its 'psf/' "
+                "subdir directly — both work; the tool auto-finds the per-group PSF subdirs "
+                "(…/<corner>/psf/<group.tag>/, the layout the cluster sweep writes). It assembles "
+                "the by-tag PSF map from the manifest, reads the PSF, fits, and lets you Create the "
+                "model cell — NO netlist / dsub / ALPS. EVERY measurement group must be present (a "
+                "missing group fails loud, not a silently-incomplete model). For multiple corners, "
+                "run this once per corner. Use it to recover a run whose import crashed, or when you "
+                "simulated outside the tool.")
             gi.addRow("Finished PSF root", self.x_import_root["w"])
             self.x_import_btn = QPushButton("Read finished simulation → fit")
             self.x_import_btn.setToolTip("Read the finished PSF directly (no re-simulation): by-tag "
@@ -5292,6 +5303,11 @@ def _selftest_import_finished(tmp):
     assert xc.result is not None and xc.report and "VOLTAGE OUTPUTS" in xc.report, "fit state not set"
     assert "pll" in xc.port_list(), f"per-output ref missing after import: {xc.port_list()}"
     assert xc.gate[0] is None and "imported finished sim" in xc.gate[2], xc.gate
+    # FORGIVING root: pointing at the CORNER dir (parent of psf/) must auto-descend into psf/ and
+    # import identically -- the user can give .../<corner> or .../<corner>/psf interchangeably.
+    cdir = tmp / "corner_layout"; shutil.copytree(root, cdir / "psf")
+    outc = xc.import_finished_sim(str(cdir), work_root=str(tmp))   # auto-descend .../<corner> -> psf/
+    assert outc["n_meas"] == ntags and outc["missing"] == [], (outc["n_meas"], outc["missing"])
     # the desync guard holds (fit belongs to THIS manifest) -> a dry model-cell build succeeds
     cellout = xc.build_model_cell("LDO_model_lab", "PMU_model_importfin",
                                   str(tmp / "cds" / "LDO_model_lab"),
