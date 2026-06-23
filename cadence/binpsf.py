@@ -121,11 +121,21 @@ def _read_header(c, a, z):
     return props
 
 
+_GROUP = 0x11                                          # a grouped TRACE section opens with this
+
+
 def _read_traces(c, a, z):
     """TRACE section -> ordered [(traceid, name, typeid)] over its minor range. Each decl:
-    0x10 id name typeid."""
+    0x10 id name typeid. A GROUPED trace section (windowed/grouped saves, e.g. ALPS transient with
+    all device traces) opens with a `0x11 <gid> <name> <count>` group header before the decls --
+    skip it, else we'd read ZERO traces."""
     lo, hi = _minor_range(c.b, a, z)
     c.o = lo
+    if c.o + 8 <= hi and c.u32() == _GROUP:            # 0x11 <gid> <name> <count> then the decls
+        c.o += 4
+        c.take_u32()                                   # group id
+        c.take_str()                                   # group name
+        c.take_u32()                                   # member count
     traces = []
     while c.o + 8 <= hi and c.u32() == _DECL:
         c.o += 4
@@ -290,6 +300,51 @@ def _read_values_walk(c, a, z, sweep_name, sweep_id, seq, name_of, dt_of, npoint
     return out
 
 
+def _read_values_windowed(c, a, z, sweep_name, traces, npoints, window_size):
+    """VALUE section for a WINDOWED PSF (header `PSF window size` != 0; Cadence/ALPS use it for
+    big TRANSIENT data). Layout (reverse-engineered + validated on a real ALPS trz.tran):
+
+        VALUE = [header: 0x14, then a u32 = header length H, then zero pad to H bytes]
+                [nbuf BUFFERS, each (1 sweep + #traces) SIGNAL blocks of `window_size` bytes,
+                 SIGNAL-MAJOR: block 0 = sweep, block 1+i = trace i in decl order]
+                [a short trailer]
+        Each signal block = window_size bytes = W doubles, of which the FIRST 2 are a per-block
+        header and the remaining W-2 are this signal's data for up to W-2 points of THIS window.
+        Points run contiguously across buffers; the last window is short -- unused slots are NaN,
+        so the true point count is where the sweep first goes non-finite (<= npoints).
+
+    Vectorized with numpy (reshape each buffer once) -- 17k+ traces stay fast. Returns the same
+    dict shape as `_read_values`: {sweep_name: arr, trace_name: arr, ..., '_sweep': sweep_name}.
+    Transient traces are real."""
+    b = c.b
+    H = c.u32(a + 4)                                   # header length (the word after 0x14)
+    data = a + H
+    W = window_size // 8                               # doubles per block
+    META = 2                                           # per-block header doubles (16 B), data after
+    DATA = W - META
+    nsig = len(traces) + 1                             # sweep + traces
+    bufsz = nsig * window_size
+    nbuf = (z - data) // bufsz if bufsz else 0         # trailer (< bufsz) is dropped by floor-div
+    if nbuf <= 0 or DATA <= 0:
+        return {sweep_name: np.asarray([]), "_sweep": sweep_name}
+    # one numpy view per buffer: (nsig, W) -> take the DATA columns -> (nsig, DATA); concat columns.
+    cols = np.empty((nsig, nbuf * DATA), dtype=float)
+    for w in range(nbuf):
+        off = data + w * bufsz
+        arr = np.frombuffer(b, dtype=">f8", count=nsig * W, offset=off).reshape(nsig, W)
+        cols[:, w * DATA:(w + 1) * DATA] = arr[:, META:META + DATA]
+    sweep = cols[0]
+    finite = np.isfinite(sweep)                        # the sweep (time) goes NaN past the last point
+    n = int(np.argmax(~finite)) if not finite.all() else sweep.size
+    if npoints:
+        n = min(n, npoints)
+    out = {sweep_name: np.array(sweep[:n])}
+    for i, (tid, nm, typeid) in enumerate(traces):
+        out[nm] = np.array(cols[1 + i, :n])            # transient node/branch values are real
+    out["_sweep"] = sweep_name
+    return out
+
+
 def _read_values(c, a, z, sweep_name, traces, dt_map, npoints):
     """VALUE section -> {name: ndarray}. The per-point layout is the fixed id sequence
     [sweepId, trace0, trace1, ...]; a GROUPED (PSF groups>=1) noise PSF uses the SAME flat layout,
@@ -354,8 +409,15 @@ def read_binpsf(path):
     # kept). See test_binpsf.py's synthetic groups=1 fixture + the real-file (freq,out) oracle.
     npoints = int(hdr.get("PSF sweep points", 0))
     traces = _read_traces(c, r0, r1)
-    dt_map = _type_datatypes(b, t0, t1, [tid for _, _, tid in traces])
     sweep_name = _read_sweep_name(c, s0, s1)
+    # WINDOWED PSF (PSF window size != 0) -- Cadence/ALPS use a signal-major buffered layout for big
+    # TRANSIENT data, NOT the flat per-point layout. A separate reader handles it (else the per-point
+    # walk would return only the sweep column -> every transient trace silently lost). All windowed
+    # (transient) traces are real, so no datatype map is needed there.
+    window_size = int(hdr.get("PSF window size", 0) or 0)
+    if window_size:
+        return _read_values_windowed(c, v0, v1, sweep_name, traces, npoints, window_size)
+    dt_map = _type_datatypes(b, t0, t1, [tid for _, _, tid in traces])
     return _read_values(c, v0, v1, sweep_name, traces, dt_map, npoints)
 
 

@@ -155,6 +155,90 @@ def _grouped_check():
     return len(freqs)
 
 
+# --------------------------------------------------------- synthetic WINDOWED (transient) PSF
+_MAJOR_W, _WINMARK = 0x15, 0x14
+
+
+def _make_windowed_fixture(path, time, sigs, window_size=64):
+    """Write a minimal WINDOWED transient binary PSF in the layout binpsf._read_values_windowed
+    reads: VALUE = [0x14 H pad-to-H][nbuf buffers][trailer]; each buffer = (1 sweep + #traces)
+    SIGNAL blocks of window_size bytes, signal-major; each block = [2 META doubles][DATA doubles];
+    the last window is short -> unused slots are NaN. `sigs` = {name: [values]} (same length as
+    `time`). Also emits a 0x11 GROUP marker in the TRACE section (binpsf must skip it)."""
+    npts = len(time)
+    W = window_size // 8
+    META, DATA = 2, window_size // 8 - 2
+    names = list(sigs)
+    nsig = 1 + len(names)
+    nbuf = -(-npts // DATA)                            # ceil
+    SWEEP_ID, T_REAL = 21, 100
+    NANV = float("nan")
+    MET = [-999.0, -888.0]                             # distinctive meta -> must be SKIPPED, not read
+
+    hb = (struct.pack(">I", _PROP_INT) + _s("PSF sweep points") + struct.pack(">I", npts)
+          + struct.pack(">I", _PROP_INT) + _s("PSF window size") + struct.pack(">I", window_size)
+          + struct.pack(">I", _PROP_INT) + _s("PSF traces") + struct.pack(">I", len(names)))
+    type_decls = (struct.pack(">I", _DECL) + struct.pack(">I", T_REAL) + _s("real")
+                  + struct.pack(">I", 0) + struct.pack(">I", _DT_REAL))
+    sweep_decls = struct.pack(">I", _DECL) + struct.pack(">I", SWEEP_ID) + _s("time")
+    # TRACE: a 0x11 GROUP header (must be skipped) then the trace decls, in signal order.
+    trace_decls = struct.pack(">I", 0x11) + struct.pack(">I", 22) + _s("group") + struct.pack(">I", len(names))
+    for i, nm in enumerate(names):
+        trace_decls += struct.pack(">I", _DECL) + struct.pack(">I", 30 + i) + _s(nm) + struct.pack(">I", T_REAL)
+
+    def block(values):                                # one signal's window_size block: META + DATA
+        body = list(MET) + list(values)
+        body += [NANV] * (W - len(body))              # pad the (short last) window with NaN
+        return struct.pack(f">{W}d", *body[:W])
+
+    value_body = struct.pack(">I", _WINMARK) + struct.pack(">I", 8)   # 0x14 + header length H=8
+    for w in range(nbuf):
+        lo, hi = w * DATA, min((w + 1) * DATA, npts)
+        cols = [time[lo:hi]] + [sigs[nm][lo:hi] for nm in names]
+        for col in cols:
+            value_body += block(col)
+    value_body += b"\x00" * 16                         # a short trailer (< buffer_size)
+
+    MINOR_HDR = struct.pack(">I", _MINOR) + struct.pack(">I", 0)
+    bodies = [hb, MINOR_HDR + type_decls, MINOR_HDR + sweep_decls, MINOR_HDR + trace_decls, value_body]
+    starts, pos = [], 0
+    for body in bodies:
+        starts.append(pos); pos += 8 + len(body)
+    total = pos
+    out = bytearray()
+    for i, body in enumerate(bodies):
+        end = starts[i + 1] if i + 1 < len(bodies) else total
+        out += struct.pack(">II", _MAJOR_W, end) + body
+    for i in (1, 2, 3):
+        struct.pack_into(">I", out, starts[i] + 8 + 4, starts[i + 1])
+    pathlib.Path(path).write_bytes(out)
+
+
+def _windowed_check():
+    """Build + read back a synthetic WINDOWED transient PSF: the 0x11 group marker is skipped, the
+    2 per-block META doubles are skipped (the -999/-888 sentinels never appear), signals are read
+    signal-major, and the NaN-padded short last window is truncated to npoints. 10 pts, 6/window."""
+    time = [float(i) for i in range(10)]              # 0..9
+    vout = [0.80 - 0.01 * i for i in range(10)]        # a droop/slew
+    iout = [10.0 * i for i in range(10)]
+    with tempfile.NamedTemporaryFile(suffix=".tran", delete=False) as tf:
+        fpath = tf.name
+    try:
+        _make_windowed_fixture(fpath, time, {"vout": vout, "iout": iout}, window_size=64)
+        d = binpsf.read_binpsf(fpath)
+        assert d["_sweep"] == "time", d["_sweep"]
+        assert set(k for k in d if k != "_sweep") == {"time", "vout", "iout"}, list(d)
+        assert np.array_equal(np.asarray(d["time"]), time), d["time"]          # 10 pts (not 12)
+        assert np.allclose(np.asarray(d["vout"]), vout, rtol=0, atol=0), d["vout"]
+        assert np.array_equal(np.asarray(d["iout"]), iout), d["iout"]
+        for k in ("time", "vout", "iout"):            # the META sentinels must NOT leak in
+            assert -999.0 not in np.asarray(d[k]) and -888.0 not in np.asarray(d[k]), (k, d[k])
+        assert np.isfinite(np.asarray(d["time"])).all(), "NaN tail must be truncated"
+    finally:
+        pathlib.Path(fpath).unlink(missing_ok=True)
+    return len(time)
+
+
 def _worst_rel(a, b):
     """Max over common signals of max|a-b| / max|a| (magnitude-aware relative error)."""
     common = sorted(set(k for k in a if k != "_sweep") & set(k for k in b if k != "_sweep"))
@@ -216,10 +300,16 @@ def main():
     #    STRUCT traces and return the freq sweep + the scalar 'out' exactly.
     ngrp = _grouped_check()
 
+    # 6. WINDOWED (transient) PSF: the signal-major buffered layout ALPS uses for big tran data
+    #    (PSF window size != 0). The per-point reader returns only the sweep -> a separate windowed
+    #    reader must recover every trace (skip the 0x11 group + the 2 per-block meta, truncate NaN).
+    nwin = _windowed_check()
+
     print(f"PASS  binpsf AC: 51 pts x 34 traces, 10Hz->500MHz, vs psfascii worst={worst:.2e} @ {wkey} "
           f"(psfascii 6-sigfig floor); auto-dispatch exact. "
           f"NOISE: {fb.size} pts, scalar 'out' matches psfascii ({nrel:.2e}), struct traces dropped. "
-          f"GROUPED (groups=1): {ngrp} pts, freq+out exact, structs dropped.")
+          f"GROUPED (groups=1): {ngrp} pts, freq+out exact, structs dropped. "
+          f"WINDOWED (tran): {nwin} pts, signal-major + meta-skip + NaN-truncate exact.")
     return 0
 
 
