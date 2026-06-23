@@ -221,6 +221,7 @@ def from_psf_multiport(root=None, *, manifest, psf_map=None, load="nom",
             for c in m["i_out"]:
                 if _manifest._probe_name(m, c) == pt["reads"][0][1]:
                     alias = probe_aliases.get(c)
+        fpath = None
         try:
             fpath = _resolve(root, psf_map, pt["tag"], pt["analysis"])
             d = psf.read_psf(fpath)
@@ -228,7 +229,10 @@ def from_psf_multiport(root=None, *, manifest, psf_map=None, load="nom",
         except (FileNotFoundError, KeyError) as e:
             if strict and pt["derive"] not in optional:
                 raise
-            out.setdefault("_skipped", []).append(f"{pt['tag']}: {e}")
+            # name the PSF FILE we actually read, so a skipped point is diagnosable (e.g. a
+            # transient whose node wasn't saved -> 'available: [time]' + which .tran it came from).
+            where = f" [read {fpath}]" if fpath else ""
+            out.setdefault("_skipped", []).append(f"{pt['tag']}{where}: {e}")
     if progress:
         progress(n, n, None)
     return out
