@@ -24,7 +24,11 @@
          libPath))))
 
 ;; Create/refresh <lib>/<cell>/veriloga from vaPath. Returns the cellview dir.
-(defun ldoImportVA (libName cellName vaPath @optional tblPath "ttt")
+;; NB: NO type template here -- there are 4 formals (3 required + 1 @optional tblPath), and a
+;; 3-char template ("ttt") mis-validates the 4th arg ("argument #4 should be a string"). The body
+;; already guards a nil tblPath, so we let SKILL skip type-checking (the Python caller always
+;; passes strings). [ldoCompileVA below keeps its "ttt" -- it has exactly 3 formals.]
+(defun ldoImportVA (libName cellName vaPath @optional tblPath)
   (let ((libObj (ddGetObj libName)) libPath cellDir vaDir)
     (unless libObj (error "ldoImportVA: lib %s not found -- run ldoEnsureLib first" libName))
     (setq libPath (or libObj~>writePath libObj~>readPath))

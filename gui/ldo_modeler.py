@@ -4830,9 +4830,22 @@ if _HAVE_QT:
                 return                           # ignore re-clicks while a fit is already running
             blockers = self._fit_blockers()
             if blockers:
+                # the common confusion: an in-situ extraction (Tab 0) ALREADY fit every port (its
+                # multi-port report is in Tab 0's Report/log), but this legacy per-port tab is empty
+                # because no single port was sent over. Point there instead of "use Tab 2".
+                if self.core.ref is None and getattr(self.extract, "result", None) is not None:
+                    QMessageBox.information(self, "Fit",
+                        "Your in-situ extraction already fit EVERY port — the multi-port report is "
+                        "in Tab 0 (Extract) → Run → the 'Report / log' window.\n\n"
+                        "This tab (3 · Fit) is the optional PER-PORT view (single output, with order "
+                        "controls + a Compare overlay). To load one port here:\n"
+                        "  Tab 0 → 'Model cell' sub-tab → 'Or send one output port →' pick a port → "
+                        "'Load into Import → Fit'.")
+                    return
                 QMessageBox.information(self, "Fit", "Cannot fit yet — missing required data:\n  "
                                        + ", ".join(blockers[:10]) + ("…" if len(blockers) > 10 else "")
-                                       + "\n\nProvide these on Tab 2 (Import).")
+                                       + "\n\nProvide these on Tab 2 (Import), or send a port from "
+                                       "Tab 0 (Extract → Model cell → 'send one output port').")
                 return
             self.b_fit.setEnabled(False); self.statusBar().showMessage("Fitting…")
             self._worker = _FitWorker(self.core)
