@@ -163,53 +163,53 @@ def main():
         print(f"   -> sweep-FIRST expects signal index {1 + k}; sweep-LAST expects {k}; "
               f"FOUND {sidx} -> {'sweep-FIRST' if sidx == 1 + k else 'sweep-LAST' if sidx == k else '??'}")
 
-    # ---- AUTO-FIND (header_skip h, points-per-window p): the combo whose sweep (signal 0) decodes
-    #      to a CLEAN monotone time 0 -> ~tmax wins. Each 256B signal block may hold [h meta dbls]
-    #      [p data dbls] with h+p == w(=32). p must tile: ceil(npts/p) <= nbuf(=nwin). ----
-    def decode(h, p, signal):
-        out = []
-        for i in range(npts):
-            bf, j = divmod(i, p)
-            out.append(f64(b, data + bf * bufsz + signal * wsz + (h + j) * 8))
-        return out
+    # ============ COMPREHENSIVE DUMP -- one run, everything needed to nail the layout ============
+    nbuf = (v1 - v0 - H - 16) // bufsz             # data buffers between header and 16B trailer
+    print(f"\nderived buffers = (len-H-16)/bufsz = {nbuf}")
 
-    def time_ok(t):
-        if not t or t[0] is None or abs(t[0]) > 1e-15:
-            return False
-        for i in range(1, npts):
-            if t[i] is None or t[i] < t[i - 1]:
-                return False
-        return 0.5 * tmax <= t[-1] <= tmax * 1.0001
+    # (1) the 1884B VALUE header: list every NON-ZERO 4-byte word (the window index / counts live
+    #     here -- it's mostly zeros). Both as u32 and as the float it would be.
+    print(f"\n--- VALUE header [{v0}..{v0 + H}) non-zero words (off-in-header : u32 : asF32-ish) ---")
+    nz = []
+    for o in range(v0, v0 + H, 4):
+        wv = u32(b, o)
+        if wv:
+            nz.append((o - v0, wv))
+    for off, wv in nz[:60]:
+        print(f"   +{off:<6} 0x{wv:08x} = {wv}")
+    print(f"   ({len(nz)} non-zero words total)")
 
-    print("\n--- AUTO-FIND (header_skip h, pts/window p): clean monotone time 0->~tmax wins ---")
-    winner = None
-    for p in range(w, 27, -1):                     # 32,31,30,29,28
-        if -(-npts // p) > nwin:                   # ceil(npts/p) must fit the buffer count
-            continue
-        for h in range(0, w - p + 1):              # h + p <= w
-            t = decode(h, p, 0)                    # sweep = signal 0 (sweep-FIRST, confirmed)
-            ok = time_ok(t)
-            if ok and winner is None:
-                winner = (h, p)
-            if ok or (h, p) in ((0, w), (2, 30)):
-                print(f"  h={h} p={p}: {'CLEAN <<<' if ok else 'no'}  "
-                      f"time[0..4]={[fmt(x) for x in t[:5]]} time[-3:]={[fmt(x) for x in t[-3:]]}")
+    # (2) sig0 (TIME) raw 32 doubles for EVERY buffer -- reveals the per-block meta + per-window
+    #     valid count (where it goes nan) + cross-window time continuity.
+    def block(buf, signal):
+        base = data + buf * bufsz + signal * wsz
+        return [f64(b, base + 8 * j) for j in range(w)]
 
-    if winner is None:
-        print("\n!! no (h,p) gave a clean time -- dumping sig0 block-0 raw (32 dbls):")
-        print("   " + " ".join(fmt(f64(b, data + j * 8)) for j in range(w)))
-        return
-    h, p = winner
-    print(f"\n==> LAYOUT: signal-major, sweep=signal 0; each {wsz}B block = [{h} meta][{p} data]; "
-          f"{nwin} buffers @ data_start + w*{bufsz}; {nwin}*{p}={nwin * p} >= {npts}")
-    t = decode(h, p, 0)
-    vk = decode(h, p, 1 + k)                        # trace k = signal 1+k
-    print(f"  time[0..6] = {[fmt(x) for x in t[:7]]}")
-    print(f"  time[-6:]  = {[fmt(x) for x in t[-6:]]}   (stop={tmax:g})")
-    print(f"  {want}[0..6] = {[fmt(x) for x in vk[:7]]}")
-    print(f"  {want}[-6:]  = {[fmt(x) for x in vk[-6:]]}")
-    # window-boundary continuity check (points p-1, p, p+1 across the first two windows)
-    print(f"  window0/1 seam time[{p-1},{p},{p+1}] = {[fmt(t[p-1]), fmt(t[p]), fmt(t[p+1])]}")
+    def n_finite_after2(vals):                     # valid data dbls assuming 2 leading meta
+        c = 0
+        for x in vals[2:]:
+            if x is None or x != x:                # None/nan -> stop
+                break
+            c += 1
+        return c
+
+    print(f"\n--- TIME (signal 0) -- all {nbuf} buffers, 32 doubles each (idx0,1 = suspected meta) ---")
+    for bw in range(nbuf):
+        vals = block(bw, 0)
+        print(f"  buf{bw}: " + " ".join(fmt(x) for x in vals))
+        print(f"        meta?=[{fmt(vals[0])},{fmt(vals[1])}]  finite-after-2 = {n_finite_after2(vals)}")
+
+    # (3) VDD0P8_PLL (signal 1+k) -- first/last of each buffer + finite count, to confirm sweep-FIRST
+    print(f"\n--- {want} (signal {1 + k}) -- per buffer: [first6] ... [last4], finite-after-2 ---")
+    for bw in range(nbuf):
+        vals = block(bw, 1 + k)
+        print(f"  buf{bw}: {[fmt(x) for x in vals[:6]]} ... {[fmt(x) for x in vals[-4:]]}  "
+              f"finite-after-2={n_finite_after2(vals)}")
+
+    # (4) sum of per-window finite-after-2 counts vs npoints (does [2 meta][N data] tile to 210?)
+    tot = sum(n_finite_after2(block(bw, 0)) for bw in range(nbuf))
+    print(f"\n--- sum(finite-after-2 over buffers) = {tot}  vs  npoints = {npts}  "
+          f"(match -> layout is [2 meta][N data] per block, N varies, last window short) ---")
     print("\n=== end probe3 (paste ALL of this) ===")
 
 
