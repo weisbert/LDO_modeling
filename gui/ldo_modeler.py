@@ -570,6 +570,25 @@ class ExtractCore:
                     psf_map=psf_map, missing=missing, skipped=skipped, n_meas=len(reads),
                     psf_root=str(root), skipped_groups=skipped_groups)
 
+    def export_va(self, model_cell, *, out_path=None, work_root=None, progress=None):
+        """Emit ONLY the combined Verilog-A from the multi-port fit (no Cadence import/compile/
+        symbol) -> the .va path. Decouples 'just give me the .va file' from 'build the cell in
+        Virtuoso'. Writes to `out_path` if given, else the workarea model dir. Requires a completed
+        run/import OF THE CURRENT MANIFEST (same desync guard as build_model_cell)."""
+        if self.result is None or self._fit_manifest is not self.manifest:
+            raise RuntimeError("run an extraction / import a finished simulation first -- there is "
+                               "no fit to emit (or the manifest changed since the last run)")
+        from insitu import pmu_corner as PC
+        supply_pin, ground = self._model_ports()
+        if out_path:
+            va_path = pathlib.Path(out_path)
+            va_path.parent.mkdir(parents=True, exist_ok=True)
+        else:
+            _base, dirs = PC.corner_dir(work_root, self._wa_gui(), self._corner())
+            va_path = pathlib.Path(dirs["model"]) / f"{model_cell}.va"
+        return PC.step_emit(self.result, cell_name=model_cell, va_path=va_path,
+                            supply=supply_pin, ground=ground, progress=progress)
+
     def port_list(self):
         return list(self.port_refs)
 
@@ -3558,26 +3577,48 @@ if _HAVE_QT:
             self.x_run_split.setSizes([200, 320])        # sensible initial split
             run_v.addWidget(self.x_run_split, 1)
 
-            # ===== MODEL-CELL sub-tab: the ONE combined VA + symbol, compiled · send-to-Fit =====
-            mgb = QGroupBox("3 · Create the model cell (Verilog-A + symbol, compiled)")
+            # ===== RESULTS / MODEL-CELL sub-tab: ONE place after a Tab-0 run/import to see the fit
+            #       summary + the full report, EXPORT the .va, or build the cell in Cadence. =====
+            res_box = QGroupBox("Results — fit summary & report")
+            rvl = QVBoxLayout(res_box)
+            self.x_model_summary = QLabel("Run (Setup/Run tabs) or import a finished simulation "
+                                          "first — the fit summary, report, and .va export appear here.")
+            self.x_model_summary.setWordWrap(True)
+            self.x_model_summary.setStyleSheet("color:#234; font-weight:bold;")
+            rvl.addWidget(self.x_model_summary)
+            self.x_modelreport = QTextEdit(); self.x_modelreport.setReadOnly(True)
+            self.x_modelreport.setStyleSheet("font-family:monospace; font-size:11px;")
+            self.x_modelreport.setMinimumHeight(160)
+            rvl.addWidget(self.x_modelreport, 1)
+            model_v.addWidget(res_box, 1)
+
+            # the combined model cell. 'Export Verilog-A' = JUST the .va file (no Cadence); 'Create
+            # model cell' = .va + import/compile/symbol in Virtuoso (skillbridge).
+            mgb = QGroupBox("Model cell (Verilog-A + symbol)")
             mf = QFormLayout(mgb)
             self.xm_lib = QLineEdit("LDO_model_lab"); self.xm_cell = QLineEdit("PMU_model")
             self.xm_path = QLineEdit()
-            self.xm_path.setPlaceholderText("on-disk Cadence library path "
-                                            "(e.g. $WORK_ROOT/ldo_modeling/cds/LDO_model_lab)")
+            self.xm_path.setPlaceholderText("on-disk Cadence library path (only for 'Create model cell')")
             mrow = QHBoxLayout()
             for lab, ed in (("lib", self.xm_lib), ("cell", self.xm_cell)):
                 mrow.addWidget(QLabel(lab)); mrow.addWidget(ed)
             mw = QWidget(); mw.setLayout(mrow); mf.addRow("Model", mw)
             mf.addRow("Library path", self.xm_path)
-            self.xm_make = QPushButton(
-                "Create model cell  (AVDD1P0 left · outputs right · VSS bottom)")
-            self.xm_make.setToolTip("Emit the combined Verilog-A from the fit, then import + "
-                                    "compile it and build the symbol cell in Cadence (live "
-                                    "skillbridge). No live session → writes the .va + SKILL plan only.")
+            brow_m = QHBoxLayout()
+            self.xm_export = QPushButton("Export Verilog-A (.va)…")
+            self.xm_export.setToolTip("Write JUST the combined Verilog-A from the fit (no Cadence / "
+                                      "no skillbridge). Pick where to save it.")
+            self.xm_export.setEnabled(False)
+            self.xm_export.clicked.connect(self._x_export_va)
+            brow_m.addWidget(self.xm_export)
+            self.xm_make = QPushButton("Create model cell (build in Cadence)")
+            self.xm_make.setToolTip("Emit the .va AND import + compile it + build the symbol cell in "
+                                    "Cadence (live skillbridge: AVDD1P0 left · outputs right · VSS "
+                                    "bottom). No live session → writes the .va + SKILL plan only.")
             self.xm_make.setEnabled(False)       # enabled only after a run -> a fit exists to emit
             self.xm_make.clicked.connect(self._x_make_cell)
-            mf.addRow(self.xm_make)
+            brow_m.addWidget(self.xm_make)
+            mf.addRow(brow_m)
             model_v.addWidget(mgb)
 
             srow2 = QHBoxLayout()
@@ -3586,7 +3627,6 @@ if _HAVE_QT:
             b_send = QPushButton("Load into Import → Fit"); b_send.clicked.connect(self._x_send)
             srow2.addWidget(b_send); srow2.addStretch(1)
             model_v.addLayout(srow2)
-            model_v.addStretch(1)
 
             self._x_mode_changed(); self._x_location_changed()   # set initial group visibility
             self._sb_initial()                                   # skillbridge indicator (import-only)
@@ -3754,6 +3794,53 @@ if _HAVE_QT:
                        f"builds the symbol cell. SKILL plan:\n{plan}")
             self.x_report.append("\n[model cell] " + msg)
             QMessageBox.information(self, "Create model cell", msg)
+
+        def _x_show_results(self, headline):
+            """After a Tab-0 run/import, surface the fit SUMMARY + the multi-port REPORT on the
+            Results sub-tab and enable the .va export + cell build (a fit now exists). The report
+            is read straight from self.extract.report (no duplication of the fit)."""
+            if not hasattr(self, "x_model_summary"):
+                return
+            res = getattr(self.extract, "result", None)
+            ports = ""
+            if res:
+                nv = len(res.get("voltage", {}) or {})
+                ni = len({r["sink"] for r in (res.get("current", []) or [])})
+                ports = f"  ·  {nv} voltage port(s) + {ni} current sink(s)"
+            self.x_model_summary.setText(headline + ports)
+            self.x_modelreport.setPlainText(self.extract.report or "(no report)")
+            self.xm_export.setEnabled(True); self.xm_make.setEnabled(True)
+
+        def _x_export_va(self):
+            """Export JUST the combined Verilog-A from the multi-port fit -- no Cadence, no
+            skillbridge. The user picks where to save it (defaults to the workarea model dir)."""
+            if getattr(self.extract, "result", None) is None:
+                QMessageBox.information(self, "Export Verilog-A",
+                    "Run an extraction (Setup/Run tabs) or import a finished simulation first — "
+                    "there's no fit to emit yet.")
+                return
+            cell = self.xm_cell.text().strip() or "PMU_model"
+            try:                                         # default save path = the workarea model dir
+                from insitu import pmu_corner as PC
+                _b, dirs = PC.corner_dir(self.xb_workdir["edit"].text().strip() or None,
+                                         self.extract._wa_gui(), self.extract._corner())
+                default = str(pathlib.Path(dirs["model"]) / f"{cell}.va")
+            except Exception:                            # noqa: BLE001
+                default = f"{cell}.va"
+            fn, _ = QFileDialog.getSaveFileName(self, "Export Verilog-A", default, "Verilog-A (*.va)")
+            if not fn:
+                return
+            try:
+                va = self.extract.export_va(cell, out_path=fn)
+            except Exception as e:                       # noqa: BLE001
+                QMessageBox.critical(self, "Export Verilog-A", f"{type(e).__name__}: {e}")
+                return
+            self.statusBar().showMessage(f"Exported Verilog-A → {va}")
+            r = QMessageBox.question(self, "Export Verilog-A",
+                                     f"Wrote the combined Verilog-A:\n{va}\n\nOpen its folder?",
+                                     QMessageBox.Open | QMessageBox.Close, QMessageBox.Close)
+            if r == QMessageBox.Open:
+                self._x_open_path(str(pathlib.Path(va).parent))
 
         def _x_browse(self):
             fn, _ = QFileDialog.getOpenFileName(self, "Pick a manifest JSON",
@@ -4275,9 +4362,10 @@ if _HAVE_QT:
             self.x_report.setPlainText(out["report"])
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
+            self._x_show_results(f"Donau+ALPS sweep done — {nmeas} measurement(s), npz {npz}")
             self.x_progmsg.setText("done")
-            self.statusBar().showMessage("Sweep done — fit complete. 'Create model cell', or send a "
-                                         "port to Import → Fit.")
+            self.statusBar().showMessage("Sweep done — fit complete. See the Model cell sub-tab to "
+                                         "export the .va or build the cell.")
 
         def _x_import_finished(self):
             """#3: read an ALREADY-FINISHED simulation directly (the per-corner psf/ root with
@@ -4346,11 +4434,13 @@ if _HAVE_QT:
                 pass
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
+            self._x_show_results(f"Imported finished sim — {out['n_meas']} measurement(s), npz {npz}"
+                                 + (f"  ·  {len(skipped)} coverage extra(s) skipped" if skipped else ""))
             self.x_progmsg.setText("done" + (f" ({len(skipped)} coverage skipped)" if skipped else ""))
             self.statusBar().showMessage("Finished simulation imported — fit complete"
                                          + (f"; {len(skipped)} coverage extra(s) skipped (see report)"
                                             if skipped else "")
-                                         + ". 'Create model cell', or send a port to Import → Fit.")
+                                         + ". See the Model cell sub-tab to export the .va.")
 
         def _x_import_failed(self, msg):
             self.x_import_btn.setEnabled(True)
@@ -4449,9 +4539,10 @@ if _HAVE_QT:
             self.x_report.setPlainText(out["report"])
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)        # a fit of the current manifest exists -> cell build OK
+            self._x_show_results(f"Extraction done — gate vs gold: {tag} ({detail})")
             self.x_progmsg.setText("done")
-            self.statusBar().showMessage(f"Extraction done — gate {tag}. 'Create model cell', "
-                                         "or pick an output port for 'Load into Import → Fit'.")
+            self.statusBar().showMessage(f"Extraction done — gate {tag}. See the Model cell sub-tab "
+                                         "to export the .va or build the cell.")
 
         def _x_failed(self, msg):
             self._x_idle()
@@ -5516,13 +5607,23 @@ def _selftest_import_finished_gui(win, tmp, app, root, mpath):
     acts0 = {a["label"]: a for a in win._x_status_menu_actions(0) if not a.get("sep")}
     assert acts0["Open PSF dir"]["enabled"], "Open PSF dir must be enabled for an imported row"
     assert not acts0["Copy JOBID"]["enabled"], "no live job handle on an imported row"
-    for p in list(win.extract.port_refs.values()) + [win.extract.npz_path]:   # clean regenerables
+    # Results sub-tab: the fit summary + report are mirrored here and the .va export is enabled, so
+    # the user can see the result, read the report, AND export the .va from ONE place.
+    assert win.xm_export.isEnabled(), "Export .va must enable after an import"
+    assert "Imported finished sim" in win.x_model_summary.text(), win.x_model_summary.text()
+    assert "VOLTAGE OUTPUTS" in win.x_modelreport.toPlainText(), "results report not mirrored"
+    # the standalone .va export writes a real file with NO Cadence/skillbridge.
+    va_out = tmp / "exported_model.va"
+    got = win.extract.export_va("PMU_model", out_path=str(va_out))
+    assert pathlib.Path(got).is_file() and pathlib.Path(got).read_text().lstrip().startswith(
+        ("//", "`include", "module", "/*")), f"export_va did not write a .va: {got}"
+    for p in list(win.extract.port_refs.values()) + [win.extract.npz_path, str(va_out)]:   # clean
         try:
             pathlib.Path(p).unlink()
         except (OSError, TypeError):
             pass
-    print("  import-finished (GUI): Read-finished button -> worker -> fit -> Create-cell + "
-          "per-group list (right-clickable) OK")
+    print("  import-finished (GUI): Read-finished -> fit -> Create-cell + per-group list + "
+          "Results report mirror + standalone .va export OK")
 
 
 def _selftest_status_menu(win, tmp, app):
