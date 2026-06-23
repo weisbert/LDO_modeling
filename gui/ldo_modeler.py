@@ -3529,7 +3529,7 @@ if _HAVE_QT:
             self.x_status.verticalHeader().setVisible(False)
             self.x_status.setEditTriggers(QTableWidget.NoEditTriggers)
             self.x_status.setSelectionMode(QTableWidget.NoSelection)
-            self.x_status.setMaximumHeight(190)
+            self.x_status.setMinimumHeight(70)           # a floor; the SPLITTER below sets the height
             # #5: per-group right-click menu -> that group's artifacts + Donau actions (state-aware).
             self.x_status.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             self.x_status.customContextMenuRequested.connect(self._x_status_menu)
@@ -3538,11 +3538,25 @@ if _HAVE_QT:
             _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
             _hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
             _sbl.addWidget(self.x_status)
-            run_v.addWidget(self.x_status_box)
 
+            # report / log: the run's multi-port fit report, the dry-run dsub command preview, or the
+            # finished-sim import summary -- whatever the last action produced.
+            self.x_report_box = QGroupBox("Report / log (fit report · dsub preview · import summary)")
+            _rbl = QVBoxLayout(self.x_report_box)
             self.x_report = QTextEdit(); self.x_report.setReadOnly(True)
             self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
-            run_v.addWidget(self.x_report, 1)
+            _rbl.addWidget(self.x_report)
+
+            # a DRAGGABLE vertical splitter between the per-group status table and the report/log, so
+            # the user can trade height between them (drag the handle). Neither pane fully collapses.
+            self.x_run_split = QtWidgets.QSplitter(QtCore.Qt.Vertical)
+            self.x_run_split.addWidget(self.x_status_box)
+            self.x_run_split.addWidget(self.x_report_box)
+            self.x_run_split.setChildrenCollapsible(False)
+            self.x_run_split.setStretchFactor(0, 0)      # status table: keep its dragged size
+            self.x_run_split.setStretchFactor(1, 1)      # report/log: take the extra space
+            self.x_run_split.setSizes([200, 320])        # sensible initial split
+            run_v.addWidget(self.x_run_split, 1)
 
             # ===== MODEL-CELL sub-tab: the ONE combined VA + symbol, compiled · send-to-Fit =====
             mgb = QGroupBox("3 · Create the model cell (Verilog-A + symbol, compiled)")
@@ -3580,7 +3594,7 @@ if _HAVE_QT:
             # (each sub-tab page is its own QScrollArea -> vertical scroll appears when needed).
             self.x_grp_pinform.setMinimumHeight(360)
             self.x_grp_modeb.setMinimumHeight(150)
-            self.x_report.setMinimumHeight(140)
+            self.x_report.setMinimumHeight(80)           # a small floor; the splitter handle resizes it
             self.x_subtabs.setCurrentIndex(0)                    # land on Setup
             return tab
 
@@ -5628,6 +5642,12 @@ def _selftest_cluster_sweep(win, tmp, app):
         win.x_subtabs.setCurrentIndex(1); app.processEvents()
         assert win.x_status_box.isVisibleTo(win), "per-group status table must show when location=cluster"
         assert win.x_dryrun.isVisibleTo(win), "preview-only toggle must show when location=cluster"
+        # the status table + report/log sit in a DRAGGABLE vertical splitter (resize by dragging)
+        from PyQt5 import QtCore as _QtC
+        assert win.x_run_split.orientation() == _QtC.Qt.Vertical, "run splitter must be vertical"
+        assert win.x_run_split.count() == 2 and win.x_run_split.widget(0) is win.x_status_box \
+            and win.x_run_split.widget(1) is win.x_report_box, "splitter holds status box + report box"
+        win.x_run_split.setSizes([300, 120]); _ = win.x_run_split.sizes()   # draggable -> sizes settable
         win.extract.load_manifest(str(mpath))
         win.xb_netlist["edit"].setText(str(base)); win.xb_pdk["edit"].setText(str(tmp))
         win.xb_ahdl["edit"].setText("")                  # blank -> the -ahdllibdir flag is dropped
