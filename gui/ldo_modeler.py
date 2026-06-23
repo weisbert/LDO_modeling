@@ -551,6 +551,10 @@ class ExtractCore:
             manifest=m, psf_map={k: str(v) for k, v in psf_map.items()}, load=corner,
             strict=True, optional_kinds=("trans", "iv", "dropout"), progress=progress)
         skipped = reads.pop("_skipped", [])
+        # which GROUPS were skipped (any member skipped) -- drives the import status table's state.
+        _smtags = {s.split(" [", 1)[0].split(":", 1)[0].strip() for s in skipped}
+        skipped_groups = sorted({g["tag"] for g in grps
+                                 if any(pt["tag"] in _smtags for pt in g["members"])})
         npz = pathlib.Path(dirs["npz"]) / f"{m['name']}_{corner}.npz"
         np.savez(npz, loads=np.array([corner]), **reads)
         self.npz_path = str(npz)
@@ -563,7 +567,8 @@ class ExtractCore:
         self.gate = (None, "", f"imported finished sim ({len(reads)} measurement(s), "
                                f"no gold reference{skip_txt})")
         return dict(npz_path=str(npz), gate=self.gate, report=self.report, ports=self.port_refs,
-                    psf_map=psf_map, missing=missing, skipped=skipped, n_meas=len(reads))
+                    psf_map=psf_map, missing=missing, skipped=skipped, n_meas=len(reads),
+                    psf_root=str(root), skipped_groups=skipped_groups)
 
     def port_list(self):
         return list(self.port_refs)
@@ -3940,8 +3945,44 @@ if _HAVE_QT:
                 st = QTableWidgetItem("—"); st.setForeground(QtGui.QColor("#777"))
                 t.setItem(i, 3, st)
 
+        def _x_status_init_import(self, groups, psf_root, skipped_groups):
+            """Fill the per-group status table from a FINISHED-SIM import (#3) -- so the user sees
+            the measurement list and can right-click a row (Open netlist / Open PSF dir / folder /
+            terminal). One row per group: state 'done' (imported) or 'skipped' (a coverage extra
+            absent from the PSF). PSF dir = the imported root's group subdir; netlist dir = the
+            sibling <root>/../netlist/<tag> when present (so 'Open netlist' works), else the PSF dir.
+            No live job handle (a finished import, not a running sweep)."""
+            t = self.x_status
+            t.setRowCount(0)
+            proot = pathlib.Path(psf_root)
+            nbase = proot.parent / "netlist"
+            skip = set(skipped_groups or [])
+            for i, g in enumerate(groups):
+                tag = g["tag"]
+                pdir = proot / tag
+                state = "skipped" if tag in skip else "done"
+                nd = nbase / tag
+                if (nd / "input.scs").is_file():
+                    ndir, scs = str(nd), str(nd / "input.scs")
+                else:
+                    ndir, scs = str(pdir), None     # no netlist sibling -> folder actions use PSF dir
+                data = {"tag": tag, "analysis": g["analysis"], "state": state,
+                        "job_id": None, "dsub_cmd": None,
+                        "netlist_dir": ndir, "psf_dir": str(pdir), "log_dir": ndir}
+                if scs:
+                    data["input_scs"] = scs
+                t.insertRow(i)
+                num = QTableWidgetItem(str(i + 1)); num.setData(QtCore.Qt.UserRole, data)
+                t.setItem(i, 0, num)
+                t.setItem(i, 1, QTableWidgetItem(tag))
+                t.setItem(i, 2, QTableWidgetItem(g["analysis"]))
+                st = QTableWidgetItem(state)
+                st.setForeground(QtGui.QColor(self._X_STATE_COLOUR.get(state, "#777")))
+                t.setItem(i, 3, st)
+
         _X_STATE_COLOUR = {"pending": "#888", "preview": "#555", "submitting": "#1565c0",
-                           "running": "#b8860b", "done": "#157f3b", "failed": "#b00020"}
+                           "running": "#b8860b", "done": "#157f3b", "failed": "#b00020",
+                           "skipped": "#a07a00"}
 
         def _x_row_for_tag(self, tag):
             """The table row index whose stashed data tag == tag, or None. Looking up by TAG (not
@@ -4002,7 +4043,8 @@ if _HAVE_QT:
                 {"sep": True},
                 {"label": "Open group folder", "enabled": bool(nd),
                  "slot": (lambda: self._x_open_path(nd)) if nd else None},
-                {"label": "Open PSF dir", "enabled": state == "done" and bool(pd),
+                {"label": "Open PSF dir",        # existence-based: live run -> after done; import -> now
+                 "enabled": bool(pd) and pathlib.Path(pd).is_dir(),
                  "slot": (lambda: self._x_open_path(pd)) if pd else None},
                 {"label": "Open terminal here", "enabled": bool(nd),
                  "slot": (lambda: self._x_open_terminal(nd)) if nd else None},
@@ -4278,6 +4320,16 @@ if _HAVE_QT:
                            "groups (with the node saved) and re-import to include them:\n"
                            + "\n".join(f"#   - {s}" for s in skipped))
             self.x_report.setPlainText(report)
+            # populate + SHOW the per-group list so the user can right-click a row (Open netlist /
+            # PSF dir / folder) -- import-finished previously left the table empty (#5 follow-up).
+            try:
+                from insitu import run as _run
+                groups = _run.groups(self.extract.manifest)
+                self._x_status_init_import(groups, out.get("psf_root", ""),
+                                           out.get("skipped_groups") or [])
+                self.x_status_box.setVisible(True)
+            except Exception:                            # noqa: BLE001  never block the import result
+                pass
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
             self.x_progmsg.setText("done" + (f" ({len(skipped)} coverage skipped)" if skipped else ""))
@@ -5425,12 +5477,25 @@ def _selftest_import_finished_gui(win, tmp, app, root, mpath):
     assert win.xm_make.isEnabled(), "Create model cell must enable after a finished-sim import"
     assert "Imported finished sim" in win.x_gate.text(), f"gate not updated: {win.x_gate.text()}"
     assert win.x_port.count() > 0, "output ports not populated after import"
+    # the per-group LIST must be populated + visible after import, so the user can right-click a row
+    # (Open netlist / Open PSF dir). Each row's PSF dir points at the imported root's group subdir.
+    from insitu import run as _runm
+    ngrp = len(_runm.groups(win.extract.manifest))
+    assert win.x_status.rowCount() == ngrp, f"import must list its {ngrp} groups, got {win.x_status.rowCount()}"
+    assert win.x_status_box.isVisibleTo(win), "the per-group list must SHOW after a finished-sim import"
+    r0 = win._x_row_data(0)
+    assert r0.get("state") == "done" and pathlib.Path(r0["psf_dir"]).is_dir(), \
+        f"imported row must be 'done' with a real PSF dir: {r0}"
+    acts0 = {a["label"]: a for a in win._x_status_menu_actions(0) if not a.get("sep")}
+    assert acts0["Open PSF dir"]["enabled"], "Open PSF dir must be enabled for an imported row"
+    assert not acts0["Copy JOBID"]["enabled"], "no live job handle on an imported row"
     for p in list(win.extract.port_refs.values()) + [win.extract.npz_path]:   # clean regenerables
         try:
             pathlib.Path(p).unlink()
         except (OSError, TypeError):
             pass
-    print("  import-finished (GUI): Read-finished button -> worker -> fit -> Create-cell enabled OK")
+    print("  import-finished (GUI): Read-finished button -> worker -> fit -> Create-cell + "
+          "per-group list (right-clickable) OK")
 
 
 def _selftest_status_menu(win, tmp, app):
@@ -5484,7 +5549,9 @@ def _selftest_status_menu(win, tmp, app):
     assert not a1["Re-run this group"]["enabled"], "re-run only when failed/done"
     assert not a1["Open PSF dir"]["enabled"], "PSF dir only when done"
 
-    # row 'g_c': DONE with a psf dir -> PSF dir + re-run on, cancel off; job handle merged
+    # row 'g_c': DONE with a psf dir that EXISTS -> PSF dir + re-run on, cancel off; handle merged.
+    # (Open PSF dir is existence-based now: it lights only once the dir is actually on disk.)
+    (tmp / "psf_gc").mkdir(parents=True, exist_ok=True)
     win._x_status_set(0, 3, "g_c", "ac", "done", {"job_id": "JOB7", "out_abs": str(tmp / "psf_gc")})
     rc = win._x_row_for_tag("g_c"); a2 = _labels(rc)
     assert a2["Open PSF dir"]["enabled"] and a2["Re-run this group"]["enabled"], "done gating"
