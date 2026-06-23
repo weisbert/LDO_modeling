@@ -353,6 +353,11 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
                 _fail_group(i, g, f"netlist/submit error: {e}")
                 continue                               # next pending group, do not abort the sweep
             dsub_cmds.append(sub["dsub_cmd"])          # one per launched group, in group order
+            # stash the live job handle on the group dict so a STRUCTURED group_status consumer
+            # (the GUI per-group menu) can surface JOBID / dsub command / PSF dir per row.
+            g["_job_id"] = sub["job_id"]
+            g["_dsub_cmd"] = sub["dsub_cmd"]
+            g["_out_abs"] = str(sub["out_abs"])
             _progress(progress, "run", f"group {i+1}/{n} {tag}: submitting")
             inflight[sub["job_id"]] = dict(i=i, g=g, out_abs=sub["out_abs"],
                                            require_simdone=sub["require_simdone"],

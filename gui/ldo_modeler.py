@@ -417,7 +417,7 @@ class ExtractCore:
     def run_cluster_sweep(self, *, netlistdir, pdk_model_dir=None, ahdllibdir=None,
                           engine="alps", donau=None, runner=None, work_root=None,
                           dry_run=False, group_status=None, log=None, cancel=None,
-                          max_parallel=1):
+                          max_parallel=1, groups=None, fit=True):
         """Run a FULL Donau+ALPS measurement sweep from the loaded manifest, pure-CLI (no ADE /
         no skillbridge): build each measurement GROUP's one-hot netlist OFFLINE from the
         designer's base input.scs, submit one dsub+alps job per group, collect the per-group PSF,
@@ -435,6 +435,9 @@ class ExtractCore:
         log            callback(msg) -- streamed progress lines.
         cancel         callback() -> bool -- stops launching NEW groups (cooperative Cancel).
         max_parallel   cap on how many GROUP jobs run on Donau at once (default 1 = serial).
+        groups         an explicit PRE-SPLIT subset of measurement groups to run (None = the full
+                       run.groups(m) set). The per-group RE-RUN menu (#5) passes a single group so a
+                       failed/done group retries WITHOUT re-running the whole sweep.
 
         Returns dict(dry_run, dsub_cmds, n_groups[, npz_path, gate, report, ports, psf_map])."""
         if self.manifest is None:
@@ -455,10 +458,16 @@ class ExtractCore:
         runres = PC.step_run(netinfo, dirs["psf"], m, engine=engine, donau=donau or DonauCfg(),
                              runner=runner, dry_run=dry_run, group_netlister=factory,
                              group_status=group_status, cancel=cancel, progress=_log,
-                             max_parallel=max_parallel)
+                             max_parallel=max_parallel, groups=groups)
         if dry_run:
             return dict(dry_run=True, dsub_cmds=runres["dsub_cmds"],
                         n_groups=len(runres["dsub_cmds"]))
+        if not fit:
+            # run-only (the per-group RE-RUN, #5): produce that group's PSF, but DON'T attempt the
+            # full multi-port fit -- one group's data can't fit the whole model. The user re-fits
+            # the full model with 'Import a finished simulation' once every group's PSF is present.
+            return dict(dry_run=False, fit=False, psf_map=runres["psf_map"],
+                        dsub_cmds=runres["dsub_cmds"], n_groups=len(runres["dsub_cmds"]))
         npz = PC.step_import(m, runres["psf_map"], npz_dir=dirs["npz"], load=corner, progress=_log)
         self.npz_path = str(npz)
         import fit_multiport as FMP
@@ -470,6 +479,65 @@ class ExtractCore:
         return dict(dry_run=False, npz_path=str(npz), gate=self.gate, report=self.report,
                     ports=self.port_refs, psf_map=runres["psf_map"],
                     dsub_cmds=runres["dsub_cmds"], n_groups=len(runres["dsub_cmds"]))
+
+    def import_finished_sim(self, psf_root, *, work_root=None, load=None):
+        """Read an ALREADY-FINISHED simulation directly -- NO netlist / dsub / ALPS (the bug's
+        recovery + serving users who simulated outside the tool). The PSF root is the per-corner
+        `psf/` dir holding one subdir per measurement GROUP (`<root>/<group.tag>/...`), exactly the
+        layout step_run writes; we assemble the SAME by-tag psf_map (run.groups(m) -> each group's
+        members read its dir), then step_import -> multi-port fit. Sets self.npz_path/result/report/
+        port_refs like run()/run_cluster_sweep, so 'Create model cell' works after (the desync guard
+        holds: self._fit_manifest is set to the CURRENT manifest).
+
+        EVERY measurement group must be present under the root: a finished run writes them all, and
+        a missing group would otherwise yield a SILENTLY incomplete model (a dropped transfer). So a
+        partial root fails LOUD here, naming the absent group dir(s), rather than fitting partial data.
+
+        Returns dict(npz_path, gate, report, ports, psf_map, missing, n_meas)."""
+        if self.manifest is None:
+            raise RuntimeError("load a manifest first")
+        from insitu import pmu_corner as PC, run as _run
+        m = self.manifest
+        root = pathlib.Path(psf_root)
+        if not root.is_dir():
+            raise FileNotFoundError(f"PSF root is not a directory: {root}")
+        # the SAME by-tag mapping step_run produces: each group's PSF dir = <root>/<group.tag>;
+        # every member measurement of that group reads from it.
+        grps = _run.groups(m)
+        psf_map, missing = {}, []
+        for g in grps:
+            gdir = root / g["tag"]
+            if gdir.is_dir():
+                for pt in g["members"]:
+                    psf_map[pt["tag"]] = str(gdir)
+            else:
+                missing.append(g["tag"])
+        if not psf_map:
+            raise FileNotFoundError(
+                f"no per-group PSF subdir under {root} -- expected <root>/<group.tag>/ for "
+                f"group(s) {[g['tag'] for g in grps]}. Point at the per-corner 'psf/' dir that "
+                f"holds the group subdirs (e.g. .../<corner>/psf/).")
+        if missing:
+            # fail LOUD rather than import a partial set + fit a silently-incomplete model. (The
+            # strict step_import would otherwise raise a cryptic 'psf_map has no entry for point'.)
+            raise FileNotFoundError(
+                f"PSF root {root} is missing {len(missing)} measurement-group dir(s): "
+                f"{', '.join(missing)}. import-finished needs EVERY group's PSF (a finished run "
+                f"writes them all under <corner>/psf/). Re-run the missing group(s), or point at the "
+                f"complete psf/ dir.")
+        corner = load or self._corner()
+        _base, dirs = PC.corner_dir(work_root, self._wa_gui(), corner)
+        npz = PC.step_import(m, psf_map, npz_dir=dirs["npz"], load=corner)
+        self.npz_path = str(npz)
+        import fit_multiport as FMP
+        self.result = FMP.fit_multiport(str(npz), m)
+        self._fit_manifest = m                        # the fit belongs to THIS manifest (desync guard)
+        self.report = FMP.report(self.result)
+        self.port_refs = FMP.export_single_port_refs(str(npz), m)
+        self.gate = (None, "", f"imported finished sim ({len(psf_map)} measurement(s), "
+                               "no gold reference)")
+        return dict(npz_path=str(npz), gate=self.gate, report=self.report, ports=self.port_refs,
+                    psf_map=psf_map, missing=missing, n_meas=len(psf_map))   # missing == [] (else raised)
 
     def port_list(self):
         return list(self.port_refs)
@@ -567,18 +635,21 @@ if _HAVE_QT:
         done = QtCore.pyqtSignal(object)
         failed = QtCore.pyqtSignal(str)
         progressed = QtCore.pyqtSignal(float, str)        # frac in [0,1], message
-        group_state = QtCore.pyqtSignal(int, int, str, str, str)   # i, n, tag, analysis, state
+        # i, n, tag, analysis, state, meta(dict: job_id/dsub_cmd/out_abs when known, else {})
+        group_state = QtCore.pyqtSignal(int, int, str, str, str, object)
         cancelled = QtCore.pyqtSignal()
 
         def __init__(self, extract, *, netlistdir, pdk, ahdl, engine, donau_cfg, dry_run,
-                     max_parallel=1, work_root=None):
+                     max_parallel=1, work_root=None, groups=None, fit=True):
             super().__init__()
             self.extract = extract
             self.netlistdir, self.pdk, self.ahdl = netlistdir, pdk, ahdl
             self.engine, self.donau_cfg, self.dry_run = engine, donau_cfg, dry_run
             self.max_parallel = max_parallel
             self.work_root = work_root
-            self._done_groups = set()                 # indices whose PSF has landed (bar driver)
+            self.groups = groups                      # None = full sweep; a subset = per-group re-run
+            self.fit = fit                            # False = run-only (re-run a group, skip the fit)
+            self._done_tags = set()                   # tags whose PSF has landed (bar driver)
             self._cancel = False
 
         def cancel(self):
@@ -587,12 +658,17 @@ if _HAVE_QT:
             self._cancel = True
 
         def _gs(self, i, n, group, state):
-            self.group_state.emit(i, n, group["tag"], group["analysis"], state)
-            # With several groups in flight at once, drive the bar off COMPLETED groups (not a
-            # single-i estimate): count each group once its PSF lands / preview is assembled.
+            # surface the live Donau handle (job_id/dsub_cmd/PSF dir) as soon as step_run stashes it
+            # on the group dict -- the per-group menu reads it from the row's stashed data.
+            meta = {k: group.get(sk) for sk, k in
+                    (("_job_id", "job_id"), ("_dsub_cmd", "dsub_cmd"), ("_out_abs", "out_abs"))
+                    if group.get(sk) is not None}
+            self.group_state.emit(i, n, group["tag"], group["analysis"], state, meta)
+            # With several groups in flight at once, drive the bar off COMPLETED groups (count each
+            # group ONCE by TAG, so a subset re-run -- i restarts at 0 -- can't double-count).
             if state in ("done", "preview"):
-                self._done_groups.add(i)
-            frac = len(self._done_groups) / max(n, 1)
+                self._done_tags.add(group["tag"])
+            frac = len(self._done_tags) / max(n, 1)
             self.progressed.emit(min(1.0, frac), f"group {i+1}/{n} {group['tag']}: {state}")
 
         def run(self):
@@ -603,10 +679,31 @@ if _HAVE_QT:
                     ahdllibdir=self.ahdl or None, engine=self.engine, donau=self.donau_cfg,
                     dry_run=self.dry_run, group_status=self._gs, work_root=self.work_root,
                     log=lambda m: self.progressed.emit(-1.0, m),
-                    cancel=lambda: self._cancel, max_parallel=self.max_parallel)
+                    cancel=lambda: self._cancel, max_parallel=self.max_parallel,
+                    groups=self.groups, fit=self.fit)
                 self.done.emit(out)
             except CancelledError:
                 self.cancelled.emit()
+            except Exception as e:
+                import traceback
+                self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
+
+    class _ImportFinishedWorker(QtCore.QThread):
+        """Read an ALREADY-FINISHED simulation (PSF root -> by-tag npz -> multi-port fit) off the
+        UI thread -- a 192MB grouped-noise PSF read can take a few seconds, so it must be threaded.
+        No netlist / dsub / ALPS: this is the bug's recovery + 'I already simulated' entry."""
+        done = QtCore.pyqtSignal(object)
+        failed = QtCore.pyqtSignal(str)
+
+        def __init__(self, extract, *, psf_root, work_root=None):
+            super().__init__()
+            self.extract = extract
+            self.psf_root, self.work_root = psf_root, work_root
+
+        def run(self):
+            try:
+                out = self.extract.import_finished_sim(self.psf_root, work_root=self.work_root)
+                self.done.emit(out)
             except Exception as e:
                 import traceback
                 self.failed.emit(f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
@@ -2998,14 +3095,82 @@ if _HAVE_QT:
                 self._set_sb("no", f"{type(e).__name__}: {str(e)[:70]}")
 
         # --- Tab 0: Extract (in-situ, Mechanism A) -------------------------------
+        def _x_scroll_page(self):
+            """A sub-tab page = a QScrollArea wrapping a content widget (mirrors _build_form_tab's
+            idiom: short window -> scroll instead of squash). Returns (page_widget, content_vbox)."""
+            page = QWidget(); pv = QVBoxLayout(page); pv.setContentsMargins(0, 0, 0, 0)
+            sc = QScrollArea(); sc.setWidgetResizable(True)
+            sc.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+            inner = QWidget(); iv = QVBoxLayout(inner)
+            sc.setWidget(inner); pv.addWidget(sc)
+            return page, iv
+
+        def _x_set_manifest_label(self, name):
+            """Reflect the loaded manifest name in the persistent status strip."""
+            if hasattr(self, "x_strip_manifest"):
+                self.x_strip_manifest.setText(f"manifest: {name or '—'}")
+
+        def _x_show_run(self):
+            """Auto-switch Tab 0 to the Run sub-tab (a run/import just started -> show its output)."""
+            if hasattr(self, "x_subtabs"):
+                self.x_subtabs.setCurrentIndex(1)            # 0=Setup, 1=Run, 2=Model cell
+
+        def _x_busy(self):
+            """True if a Tab-0 worker thread is still running. SAFE against a prior worker that has
+            been deleteLater'd (its Python wrapper outlives the C++ object -> isRunning() would raise
+            RuntimeError); a deleted/None worker is not busy."""
+            w = getattr(self, "_xw", None)
+            if w is None:
+                return False
+            try:
+                return bool(w.isRunning())
+            except RuntimeError:                             # C++ object already deleted -> not busy
+                return False
+
         def _tab_extract(self):
-            # [Fix C] wrap the tab content in a QScrollArea (mirror _build_form_tab's idiom):
-            # outer widget -> QScrollArea(setWidgetResizable) -> inner content widget. When the
-            # window is short the tab now SCROLLS vertically instead of squashing the blocks.
+            # Tab 0 is split into Setup / Run / Model-cell SUB-TABS (a nested QTabWidget) with a thin
+            # PERSISTENT status strip above them (skillbridge · current manifest · gate · progress),
+            # so the 3-stage pipeline no longer crams the status table + log into one squashed scroll.
+            # Pure reparenting: every widget keeps its identity, so the worker wiring + live-button
+            # logic are untouched. (The Form/Raw-JSON subtabs idiom is the same pattern as :788.)
             tab = QWidget(); tabv = QVBoxLayout(tab); tabv.setContentsMargins(0, 0, 0, 0)
-            scroll = QScrollArea(); scroll.setWidgetResizable(True)
-            scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-            w = QWidget(); outer = QVBoxLayout(w)
+
+            # ---- persistent status strip (always visible above the sub-tabs) -------------
+            strip = QWidget()
+            strip.setStyleSheet("background:#f4f6f9; border-bottom:1px solid #d6dde6;")
+            sl = QHBoxLayout(strip); sl.setContentsMargins(8, 3, 8, 3)
+            self.x_sb_status = QLabel(); self.x_sb_status.setToolTip(
+                "Whether a live Virtuoso skillbridge server is reachable. Needed for Mode A "
+                "(resolve pins), the ADE engine, and Create model cell. Mode B / offline modeling "
+                "do NOT need it. Click Check after starting the CIW skillbridge server.")
+            self.x_sb_check = QPushButton("Check")
+            self.x_sb_check.setToolTip("Test the skillbridge connection now (opens a bounded probe).")
+            self.x_sb_check.clicked.connect(self._check_skillbridge)
+            self.x_strip_manifest = QLabel("manifest: —")
+            self.x_strip_manifest.setStyleSheet("color:#234;")
+            self.x_strip_manifest.setToolTip("The loaded pin-role manifest driving Build & Run.")
+            self.x_gate = QLabel("—")
+            self.x_prog = QtWidgets.QProgressBar(); self.x_prog.setRange(0, 100)
+            self.x_prog.setValue(0); self.x_prog.setTextVisible(False); self.x_prog.setMaximumWidth(160)
+            self.x_progmsg = QLabel(""); self.x_progmsg.setStyleSheet("color:#555; font-size:11px;")
+            sl.addWidget(self.x_sb_status); sl.addWidget(self.x_sb_check)
+            _sep = QLabel("│"); _sep.setStyleSheet("color:#bbb;"); sl.addWidget(_sep)
+            sl.addWidget(self.x_strip_manifest); sl.addStretch(1)
+            sl.addWidget(self.x_gate, 2)
+            sl.addWidget(self.x_prog); sl.addWidget(self.x_progmsg, 1)
+            tabv.addWidget(strip)
+
+            # ---- the three sub-tabs (each its own QScrollArea page) ----------------------
+            self.x_subtabs = QTabWidget()
+            setup_page, setup_v = self._x_scroll_page()
+            run_page, run_v = self._x_scroll_page()
+            model_page, model_v = self._x_scroll_page()
+            self.x_subtabs.addTab(setup_page, "Setup")
+            self.x_subtabs.addTab(run_page, "Run")
+            self.x_subtabs.addTab(model_page, "Model cell")
+            tabv.addWidget(self.x_subtabs, 1)
+            outer = setup_v        # the SETUP page collects mode + pin form + manifest + Mode-B + cluster
+
             help_ = QLabel(
                 "<b>In-situ PMU LDO modeling — one corner, end to end.</b> Fill the form with your "
                 "PMU's <b>symbol pin names</b> (the tool resolves them to TB nets and builds the "
@@ -3048,16 +3213,7 @@ if _HAVE_QT:
                                    "Use this when the tool can't netlist for you.")
             self.x_mode.currentIndexChanged.connect(self._x_mode_changed)
             mrow.addWidget(self.x_mode); mrow.addStretch(1)
-            # skillbridge (live Virtuoso) connection indicator -- tells you up front whether the
-            # live paths (Mode A resolve, ADE run, Create model cell) can work.
-            self.x_sb_status = QLabel(); self.x_sb_status.setToolTip(
-                "Whether a live Virtuoso skillbridge server is reachable. Needed for Mode A "
-                "(resolve pins), the ADE engine, and Create model cell. Mode B / offline modeling "
-                "do NOT need it. Click Check after starting the CIW skillbridge server.")
-            self.x_sb_check = QPushButton("Check")
-            self.x_sb_check.setToolTip("Test the skillbridge connection now (opens a bounded probe).")
-            self.x_sb_check.clicked.connect(self._check_skillbridge)
-            mrow.addWidget(self.x_sb_status); mrow.addWidget(self.x_sb_check)
+            # (the skillbridge connection indicator + Check button now live in the persistent strip.)
             mw = QWidget(); mw.setLayout(mrow); outer.addWidget(mw)
 
             # ---- pin FORM (deliverable 1): symbol pins -> resolved manifest (MODE A) -----
@@ -3278,11 +3434,33 @@ if _HAVE_QT:
             df.addRow("Max parallel jobs", self.xd_maxjobs)
             outer.addWidget(self.x_grp_donau)
 
+            # ===== RUN sub-tab: summary · import-finished · Build&Run · status table · report ====
             self.x_summary = QTextEdit(); self.x_summary.setReadOnly(True)
             self.x_summary.setMaximumHeight(120)
             self.x_summary.setStyleSheet("font-family:monospace; font-size:11px;")
-            outer.addWidget(self.x_summary)
+            run_v.addWidget(self.x_summary)
 
+            # ---- import an ALREADY-FINISHED simulation (#3): read PSF directly, skip the sweep ----
+            self.x_grp_import = QGroupBox("Import a finished simulation (skip the sweep)")
+            gi = QFormLayout(self.x_grp_import)
+            self.x_import_root = self._path_row("x_import_root", dir_only=True)
+            self.x_import_root["edit"].setPlaceholderText(
+                "the per-corner psf/ dir holding per-group subdirs (…/<corner>/psf/)")
+            self.x_import_root["edit"].setToolTip(
+                "An ALREADY-FINISHED simulation's PSF root: the per-corner 'psf/' directory holding "
+                "one subdir per measurement GROUP (…/<corner>/psf/<group.tag>/). The tool assembles "
+                "the by-tag PSF map from the loaded manifest, reads the PSF, fits, and lets you Create "
+                "the model cell — NO netlist / dsub / ALPS. Use this to recover a run whose import "
+                "crashed, or when you simulated outside the tool.")
+            gi.addRow("Finished PSF root", self.x_import_root["w"])
+            self.x_import_btn = QPushButton("Read finished simulation → fit")
+            self.x_import_btn.setToolTip("Read the finished PSF directly (no re-simulation): by-tag "
+                                         "npz → multi-port fit → enables Create model cell.")
+            self.x_import_btn.clicked.connect(self._x_import_finished)
+            gi.addRow(self.x_import_btn)
+            run_v.addWidget(self.x_grp_import)
+
+            # ---- Build & Run (the sweep) -------------------------------------------------
             brow = QHBoxLayout()
             self.x_run = QPushButton("2 · Build && Run"); self.x_run.clicked.connect(self._x_run)
             self.x_run.setEnabled(False)
@@ -3294,18 +3472,10 @@ if _HAVE_QT:
             self.x_dryrun = QCheckBox("Preview only (dry-run)")
             self.x_dryrun.setToolTip("Cluster runs: assemble + show the per-group dsub commands "
                                      "WITHOUT submitting. Untick to actually run the sweep on Donau.")
-            brow.addWidget(self.x_dryrun)
-            self.x_gate = QLabel("—"); brow.addWidget(self.x_gate, 1)
-            outer.addLayout(brow)
-            # live progress (per measurement group) -- ade runs stream here so the window
-            # never looks wedged; spectre_cli ticks 0->100 quickly.
-            prow = QHBoxLayout()
-            self.x_prog = QtWidgets.QProgressBar(); self.x_prog.setRange(0, 100)
-            self.x_prog.setValue(0); self.x_prog.setTextVisible(False)
-            prow.addWidget(self.x_prog, 1)
-            self.x_progmsg = QLabel(""); self.x_progmsg.setStyleSheet("color:#555; font-size:11px;")
-            prow.addWidget(self.x_progmsg, 2)
-            outer.addLayout(prow)
+            brow.addWidget(self.x_dryrun); brow.addStretch(1)
+            run_v.addLayout(brow)
+            # (the gate label + live progress bar live in the persistent strip above the sub-tabs,
+            #  so they stay visible whichever sub-tab is showing.)
 
             # per-GROUP run status (cluster Donau+ALPS sweep): one row per measurement group, live
             # state pending -> running -> done|failed (or 'preview' for a dry-run). Shown only when
@@ -3318,18 +3488,21 @@ if _HAVE_QT:
             self.x_status.setEditTriggers(QTableWidget.NoEditTriggers)
             self.x_status.setSelectionMode(QTableWidget.NoSelection)
             self.x_status.setMaximumHeight(190)
+            # #5: per-group right-click menu -> that group's artifacts + Donau actions (state-aware).
+            self.x_status.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            self.x_status.customContextMenuRequested.connect(self._x_status_menu)
             _hh = self.x_status.horizontalHeader()
             _hh.setStretchLastSection(True)
             _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
             _hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
             _sbl.addWidget(self.x_status)
-            outer.addWidget(self.x_status_box)
+            run_v.addWidget(self.x_status_box)
 
             self.x_report = QTextEdit(); self.x_report.setReadOnly(True)
             self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
-            outer.addWidget(self.x_report, 1)
+            run_v.addWidget(self.x_report, 1)
 
-            # ---- model cell (deliverable 3): the ONE combined VA + symbol, compiled -----
+            # ===== MODEL-CELL sub-tab: the ONE combined VA + symbol, compiled · send-to-Fit =====
             mgb = QGroupBox("3 · Create the model cell (Verilog-A + symbol, compiled)")
             mf = QFormLayout(mgb)
             self.xm_lib = QLineEdit("LDO_model_lab"); self.xm_cell = QLineEdit("PMU_model")
@@ -3349,23 +3522,24 @@ if _HAVE_QT:
             self.xm_make.setEnabled(False)       # enabled only after a run -> a fit exists to emit
             self.xm_make.clicked.connect(self._x_make_cell)
             mf.addRow(self.xm_make)
-            outer.addWidget(mgb)
+            model_v.addWidget(mgb)
 
             srow2 = QHBoxLayout()
             srow2.addWidget(QLabel("Or send one output port →"))
             self.x_port = QComboBox(); srow2.addWidget(self.x_port)
             b_send = QPushButton("Load into Import → Fit"); b_send.clicked.connect(self._x_send)
             srow2.addWidget(b_send); srow2.addStretch(1)
-            outer.addLayout(srow2)
+            model_v.addLayout(srow2)
+            model_v.addStretch(1)
+
             self._x_mode_changed(); self._x_location_changed()   # set initial group visibility
             self._sb_initial()                                   # skillbridge indicator (import-only)
-            # [Fix C] give the major blocks a sensible minimum height so they don't collapse to
-            # nothing when the tab is short -- the QScrollArea below provides the vertical scroll.
+            # major blocks keep a sensible minimum height so they don't collapse on a short window
+            # (each sub-tab page is its own QScrollArea -> vertical scroll appears when needed).
             self.x_grp_pinform.setMinimumHeight(360)
             self.x_grp_modeb.setMinimumHeight(150)
             self.x_report.setMinimumHeight(140)
-            scroll.setWidget(w)                                  # [Fix C] content -> scroll -> tab
-            tabv.addWidget(scroll)
+            self.x_subtabs.setCurrentIndex(0)                    # land on Setup
             return tab
 
         def _form_gui(self):
@@ -3479,6 +3653,7 @@ if _HAVE_QT:
             self.x_summary.setPlainText(txt)
             self.x_run.setEnabled(True)
             self.xm_make.setEnabled(False)       # new manifest -> no fit yet (re-run before cell build)
+            self._x_set_manifest_label((self.extract.manifest or {}).get("name"))
             self.statusBar().showMessage(f"Manifest built → {pathlib.Path(path).name}. "
                                          "'Build & Run' to extract." + (" (see warnings)" if warns else ""))
 
@@ -3543,6 +3718,7 @@ if _HAVE_QT:
                     self.xm_cell.setText(f"{dcell}_model")
                 self.x_run.setEnabled(True)
                 self.xm_make.setEnabled(False)   # new manifest -> no fit yet (re-run before cell build)
+                self._x_set_manifest_label((self.extract.manifest or {}).get("name"))
                 self.statusBar().showMessage("Manifest loaded — 'Build & Run' to extract.")
             except Exception as e:
                 QMessageBox.critical(self, "Manifest", f"{type(e).__name__}: {e}")
@@ -3582,6 +3758,14 @@ if _HAVE_QT:
                 self._x_load()                            # reload + refresh the summary/plan
 
         def _x_run(self):
+            # NB: the auto-switch to the Run sub-tab fires only once a run/preview is actually
+            # COMMITTED (past every guard), so an early-return guidance dialog leaves the user on
+            # Setup where its Engine/Run-on controls live (matches _x_import_finished/_x_rerun_group).
+            if self._x_busy():
+                QMessageBox.information(self, "Build & Run",
+                    "A run/import is already in progress — wait for it (or Cancel) before starting "
+                    "another (they share the extraction state).")
+                return
             mode = self.x_mode.currentData()
             location = self.x_location.currentData()
             engine = self.x_backend.currentData()
@@ -3604,7 +3788,9 @@ if _HAVE_QT:
                 return
             # the existing in-process worker (ade / spectre_cli).
             backend = engine if engine in ("ade", "spectre_cli") else "spectre_cli"
+            self._x_show_run()                               # committed -> show the Run sub-tab (#4)
             self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
+            self.x_import_btn.setEnabled(False)          # busy: block a racing finished-sim import
             self.x_gate.setText("running…")
             self.x_prog.setValue(0); self.x_progmsg.setText("starting…")
             self.statusBar().showMessage("Extracting (augment → run → PSF → npz → fit)…")
@@ -3656,7 +3842,9 @@ if _HAVE_QT:
                 QMessageBox.critical(self, "Cluster run", f"{type(e).__name__}: {e}")
                 return
             self._x_status_init(groups)
+            self._x_show_run()                               # committed -> show the Run sub-tab (#4)
             self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
+            self.x_import_btn.setEnabled(False)          # busy: block a racing finished-sim import
             self.x_prog.setValue(0)
             self.x_gate.setText("preview…" if dry else "running…")
             self.x_progmsg.setText("assembling per-group netlists…" if dry else "submitting sweep…")
@@ -3675,15 +3863,42 @@ if _HAVE_QT:
             self._xw.finished.connect(self._xw.deleteLater)
             self._xw.start()
 
+        def _x_group_dirs(self):
+            """The workarea {netlist,psf} dirs the per-group sweep writes under, for THIS manifest
+            (mirrors pmu_corner.corner_dir + step_run's per-group <tag> subdir layout). Returns a
+            dict or None when no manifest is loaded (the menu degrades to copy-only)."""
+            try:
+                from insitu import pmu_corner as PC
+                gui = self.extract._wa_gui()
+                corner = self.extract._corner()
+                wr = self.xb_workdir["edit"].text().strip() or None
+                _base, dirs = PC.corner_dir(wr, gui, corner)
+                return {k: str(v) for k, v in dirs.items()}
+            except Exception:                            # noqa: BLE001  no manifest / bad fields
+                return None
+
         def _x_status_init(self, groups):
-            """Fill the per-group status table from the manifest's measurement groups (one row
-            per group: #, tag, analysis, state='—'). Called once before a sweep starts."""
+            """Fill the per-group status table from the manifest's measurement groups (one row per
+            group: #, tag, analysis, state='—'), STASHING each row's per-group data (tag, analysis,
+            the deterministic netlist/PSF/log paths) as UserRole on the # cell so the right-click
+            menu (#5) can act on it. job_id / dsub_cmd are filled in later from the worker. Called
+            once before a sweep starts."""
             t = self.x_status
             t.setRowCount(0)
+            dirs = self._x_group_dirs()
             for i, g in enumerate(groups):
+                tag = g["tag"]
+                data = {"tag": tag, "analysis": g["analysis"], "state": "—",
+                        "job_id": None, "dsub_cmd": None}
+                if dirs:
+                    nd = str(pathlib.Path(dirs["netlist"]) / tag)
+                    data.update(netlist_dir=nd, input_scs=str(pathlib.Path(nd) / "input.scs"),
+                                psf_dir=str(pathlib.Path(dirs["psf"]) / tag), log_dir=nd)
                 t.insertRow(i)
-                t.setItem(i, 0, QTableWidgetItem(str(i + 1)))
-                t.setItem(i, 1, QTableWidgetItem(g["tag"]))
+                num = QTableWidgetItem(str(i + 1))
+                num.setData(QtCore.Qt.UserRole, data)    # per-row data lives on the # cell
+                t.setItem(i, 0, num)
+                t.setItem(i, 1, QTableWidgetItem(tag))
                 t.setItem(i, 2, QTableWidgetItem(g["analysis"]))
                 st = QTableWidgetItem("—"); st.setForeground(QtGui.QColor("#777"))
                 t.setItem(i, 3, st)
@@ -3691,13 +3906,257 @@ if _HAVE_QT:
         _X_STATE_COLOUR = {"pending": "#888", "preview": "#555", "submitting": "#1565c0",
                            "running": "#b8860b", "done": "#157f3b", "failed": "#b00020"}
 
-        def _x_status_set(self, i, n, tag, analysis, state):
-            """Update one group's row state (live, from the worker's group_state signal)."""
-            if i >= self.x_status.rowCount():            # defensive: table not pre-filled
+        def _x_row_for_tag(self, tag):
+            """The table row index whose stashed data tag == tag, or None. Looking up by TAG (not
+            the worker's i) keeps the row mapping correct when a SUBSET re-run restarts i at 0."""
+            t = self.x_status
+            for r in range(t.rowCount()):
+                it = t.item(r, 0)
+                d = it.data(QtCore.Qt.UserRole) if it else None
+                if d and d.get("tag") == tag:
+                    return r
+            return None
+
+        def _x_status_set(self, i, n, tag, analysis, state, meta=None):
+            """Update one group's row state (live, from the worker's group_state signal) AND merge
+            any newly-known job handle (job_id/dsub_cmd/out_abs) into the row's stashed data so the
+            per-group menu can use it. Locates the row BY TAG (robust to subset re-runs)."""
+            row = self._x_row_for_tag(tag)
+            if row is None:                              # defensive: table not pre-filled
                 return
             it = QTableWidgetItem(state)
             it.setForeground(QtGui.QColor(self._X_STATE_COLOUR.get(state, "#333")))
-            self.x_status.setItem(i, 3, it)
+            self.x_status.setItem(row, 3, it)
+            cell0 = self.x_status.item(row, 0)
+            data = dict(cell0.data(QtCore.Qt.UserRole) or {"tag": tag})
+            data["state"] = state
+            for k in ("job_id", "dsub_cmd"):
+                if meta and meta.get(k) is not None:
+                    data[k] = meta[k]
+            if meta and meta.get("out_abs"):
+                data["psf_dir"] = meta["out_abs"]        # the authoritative PSF dir from finalize
+            cell0.setData(QtCore.Qt.UserRole, data)
+
+        # --- per-group right-click menu (#5): artifacts + Donau actions, state-aware -----
+        def _x_row_data(self, row):
+            """The stashed per-row data dict for a status row (on the # cell's UserRole), or {}."""
+            it = self.x_status.item(row, 0) if 0 <= row < self.x_status.rowCount() else None
+            return dict((it.data(QtCore.Qt.UserRole) if it else None) or {})
+
+        def _x_status_menu_actions(self, row):
+            """The ORDERED per-group menu spec for a status row -> a list of {label, enabled, slot}
+            dicts (or {"sep": True}). STATE-AWARE off the row's State: log/tail/jump only after the
+            group STARTED; PSF dir only when done; Cancel only while running; Re-run only when
+            failed/done; JOBID/dsub/djob/dkill only once the job handle is known. Pure (no popup) so
+            the selftest can assert structure + gating without a real menu/subprocess."""
+            d = self._x_row_data(row)
+            state = d.get("state", "—")
+            started = state in ("submitting", "running", "done", "failed")
+            have_job = bool(d.get("job_id"))
+            nd, pd, scs = d.get("netlist_dir"), d.get("psf_dir"), d.get("input_scs")
+            job, dsub, tag = d.get("job_id"), d.get("dsub_cmd"), d.get("tag")
+            A = [
+                {"label": "Open netlist (input.scs)", "enabled": bool(scs),
+                 "slot": (lambda: self._x_open_path(scs)) if scs else None},
+                {"label": "Tail output (dpeek)", "enabled": started and have_job,
+                 "slot": (lambda: self._x_tail(job)) if have_job else None},
+                {"label": "Jump to first error", "enabled": started,
+                 "slot": (lambda dd=d: self._x_jump_error(dd))},
+                {"sep": True},
+                {"label": "Open group folder", "enabled": bool(nd),
+                 "slot": (lambda: self._x_open_path(nd)) if nd else None},
+                {"label": "Open PSF dir", "enabled": state == "done" and bool(pd),
+                 "slot": (lambda: self._x_open_path(pd)) if pd else None},
+                {"label": "Open terminal here", "enabled": bool(nd),
+                 "slot": (lambda: self._x_open_terminal(nd)) if nd else None},
+                {"label": "Copy folder path", "enabled": bool(nd),
+                 "slot": (lambda: self._x_copy(nd)) if nd else None},
+                {"sep": True},
+                {"label": "Copy JOBID", "enabled": have_job,
+                 "slot": (lambda: self._x_copy(str(job))) if have_job else None},
+                {"label": "Copy dsub command", "enabled": bool(dsub),
+                 "slot": (lambda: self._x_copy(shlex.join(str(x) for x in dsub))) if dsub else None},
+                {"label": "Check job status (djob)", "enabled": have_job,
+                 "slot": (lambda: self._x_djob(job)) if have_job else None},
+                {"label": "Cancel job (dkill)",
+                 # killable whenever a live job handle exists and the job is not yet terminal -- in
+                 # particular while QUEUED ('pending'), which is the main window for cancelling.
+                 "enabled": have_job and state in ("submitting", "pending", "running"),
+                 "slot": (lambda: self._x_dkill(job)) if have_job else None},
+                {"sep": True},
+                {"label": "Re-run this group", "enabled": state in ("failed", "done"),
+                 "slot": (lambda t=tag: self._x_rerun_group(t)) if tag else None},
+            ]
+            return A
+
+        def _x_status_menu(self, pos):
+            """Pop up the per-group menu for the right-clicked status row."""
+            row = self.x_status.rowAt(pos.y())
+            if row < 0:
+                return
+            menu = QtWidgets.QMenu(self.x_status)
+            for spec in self._x_status_menu_actions(row):
+                if spec.get("sep"):
+                    menu.addSeparator(); continue
+                act = menu.addAction(spec["label"])
+                act.setEnabled(bool(spec.get("enabled")) and spec.get("slot") is not None)
+                if spec.get("slot"):
+                    act.triggered.connect(spec["slot"])
+            menu.exec_(self.x_status.viewport().mapToGlobal(pos))
+
+        def _x_open_path(self, path):
+            """xdg-open a file or folder (best effort)."""
+            import subprocess
+            p = pathlib.Path(path)
+            if not p.exists():
+                QMessageBox.information(self, "Open", f"Not present (yet): {path}")
+                return
+            try:
+                subprocess.Popen(["xdg-open", str(p)])
+            except Exception as e:                       # noqa: BLE001
+                QMessageBox.warning(self, "Open", f"Could not open {path}: {e}")
+
+        def _x_open_terminal(self, folder):
+            """Open a GUI terminal in `folder`, detecting gnome-terminal/konsole/xfce4-terminal/xterm.
+            On a headless / X-forward box with NO GUI terminal, FALL BACK to copying `cd <folder>` to
+            the clipboard (the handoff's explicit requirement). Returns the term used, or None on
+            fallback (so the selftest can assert the fallback path)."""
+            import shutil as _sh
+            import subprocess
+            folder = str(folder)
+            for term, args in (("gnome-terminal", ["--working-directory", folder]),
+                               ("konsole", ["--workdir", folder]),
+                               ("xfce4-terminal", ["--working-directory", folder]),
+                               # xterm -e exec's its argv directly with NO shell, so the cd snippet
+                               # must run under an explicit `sh -c` (a bare string would exec a
+                               # nonexistent binary and the window would flash + close).
+                               ("xterm", ["-e", "sh", "-c", f"cd {shlex.quote(folder)}; exec $SHELL"])):
+                if _sh.which(term):
+                    try:
+                        subprocess.Popen([term, *args])
+                        return term
+                    except Exception:                    # noqa: BLE001  try the next terminal
+                        continue
+            self._x_copy(f"cd {shlex.quote(folder)}")
+            self.statusBar().showMessage(f"No GUI terminal found — copied 'cd {folder}' to the clipboard.")
+            return None
+
+        def _x_copy(self, text):
+            QApplication.clipboard().setText(str(text))
+            self.statusBar().showMessage(f"Copied: {str(text)[:80]}")
+
+        def _x_djob(self, job_id):
+            from cluster import donau
+            try:
+                res = donau.SubprocessRunner()(donau.build_djob_cmd(job_id))
+                out = (res.stdout or "") + (("\n" + res.stderr) if getattr(res, "stderr", "") else "")
+            except Exception as e:                       # noqa: BLE001
+                out = f"{type(e).__name__}: {e}"
+            QMessageBox.information(self, f"djob {job_id}", out or "(no output)")
+
+        def _x_dkill(self, job_id):
+            if QMessageBox.question(self, "Cancel job",
+                                    f"dkill {job_id}? This stops the cluster job.") != QMessageBox.Yes:
+                return
+            from cluster import donau
+            try:
+                donau.cancel(job_id, donau.SubprocessRunner())
+                self.statusBar().showMessage(f"dkill {job_id} sent.")
+            except Exception as e:                       # noqa: BLE001
+                QMessageBox.warning(self, "Cancel job", f"dkill failed: {e}")
+
+        def _x_tail(self, job_id):
+            from cluster import donau
+            tail = donau.peek_tail(job_id, donau.SubprocessRunner())
+            QMessageBox.information(self, f"dpeek {job_id}", tail or "(no output yet)")
+
+        def _x_jump_error(self, data):
+            """Surface the FIRST error line (with a little context) from the job tail (dpeek) or any
+            local *.log/*.out in the group folder. Falls back to a 'nothing yet' note."""
+            text = ""
+            job = data.get("job_id")
+            if job:
+                from cluster import donau
+                text = donau.peek_tail(job, donau.SubprocessRunner(), lines=400) or ""
+            if not text:
+                nd = data.get("log_dir") or data.get("netlist_dir")
+                if nd and pathlib.Path(nd).is_dir():
+                    logs = sorted(pathlib.Path(nd).glob("*.log")) + sorted(pathlib.Path(nd).glob("*.out"))
+                    for lf in logs:
+                        try:
+                            text = lf.read_text(errors="replace"); break
+                        except OSError:
+                            pass
+            lines = text.splitlines()
+            hit = next((k for k, ln in enumerate(lines)
+                        if "error" in ln.lower() or "fatal" in ln.lower()), None)
+            if hit is None:
+                QMessageBox.information(self, "Jump to first error",
+                    "No error line in the job output yet." if text else "No log output available yet.")
+                return
+            ctx = "\n".join(lines[max(0, hit - 2): hit + 6])
+            QMessageBox.information(self, f"First error (line {hit + 1})", ctx)
+
+        def _x_rerun_group(self, tag):
+            """Re-run a SINGLE measurement group (#5) WITHOUT re-running the whole sweep -- closes
+            the resilient-sweep loop (0d3b9db isolates a failure; this retries just that group).
+            Recomputes the group by tag, then launches the cluster worker scoped to [group] in
+            run-ONLY mode (produces the group's PSF; the user re-fits via 'Import a finished
+            simulation' once every group is present)."""
+            if getattr(self.extract, "manifest", None) is None:
+                return
+            if self._x_busy():
+                QMessageBox.information(self, "Re-run group",
+                    "A run is already in progress — wait for it (or Cancel) before re-running a group.")
+                return
+            netdir = self.xb_netlist["edit"].text().strip()
+            if not netdir:
+                QMessageBox.information(self, "Re-run group",
+                    "Re-run needs the base netlist dir (Mode B 'Netlist dir (input.scs)'). Set it, "
+                    "then re-run this group.")
+                return
+            from insitu import run as _run
+            g = next((gg for gg in _run.groups(self.extract.manifest) if gg["tag"] == tag), None)
+            if g is None:
+                return
+            from cluster import donau
+            cfg = donau.DonauCfg(account=self.xd_account.text().strip() or "ug_rfic.rfSClass",
+                                 queue=self.xd_queue.text().strip() or "short",
+                                 resource=f"cpu={self.xd_cpu.value()};mem={self.xd_mem.value()}")
+            eng = "spectre" if self.x_backend.currentData() == "spectre_cli" else "alps"
+            dry = self.x_dryrun.isChecked()
+            self._x_show_run()
+            self._x_status_set(0, 1, tag, g["analysis"], "pending")
+            self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
+            self.x_import_btn.setEnabled(False)          # busy: block a racing finished-sim import
+            self.x_progmsg.setText(f"re-running group {tag}…")
+            self.statusBar().showMessage(f"Re-running group {tag} (single group, no full re-sweep)…")
+            self._xw = _ClusterSweepWorker(
+                self.extract, netlistdir=netdir, pdk=self.xb_pdk["edit"].text().strip(),
+                ahdl=self.xb_ahdl["edit"].text().strip(), engine=eng, donau_cfg=cfg, dry_run=dry,
+                max_parallel=1, work_root=self.xb_workdir["edit"].text().strip() or None,
+                groups=[g], fit=False)
+            self._xw.group_state.connect(self._x_status_set)
+            self._xw.progressed.connect(self._x_progress)
+            self._xw.done.connect(self._x_rerun_done)
+            self._xw.failed.connect(self._x_failed)
+            self._xw.cancelled.connect(self._x_cancelled)
+            self._xw.finished.connect(self._xw.deleteLater)
+            self._xw.start()
+
+        def _x_rerun_done(self, out):
+            """A single-group re-run finished (run-only). The row already shows done/preview; prompt
+            the user to re-fit the full model via 'Import a finished simulation'."""
+            self._x_idle()
+            if out.get("dry_run"):
+                cmds = out.get("dsub_cmds") or []
+                self.x_progmsg.setText("preview")
+                self.statusBar().showMessage(f"Re-run PREVIEW — {len(cmds)} dsub command(s), nothing "
+                                             "submitted.")
+                return
+            self.x_progmsg.setText("group re-run done")
+            self.statusBar().showMessage("Group re-run done — its PSF landed. Use 'Import a finished "
+                                         "simulation' (the per-corner psf/ dir) to re-fit the full model.")
 
         def _x_cluster_done(self, out):
             """A Donau+ALPS sweep finished. Dry-run -> show the per-group dsub commands; a real
@@ -3726,6 +4185,62 @@ if _HAVE_QT:
             self.x_progmsg.setText("done")
             self.statusBar().showMessage("Sweep done — fit complete. 'Create model cell', or send a "
                                          "port to Import → Fit.")
+
+        def _x_import_finished(self):
+            """#3: read an ALREADY-FINISHED simulation directly (the per-corner psf/ root with
+            per-group subdirs) -- NO netlist / dsub / ALPS. Assembles the by-tag npz, fits, and
+            enables 'Create model cell'. Recovers a run whose import crashed + serves users who
+            simulated outside the tool."""
+            if self._x_busy():
+                QMessageBox.information(self, "Import finished simulation",
+                    "A run/import is already in progress — wait for it (or Cancel) before reading a "
+                    "finished simulation (they share the extraction state).")
+                return
+            if getattr(self.extract, "manifest", None) is None:
+                QMessageBox.information(self, "Import finished simulation",
+                    "Load a manifest first (Mode A builds one from the pin form; or Load one below) "
+                    "— the by-tag PSF mapping needs the manifest's measurement groups.")
+                return
+            root = self.x_import_root["edit"].text().strip()
+            if not root:
+                QMessageBox.information(self, "Import finished simulation",
+                    "Point 'Finished PSF root' at the per-corner 'psf/' directory holding one subdir "
+                    "per measurement group (…/<corner>/psf/<group.tag>/). The tool reads the PSF "
+                    "directly — no re-simulation, no netlist / dsub / ALPS.")
+                return
+            self._x_show_run()
+            self.x_run.setEnabled(False); self.x_cancel.setEnabled(False)
+            self.x_import_btn.setEnabled(False)
+            self.x_gate.setText("importing…"); self.x_prog.setValue(0)
+            self.x_progmsg.setText("reading finished PSF → npz → fit…")
+            self.statusBar().showMessage("Reading a finished simulation (PSF → npz → fit)…")
+            self._xw = _ImportFinishedWorker(
+                self.extract, psf_root=root,
+                work_root=self.xb_workdir["edit"].text().strip() or None)
+            self._xw.done.connect(self._x_import_done)
+            self._xw.failed.connect(self._x_import_failed)
+            self._xw.finished.connect(self._xw.deleteLater)
+            self._xw.start()
+
+        def _x_import_done(self, out):
+            """A finished-sim import completed -> show the fit report + enable 'Create model cell'."""
+            self._x_idle(); self.x_import_btn.setEnabled(True)
+            self.x_prog.setValue(100)
+            npz = pathlib.Path(out["npz_path"]).name
+            miss = out.get("missing") or []
+            misstxt = f" · {len(miss)} group dir(s) absent" if miss else ""
+            self.x_gate.setText(f"<b><span style='color:#157f3b'>Imported finished sim</span></b> "
+                                f"— {out['n_meas']} measurement(s), npz {npz}{misstxt}")
+            self.x_report.setPlainText(out["report"])
+            self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
+            self.xm_make.setEnabled(True)                # a fit of the current manifest exists
+            self.x_progmsg.setText("done")
+            self.statusBar().showMessage("Finished simulation imported — fit complete. 'Create "
+                                         "model cell', or send a port to Import → Fit.")
+
+        def _x_import_failed(self, msg):
+            self.x_import_btn.setEnabled(True)
+            self._x_failed(msg)
 
         def _x_cluster_preview(self, engine, mode):
             """Mode-B / cluster: validate inputs and PREVIEW the exact run command(s) per
@@ -3777,6 +4292,7 @@ if _HAVE_QT:
                       "#   per-group one-hot netlists are built automatically — set Run-on = cluster",
                       "#   and click Build & Run to execute the full Donau+ALPS sweep (each group",
                       "#   gets its own one-hot netlist; watch the per-group status table)."]
+                self._x_show_run()                       # committed a preview -> show its dump (#4)
                 self.x_report.setPlainText("\n".join(L))
                 self.x_gate.setText(f"{where} preview — {len(grps)} command(s) above")
                 self.statusBar().showMessage(f"Previewed {len(grps)} {where} command(s) "
@@ -3805,6 +4321,8 @@ if _HAVE_QT:
         def _x_idle(self):
             """Return Tab 0 to the runnable state (re-run is just 'Build & Run' again)."""
             self.x_run.setEnabled(True); self.x_cancel.setEnabled(False)
+            if hasattr(self, "x_import_btn"):
+                self.x_import_btn.setEnabled(True)       # symmetric with the run starters' disable
 
         def _x_done(self, out):
             self._x_idle()
@@ -4703,6 +5221,199 @@ def _selftest_extract(tmp):
             pass
 
 
+def _selftest_import_finished(tmp):
+    """Headless smoke of the import-finished-sim entry (#3, Qt-free): assemble a GROUPED PSF root
+    in the <root>/<group.tag>/ layout step_run writes (from the spectre_cli fixture), then
+    ExtractCore.import_finished_sim reads it directly -- NO netlist/dsub/ALPS -- builds the BY-TAG
+    psf_map, runs step_import -> multi-port fit, and sets result/report/port_refs so 'Create model
+    cell' works after (the desync guard holds). A v_out-only manifest whose nets match the fixture's
+    allpub .ac (supply VDD1P0 / out VDD0P8_PLL, no i_out -> no CLI-alias probe-current reads), so
+    the derives hit; the real recovery target is a grouped ALPS noise PSF the box validates. Also
+    checks the no-PSF-dir error path. SKIP if the fixture (work_pmu) is absent."""
+    import json
+    import shutil
+    from insitu import run as _run, manifest as _M
+    ZDIR = ROOT / "cadence" / "work_pmu" / "z_pll" / "raw"     # Zout run (1A at out): finite Zout
+    PDIR = ROOT / "cadence" / "work_pmu" / "p_pll_1p0" / "raw"  # PSRR run (1V at supply): finite H
+    NZDIR = ROOT / "cadence" / "work_pmu" / "n_pll" / "raw"     # noise run: the scalar 'out'
+    zac = next(ZDIR.glob("*.ac"), None) if ZDIR.is_dir() else None
+    pac = next(PDIR.glob("*.ac"), None) if PDIR.is_dir() else None
+    nz = next(NZDIR.glob("*.noise"), None) if NZDIR.is_dir() else None
+    if zac is None or pac is None or nz is None:
+        print("  import-finished: SKIPPED -- spectre_cli fixture (work_pmu) unavailable")
+        return None
+    man = {"name": "importfin_selftest",
+           "dut": {"lib": "L", "cell": "C", "tb_lib": "TBL", "tb_cell": "TBC", "tb_inst": "X"},
+           "ground": "VSS", "corner": "tt_25c",
+           "supplies": {"vdd1p0": {"net": "VDD1P0", "dc": 1.0, "pin": "VDD1P0"}},
+           "v_out": {"pll": {"net": "VDD0P8_PLL", "pin": "VDD0P8_PLL", "iload": 5e-4}},
+           "current_psrr_supplies": []}
+    mpath = tmp / "importfin.manifest.json"; mpath.write_text(json.dumps(man))
+    xc = ExtractCore(); xc.load_manifest(str(mpath))
+    grps = _run.groups(xc.manifest)
+    ntags = len(_M.measurements(xc.manifest))
+    # build the GROUPED PSF root: one subdir per group.tag holding the STIMULUS-matching fixture
+    # file -- noise -> the real .noise; a supply-PSRR group -> the PSRR run (Vsupply=1, finite H);
+    # a Zout group -> the Zout run (1A at out). (Mismatched stimulus would derive non-finite H and
+    # break the fit -- the values must be physical even though the topology is a stand-in.)
+    root = tmp / "finished_psf"
+    for g in grps:
+        gd = root / g["tag"]; gd.mkdir(parents=True, exist_ok=True)
+        if g["analysis"] == "noise":
+            src = nz
+        elif any(p.get("derive") == "psrr" for p in g["members"]):
+            src = pac
+        else:
+            src = zac
+        shutil.copyfile(src, gd / src.name)
+    # error path: a root with NO per-group subdir must fail loudly (not silently fabricate an npz)
+    empty = tmp / "empty_psf"; empty.mkdir(parents=True, exist_ok=True)
+    try:
+        xc.import_finished_sim(str(empty), work_root=str(tmp))
+        raise AssertionError("import_finished_sim must reject a root with no per-group PSF subdirs")
+    except FileNotFoundError:
+        pass
+    # PARTIAL root: some groups present, one absent -> must fail LOUD naming the missing group
+    # (a finished run writes them all; a partial import would silently drop a transfer). Move one
+    # group dir aside, assert the clear error, then restore it for the successful import below.
+    drop = grps[-1]["tag"]
+    aside = root.with_name("finished_psf_aside")
+    (root / drop).rename(aside)
+    try:
+        xc.import_finished_sim(str(root), work_root=str(tmp))
+        raise AssertionError("import_finished_sim must reject a PARTIAL root (a group dir missing)")
+    except FileNotFoundError as e:
+        assert drop in str(e), f"partial-root error must name the missing group: {e}"
+    aside.rename(root / drop)
+    # the real read: by-tag psf_map -> step_import -> fit; state set so Create-cell would work
+    out = xc.import_finished_sim(str(root), work_root=str(tmp))
+    assert pathlib.Path(out["npz_path"]).exists(), "import-finished wrote no npz"
+    assert out["n_meas"] == ntags and out["missing"] == [], (out["n_meas"], ntags, out["missing"])
+    assert xc.result is not None and xc.report and "VOLTAGE OUTPUTS" in xc.report, "fit state not set"
+    assert "pll" in xc.port_list(), f"per-output ref missing after import: {xc.port_list()}"
+    assert xc.gate[0] is None and "imported finished sim" in xc.gate[2], xc.gate
+    # the desync guard holds (fit belongs to THIS manifest) -> a dry model-cell build succeeds
+    cellout = xc.build_model_cell("LDO_model_lab", "PMU_model_importfin",
+                                  str(tmp / "cds" / "LDO_model_lab"),
+                                  session=None, dry_run=True, work_root=str(tmp))
+    assert pathlib.Path(cellout["va"]).exists() and not cellout["built"], "import->cell dry build"
+    print(f"  import-finished: grouped root ({len(grps)} groups) -> by-tag npz -> fit "
+          f"({out['n_meas']} measurement(s)) -> Create-cell ready OK")
+    for p in list(xc.port_refs.values()) + [xc.npz_path, cellout["va"]]:
+        try:
+            pathlib.Path(p).unlink()
+        except OSError:
+            pass
+    return str(root), str(mpath)                          # reused by the GUI button check (#3)
+
+
+def _selftest_import_finished_gui(win, tmp, app, root, mpath):
+    """Drive the Run-tab 'Read finished simulation' BUTTON (#3) end to end through the worker:
+    load the manifest, set the PSF root, click -> the import worker reads the grouped root, fits,
+    auto-switches to the Run sub-tab, and enables 'Create model cell'. Reuses the grouped root the
+    Qt-free core test built. No skillbridge / dsub / ALPS."""
+    import os
+    _old_wr = os.environ.get("WORK_ROOT"); os.environ["WORK_ROOT"] = str(tmp)
+    try:
+        win.x_subtabs.setCurrentIndex(0)                 # start on Setup -> the import must switch
+        win.extract.load_manifest(str(mpath)); app.processEvents()
+        win.x_import_root["edit"].setText(str(root))
+        win.xm_make.setEnabled(False)                    # ensure the assert below is meaningful
+        win._x_import_finished()                         # -> _ImportFinishedWorker
+        assert win.x_subtabs.currentIndex() == 1, "import must auto-switch to the Run sub-tab"
+        assert win._xw.wait(20000), "import-finished worker did not finish"
+        app.processEvents()                              # deliver the queued done signal
+    finally:
+        if _old_wr is None:
+            os.environ.pop("WORK_ROOT", None)
+        else:
+            os.environ["WORK_ROOT"] = _old_wr
+    assert win.xm_make.isEnabled(), "Create model cell must enable after a finished-sim import"
+    assert "Imported finished sim" in win.x_gate.text(), f"gate not updated: {win.x_gate.text()}"
+    assert win.x_port.count() > 0, "output ports not populated after import"
+    for p in list(win.extract.port_refs.values()) + [win.extract.npz_path]:   # clean regenerables
+        try:
+            pathlib.Path(p).unlink()
+        except (OSError, TypeError):
+            pass
+    print("  import-finished (GUI): Read-finished button -> worker -> fit -> Create-cell enabled OK")
+
+
+def _selftest_status_menu(win, tmp, app):
+    """The per-group right-click menu (#5): custom-menu policy + STATE-AWARE action gating + the
+    job-handle plumbing (job_id/dsub_cmd/psf_dir merged from group_state) + the clipboard copy +
+    the no-GUI-terminal FALLBACK. Pure: drives the action-spec helper + the non-blocking slots
+    directly (the QMenu popup itself is modal, so it's not exec'd here)."""
+    from PyQt5 import QtCore
+    win.xb_workdir["edit"].setText(str(tmp))            # keep corner_dir writes inside tmp
+    win.extract.load_manifest("pmu_top")
+    assert win.x_status.contextMenuPolicy() == QtCore.Qt.CustomContextMenu, \
+        "status table must enable a custom context menu (#5)"
+    groups = [{"tag": "g_a", "analysis": "ac"}, {"tag": "g_b", "analysis": "noise"},
+              {"tag": "g_c", "analysis": "ac"}]
+    win._x_status_init(groups)
+    assert win.x_status.rowCount() == 3, "status table must seed one row per group"
+
+    def _labels(row):
+        return {a["label"]: a for a in win._x_status_menu_actions(row) if not a.get("sep")}
+
+    # row 0: NOT started ("—") -> path actions live, but tail/PSF/cancel/re-run/jobid gated OFF
+    a0 = _labels(0)
+    assert a0["Open group folder"]["enabled"] and a0["Open netlist (input.scs)"]["enabled"], \
+        "by-path actions must be available from the seeded paths"
+    for lab in ("Tail output (dpeek)", "Open PSF dir", "Cancel job (dkill)",
+                "Re-run this group", "Copy JOBID", "Copy dsub command"):
+        assert not a0[lab]["enabled"], f"'{lab}' must be disabled before the group starts"
+    full = [a.get("label") for a in win._x_status_menu_actions(0)]
+    for lab in ("Open netlist (input.scs)", "Jump to first error", "Open PSF dir",
+                "Open terminal here", "Copy folder path", "Check job status (djob)",
+                "Re-run this group"):
+        assert lab in full, f"menu missing '{lab}'"
+    assert full.count(None) >= 3, "menu must carry separators between groups of actions"
+
+    # row 'g_a': QUEUED ('pending') WITH a job handle -> Cancel MUST be enabled (the main window
+    # for killing a stuck-in-queue job); a 'pending' WITHOUT a handle (the pre-submit emit) must not.
+    a0p = _labels(0)
+    assert not a0p["Cancel job (dkill)"]["enabled"], "pending without a job handle -> no cancel"
+    win._x_status_set(0, 3, "g_a", "ac", "pending", {"job_id": "JOBQ"})
+    aq = _labels(win._x_row_for_tag("g_a"))
+    assert aq["Cancel job (dkill)"]["enabled"], "Cancel must be enabled for a QUEUED job with a handle"
+    assert not aq["Open PSF dir"]["enabled"], "PSF dir still off while pending"
+
+    # row 'g_b': RUNNING with a live job handle -> cancel + djob + copy-jobid/dsub on, re-run off
+    win._x_status_set(0, 3, "g_b", "noise", "running",
+                      {"job_id": "JOB42", "dsub_cmd": ["dsub", "-A", "ug_rfic"]})
+    a1 = _labels(win._x_row_for_tag("g_b"))
+    assert a1["Cancel job (dkill)"]["enabled"] and a1["Copy JOBID"]["enabled"], "running+job gating"
+    assert a1["Copy dsub command"]["enabled"] and a1["Check job status (djob)"]["enabled"]
+    assert a1["Tail output (dpeek)"]["enabled"], "tail enabled once a started job has a handle"
+    assert not a1["Re-run this group"]["enabled"], "re-run only when failed/done"
+    assert not a1["Open PSF dir"]["enabled"], "PSF dir only when done"
+
+    # row 'g_c': DONE with a psf dir -> PSF dir + re-run on, cancel off; job handle merged
+    win._x_status_set(0, 3, "g_c", "ac", "done", {"job_id": "JOB7", "out_abs": str(tmp / "psf_gc")})
+    rc = win._x_row_for_tag("g_c"); a2 = _labels(rc)
+    assert a2["Open PSF dir"]["enabled"] and a2["Re-run this group"]["enabled"], "done gating"
+    assert not a2["Cancel job (dkill)"]["enabled"], "cancel off when done"
+    assert win._x_row_data(rc).get("job_id") == "JOB7", "job handle not merged into the row data"
+    assert win._x_row_data(rc).get("psf_dir") == str(tmp / "psf_gc"), "PSF dir not merged"
+
+    # clipboard copy slot + the no-GUI-terminal FALLBACK (copy a shell-quoted `cd <dir>`)
+    win._x_copy("hello-clip"); app.processEvents()
+    assert QApplication.clipboard().text() == "hello-clip", "copy slot did not set the clipboard"
+    import shutil as _sh
+    _orig = _sh.which; _sh.which = lambda *_a, **_k: None
+    try:
+        res = win._x_open_terminal("/tmp/grp dir")       # a space -> must be shell-quoted
+    finally:
+        _sh.which = _orig
+    assert res is None, "terminal action must FALL BACK (return None) when no GUI terminal exists"
+    assert QApplication.clipboard().text() == "cd '/tmp/grp dir'", \
+        f"terminal fallback must copy a quoted cd: {QApplication.clipboard().text()!r}"
+    print("  status-menu (#5): custom menu + state-aware gating + job-handle merge + copy + "
+          "terminal fallback OK")
+
+
 def _selftest_cluster_sweep(win, tmp, app):
     """The GUI Donau+ALPS SWEEP path (the user-facing goal): the offline per-group netlister +
     the live per-group status table, exercised via a DRY-RUN (assemble the per-group dsub
@@ -4751,6 +5462,9 @@ def _selftest_cluster_sweep(win, tmp, app):
         win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
         win.x_location.setCurrentIndex(win.x_location.findData("cluster"))
         win.x_backend.setCurrentIndex(win.x_backend.findData("alps")); app.processEvents()
+        # #4: the status table + dry-run toggle live on the Run sub-tab -> activate it to check
+        # isVisibleTo (a non-active sub-tab page is hidden by the QTabWidget's stack).
+        win.x_subtabs.setCurrentIndex(1); app.processEvents()
         assert win.x_status_box.isVisibleTo(win), "per-group status table must show when location=cluster"
         assert win.x_dryrun.isVisibleTo(win), "preview-only toggle must show when location=cluster"
         win.extract.load_manifest(str(mpath))
@@ -4758,7 +5472,9 @@ def _selftest_cluster_sweep(win, tmp, app):
         win.xb_ahdl["edit"].setText("")                  # blank -> the -ahdllibdir flag is dropped
         win.xd_cpu.setValue(16); win.xd_mem.setValue(16000); win.xd_maxjobs.setValue(3)
         win.x_dryrun.setChecked(True)
+        win.x_subtabs.setCurrentIndex(0)                 # start on Setup -> _x_run must auto-switch
         win._x_run()                                     # cluster -> the dry-run sweep worker
+        assert win.x_subtabs.currentIndex() == 1, "Build & Run must auto-switch to the Run sub-tab (#4)"
         assert win._xw.max_parallel == 3, "worker must take the Max-parallel-jobs spinbox value"
         assert win._xw.wait(15000), "cluster sweep worker did not finish"
         app.processEvents()                              # deliver the queued done/group_state signals
@@ -5358,6 +6074,10 @@ def _selftest(require_qt=False):
     # 1d) In-situ ExtractCore (Tab 0) + combined model-cell dry build (deliverable 3) -- Qt-free
     _selftest_extract(tmp)
 
+    # 1e) Import-finished-sim entry (#3) -- grouped PSF root -> by-tag npz -> fit, Qt-free.
+    #     Returns (root, mpath) reused by the GUI button check below (None if the fixture is absent).
+    _impfin = _selftest_import_finished(tmp)
+
     # 2) Qt layer (offscreen) if available -- build window, REGRESSION-test the import button path
     #    (populate pickers -> apply profile -> collect must survive), render, and screenshot.
     if _HAVE_QT:
@@ -5457,6 +6177,11 @@ def _selftest(require_qt=False):
         else:
             print("  qt: current-port overlay skipped (no work_isrc/*.npz characterized)")
         # Mode A/B + location/Donau visibility (offscreen: use isVisibleTo, not isVisible).
+        # #4: these groups live on the SETUP sub-tab -> activate it (a non-active sub-tab page is
+        # hidden by the QTabWidget's stack, which would defeat isVisibleTo).
+        assert win.x_subtabs.count() == 3 and [win.x_subtabs.tabText(i) for i in range(3)] == \
+            ["Setup", "Run", "Model cell"], "Tab 0 must split into Setup/Run/Model-cell sub-tabs"
+        win.x_subtabs.setCurrentIndex(0); app.processEvents()
         win.x_mode.setCurrentIndex(win.x_mode.findData("schematic")); app.processEvents()
         assert win.x_grp_pinform.isVisibleTo(win) and not win.x_grp_modeb.isVisibleTo(win), \
             "Mode A must show the pin form, hide the import group"
@@ -5482,6 +6207,11 @@ def _selftest(require_qt=False):
         # Donau+ALPS cluster SWEEP from the GUI (the user-facing goal): offline per-group
         # netlister + the live per-group status table, via a dry-run (no submit).
         _selftest_cluster_sweep(win, tmp, app)
+        # Import-finished-sim BUTTON (#3): drive the Run-tab worker on the grouped root built above.
+        if _impfin:
+            _selftest_import_finished_gui(win, tmp, app, *_impfin)
+        # Per-group right-click menu (#5): policy + state-aware gating + job-handle plumbing.
+        _selftest_status_menu(win, tmp, app)
         # Mode-B LOCAL preview: the BARE per-group engine command (no dsub wrap), pure (no submit).
         win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
         win.x_location.setCurrentIndex(win.x_location.findData("local"))

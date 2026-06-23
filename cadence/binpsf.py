@@ -184,28 +184,83 @@ def _scan_to_marker(b, o, limit, next_id):
     return limit
 
 
-def _read_values(c, a, z, sweep_name, traces, dt_map, npoints):
-    """VALUE section -> {name: ndarray}. Walk the known per-point id sequence; delimit each
-    entry by scanning to the next expected marker (handles variable-width struct traces).
-    Scalars are stored real/complex per their datatype; struct traces are consumed but
-    dropped (not part of the contract)."""
+def _measure_point(c, a, z, seq, sweep_id):
+    """Measure POINT 0: walk the known id sequence ONCE, delimiting each entry by scanning to the
+    next expected marker, and record per-id (payload width in doubles, byte offset of the payload
+    within the point) plus the total point STRIDE in bytes. For grouped/flat PSF the per-point
+    layout is CONSTANT, so every later point i is then read directly at `v0 + i*stride + off` --
+    no full-file scan (a 192MB grouped-noise file with ~20k per-instance struct traces would
+    otherwise crawl every byte). Returns (widths, offsets, stride) or None if the point-0 walk
+    loses alignment (caller -> the slow per-entry walk)."""
     b = c.b
-    sweep_id = c.u32(a + 4)                           # first VALUE entry id (after 0x10 marker)
-    seq = [sweep_id] + [tid for tid, _, _ in traces]
-    name_of = {tid: nm for tid, nm, _ in traces}
-    # datatype per id: sweep is real; each trace from its referenced type. A known STRUCT
-    # (per-instance noise breakdown) is dropped; an unknown type is resolved from the actual
-    # payload width at parse time (1 double -> real, 2 -> complex, wider -> struct, dropped).
-    dt_of = {sweep_id: _DT_REAL}
+    widths, offs = {}, {}
+    o = a
+    for k, eid in enumerate(seq):
+        if o + 8 > z or c.u32(o) != _DECL or c.u32(o + 4) != eid:
+            return None                              # alignment lost -> not the flat layout
+        payload = o + 8
+        nxt = seq[k + 1] if k + 1 < len(seq) else sweep_id   # last entry -> next point's sweep
+        end = _scan_to_marker(b, payload, z, nxt)
+        widths[eid] = (end - payload) // 8
+        offs[eid] = payload - a
+        o = end
+    return widths, offs, o - a
+
+
+def _keep_dt(dt, width):
+    """The effective scalar datatype of a measured trace: real (1 double) or complex (2 doubles),
+    or None to DROP it (a struct / any wider-than-scalar trace -- the per-instance noise breakdown
+    is not part of the contract). Shared by the fast and slow paths so both keep EXACTLY the same
+    columns: a known datatype wins; an unlocated type (None) is resolved from the measured width."""
+    if dt == _DT_REAL or (dt is None and width == 1):
+        return _DT_REAL
+    if dt == _DT_COMPLEX or (dt is None and width == 2):
+        return _DT_COMPLEX
+    return None                                        # struct / unexpected width -> dropped
+
+
+def _read_values_fast(c, a, sweep_name, sweep_id, seq, name_of, dt_of, widths, offs, stride, npoints):
+    """Read every WANTED column by the constant stride measured from point 0 -- N x (#kept cols)
+    double reads, never a full-file scan. Struct/wide traces are skipped by their measured width."""
+    cols, order = {}, []
+    for eid in seq:
+        w = widths.get(eid)
+        if w is None:
+            continue
+        dt = _DT_REAL if eid == sweep_id else _keep_dt(dt_of.get(eid), w)
+        if dt is None:                                 # struct / wide -> dropped (no column)
+            continue
+        nm = sweep_name if eid == sweep_id else name_of[eid]
+        off = offs[eid]
+        if dt == _DT_REAL:
+            cols[nm] = np.fromiter((c.f64(a + i * stride + off) for i in range(npoints)),
+                                   dtype=float, count=npoints)
+        else:
+            arr = np.empty(npoints, dtype=complex)
+            for i in range(npoints):
+                base = a + i * stride + off
+                arr[i] = complex(c.f64(base), c.f64(base + 8))
+            cols[nm] = arr
+        order.append(nm)
+    out = {nm: cols[nm] for nm in order}               # sweep first (seq[0]), then trace order
+    out["_sweep"] = sweep_name
+    return out
+
+
+def _read_values_walk(c, a, z, sweep_name, sweep_id, seq, name_of, dt_of, npoints):
+    """The proven per-entry walk: delimit each entry by scanning to the next expected marker
+    (handles variable-width struct traces). Used for npoints<=1 and as the fallback when the
+    constant-stride invariant does not hold. Scalars stored real/complex per datatype; struct /
+    wider-than-scalar traces are consumed but dropped (their column stays short -> filtered out)."""
+    b = c.b
     cols = {sweep_name: []}
     order = [sweep_name]
-    for tid, nm, typeid in traces:
-        dt = dt_map.get(typeid)                        # None if the type wasn't located
-        dt_of[tid] = dt
-        if dt != _DT_STRUCT:                           # struct traces never get a column
-            cols[nm] = []
-            order.append(nm)
-
+    for eid in seq:                                    # non-struct traces get a column, in order
+        if eid == sweep_id:
+            continue
+        if dt_of.get(eid) != _DT_STRUCT:
+            cols[name_of[eid]] = []
+            order.append(name_of[eid])
     total = npoints * len(seq) if npoints else 1 << 30
     o = a
     for k in range(total):
@@ -216,7 +271,7 @@ def _read_values(c, a, z, sweep_name, traces, dt_map, npoints):
         last = (npoints and k == total - 1)
         nxt = None if last else seq[(k + 1) % len(seq)]
         end = z if nxt is None else _scan_to_marker(b, o, z, nxt)
-        dt, nd = dt_of[eid], (end - o) // 8
+        dt, nd = dt_of.get(eid), (end - o) // 8
         nm = sweep_name if eid == sweep_id else name_of[eid]
         if dt == _DT_REAL or (dt is None and nd == 1):
             cols[nm].append(c.f64(o))                 # real scalar (sweep var, noise 'out')
@@ -235,6 +290,47 @@ def _read_values(c, a, z, sweep_name, traces, dt_map, npoints):
     return out
 
 
+def _read_values(c, a, z, sweep_name, traces, dt_map, npoints):
+    """VALUE section -> {name: ndarray}. The per-point layout is the fixed id sequence
+    [sweepId, trace0, trace1, ...]; a GROUPED (PSF groups>=1) noise PSF uses the SAME flat layout,
+    only with ~20k per-instance STRUCT traces appended. We FIRST measure point 0 (each entry's
+    width + offset + the constant stride), VALIDATE the stride tiles the section and the 2nd point
+    opens with the sweep marker at the predicted offset, then read each wanted column directly by
+    stride -- so a huge grouped file costs N x (#kept cols) reads, not a full-file scan. If that
+    invariant does not hold (or npoints<=1) we fall back to the proven per-entry walk. Struct /
+    wider-than-scalar traces are dropped either way (the contract uses only the scalar/complex
+    traces, e.g. the noise total 'out')."""
+    b = c.b
+    sweep_id = c.u32(a + 4)                           # first VALUE entry id (after 0x10 marker)
+    seq = [sweep_id] + [tid for tid, _, _ in traces]
+    name_of = {tid: nm for tid, nm, _ in traces}
+    # datatype per id: sweep is real; each trace from its referenced type (None if not located,
+    # then resolved from the measured payload width: 1->real, 2->complex, wider->struct/dropped).
+    dt_of = {sweep_id: _DT_REAL}
+    for tid, _, typeid in traces:
+        dt_of[tid] = dt_map.get(typeid)
+    meas = _measure_point(c, a, z, seq, sweep_id) if (npoints and npoints > 1) else None
+    if meas is not None:
+        widths, offs, stride = meas
+        seclen = z - a
+        # constant-stride invariant -- STRICT, so a genuinely variable-stride file (per-instance
+        # struct widths that differ across sweep points) falls back to the proven walk instead of
+        # being silently misread by a fixed stride. The real grouped files carry an exactly 4-byte
+        # trailer (npoints*stride == seclen-4), so require a SUB-DOUBLE trailer; AND spot-check that
+        # BOTH the 2nd point AND the LAST point open with the sweep marker at the predicted stride
+        # (a width change that first appears at a later point can't be caught by point 1 alone).
+        trailer = seclen - npoints * stride
+        tiles = stride > 0 and 0 <= trailer < 8
+        nextok = (a + stride + 8 <= z and c.u32(a + stride) == _DECL
+                  and c.u32(a + stride + 4) == sweep_id)
+        lp = a + (npoints - 1) * stride
+        lastok = (lp + 8 <= z and c.u32(lp) == _DECL and c.u32(lp + 4) == sweep_id)
+        if tiles and nextok and lastok:
+            return _read_values_fast(c, a, sweep_name, sweep_id, seq, name_of, dt_of,
+                                     widths, offs, stride, npoints)
+    return _read_values_walk(c, a, z, sweep_name, sweep_id, seq, name_of, dt_of, npoints)
+
+
 # --------------------------------------------------------------------------- API
 def read_binpsf(path):
     """Read a binary PSF file -> {name: ndarray} (the sweep column + every saved SCALAR
@@ -251,9 +347,11 @@ def read_binpsf(path):
                          f"(not a recognised binary PSF?)")
     (h0, h1), (t0, t1), (s0, s1), (r0, r1), (v0, v1) = secs[:5]
     hdr = _read_header(c, h0, h1)
-    if int(hdr.get("PSF groups", 0)):                 # sweep-grouped data -- a layout we have
-        raise NotImplementedError(                     # not needed/seen (our saves give groups=0)
-            f"{path}: grouped PSF (PSF groups={hdr['PSF groups']}) not supported")
+    # grouped PSF (PSF groups>=1) is the SAME flat per-point VALUE layout as groups=0 -- ALPS just
+    # saved every device's noise contribution as ~20k extra per-instance STRUCT traces. The guard
+    # that used to reject groups>=1 was a false wall: _read_values measures the constant stride
+    # from point 0 and reads only the wanted scalar columns (the structs are dropped, sweep+'out'
+    # kept). See test_binpsf.py's synthetic groups=1 fixture + the real-file (freq,out) oracle.
     npoints = int(hdr.get("PSF sweep points", 0))
     traces = _read_traces(c, r0, r1)
     dt_map = _type_datatypes(b, t0, t1, [tid for _, _, tid in traces])
