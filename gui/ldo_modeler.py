@@ -480,20 +480,26 @@ class ExtractCore:
                     ports=self.port_refs, psf_map=runres["psf_map"],
                     dsub_cmds=runres["dsub_cmds"], n_groups=len(runres["dsub_cmds"]))
 
-    def import_finished_sim(self, psf_root, *, work_root=None, load=None):
+    def import_finished_sim(self, psf_root, *, work_root=None, load=None, progress=None):
         """Read an ALREADY-FINISHED simulation directly -- NO netlist / dsub / ALPS (the bug's
         recovery + serving users who simulated outside the tool). The PSF root is the per-corner
         `psf/` dir holding one subdir per measurement GROUP (`<root>/<group.tag>/...`), exactly the
         layout step_run writes; we assemble the SAME by-tag psf_map (run.groups(m) -> each group's
-        members read its dir), then step_import -> multi-port fit. Sets self.npz_path/result/report/
+        members read its dir), then read -> multi-port fit. Sets self.npz_path/result/report/
         port_refs like run()/run_cluster_sweep, so 'Create model cell' works after (the desync guard
         holds: self._fit_manifest is set to the CURRENT manifest).
 
-        EVERY measurement group must be present under the root: a finished run writes them all, and
+        EVERY measurement GROUP must be present under the root: a finished run writes them all, and
         a missing group would otherwise yield a SILENTLY incomplete model (a dropped transfer). So a
         partial root fails LOUD here, naming the absent group dir(s), rather than fitting partial data.
+        EXCEPTION: a COVERAGE-only measurement (slew transient / I-V / dropout) whose signal wasn't
+        saved in the finished PSF is SKIPPED with a VISIBLE note (it only enriches the model; the core
+        z/psrr/noise/y/pi transfers stand alone) -- so one un-saved transient can't block the whole
+        import. A missing CORE transfer still fails loud.
 
-        Returns dict(npz_path, gate, report, ports, psf_map, missing, n_meas)."""
+        `progress(done, total, tag)` is called per measurement read (for a GUI progress bar).
+
+        Returns dict(npz_path, gate, report, ports, psf_map, missing, skipped, n_meas)."""
         if self.manifest is None:
             raise RuntimeError("load a manifest first")
         from insitu import pmu_corner as PC, run as _run
@@ -511,40 +517,53 @@ class ExtractCore:
             return any((d / g["tag"]).is_dir() for g in grps)
         if not _has_groups(root) and (root / "psf").is_dir() and _has_groups(root / "psf"):
             root = root / "psf"
+        _OPTIONAL = ("trans", "iv", "dropout")        # COVERAGE-only derives (skippable)
         psf_map, missing = {}, []
         for g in grps:
             gdir = root / g["tag"]
             if gdir.is_dir():
                 for pt in g["members"]:
                     psf_map[pt["tag"]] = str(gdir)
-            else:
-                missing.append(g["tag"])
+            elif not all(pt["derive"] in _OPTIONAL for pt in g["members"]):
+                missing.append(g["tag"])              # a CORE group dir absent -> fatal (below)
+            # else: a COVERAGE group dir absent -> left out of psf_map, skipped at read time (the
+            # optional_kinds path records it in `skipped`), never fatal.
         if not psf_map:
             raise FileNotFoundError(
                 f"no per-group PSF subdir under {root} -- expected <root>/<group.tag>/ for "
                 f"group(s) {[g['tag'] for g in grps]}. Point at ONE corner's run dir or its 'psf/' "
                 f"subdir (e.g. .../<corner> or .../<corner>/psf/).")
         if missing:
-            # fail LOUD rather than import a partial set + fit a silently-incomplete model. (The
-            # strict step_import would otherwise raise a cryptic 'psf_map has no entry for point'.)
+            # fail LOUD rather than import a partial CORE set + fit a silently-incomplete model.
             raise FileNotFoundError(
-                f"PSF root {root} is missing {len(missing)} measurement-group dir(s): "
-                f"{', '.join(missing)}. import-finished needs EVERY group's PSF (a finished run "
-                f"writes them all under <corner>/psf/). Re-run the missing group(s), or point at the "
-                f"complete psf/ dir.")
+                f"PSF root {root} is missing {len(missing)} CORE measurement-group dir(s): "
+                f"{', '.join(missing)}. import-finished needs every core group's PSF (z/psrr/noise/"
+                f"y/pi). Re-run the missing group(s), or point at the complete psf/ dir. (Coverage "
+                f"extras -- slew/I-V/dropout -- are skipped if absent, not fatal.)")
         corner = load or self._corner()
         _base, dirs = PC.corner_dir(work_root, self._wa_gui(), corner)
-        npz = PC.step_import(m, psf_map, npz_dir=dirs["npz"], load=corner)
+        # read the PSF ourselves (not step_import) so we can (a) tolerate a missing COVERAGE extra
+        # and (b) stream per-measurement progress. A missing trans/iv/dropout signal is recorded in
+        # `skipped`; a missing CORE transfer still raises (optional_kinds gates exactly the extras).
+        import numpy as np
+        from insitu import importmp as _imp
+        reads = _imp.from_psf_multiport(
+            manifest=m, psf_map={k: str(v) for k, v in psf_map.items()}, load=corner,
+            strict=True, optional_kinds=("trans", "iv", "dropout"), progress=progress)
+        skipped = reads.pop("_skipped", [])
+        npz = pathlib.Path(dirs["npz"]) / f"{m['name']}_{corner}.npz"
+        np.savez(npz, loads=np.array([corner]), **reads)
         self.npz_path = str(npz)
         import fit_multiport as FMP
         self.result = FMP.fit_multiport(str(npz), m)
         self._fit_manifest = m                        # the fit belongs to THIS manifest (desync guard)
         self.report = FMP.report(self.result)
         self.port_refs = FMP.export_single_port_refs(str(npz), m)
-        self.gate = (None, "", f"imported finished sim ({len(psf_map)} measurement(s), "
-                               "no gold reference)")
+        skip_txt = f"; {len(skipped)} coverage extra(s) skipped" if skipped else ""
+        self.gate = (None, "", f"imported finished sim ({len(reads)} measurement(s), "
+                               f"no gold reference{skip_txt})")
         return dict(npz_path=str(npz), gate=self.gate, report=self.report, ports=self.port_refs,
-                    psf_map=psf_map, missing=missing, n_meas=len(psf_map))   # missing == [] (else raised)
+                    psf_map=psf_map, missing=missing, skipped=skipped, n_meas=len(reads))
 
     def port_list(self):
         return list(self.port_refs)
@@ -701,15 +720,22 @@ if _HAVE_QT:
         No netlist / dsub / ALPS: this is the bug's recovery + 'I already simulated' entry."""
         done = QtCore.pyqtSignal(object)
         failed = QtCore.pyqtSignal(str)
+        progressed = QtCore.pyqtSignal(float, str)        # frac in [0,1], message
 
         def __init__(self, extract, *, psf_root, work_root=None):
             super().__init__()
             self.extract = extract
             self.psf_root, self.work_root = psf_root, work_root
 
+        def _progress(self, done, total, tag):
+            frac = (done / total) if total else 0.0
+            msg = f"reading {tag} ({done + 1}/{total})" if tag else "reads done — fitting…"
+            self.progressed.emit(min(1.0, frac), msg)
+
         def run(self):
             try:
-                out = self.extract.import_finished_sim(self.psf_root, work_root=self.work_root)
+                out = self.extract.import_finished_sim(
+                    self.psf_root, work_root=self.work_root, progress=self._progress)
                 self.done.emit(out)
             except Exception as e:
                 import traceback
@@ -4228,26 +4254,37 @@ if _HAVE_QT:
             self._xw = _ImportFinishedWorker(
                 self.extract, psf_root=root,
                 work_root=self.xb_workdir["edit"].text().strip() or None)
+            self._xw.progressed.connect(self._x_progress)   # live read progress in the strip
             self._xw.done.connect(self._x_import_done)
             self._xw.failed.connect(self._x_import_failed)
             self._xw.finished.connect(self._xw.deleteLater)
             self._xw.start()
 
         def _x_import_done(self, out):
-            """A finished-sim import completed -> show the fit report + enable 'Create model cell'."""
+            """A finished-sim import completed -> show the fit report + enable 'Create model cell'.
+            A coverage extra (slew/I-V/dropout) that wasn't saved in the PSF is noted, NOT fatal."""
             self._x_idle(); self.x_import_btn.setEnabled(True)
             self.x_prog.setValue(100)
             npz = pathlib.Path(out["npz_path"]).name
-            miss = out.get("missing") or []
-            misstxt = f" · {len(miss)} group dir(s) absent" if miss else ""
+            skipped = out.get("skipped") or []
+            skiptxt = f" · {len(skipped)} coverage extra(s) skipped" if skipped else ""
             self.x_gate.setText(f"<b><span style='color:#157f3b'>Imported finished sim</span></b> "
-                                f"— {out['n_meas']} measurement(s), npz {npz}{misstxt}")
-            self.x_report.setPlainText(out["report"])
+                                f"— {out['n_meas']} measurement(s), npz {npz}{skiptxt}")
+            report = out["report"]
+            if skipped:
+                report += ("\n\n# " + "-" * 70 + f"\n# {len(skipped)} COVERAGE measurement(s) "
+                           "SKIPPED — their signal wasn't saved in the finished PSF. The CORE model "
+                           "imported fine; these only add slew / I-V / dropout detail. Re-run those "
+                           "groups (with the node saved) and re-import to include them:\n"
+                           + "\n".join(f"#   - {s}" for s in skipped))
+            self.x_report.setPlainText(report)
             self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
-            self.x_progmsg.setText("done")
-            self.statusBar().showMessage("Finished simulation imported — fit complete. 'Create "
-                                         "model cell', or send a port to Import → Fit.")
+            self.x_progmsg.setText("done" + (f" ({len(skipped)} coverage skipped)" if skipped else ""))
+            self.statusBar().showMessage("Finished simulation imported — fit complete"
+                                         + (f"; {len(skipped)} coverage extra(s) skipped (see report)"
+                                            if skipped else "")
+                                         + ". 'Create model cell', or send a port to Import → Fit.")
 
         def _x_import_failed(self, msg):
             self.x_import_btn.setEnabled(True)
@@ -5296,16 +5333,21 @@ def _selftest_import_finished(tmp):
     except FileNotFoundError as e:
         assert drop in str(e), f"partial-root error must name the missing group: {e}"
     aside.rename(root / drop)
-    # the real read: by-tag psf_map -> step_import -> fit; state set so Create-cell would work
-    out = xc.import_finished_sim(str(root), work_root=str(tmp))
+    # the real read: by-tag psf_map -> fit; PROGRESS streamed per measurement; state set
+    ticks = []
+    out = xc.import_finished_sim(str(root), work_root=str(tmp),
+                                 progress=lambda d, n, tag: ticks.append((d, n, tag)))
     assert pathlib.Path(out["npz_path"]).exists(), "import-finished wrote no npz"
-    assert out["n_meas"] == ntags and out["missing"] == [], (out["n_meas"], ntags, out["missing"])
+    assert out["n_meas"] == ntags and out["missing"] == [] and out["skipped"] == [], \
+        (out["n_meas"], ntags, out["missing"], out["skipped"])
+    assert len(ticks) == ntags + 1 and ticks[-1][2] is None, \
+        f"progress must tick once per measurement + a final tick: {ticks}"
     assert xc.result is not None and xc.report and "VOLTAGE OUTPUTS" in xc.report, "fit state not set"
     assert "pll" in xc.port_list(), f"per-output ref missing after import: {xc.port_list()}"
     assert xc.gate[0] is None and "imported finished sim" in xc.gate[2], xc.gate
     # FORGIVING root: pointing at the CORNER dir (parent of psf/) must auto-descend into psf/ and
     # import identically -- the user can give .../<corner> or .../<corner>/psf interchangeably.
-    cdir = tmp / "corner_layout"; shutil.copytree(root, cdir / "psf")
+    cdir = tmp / "corner_layout"; shutil.copytree(root, cdir / "psf", dirs_exist_ok=True)
     outc = xc.import_finished_sim(str(cdir), work_root=str(tmp))   # auto-descend .../<corner> -> psf/
     assert outc["n_meas"] == ntags and outc["missing"] == [], (outc["n_meas"], outc["missing"])
     # the desync guard holds (fit belongs to THIS manifest) -> a dry model-cell build succeeds
@@ -5320,6 +5362,42 @@ def _selftest_import_finished(tmp):
             pathlib.Path(p).unlink()
         except OSError:
             pass
+
+    # COVERAGE-tolerance: a manifest with a slew TRANSIENT (tag tr_pll_2m) whose group has no
+    # usable .tran in the finished PSF must SKIP that coverage extra (recorded, not fatal) while
+    # the CORE model still imports -- exactly the user's KeyError case ('VDD0P8_PLL' not saved in
+    # the transient PSF). The CORE z/noise/psrr groups are present and physical, as above.
+    manc = dict(man); manc["name"] = "importfin_cov_selftest"
+    manc["coverage"] = {"tier": "T0", "enable": {"slew": True},
+                        "transient": {"pll": {"steps": [{"from": 0.0, "to": 5e-4, "label": "2m"}],
+                                              "tstop": 1e-6, "tstep": 1e-9}}}
+    mpathc = tmp / "importfin_cov.manifest.json"; mpathc.write_text(json.dumps(manc))
+    xcc = ExtractCore(); xcc.load_manifest(str(mpathc))
+    grpsc = _run.groups(xcc.manifest)
+    tr_tag = next(g["tag"] for g in grpsc if g["analysis"] == "tran")    # 'g_tr_pll_2m'
+    rootc = tmp / "finished_psf_cov"
+    for g in grpsc:
+        gd = rootc / g["tag"]; gd.mkdir(parents=True, exist_ok=True)
+        if g["analysis"] == "noise":
+            shutil.copyfile(nz, gd / nz.name)
+        elif g["analysis"] == "tran":
+            shutil.copyfile(zac, gd / zac.name)        # a present dir but NO .tran -> read skips it
+        elif any(p.get("derive") == "psrr" for p in g["members"]):
+            shutil.copyfile(pac, gd / pac.name)
+        else:
+            shutil.copyfile(zac, gd / zac.name)
+    outk = xcc.import_finished_sim(str(rootc), work_root=str(tmp))
+    assert outk["skipped"] and any("tr_pll_2m" in s for s in outk["skipped"]), \
+        f"missing-coverage transient must be SKIPPED (not fatal): {outk['skipped']}"
+    assert xcc.result is not None and "pll" in xcc.port_list(), "core model must still import"
+    assert "coverage extra(s) skipped" in xcc.gate[2], xcc.gate
+    for p in list(xcc.port_refs.values()) + [xcc.npz_path]:
+        try:
+            pathlib.Path(p).unlink()
+        except OSError:
+            pass
+    print(f"  import-finished: coverage-tolerant — transient {tr_tag} skipped (not saved), "
+          f"core model imported + progress streamed OK")
     return str(root), str(mpath)                          # reused by the GUI button check (#3)
 
 

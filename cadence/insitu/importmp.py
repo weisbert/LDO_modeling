@@ -194,16 +194,27 @@ def _derive(point, d, probe_alias=None):
 
 # --------------------------------------------------------------------------- assemble
 def from_psf_multiport(root=None, *, manifest, psf_map=None, load="nom",
-                       probe_aliases=None, strict=True):
+                       probe_aliases=None, strict=True, optional_kinds=(), progress=None):
     """Read every measurement point's PSF -> the generalized multi-port npz dict for one
     `load` (corner) label. `manifest` is a loaded manifest dict; `root` selects the CLI
     layout, or pass an explicit `psf_map={tag: file|dir}` from run.py. `probe_aliases`
     maps a sink key -> a fallback PSF current key (for foreign probe names, e.g. the CLI
-    gold's Vb500/Vb1u). With strict=False, points whose PSF is missing are skipped."""
+    gold's Vb500/Vb1u). With strict=False, points whose PSF is missing/unreadable are skipped.
+
+    `optional_kinds` is a per-DERIVE allow-list of points that may be skipped EVEN under strict:
+    a derive in this set whose PSF/signal is missing is recorded in out['_skipped'] instead of
+    raising (the rest stay strict). Used by import-finished to tolerate a missing COVERAGE extra
+    (slew/I-V/dropout) -- those enrich the model but the core transfers stand alone -- without
+    letting it abort the whole import. `progress(done, total, tag)` is called before each point
+    (tag=None on the final tick) so a GUI can show read progress."""
     m = manifest
     points = _manifest.measurements(m)
+    optional = set(optional_kinds)
     out = {}
-    for pt in points:
+    n = len(points)
+    for i, pt in enumerate(points):
+        if progress:
+            progress(i, n, pt["tag"])
         alias = None
         if probe_aliases and pt["reads"] and pt["reads"][0][0] == "i":
             # the sink key is the 2nd token of the tag's probe; map via the i_out key
@@ -215,9 +226,11 @@ def from_psf_multiport(root=None, *, manifest, psf_map=None, load="nom",
             d = psf.read_psf(fpath)
             out[f"{pt['key']}_{load}"] = _derive(pt, d, probe_alias=alias)
         except (FileNotFoundError, KeyError) as e:
-            if strict:
+            if strict and pt["derive"] not in optional:
                 raise
             out.setdefault("_skipped", []).append(f"{pt['tag']}: {e}")
+    if progress:
+        progress(n, n, None)
     return out
 
 
