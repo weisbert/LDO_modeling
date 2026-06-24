@@ -74,7 +74,6 @@ class ModelerCore:
         self.result = None           # fit_model.FitResult
         self._fit_ref = None         # ref_path the current result was fit from (desync guard)
         self.warnings = []
-        self.trans_info = {}         # per-corner trans-ID extraction diagnostics (Tab 5)
 
     # ---- import -----------------------------------------------------------------
     def import_data(self, files, fmt=None, sv_is_psd2=False):
@@ -87,37 +86,6 @@ class ModelerCore:
         self.result = None           # invalidate any prior fit -- it belonged to another ref
         self.warnings = ic.validate(self.ref)
         return self.ref_path, self.warnings
-
-    def import_trans(self, waveforms, plan_json, extra_files=None, outdir=None):
-        """Build a reference from ONE multitone trans-ID run (productionization piece C).
-        `waveforms` = {corner: [band0_wave, band1_wave, ...]} (paths or arrays); `plan_json` =
-        the sidecar emitted by trans_id.emit_stim_va. Converts the waveforms to Zout/PSRR z/p
-        CSVs (+ nominal hf) via trans_import, MERGES with extra_files (the noise/DC the user
-        already picked on Tab 2 -- noise stays a separate .noise), and funnels through the
-        EXISTING import_data() so assemble + guardrails + npz schema are reused, never
-        duplicated. trans-derived z/p WIN over any same-key extra_files. Returns
-        (ref_path, warnings)."""
-        import trans_import
-        plan = trans_import.load_plan(plan_json)
-        outdir = pathlib.Path(outdir) if outdir else (ROOT / "work" / "trans_csv" / self.profile.name)
-        zp_files, info = trans_import.import_run(plan, waveforms, outdir,
-                                                 nominal=self.profile.nominal)
-        self.trans_info = info
-        files = dict(extra_files or {})
-        files.update(zp_files)                 # trans z/p take precedence
-        return self.import_data(files)
-
-    def import_trans_folder(self, folder, plan_json, extra_files=None, outdir=None):
-        """Folder-gesture wrapper: match <corner>_b<band>.* exports in `folder` against the
-        plan, then import_trans. Returns (ref_path, warnings); raises if no corner matched."""
-        import trans_import
-        plan = trans_import.load_plan(plan_json)
-        waveforms = trans_import.match_wave_dir(folder, plan, self.profile.loads)
-        if not waveforms:
-            raise RuntimeError(
-                "no waveform files matched. Expected <corner>_b<band>.csv (e.g. 20u_b0.csv, "
-                "20u_b1.csv, ...) for your load corners, one per band in plan.json.")
-        return self.import_trans(waveforms, plan_json, extra_files=extra_files, outdir=outdir)
 
     def use_existing_ref(self, ref_path):
         """Point at an already-assembled npz (skip import) -- e.g. a Target-A variant."""
@@ -2909,14 +2877,16 @@ if _HAVE_QT:
             self.resize(1180, 820)
             self.tabs = QTabWidget()
             self.setCentralWidget(self.tabs)
+            # Three top-level tabs: Extract (in-situ), the Report results page (index 1), and a
+            # 'Manual (legacy)' container nesting the hand-import workflow (Profile/Import/Fit/
+            # Compare). Keep a report_tab ref for the post-fit auto-switch + Run-tab jump button.
             self.tabs.addTab(self._tab_extract(), "0 · Extract (in-situ)")
-            self.tabs.addTab(self._tab_profile(), "1 · Profile")
-            self.tabs.addTab(self._tab_import(), "2 · Import data")
-            self.tabs.addTab(self._tab_fit(), "3 · Fit")
-            self.tabs.addTab(self._tab_compare(), "4 · Compare")
-            self.tabs.addTab(self._tab_transid(), "5 · Trans-ID")
+            self.report_tab = self._tab_report()
+            self.tabs.addTab(self.report_tab, "Report")
+            self.tabs.addTab(self._tab_manual(), "Manual (legacy)")
             self.statusBar().showMessage(
-                "In-situ extraction → Tab 0. Or hand-imported data → Tab 1 Profile.")
+                "In-situ extraction → the Extract tab (fit report lands in Report). "
+                "Hand-imported data → Manual (legacy) → Profile.")
             self._load_autosave()           # restore last session's form entries (if any)
 
         # --- form-state persistence (PMU pin form + Profile) ---------------------
@@ -3577,6 +3547,19 @@ if _HAVE_QT:
             self.x_run_split.setSizes([200, 320])        # sensible initial split
             run_v.addWidget(self.x_run_split, 1)
 
+            # a one-click jump to the top-level Report tab (the per-port GT-vs-model overlay). Built
+            # once here (Run section), enabled only once a fit exists (_x_show_results enables it).
+            jrow = QHBoxLayout()
+            jrow.addStretch(1)
+            self.x_view_report = QPushButton("View fit report →")
+            self.x_view_report.setToolTip("Jump to the top-level Report tab: per-port GT-vs-model "
+                                          "overlays + the copy-pasteable debug report.")
+            self.x_view_report.setEnabled(False)
+            self.x_view_report.clicked.connect(
+                lambda: self.tabs.setCurrentWidget(self.report_tab))
+            jrow.addWidget(self.x_view_report)
+            run_v.addLayout(jrow)
+
             # ===== RESULTS / MODEL-CELL sub-tab: ONE place after a Tab-0 run/import to see the fit
             #       summary + the full report, EXPORT the .va, or build the cell in Cadence. =====
             res_box = QGroupBox("Results — fit summary & report")
@@ -3620,13 +3603,6 @@ if _HAVE_QT:
             brow_m.addWidget(self.xm_make)
             mf.addRow(brow_m)
             model_v.addWidget(mgb)
-
-            srow2 = QHBoxLayout()
-            srow2.addWidget(QLabel("Or send one output port →"))
-            self.x_port = QComboBox(); srow2.addWidget(self.x_port)
-            b_send = QPushButton("Load into Import → Fit"); b_send.clicked.connect(self._x_send)
-            srow2.addWidget(b_send); srow2.addStretch(1)
-            model_v.addLayout(srow2)
 
             self._x_mode_changed(); self._x_location_changed()   # set initial group visibility
             self._sb_initial()                                   # skillbridge indicator (import-only)
@@ -3810,6 +3786,418 @@ if _HAVE_QT:
             self.x_model_summary.setText(headline + ports)
             self.x_modelreport.setPlainText(self.extract.report or "(no report)")
             self.xm_export.setEnabled(True); self.xm_make.setEnabled(True)
+            # (re)build the top-level Report tab from this fit, enable its jump button, and land the
+            # user on it -- the single chokepoint after run / import-finished / cluster done. Only
+            # auto-switch if the report actually built (else stay put rather than dump the user on an
+            # empty/"unavailable" Report tab).
+            if res:
+                ok = self._refresh_report()
+                if hasattr(self, "x_view_report"):
+                    self.x_view_report.setEnabled(ok)
+                if ok and hasattr(self, "report_tab"):
+                    self.tabs.setCurrentWidget(self.report_tab)
+
+        # ======================================================================= Report tab
+        def _tab_report(self):
+            """Top-level 'Report' tab: a grouped per-port LIST (left) + a GT-vs-model DETAIL pane
+            (right), plus a worst-case summary line and Copy/Save of the copy-pasteable debug
+            report. Pure presentation over report_multiport.port_views / debug_report -- it does
+            NOT re-fit. Built in __init__ (before any fit) so every widget guards on no-result."""
+            self._report_views = []                  # cached port_views (selection is cheap)
+            tab = QWidget(); v = QVBoxLayout(tab)
+
+            # ---- top: summary line + Copy / Save buttons -----------------------------------
+            top = QHBoxLayout()
+            self.rep_summary = QLabel("Run an extraction or import a finished simulation in the "
+                                      "Extract tab — the per-port fit report appears here.")
+            self.rep_summary.setWordWrap(True)
+            self.rep_summary.setStyleSheet("color:#234; font-weight:bold;")
+            top.addWidget(self.rep_summary, 1)
+            self.rep_copy = QPushButton("Copy debug report")
+            self.rep_copy.setToolTip("Copy the copy-pasteable multi-port debug report to the clipboard.")
+            self.rep_copy.clicked.connect(self._report_copy)
+            self.rep_save = QPushButton("Save debug report…")
+            self.rep_save.setToolTip("Write the copy-pasteable multi-port debug report to a text file.")
+            self.rep_save.clicked.connect(self._report_save)
+            top.addWidget(self.rep_copy); top.addWidget(self.rep_save)
+            v.addLayout(top)
+
+            # ---- splitter: LEFT grouped tree | RIGHT detail pane ----------------------------
+            split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+            self.rep_tree = QtWidgets.QTreeWidget()
+            self.rep_tree.setHeaderHidden(True)
+            self.rep_tree.setMinimumWidth(240)
+            self.rep_tree.currentItemChanged.connect(self._report_tree_selected)
+            split.addWidget(self.rep_tree)
+
+            detail = QWidget(); dv = QVBoxLayout(detail)
+            self.rep_header = QLabel("")
+            self.rep_header.setWordWrap(True)
+            self.rep_header.setStyleSheet("font-family:monospace; font-weight:bold; color:#123;")
+            dv.addWidget(self.rep_header)
+            self.rep_canvas = _Canvas(2, 3, figsize=(9, 6))
+            dv.addWidget(self.rep_canvas, 1)
+            self.rep_notes = QLabel("")          # current-port notes (esp. current-noise caveat)
+            self.rep_notes.setWordWrap(True)
+            self.rep_notes.setStyleSheet("color:#a40; font-size:11px;")
+            dv.addWidget(self.rep_notes)
+            self.rep_empty = QLabel("Run an extraction or import a finished simulation in the "
+                                    "Extract tab — the per-port fit report appears here.")
+            self.rep_empty.setWordWrap(True)
+            self.rep_empty.setStyleSheet("color:#666; font-style:italic;")
+            self.rep_empty.setAlignment(QtCore.Qt.AlignCenter)
+            dv.addWidget(self.rep_empty, 1)
+            split.addWidget(detail)
+            split.setStretchFactor(0, 0); split.setStretchFactor(1, 1)
+            split.setSizes([260, 760])
+            v.addWidget(split, 1)
+
+            self._report_set_enabled(False)          # empty state until a fit exists
+            return tab
+
+        def _report_set_enabled(self, on):
+            """Toggle the buttons + the empty-state placeholder vs the detail canvas."""
+            for w in ("rep_copy", "rep_save"):
+                if hasattr(self, w):
+                    getattr(self, w).setEnabled(on)
+            if hasattr(self, "rep_empty"):
+                self.rep_empty.setVisible(not on)
+            for w in ("rep_canvas", "rep_header", "rep_notes"):
+                if hasattr(self, w):
+                    getattr(self, w).setVisible(on)
+
+        def _report_leaf_label(self, view):
+            """The per-port leaf text: a usable/not BADGE + pin + a terse worst-case digest, so the
+            tree reads as a grade-card at a glance ([OK] good · [~] caveats · [!!] review)."""
+            badge = f"[{(view.get('grade') or {}).get('badge', 'OK')}] "
+            if view["kind"] == "voltage":
+                w = view["worst"]
+                return (f"{badge}{view['pin']}   Zrms {w['zrms']:.2f} · PSRR {w['prms']:.2f} · "
+                        f"noise {w['nrms']:.2f} dB")
+            m = view["metrics"]
+            sign = "OK" if m.get("sign_ok", True) else "SIGN!"
+            return f"{badge}{view['pin']}   {view['pol']} · IVrms {m.get('ivrms', float('nan')):.1f}% · {sign}"
+
+        def _refresh_report(self):
+            """(Re)build the left tree from port_views(...), preserve/seed a selection, and render
+            the selected port. Safe to call before any fit (shows the empty state). Returns True
+            iff at least one port was rendered (so the caller can gate the auto-switch)."""
+            if not hasattr(self, "rep_tree"):
+                return False
+            res = getattr(self.extract, "result", None)
+            if res is None:
+                self._report_views = []
+                self.rep_tree.clear()
+                self.rep_summary.setText("Run an extraction or import a finished simulation in the "
+                                         "Extract tab — the per-port fit report appears here.")
+                self._report_set_enabled(False)
+                self.rep_canvas.clear(); self.rep_canvas.draw()
+                self.rep_header.setText(""); self.rep_notes.setText("")
+                return False
+            try:
+                import report_multiport as RMP
+                views = RMP.port_views(res, self.extract.npz_path, self.extract.manifest)
+            except Exception as e:                   # noqa: BLE001 -- never let report-build crash a fit
+                self._report_views = []
+                self.rep_tree.clear()
+                self.rep_summary.setText(f"Report unavailable: {type(e).__name__}: {e}")
+                self._report_set_enabled(False)
+                return False
+            self._report_views = views
+            self._report_set_enabled(bool(views))
+
+            # summary roll-up: counts + worst voltage Zout/PSRR/noise across all rails
+            vv = [x for x in views if x["kind"] == "voltage"]
+            cv = [x for x in views if x["kind"] == "current"]
+            def _wz(k):
+                vals = [x["worst"][k] for x in vv if np.isfinite(x["worst"].get(k, np.nan))]
+                return max(vals) if vals else float("nan")
+            import report_multiport as RMP
+            og = RMP.overall_grade(views)
+            self.rep_summary.setText(
+                f"OVERALL: [{og['badge']}] {og['verdict']}"
+                + (f"  (review: {', '.join(og['offenders'])})" if og["offenders"] else "")
+                + f"   ·   {len(vv)} voltage + {len(cv)} current  ·  worst Zout "
+                f"{_wz('zrms'):.2f} · PSRR {_wz('prms'):.2f} · noise {_wz('nrms'):.2f} dB")
+            self.rep_summary.setStyleSheet(
+                "font-weight:bold; color:" + {0: "#1a7a1a", 1: "#9a6a00"}.get(og["level"], "#c00"))
+
+            # remember the current selection (by pin) so a re-fit doesn't jump the user around
+            prev = None
+            it = self.rep_tree.currentItem()
+            if it is not None:
+                prev = it.data(0, QtCore.Qt.UserRole)
+
+            self.rep_tree.blockSignals(True)
+            self.rep_tree.clear()
+            # leaf colour = modeling grade: green usable / amber caveats / red review.
+            grade_brush = {0: QtGui.QBrush(QtGui.QColor("#1a7a1a")),
+                           1: QtGui.QBrush(QtGui.QColor("#9a6a00")),
+                           2: QtGui.QBrush(QtGui.QColor("#c00"))}
+            groups = {}
+            first_leaf = None
+            for idx, view in enumerate(views):
+                gkey = "Voltage outputs" if view["kind"] == "voltage" else "Current sinks"
+                if gkey not in groups:
+                    g = QtWidgets.QTreeWidgetItem([gkey])
+                    g.setFlags(QtCore.Qt.ItemIsEnabled)          # group header: not selectable
+                    f = g.font(0); f.setBold(True); g.setFont(0, f)
+                    self.rep_tree.addTopLevelItem(g); g.setExpanded(True)
+                    groups[gkey] = g
+                leaf = QtWidgets.QTreeWidgetItem([self._report_leaf_label(view)])
+                leaf.setData(0, QtCore.Qt.UserRole, view["pin"])
+                leaf.setData(0, QtCore.Qt.UserRole + 1, idx)
+                leaf.setForeground(0, grade_brush[(view.get("grade") or {}).get("level", 0)])
+                groups[gkey].addChild(leaf)
+                if first_leaf is None:
+                    first_leaf = leaf
+            # resolve the selection: the prior pin if it still exists, else the first leaf
+            target = first_leaf
+            if prev is not None:
+                for i in range(self.rep_tree.topLevelItemCount()):
+                    g = self.rep_tree.topLevelItem(i)
+                    for j in range(g.childCount()):
+                        if g.child(j).data(0, QtCore.Qt.UserRole) == prev:
+                            target = g.child(j)
+            self.rep_tree.blockSignals(False)
+            if target is not None:
+                self.rep_tree.setCurrentItem(target)     # fires _report_tree_selected -> render
+                return True
+            self.rep_canvas.clear(); self.rep_canvas.draw()
+            self.rep_header.setText(""); self.rep_notes.setText("")
+            return False
+
+        def _report_tree_selected(self, cur, _prev=None):
+            if cur is None:
+                return
+            idx = cur.data(0, QtCore.Qt.UserRole + 1)
+            if idx is None or idx >= len(self._report_views):    # a group header (no port payload)
+                return
+            self._render_report_port(self._report_views[idx])
+
+        def _render_report_port(self, view):
+            """Dispatch the detail pane: voltage 2x3 overlay vs current adaptive overlay."""
+            if view["kind"] == "voltage":
+                self._render_report_voltage(view)
+            else:
+                self._render_report_current(view)
+
+        def _render_report_voltage(self, view):
+            """Voltage rail detail: a corner picker + the 2x3 GT-vs-model overlay (mirrors the
+            Compare tab's _refresh_compare panel set), driven from view['corners'][il]."""
+            self.rep_notes.setText("")
+            loads = view["loads"]
+            # (re)build a corner picker bound to this voltage rail. We rebuild it on each voltage
+            # render so its entries always match the rail's own loads (cheap; <= a few corners).
+            if not hasattr(self, "rep_corner_row"):
+                self.rep_corner_row = QHBoxLayout()
+                self.rep_corner_label = QLabel("Corner:")
+                self.rep_corner_row.addWidget(self.rep_corner_label)
+                self.rep_corner = QComboBox()
+                self.rep_corner.currentIndexChanged.connect(self._report_corner_changed)
+                self.rep_corner_row.addWidget(self.rep_corner); self.rep_corner_row.addStretch(1)
+                # insert the picker just under the header (index 1 of the detail layout)
+                self.rep_canvas.parentWidget().layout().insertLayout(1, self.rep_corner_row)
+            self.rep_corner_label.setVisible(True)       # show the whole row for voltage rails
+            self.rep_corner.setVisible(True)
+            self.rep_corner.blockSignals(True)
+            self.rep_corner.clear()
+            for il in loads:
+                self.rep_corner.addItem(str(il))
+            self.rep_corner.blockSignals(False)
+            self._rep_current_voltage = view
+            il = loads[0]
+            self._report_draw_voltage(view, il)
+
+        def _report_corner_changed(self, _idx=None):
+            view = getattr(self, "_rep_current_voltage", None)
+            if view is None or not hasattr(self, "rep_corner"):
+                return
+            il = self.rep_corner.currentText()
+            if il and il in view["corners"]:
+                self._report_draw_voltage(view, il)
+
+        def _report_draw_voltage(self, view, il):
+            """Draw the 2x3 voltage overlay for one corner (Zout |Z| / Zout phase / noise / PSRR
+            atten / PSRR phase / scores) -- GT solid lw=2, model dashed, primary supply for PSRR."""
+            c = view["corners"][il]
+            sup = view["supplies"][0] if view["supplies"] else None
+            Hg = c["psrr_supplies"][sup]["Hg"] if sup else c["Hg"]
+            Hm = c["psrr_supplies"][sup]["Hm"] if sup else c["Hm"]
+            ax = self.rep_canvas.axes
+            self.rep_canvas.clear()
+            ax[0, 0].loglog(c["fz"], np.abs(c["Zg"]), label="GT", lw=2)
+            ax[0, 0].loglog(c["fz"], np.abs(c["Zm"]), "--", label="model")
+            ax[0, 0].set_title(f"Zout |Z| ({il})"); ax[0, 0].set_ylabel("ohm")
+            ax[0, 1].semilogx(c["fz"], np.degrees(np.angle(c["Zg"])), label="GT", lw=2)
+            ax[0, 1].semilogx(c["fz"], np.degrees(np.angle(c["Zm"])), "--", label="model")
+            ax[0, 1].set_title("Zout phase [deg]")
+            ax[0, 2].loglog(c["fn"], np.asarray(c["Sg"]) * 1e9, label="GT", lw=2)
+            ax[0, 2].loglog(c["fn"], np.asarray(c["Sm"]) * 1e9, "--", label="model")
+            ax[0, 2].set_title("noise [nV/√Hz]")
+            ax[1, 0].semilogx(c["fp"], -20 * np.log10(np.abs(Hg) + 1e-30), label="GT", lw=2)
+            ax[1, 0].semilogx(c["fp"], -20 * np.log10(np.abs(Hm) + 1e-30), "--", label="model")
+            ax[1, 0].set_title(f"PSRR atten [dB] ({sup or 'supply'})")
+            ax[1, 1].semilogx(c["fp"], np.degrees(np.angle(Hg)), label="GT", lw=2)
+            ax[1, 1].semilogx(c["fp"], np.degrees(np.angle(Hm)), "--", label="model")
+            ax[1, 1].set_title("PSRR phase [deg]")
+            sc = c["scores"]
+            # list EVERY supply's PSRR RMS (a multi-supply rail must not hide the non-headline
+            # supplies behind the single plotted primary) -- the headline panel names which one.
+            psrr_lines = "\n".join(f"PSRR {s:<10}= {rmsdeg[0]:6.3f} dB"
+                                   for s, rmsdeg in sc.get("psrr", {}).items())
+            g = view.get("grade") or {}
+            ax[1, 2].axis("off")
+            ax[1, 2].text(0.0, 0.98,
+                          f"VERDICT [{g.get('badge', 'OK')}]: {g.get('verdict', '')}\n\n"
+                          f"corner {il}\n"
+                          f"Zout RMS    = {sc['zrms']:6.3f} dB\n"
+                          f"{psrr_lines}\n"
+                          f"noise RMS   = {sc['nrms']:6.3f} dB",
+                          fontsize=10, family="monospace", va="top")
+            for a in (ax[0, 0], ax[0, 1], ax[0, 2], ax[1, 0], ax[1, 1]):
+                a.set_xlabel("Hz"); a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+            self.rep_canvas.draw()
+            g = view.get("grade") or {}
+            self.rep_header.setText(
+                f"[{g.get('badge', 'OK')}] {g.get('verdict', '')}   ·   {view['pin']}  ·  voltage rail"
+                f"  ·  Cout={view['cout']*1e12:.1f}pF ESR={view['esr']:.3f}Ω  ·  worst Zrms "
+                f"{view['worst']['zrms']:.2f} / PSRR {view['worst']['prms']:.2f} / "
+                f"noise {view['worst']['nrms']:.2f} dB")
+
+        def _render_report_current(self, view):
+            """Current sink detail: draw ONLY the panels named in view['present'] (iv/y/psrr/idcT)
+            in the fixed 2x3 grid; blank the cells with no panel; always show the metrics box +
+            the notes (esp. 'current-noise: not measured in-situ')."""
+            if hasattr(self, "rep_corner"):              # current ports have no corner picker
+                self.rep_corner_label.setVisible(False)  # hide the whole row (label + combo)
+                self.rep_corner.setVisible(False)
+            present = set(view.get("present", []))
+            vw, mo, m = view["view"], view["models"], view["metrics"]
+            ax = self.rep_canvas.axes
+            self.rep_canvas.clear()
+
+            # I-V knee  (top-left)
+            a = ax[0, 0]
+            if "iv" in present:
+                a.plot(vw["iv_v"], np.asarray(vw["iv_i"]) * 1e6, label="GT", lw=2)
+                a.plot(vw["iv_v"], np.asarray(mo["iv"]) * 1e6, "--", label="model")
+                a.axvline(vw.get("vc", 0.0), color="k", ls=":", lw=.8)
+                a.set_title("I-V compliance knee"); a.set_xlabel("Vo [V]"); a.set_ylabel("I [µA]")
+                a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+            else:
+                self._report_blank(a, "no I-V panel")
+
+            # |Y| admittance  (top-mid)
+            a = ax[0, 1]
+            if "y" in present:
+                a.loglog(vw["ac_f"], np.abs(vw["ac_y"]), label="GT", lw=2)
+                a.loglog(vw["ac_f"], np.abs(mo["y"]), "--", label="model")
+                a.set_title("|Y| admittance [S]"); a.set_xlabel("Hz")
+                a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+            else:
+                self._report_blank(a, "no |Y| panel")
+
+            # Idc(T)  (top-right)
+            a = ax[0, 2]
+            if "idcT" in present:
+                a.plot(vw["temps"], np.asarray(vw["idcT"]) * 1e6, "o-", label="GT", lw=2)
+                a.plot(vw["temps"], np.asarray(mo["idcT"]) * 1e6, "s--", label="model")
+                a.set_title("Idc(T) [µA]"); a.set_xlabel("T [°C]")
+                a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+            else:
+                self._report_blank(a, "no Idc(T) panel")
+
+            # current-PSRR per supply  (bottom-left)
+            a = ax[1, 0]
+            if "psrr" in present and view.get("psrr_supplies"):
+                for s, sp in view["psrr_supplies"].items():
+                    a.loglog(sp["f"], np.abs(sp["Gg"]), lw=2, label=f"GT {s}")
+                    a.loglog(sp["f"], np.abs(sp["Gm"]), "--", label=f"model {s}")
+                a.set_title("current-PSRR |dI/dVdd| [S]"); a.set_xlabel("Hz")
+                a.grid(True, which="both", alpha=.3); a.legend(fontsize=7)
+            else:
+                self._report_blank(a, "no current-PSRR panel")
+
+            # blank the unused bottom-mid cell
+            self._report_blank(ax[1, 1], "")
+
+            # metrics text box  (bottom-right, always)
+            def _f(x, fmt):
+                try:
+                    return ("n/a" if not np.isfinite(x) else format(x, fmt))
+                except (TypeError, ValueError):
+                    return "n/a"
+            sign = "OK" if m.get("sign_ok", True) else f"FLIP! ({m.get('gdd_sign')} vs GT {m.get('gt_sign')})"
+            g = view.get("grade") or {}
+            ax[1, 2].axis("off")
+            ax[1, 2].text(0.0, 0.98,
+                          f"VERDICT [{g.get('badge', 'OK')}]: {g.get('verdict', '')}\n\n"
+                          f"port {view['pin']}  ({view['pol']})\n\n"
+                          f"Idc       = {_f(m.get('idc_ua'), '.3f')} µA\n"
+                          f"I-V  RMS  = {_f(m.get('ivrms'), '.2f')} %\n"
+                          f"rout      = {_f(m.get('rout_M'), '.1f')} MΩ\n"
+                          f"Cp        = {_f(m.get('cp_fF'), '.1f')} fF\n"
+                          f"gdd       = {_f(m.get('gdd_nS'), '+.3f')} nS ({m.get('gdd_sign', '?')})\n"
+                          f"PSRR sign = {sign}\n"
+                          f"Yrms      = {_f(m.get('yrms'), '.2f')} dB\n"
+                          f"Prms      = {_f(m.get('prms'), '.2f')} dB\n"
+                          f"noise RMS = {_f(m.get('nrms'), '.2f')} dB\n"
+                          f"PTAT g/m  = {_f(m.get('ptat_g'), '.3f')} / {_f(m.get('ptat_m'), '.3f')}",
+                          fontsize=9, family="monospace", va="top")
+            self.rep_canvas.draw()
+            g = view.get("grade") or {}
+            self.rep_header.setText(
+                f"[{g.get('badge', 'OK')}] {g.get('verdict', '')}   ·   {view['pin']}  ·  "
+                f"current {view['pol']}  ·  Idc {_f(m.get('idc_ua'), '.2f')}µA "
+                f"·  panels: {', '.join(sorted(present)) or '—'}")
+            notes = view.get("notes", []) or []
+            self.rep_notes.setText("  ·  ".join(str(n) for n in notes))
+
+        def _report_blank(self, a, msg):
+            """Grey/blank a grid cell that carries no panel (an absent current sub-measurement)."""
+            a.axis("off")
+            if msg:
+                a.text(0.5, 0.5, msg, ha="center", va="center", color="#aaa",
+                       fontsize=9, family="monospace")
+
+        def _report_text(self):
+            """The copy-pasteable debug report str (or a friendly placeholder if no fit yet)."""
+            if getattr(self.extract, "result", None) is None:
+                return ""
+            import report_multiport as RMP
+            return RMP.debug_report(self.extract.result, self.extract.npz_path, self.extract.manifest)
+
+        def _report_copy(self):
+            txt = self._report_text()
+            if not txt:
+                QMessageBox.information(self, "Debug report",
+                                        "No fit yet — run an extraction or import a finished sim first.")
+                return
+            QApplication.clipboard().setText(txt)
+            self.statusBar().showMessage("Copied the multi-port debug report to the clipboard.")
+            QMessageBox.information(self, "Debug report", "Copied the debug report to the clipboard.")
+
+        def _report_save(self):
+            txt = self._report_text()
+            if not txt:
+                QMessageBox.information(self, "Debug report",
+                                        "No fit yet — run an extraction or import a finished sim first.")
+                return
+            name = (self.extract.manifest or {}).get("name", "pmu") if self.extract.manifest else "pmu"
+            fn, _ = QFileDialog.getSaveFileName(self, "Save debug report",
+                                                f"{name}_report.txt", "Text (*.txt)")
+            if not fn:
+                return
+            if not fn.endswith(".txt"):
+                fn += ".txt"
+            try:
+                pathlib.Path(fn).write_text(txt, encoding="utf-8")
+            except OSError as e:
+                QMessageBox.critical(self, "Debug report", f"Could not write: {e}")
+                return
+            self.statusBar().showMessage(f"Saved the debug report → {fn}")
+            QMessageBox.information(self, "Debug report", f"Wrote the debug report:\n{fn}")
 
         def _x_export_va(self):
             """Export JUST the combined Verilog-A from the multi-port fit -- no Cadence, no
@@ -4360,7 +4748,6 @@ if _HAVE_QT:
             self.x_gate.setText(f"<b><span style='color:#157f3b'>Donau+ALPS sweep DONE</span></b> "
                                 f"— {nmeas} measurement(s), npz {npz}")
             self.x_report.setPlainText(out["report"])
-            self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
             self._x_show_results(f"Donau+ALPS sweep done — {nmeas} measurement(s), npz {npz}")
             self.x_progmsg.setText("done")
@@ -4432,7 +4819,6 @@ if _HAVE_QT:
                 self.x_status_box.setVisible(True)
             except Exception:                            # noqa: BLE001  never block the import result
                 pass
-            self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
             self._x_show_results(f"Imported finished sim — {out['n_meas']} measurement(s), npz {npz}"
                                  + (f"  ·  {len(skipped)} coverage extra(s) skipped" if skipped else ""))
@@ -4537,7 +4923,6 @@ if _HAVE_QT:
             self.x_gate.setText(f"<b>gate vs gold: <span style='color:{colour}'>{tag}</span></b> "
                                 f"({detail}) — npz {pathlib.Path(out['npz_path']).name}")
             self.x_report.setPlainText(out["report"])
-            self.x_port.clear(); self.x_port.addItems(self.extract.port_list())
             self.xm_make.setEnabled(True)        # a fit of the current manifest exists -> cell build OK
             self._x_show_results(f"Extraction done — gate vs gold: {tag} ({detail})")
             self.x_progmsg.setText("done")
@@ -4550,24 +4935,21 @@ if _HAVE_QT:
             self.x_progmsg.setText("failed")
             QMessageBox.critical(self, "Extraction failed", msg)
 
-        def _x_send(self):
-            port = self.x_port.currentText()
-            if not port or port not in self.extract.port_refs:
-                return
-            refp = self.extract.port_refs[port]
-            try:
-                self.core.use_existing_ref(refp)
-                self.core.profile.name = pathlib.Path(refp).stem
-                # reuse the GUI's full programmatic-profile sync (Profile + Import grid +
-                # Compare corner dropdown + cout/esr), so Fit/Compare operate on this port.
-                self.refresh_from_profile()
-                self.tabs.setCurrentIndex(3)        # jump to Fit (tab 0=Extract shifted it)
-                self.statusBar().showMessage(f"Loaded port '{port}' ({pathlib.Path(refp).name}) "
-                                             "→ Fit, then Compare.")
-            except Exception as e:
-                QMessageBox.critical(self, "Load port", f"{type(e).__name__}: {e}")
+        # --- 'Manual (legacy)' container: nested sub-tabs for the hand-import workflow ---
+        def _tab_manual(self):
+            """Top-level 'Manual (legacy)' tab — a nested QTabWidget holding the hand-imported
+            single-port workflow (Profile · Import data · Fit · Compare). Each _tab_* is still
+            constructed exactly once; the widgets they create (self.cmp_*, self.fit_table,
+            self.file_edits, …) are reached by reference throughout, so reparenting under this
+            container does not change any behaviour."""
+            self.manual_tabs = QTabWidget()
+            self.manual_tabs.addTab(self._tab_profile(), "Profile")
+            self.manual_tabs.addTab(self._tab_import(), "Import data")
+            self.manual_tabs.addTab(self._tab_fit(), "Fit")
+            self.manual_tabs.addTab(self._tab_compare(), "Compare")
+            return self.manual_tabs
 
-        # --- Tab 1: Profile ------------------------------------------------------
+        # --- Manual sub-tab: Profile ---------------------------------------------
         def _tab_profile(self):
             w = QWidget(); outer = QVBoxLayout(w)
             help_ = QLabel(
@@ -4576,7 +4958,7 @@ if _HAVE_QT:
                 "<b>You only need to fill 3 things here</b> (marked *): a <b>name</b>, the <b>supply "
                 "voltage</b> your LDO runs at, and the <b>3 load currents</b> you characterized "
                 "(low / typical / high). The rest is optional and auto-filled.<br>"
-                "Then: <b>2 Import data → 3 Fit → 4 Compare</b>.")
+                "Then the sibling sub-tabs: <b>Import data → Fit → Compare</b>.")
             help_.setWordWrap(True)
             help_.setStyleSheet("background:#eef5ff; padding:9px; border:1px solid #cdddee;")
             outer.addWidget(help_)
@@ -4851,7 +5233,7 @@ if _HAVE_QT:
             self._preview()
             self._refresh_compare_ports()        # surface any current ports the new ref carries
             self.b_emit.setEnabled(False)        # new data invalidates any prior fit -> must re-Fit
-            self.statusBar().showMessage(f"Imported → {path.name}. → go to Fit (Tab 3).")
+            self.statusBar().showMessage(f"Imported → {path.name}. → go to the Fit sub-tab.")
 
         def _missing_required(self, files):
             """List required (quantity@corner) slots not yet provided -- shown after import."""
@@ -4908,7 +5290,7 @@ if _HAVE_QT:
             Zout-HF falls back to z_<nom> and DC dropout is only needed at emit, so neither blocks fit."""
             ref = self.core.ref
             if ref is None:
-                return ["(no data imported — use Tab 2)"]
+                return ["(no data imported — use the Import data sub-tab)"]
             need = []
             for il in self.core.profile.loads:
                 need += [f"{q}_{il}" for q in ("z", "p", "noise") if f"{q}_{il}" not in ref]
@@ -4921,22 +5303,20 @@ if _HAVE_QT:
                 return                           # ignore re-clicks while a fit is already running
             blockers = self._fit_blockers()
             if blockers:
-                # the common confusion: an in-situ extraction (Tab 0) ALREADY fit every port (its
-                # multi-port report is in Tab 0's Report/log), but this legacy per-port tab is empty
-                # because no single port was sent over. Point there instead of "use Tab 2".
+                # the common confusion: an in-situ extraction (Tab 0) ALREADY fit every port and
+                # its per-port report lives in the top-level Report tab, but this legacy Manual Fit
+                # tab is empty because it only ever holds hand-imported single-port data.
                 if self.core.ref is None and getattr(self.extract, "result", None) is not None:
                     QMessageBox.information(self, "Fit",
-                        "Your in-situ extraction already fit EVERY port — the multi-port report is "
-                        "in Tab 0 (Extract) → Run → the 'Report / log' window.\n\n"
-                        "This tab (3 · Fit) is the optional PER-PORT view (single output, with order "
-                        "controls + a Compare overlay). To load one port here:\n"
-                        "  Tab 0 → 'Model cell' sub-tab → 'Or send one output port →' pick a port → "
-                        "'Load into Import → Fit'.")
+                        "Your in-situ extraction already fit every port — see the Report tab for the "
+                        "per-port fit report (Zout/PSRR/noise + current ports).\n\n"
+                        "This Manual Fit tab is for hand-imported single-port data only. To use it, "
+                        "import a single port's data on the Manual → 'Import data' sub-tab first.")
                     return
                 QMessageBox.information(self, "Fit", "Cannot fit yet — missing required data:\n  "
                                        + ", ".join(blockers[:10]) + ("…" if len(blockers) > 10 else "")
-                                       + "\n\nProvide these on Tab 2 (Import), or send a port from "
-                                       "Tab 0 (Extract → Model cell → 'send one output port').")
+                                       + "\n\nProvide these on the Manual → 'Import data' sub-tab. "
+                                       "(For in-situ extraction, see the Report tab instead.)")
                 return
             self.b_fit.setEnabled(False); self.statusBar().showMessage("Fitting…")
             self._worker = _FitWorker(self.core)
@@ -5163,86 +5543,6 @@ if _HAVE_QT:
                                     "It localizes every mismatch (Zout/PSRR/noise) in plain text -- "
                                     "paste the whole file to describe the fit.")
 
-        # --- Tab 5: Trans-ID (one multitone transient -> auto Zout/PSRR) ----------
-        def _tab_transid(self):
-            w = QWidget(); lay = QVBoxLayout(w)
-            legend = QLabel(
-                "<b>Multitone trans-ID (auto Zout + PSRR):</b> if you characterized this LDO with "
-                "the Verilog-A multitone stimulus fixture (one transient per band, emitted by "
-                "<code>trans_id.emit_stim_va</code>), point here at the <b>plan.json</b> and the "
-                "<b>folder</b> of exported waveforms named "
-                "<code>&lt;corner&gt;_b&lt;band&gt;.csv</code> (e.g. 20u_b0.csv, 20u_b1.csv …, "
-                "each <code>time, v(vin), v(vout)</code>). It coherently extracts <b>Zout &amp; "
-                "PSRR</b> for every corner and feeds them to Import — no AC sweeps needed.<br>"
-                "<b>Noise + DC still come from Tab 2</b> (a transient carries no device noise); "
-                "tick the box to reuse the files already picked there.")
-            legend.setWordWrap(True)
-            legend.setStyleSheet("background:#eef5ff; padding:7px; border:1px solid #cdddee;")
-            lay.addWidget(legend)
-            form = QFormLayout()
-            self.tid_plan = QLineEdit(); bp = QPushButton("…"); bp.setMaximumWidth(28)
-            bp.clicked.connect(lambda: self._pick_into(self.tid_plan, "plan (*.json);;All (*)"))
-            hp = QHBoxLayout(); hp.addWidget(self.tid_plan); hp.addWidget(bp)
-            self.tid_folder = QLineEdit(); bf = QPushButton("…"); bf.setMaximumWidth(28)
-            bf.clicked.connect(self._pick_trans_folder)
-            hf = QHBoxLayout(); hf.addWidget(self.tid_folder); hf.addWidget(bf)
-            form.addRow("plan.json", hp)
-            form.addRow("waveform folder", hf)
-            lay.addLayout(form)
-            self.tid_merge = QCheckBox("reuse Noise / DC files already picked on Tab 2")
-            self.tid_merge.setChecked(True)
-            lay.addWidget(self.tid_merge)
-            b = QPushButton("Extract z/p from trans   →   Import")
-            b.clicked.connect(self._do_import_trans)
-            lay.addWidget(b)
-            self.tid_log = QTextEdit(); self.tid_log.setReadOnly(True)
-            lay.addWidget(self.tid_log)
-            return w
-
-        def _pick_into(self, edit, filt):
-            fn, _ = QFileDialog.getOpenFileName(self, "Select file", str(ROOT), filt)
-            if fn:
-                edit.setText(fn)
-
-        def _pick_trans_folder(self):
-            d = QFileDialog.getExistingDirectory(self, "Folder with <corner>_b<band> waveforms",
-                                                 str(ROOT))
-            if d:
-                self.tid_folder.setText(d)
-
-        def _do_import_trans(self):
-            if not self._apply_profile():
-                return
-            plan = self.tid_plan.text().strip()
-            folder = self.tid_folder.text().strip()
-            if not plan or not folder:
-                QMessageBox.information(self, "Trans-ID",
-                                       "Pick both a plan.json and a waveform folder.")
-                return
-            extra = None
-            if self.tid_merge.isChecked():       # reuse Noise/DC the user picked on Tab 2
-                extra = {k: v for k, v in self._collect_files().items()
-                         if k[0] in ("noise", "dc_loadreg", "dc_dropout", "dc_linereg",
-                                     "spurs", "spur_500u")}
-            try:
-                path, warns = self.core.import_trans_folder(folder, plan, extra_files=extra)
-            except Exception as e:
-                QMessageBox.critical(self, "Trans-ID import failed", str(e))
-                return
-            corners = ", ".join(self.core.trans_info.keys())
-            txt = f"Wrote {path}\nExtracted Zout/PSRR from trans for corners: {corners}\n"
-            if not warns:
-                txt += "Guardrails: no issues detected.\n"
-            for wn in warns:
-                txt += f"[{wn['level'].upper()}] {wn['quantity']}: {wn['msg']}\n"
-            miss = self._missing_required(self._collect_files())
-            if miss:
-                txt += ("[INFO] still missing (add on Tab 2): " + ", ".join(miss) + "\n")
-            self.tid_log.setText(txt)
-            self.b_emit.setEnabled(False)        # new data invalidates any prior fit
-            self._preview()
-            self.statusBar().showMessage(f"Trans-ID → {path.name}. Add Noise/DC if needed, then Fit.")
-
 
 # =============================================================================== tests
 def _synth_arrays():
@@ -5289,71 +5589,6 @@ def _synth_arrays():
     iddc = np.linspace(1e-6, 6e-3, 80)
     A["dc_dropout"] = np.c_[iddc, np.maximum(1.0 - 18.0 * iddc, 0.1)]
     return A, loads, nom
-
-
-def _selftest_transid(A, loads, nom, tmp):
-    """Headless verification of the Tab-5 trans-ID path (no Qt, no simulator): synth a one-band
-    multitone waveform per corner from the reference's Zout/PSRR, run it through
-    ModelerCore.import_trans_folder (-> trans_import -> import_cadence.assemble), and assert the
-    ref gets z/p/noise per corner, recovers Zout/PSRR to tolerance, and is fittable."""
-    import json
-    import trans_id
-    import trans_import
-    pl = trans_id.plan_band(f_lo=1e5, f_hi=1e7, n_per_dec=12, ppp=12)
-    N = pl["N"]; tg = pl["t0"] + pl["dt"] * np.arange(N)
-    va, ib, VDD = trans_id.VA_DEFAULT, trans_id.IB_DEFAULT, trans_id.VDD
-    cin = trans_import._cinterp
-    wdir = tmp / "transwav"; wdir.mkdir(parents=True, exist_ok=True)
-    for il in loads:                              # synth vout/vin = inverse of _spectrum
-        z, p = A[f"z_{il}"], A[f"p_{il}"]
-        Zt = cin(pl["fb"], z[:, 0], z[:, 1] + 1j * z[:, 2])
-        Ht = cin(pl["fa"], p[:, 0], p[:, 1] + 1j * p[:, 2])
-        vin = np.full(N, VDD)
-        for f in pl["fa"]:
-            vin = vin + va * np.sin(2 * np.pi * float(f) * tg)
-        vout = np.full(N, 1.0)
-        for f, Z in zip(pl["fb"], Zt):
-            vout = vout + ib * np.abs(Z) * np.sin(2 * np.pi * float(f) * tg + np.angle(Z))
-        for f, H in zip(pl["fa"], Ht):
-            vout = vout + va * np.abs(H) * np.sin(2 * np.pi * float(f) * tg + np.angle(H))
-        np.savetxt(wdir / f"{il}_b0.csv", np.c_[tg, vin, vout])
-    bj = dict(index=0, f_lo=pl["f_lo"], f_hi=pl["f_hi"], N=int(N), dt=pl["dt"], t0=pl["t0"],
-              fa=[float(x) for x in pl["fa"]], ba=[int(b) for b in pl["ba"]],
-              fb=[float(x) for x in pl["fb"]], bb=[int(b) for b in pl["bb"]])
-    plan_path = wdir / "plan.json"
-    plan_path.write_text(json.dumps(dict(VDD=VDD, va=va, ib=ib, iload=0.0, bands=[bj])))
-
-    core2 = ModelerCore()
-    core2.profile = Profile(name="_gui_transid_selftest", loads=loads, nominal=nom,
-                            cout=float(A["meta_cout"]), esr=float(A["meta_esr"]), vref=1.05)
-    extra = {("noise", il): str(tmp / f"noise_{il}.csv") for il in loads
-             if (tmp / f"noise_{il}.csv").exists()}
-    if (tmp / "dc_loadreg.csv").exists():
-        extra[("dc_loadreg", None)] = str(tmp / "dc_loadreg.csv")
-    path, warns = core2.import_trans_folder(str(wdir), str(plan_path), extra_files=extra)
-    for il in loads:
-        for q in ("z", "p", "noise"):
-            assert f"{q}_{il}" in core2.ref, f"trans-ID ref missing {q}_{il}"
-    assert f"z_{nom}_hf" in core2.ref, "trans-ID ref missing nominal z_hf"
-    zr, pr = core2.ref[f"z_{nom}"], core2.ref[f"p_{nom}"]
-    zg, pg = A[f"z_{nom}"], A[f"p_{nom}"]
-    ez = float(np.max(np.abs(20 * np.log10(np.abs(zr[:, 1] + 1j * zr[:, 2]) /
-                            np.abs(cin(zr[:, 0], zg[:, 0], zg[:, 1] + 1j * zg[:, 2]))))))
-    ep = float(np.max(np.abs(20 * np.log10(np.abs(pr[:, 1] + 1j * pr[:, 2]) /
-                            np.abs(cin(pr[:, 0], pg[:, 0], pg[:, 1] + 1j * pg[:, 2]))))))
-    assert ez < 0.5 and ep < 0.5, f"trans-ID recovery off (Zout {ez:.3f} dB, PSRR {ep:.3f} dB)"
-    core2.fit()
-    assert core2.result is not None, "trans-ID ref not fittable"
-    try:                                          # close + unlink the trans-ID selftest npz
-        import fit_model
-        if getattr(fit_model, "ref", None) is not None and hasattr(fit_model.ref, "close"):
-            fit_model.ref.close()
-        pathlib.Path(path).unlink()
-    except OSError:
-        pass
-    print(f"  trans-ID: import_trans -> z/p/noise OK ({len(loads)} corners; "
-          f"Zout {ez:.3f} dB / PSRR {ep:.3f} dB recovery; fittable)")
-    return True
 
 
 def _selftest_pinform(tmp):
@@ -5594,12 +5829,14 @@ def _selftest_import_finished_gui(win, tmp, app, root, mpath):
             os.environ["WORK_ROOT"] = _old_wr
     assert win.xm_make.isEnabled(), "Create model cell must enable after a finished-sim import"
     assert "Imported finished sim" in win.x_gate.text(), f"gate not updated: {win.x_gate.text()}"
-    assert win.x_port.count() > 0, "output ports not populated after import"
     # the per-group LIST must be populated + visible after import, so the user can right-click a row
     # (Open netlist / Open PSF dir). Each row's PSF dir points at the imported root's group subdir.
     from insitu import run as _runm
     ngrp = len(_runm.groups(win.extract.manifest))
     assert win.x_status.rowCount() == ngrp, f"import must list its {ngrp} groups, got {win.x_status.rowCount()}"
+    # the post-fit chokepoint now auto-switches to the top-level Report tab; re-activate Tab 0 + its
+    # Run sub-tab so the per-group-list visibility assertion (Run-tab content) is meaningful again.
+    win.tabs.setCurrentIndex(0); win.x_subtabs.setCurrentIndex(1); app.processEvents()
     assert win.x_status_box.isVisibleTo(win), "the per-group list must SHOW after a finished-sim import"
     r0 = win._x_row_data(0)
     assert r0.get("state") == "done" and pathlib.Path(r0["psf_dir"]).is_dir(), \
@@ -5624,6 +5861,82 @@ def _selftest_import_finished_gui(win, tmp, app, root, mpath):
             pass
     print("  import-finished (GUI): Read-finished -> fit -> Create-cell + per-group list + "
           "Results report mirror + standalone .va export OK")
+
+
+def _selftest_report_tab(win, tmp, app):
+    """The top-level Report tab: a SELF-CONTAINED multi-port fixture (voltage rail + in-situ
+    current sink, via test_fit_multiport_depth._sweep_npz + fit_multiport) drives
+    report_multiport.port_views/debug_report through the GUI. Asserts the grouped tree, leaf
+    selection (voltage + current renders without exception), the Copy-debug-report clipboard
+    path, and screenshots the Report tab + its detail canvas. The fixture npz stays on disk for
+    the duration (port_views re-reads it for the current sink)."""
+    import sys as _sys
+    _hpath = str((ROOT / "harness").resolve())
+    if _hpath not in _sys.path:
+        _sys.path.insert(0, _hpath)
+    import fit_multiport as _FMP
+    import report_multiport as _RMP
+    from test_fit_multiport_depth import _sweep_npz   # the real multi-port synthesizer
+
+    rep_dir = pathlib.Path(tmp) / "report_fixture"; rep_dir.mkdir(parents=True, exist_ok=True)
+    npz, m = _sweep_npz(rep_dir, with_temp=True, name="rpttab")
+    res = _FMP.fit_multiport(str(npz), m)
+
+    # seed the GUI's extract front-half exactly as a real run/import leaves it
+    win.extract.result = res
+    win.extract.npz_path = str(npz)
+    win.extract.manifest = m
+
+    # exactly three top-level tabs now: Extract · Report (index 1) · Manual (legacy)
+    tab_labels = [win.tabs.tabText(i) for i in range(win.tabs.count())]
+    assert tab_labels == ["0 · Extract (in-situ)", "Report", "Manual (legacy)"], \
+        f"unexpected top-level tabs: {tab_labels}"
+    assert win.tabs.widget(tab_labels.index("Report")) is win.report_tab, "report_tab ref desync"
+    # the Manual container nests the hand-import workflow as four sub-tabs
+    manual_labels = [win.manual_tabs.tabText(i) for i in range(win.manual_tabs.count())]
+    assert manual_labels == ["Profile", "Import data", "Fit", "Compare"], \
+        f"unexpected Manual sub-tabs: {manual_labels}"
+
+    # build the tree + render the seeded selection
+    win._refresh_report(); app.processEvents()
+    # count leaves under each group header
+    vleaves, cleaves = [], []
+    for i in range(win.rep_tree.topLevelItemCount()):
+        g = win.rep_tree.topLevelItem(i)
+        bucket = vleaves if g.text(0) == "Voltage outputs" else cleaves
+        for j in range(g.childCount()):
+            bucket.append(g.child(j))
+    assert len(vleaves) >= 1, "Report tree has no voltage leaf"
+    assert len(cleaves) >= 1, "Report tree has no current leaf (fixture has an in-situ sink)"
+
+    # select the first voltage port, then the first current port -- neither may raise
+    win.rep_tree.setCurrentItem(vleaves[0]); app.processEvents()
+    win.rep_tree.setCurrentItem(cleaves[0]); app.processEvents()
+    # exercise the voltage corner picker (current ports have none)
+    win.rep_tree.setCurrentItem(vleaves[0]); app.processEvents()
+    if win.rep_corner.count() > 1:
+        win.rep_corner.setCurrentIndex(1); app.processEvents()
+
+    # screenshot the whole window on the Report tab + the detail canvas figure
+    win.tabs.setCurrentWidget(win.report_tab); app.processEvents()
+    out = ROOT / "work" / "gui_selftest_out"; out.mkdir(parents=True, exist_ok=True)
+    p_tab = out / "report_tab.png"; p_ov = out / "report_overlay.png"
+    ok_tab = bool(win.grab().save(str(p_tab)))
+    win.rep_canvas.fig.savefig(str(p_ov), dpi=110)
+    assert ok_tab and p_tab.is_file() and p_ov.is_file(), "Report-tab screenshots not written"
+
+    # 'Copy debug report' (clipboard) + the underlying debug_report content
+    win._report_copy(); app.processEvents()
+    txt = _RMP.debug_report(res, str(npz), m)
+    assert isinstance(txt, str) and txt.strip(), "debug_report returned empty"
+    assert "MULTI-PORT MODEL DEBUG REPORT" in txt, "debug_report missing the header"
+    clip = QApplication.clipboard().text()
+    assert "MULTI-PORT MODEL DEBUG REPORT" in clip, "Copy-debug-report did not reach the clipboard"
+
+    # leave the seeded result in place (the caller's later teardown ignores it); but DO unlink the
+    # fixture npz now we're done reading it (avoid leaking a temp file into work/).
+    print(f"  qt: Report tab — {len(vleaves)} voltage + {len(cleaves)} current leaf/leaves, "
+          f"voltage+current render + corner picker + clipboard OK; shots {p_tab.name}/{p_ov.name}")
 
 
 def _selftest_status_menu(win, tmp, app):
@@ -6360,9 +6673,6 @@ def _selftest(require_qt=False):
     except OSError:
         pass
 
-    # 1b) Trans-ID import path (Tab 5) -- headless, no simulator
-    _selftest_transid(A, loads, nom, tmp)
-
     # 1c) Extract-tab PIN FORM (deliverable 1) -- gui+netmap -> manifest, Qt-free, no skillbridge
     _selftest_pinform(tmp)
 
@@ -6561,6 +6871,17 @@ def _selftest(require_qt=False):
                 os.environ.pop("MODEL_ROOT", None)
             else:
                 os.environ["MODEL_ROOT"] = _mr_saved
+        # top-level Report tab (#new): grouped per-port tree + GT-vs-model detail overlay +
+        # Copy/Save debug report. Self-contained multi-port fixture; dialogs stubbed (the Copy
+        # handler pops a confirmation QMessageBox that would otherwise block offscreen).
+        import PyQt5.QtWidgets as _RQW
+        _rorig = (_RQW.QMessageBox.information, _RQW.QFileDialog.getSaveFileName)
+        _RQW.QMessageBox.information = staticmethod(lambda *a, **k: None)
+        _RQW.QFileDialog.getSaveFileName = staticmethod(lambda *a, **k: ("", ""))
+        try:
+            _selftest_report_tab(win, tmp, app)
+        finally:
+            (_RQW.QMessageBox.information, _RQW.QFileDialog.getSaveFileName) = _rorig
         # form-config persistence: type values -> autosave -> a FRESH window must restore them;
         # named save/load round-trips too. (LDO_CONFIG_DIR points at the temp dir set above.)
         win.xf_dutlib.setText("PMU_TOP"); win.xf_dutcell.setText("pmu_top")
@@ -6633,7 +6954,8 @@ def main():
     win = MainWindow(core)
     if a.ref:
         win.refresh_from_profile()           # push the loaded profile into the widgets (no stale defaults)
-        win.statusBar().showMessage(f"Loaded {pathlib.Path(a.ref).name}. Go to Fit (Tab 3).")
+        win.statusBar().showMessage(f"Loaded {pathlib.Path(a.ref).name}. "
+                                    "Go to Manual (legacy) → Fit.")
     win.show()
     sys.exit(app.exec_())
 
