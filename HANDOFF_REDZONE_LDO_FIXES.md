@@ -15,7 +15,8 @@ directly — the toggle never reached it.)
 
 **Fixes shipped this session:**
 - **Manifest (the actual fix)** — `REAL_wur_pmu_top.json` `coverage` now declares
-  `"temps": [-40, 25, 125]`, `"enable": {"inoise": true}`, and top-level `"tnom_c": 25`. Verified
+  `"temps": [-40, 55, 125]`, `"enable": {"inoise": true}`, and top-level `"tnom_c": 55` (55 °C =
+  the house nominal = code `fit_isrc.TNOM`, so the bake temp lands on the model reference). Verified
   live: `M.validate` ✓, `M.temps` → `[-40,25,125]`, `coverage_enabled(inoise)` ✓, **3
   `noise_i_<sink>` measurements** emitted (each `oprobe=Vbias_*`), the deck line is real
   (`nz oprobe=Vbias_500n_lpf noise start=10 stop=100M dec=20`), and the temp guardrail clears.
@@ -31,7 +32,7 @@ directly — the toggle never reached it.)
 The deck statements are **Spectre-18.1-validated but ALPS-keyword-UNVERIFIED** (see
 `netlist_augment.py:592,607`). On the real ALPS run, if either keyword silently no-ops the panel
 comes up wrong with **no error**. So when the new report arrives, confirm:
-1. **`i1p5u_ptat` Idc(T) actually SLOPES** across −40/25/125 (flat ⇒ ALPS ignored `options temp=`).
+1. **`i1p5u_ptat` Idc(T) actually SLOPES** across −40/55/125 (flat ⇒ ALPS ignored `options temp=`).
 2. **current-noise `[1,1]` panels are non-blank** (blank ⇒ ALPS wrote the `noise oprobe=` PSD under
    a PSF key `importmp._read_noise_out` doesn't recognize → point silently skipped, `strict=False`).
 3. Sim-budget note: current-noise groups are load- **and** temp-swept, so ~3 sinks × N_loads × 3
