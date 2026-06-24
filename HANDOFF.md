@@ -1,3 +1,63 @@
+# UPDATE (2026-06-24) — in-situ fit REPORT tab + modeling GRADE SHIPPED (pushed @ 6cd629e)
+
+**Goal:** after a fit in Tab 0 · Extract (real run OR "Import a finished simulation"/load-folder), SEE the
+per-port fit report — text(scores)+graphics(GT-vs-model) for every modeled quantity (PMU_WUR_TOP = 2 VDD
+rails + 3 current ports) — plus a clear "能不能用" GRADE and a copy-pasteable DEBUG report the user pastes
+back to reproduce a bug. **DONE, local-green, pushed `6cd629e` (main). NOT yet box-validated on real data.**
+
+**User design decisions (3 forks, locked):** Report = a NEW top-level tab (not a sub-tab); the old
+Profile/Import/Fit/Compare → ONE collapsed **Manual (legacy)** tab (nested sub-tabs); port selector = grouped
+LIST + detail pane. Top-level tabs are now exactly **`0 · Extract (in-situ)` | `Report` | `Manual (legacy)`**.
+**Trans-ID DELETED**; the broken **"Or send one output port →" hack DELETED**.
+
+**What shipped (`6cd629e`, 3 files, +1313/−230):**
+- **NEW `harness/report_multiport.py`** (+ `test_report_multiport.py`, 10 tests) — pure-numpy, Qt-free data layer:
+  - `port_views(result, npz_path, manifest) -> [view...]` (voltage rails first, then current sinks). Voltage
+    overlay arrays are rebuilt from the multi-port fit params `result["voltage"][o]["P"][il]` via
+    `FM.zmodel/psrr_model/noise_model_sv` = **the emitted model** (no re-fit). Current sinks are sourced
+    **IN-SITU** from the npz `y_<c>_<load>` / `pi_<c>_<s>_<load>` / `iv_<c>_<label>` keys (importmp.current_ports)
+    + fit_isrc, with an ADAPTIVE `present` panel set; current-noise is NEVER an in-situ panel (no GT).
+  - `grade_port(view)` / `overall_grade(views)` + `GRADE_BARS` → 3-level verdict USABLE / minor-caveats /
+    REVIEW (badge OK/~/!!). Attached as `view["grade"]`.
+  - `debug_report(...)` → per-port scores + diagnosis (voltage via `report._diagnose` computed IN-MEMORY from
+    the multi-port params — NO re-fit, NO disk write; current via `current_digest._diagnose`) + OVERALL GRADE
+    + the bars + a `TO REPRODUCE` footer with the manifest INLINED + the npz named to attach.
+- **`gui/ldo_modeler.py`** — new `_tab_report()` (grouped `QTreeWidget` Voltage/Current + detail `_Canvas`,
+  green/amber/red grade leaves, summary verdict, Copy/Save debug report); `_x_show_results` (the single post-fit
+  chokepoint, fires on run / cluster-sweep / import-finished) refreshes the report, enables a "View fit report →"
+  button, and auto-switches to it (gated on build success). `_tab_manual()` folds the 4 old tabs.
+
+**3 gotchas the next session MUST know (each was a real bug caught + fixed here):**
+1. **Current ports are IN-SITU, not digest.** A real extraction populates `y_/pi_/iv_<c>` keys (→ `result["current"]`)
+   but does NOT populate the `iport_*` air-gap digest registry (`current_digest.list_iports`, written only by
+   `digest_import.py`). The first draft keyed off the digest → current overlays were EMPTY on real runs. Report
+   tab sources current ports from `manifest["i_out"]` / `importmp.current_ports`.
+2. **Current-PSRR sign = dI/dVdd = −pi.** importmp stores `pi = −I/Vsup`; emit fits gdd on `−PI`. The report
+   negates to match (else the displayed gdd sign is inverted vs the .va). Note: `sign_ok` is a fit-vs-GT check,
+   NOT an emit cross-check — an analytic report can't see an emit-side sign bug (same caveat as fit_isrc).
+3. **The diagnosis is computed in-memory from the multi-port params** (report._corner with nmode="norton",
+   nfkv=None; `_diagnose` only needs `result.cout`). Do NOT reintroduce the per-rail `fit_variant` re-fit — it
+   wrote single-port refs into `results/ref/`.
+
+**Verify (both green now):**
+`QT_QPA_PLATFORM=offscreen python3 gui/ldo_modeler.py --selftest --require-qt` (PASS) ·
+`python3 -m pytest harness/ cadence/insitu/ cadence/cluster/ -q --ignore-glob='*_spectre.py' -k 'not spectre and not ngspice'` (323 pass).
+Use `python3` (no `python`). Screenshots render headless to `work/gui_selftest_out/` (report_tab / grade_voltage /
+grade_current / final_manual).
+
+**NEXT (box-only + minor):**
+1. **Red-zone box-validate** on a REAL PMU_WUR_TOP extraction: run Tab-0 → confirm the Report tab shows all 2
+   rails + 3 current ports with sane overlays + grades; paste a `debug_report` back if anything grades REVIEW.
+2. **`bash apply`** to deploy into the red-zone venv (see [[redzone-install-prefix]]).
+3. **Tune `GRADE_BARS`** in `report_multiport.py` if the USABLE/REVIEW thresholds don't match the designer's
+   acceptance bar (they're transparent + printed in the debug report — the designer owns the bar).
+4. MINOR: the Extract → "Model cell" sub-tab still dumps the plain-text report (`x_modelreport`), now redundant
+   with the Report tab — could slim to a "View full report →" pointer.
+
+Full state in memory [[next-report-tab-build]].
+
+---
+
 # UPDATE (2026-06-15) — ade chain COMPLETE end-to-end + config-view fidelity DONE (pushed @ 818b959)
 
 **The whole "ade hang" saga was ONE misread status code — fixed; the full in-situ extraction now runs
