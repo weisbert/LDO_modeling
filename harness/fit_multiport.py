@@ -135,11 +135,28 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
                          pcb0=Q[0], pcb1=Q[1], pcw0=Q[2], pcq=Q[3], _psrr=psrr_params)
         # joint Norton-@vout noise bank over corners (reads FM.ref noise_<il>, FM.C/RC)
         NB = FM.fit_noise_bank(zfits)
-        nfk = list(NB["fk"])
+        # GATED HYBRID (series voltage-noise) keep-best -- mirror fit_all's gated attempt so the
+        # multi-port SCORE/REPORT matches the emitted single-port VA (which engages hybrid via
+        # fit_all). A real LOOP-SHAPED rail has In=Sv/|Zout| falling steeper than the Norton bank
+        # can hold (the WuR pll/vco: Norton ~11dB, hybrid ~0.5dB). Engage ONLY when Norton STALLED
+        # above the trigger AND the hybrid is a clear (>0.5dB) win (keep-best -> zero regression;
+        # every synthetic ref fits <=3.7dB Norton -> never fires there -> byte-identical).
+        nmode, nfkv, NH = "norton", [], None
+        if NB["worst"] > FM.NOISE_ADAPT_TRIG:
+            NH = FM.fit_noise_hybrid(zfits)
+            if NH["worst"] < NB["worst"] - 0.5:
+                nmode, nfkv = "hybrid", list(NH["fkv"])
+        nfk = list(NB["fk"]) if nmode == "norton" else []
         for il in loads:
-            P[il]["gnw"] = NB["gw"][il]
-            for k in range(len(nfk)):
-                P[il][f"gn{k+1}"] = NB["gk"][il][k]
+            if nmode == "hybrid":
+                P[il]["gnw"] = NH["gw"][il]
+                P[il]["snw"] = NH["snw"][il]
+                for k in range(len(nfkv)):
+                    P[il][f"sn{k+1}"] = NH["snk"][il][k]
+            else:
+                P[il]["gnw"] = NB["gw"][il]
+                for k in range(len(nfk)):
+                    P[il][f"gn{k+1}"] = NB["gk"][il][k]
         # per-corner per-metric error (model vs GT), using the SAME transfer fns as the fit
         for il in loads:
             e = dict(il=il)
@@ -159,7 +176,7 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
                                     np.angle(Hm[sel] / Hg[sel]) ** 2)))))
             gn = sp[f"noise_{il}"]; fn = gn[:, 0]; Sg = gn[:, 1]
             Sm = FM.noise_model_sv(P[il], fn, FM.zmodel(fn, *zfits[il]),
-                                   nfk=nfk, nmode="norton")
+                                   nfk=nfk, nfkv=nfkv, nmode=nmode)
             e["nrms"] = float(np.sqrt(np.mean(
                 (20 * np.log10((Sm + 1e-30) / (Sg + 1e-30))) ** 2)))
             err.append(e)
@@ -168,8 +185,8 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     # per the contract). Single-OP -> one label or empty (baked literal downstream).
     schedule_loads = [il for il in loads
                       if np.isfinite(P[il]["iv"]) and P[il]["iv"] != 0.0]
-    return dict(P=P, nfk=nfk, cout=cout, esr=esr, err=err, supplies=list(supplies),
-                schedule_loads=schedule_loads)
+    return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
+                supplies=list(supplies), schedule_loads=schedule_loads)
 
 
 def _amps_ok(il):

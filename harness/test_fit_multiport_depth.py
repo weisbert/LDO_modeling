@@ -243,3 +243,32 @@ def test_current_noise_absent_keeps_honest_zero_stub(tmp_path):
     assert row["in_white"] == 0.0 and row["in_kf"] == 0.0
     cv = next(v for v in RMP.port_views(res, str(npz), m) if v["kind"] == "current")
     assert "noise" not in cv["present"] and not np.isfinite(cv["metrics"]["nrms"])
+
+
+# =============================================== gated HYBRID voltage-noise (loop-shaped rails)
+def test_voltage_noise_hybrid_engages_on_loop_shaped_rail(tmp_path):
+    """A real loop-shaped rail (high-Q Zout peak + a smoothly-falling Sv) has In=Sv/|Zout| the
+    Norton bank can't hold -> the gated keep-best engages 'hybrid' (series voltage-noise) and the
+    nrms drops sharply. A FLAT synthetic rail stays 'norton' (no regression, byte-identical)."""
+    # flat synthetic rail -> norton
+    npz0, m = _sweep_npz(tmp_path, with_temp=False, name="flat")
+    res0 = FMP.fit_multiport(str(npz0), m)
+    assert res0["voltage"]["pll"]["nmode"] == "norton"
+    # loop-shaped rail -> hybrid, much lower nrms
+    ref = dict(np.load(npz0, allow_pickle=True))
+    f = np.logspace(1, np.log10(5e8), 120); w = 2 * np.pi * f; w0 = 2 * np.pi * 10e6; Q = 8
+    Z = (1j * w * 0.02) / (1 - (w / w0) ** 2 + 1j * w / (Q * w0)) + 0.1     # high-Q Zout
+    fn = np.logspace(1, 8, 40); Sv = np.sqrt((3e-8) ** 2 + 1e-9 / fn)        # falling Sv
+    for lbl in [str(x) for x in ref["loads"]]:
+        if f"z_pll_{lbl}" in ref:
+            ref[f"z_pll_{lbl}"] = np.c_[f, Z.real, Z.imag]
+            ref[f"noise_pll_{lbl}"] = np.c_[fn, Sv]
+    p2 = tmp_path / "loop.npz"; np.savez(p2, **ref)
+    res = FMP.fit_multiport(str(p2), m)
+    fit = res["voltage"]["pll"]
+    assert fit["nmode"] == "hybrid" and fit["nfkv"]
+    assert max(e["nrms"] for e in fit["err"]) < 6.0       # hybrid holds it (Norton stalled ~16dB)
+    # the report path REPRODUCES the same nrms (uses the rail's nmode/nfkv, not hardcoded norton)
+    import report_multiport as RMP
+    cv = next(v for v in RMP.port_views(res, str(p2), m) if v["kind"] == "voltage")
+    assert cv["worst"]["nrms"] < 6.0

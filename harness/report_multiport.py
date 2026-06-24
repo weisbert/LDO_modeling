@@ -113,19 +113,19 @@ def overall_grade(views):
 
 # --------------------------------------------------------------- voltage-rail overlay
 @contextlib.contextmanager
-def _rail_context(cout, esr):
+def _rail_context(cout, esr, nmode="norton"):
     """Set fit_model's module globals to one voltage rail's physical Cout/ESR (zmodel reads
-    FM.C/FM.RC) + a clean norton/no-feedthrough noise context, restoring on exit. This is the
-    SAME state fit_multiport._fit_voltage_output established when it produced the rail's `err`
-    block, so the model arrays we evaluate here equal the emitted model exactly."""
+    FM.C/FM.RC) + the rail's noise-block mode (norton | hybrid -- the multi-port fit's gated
+    keep-best). This is the SAME state fit_multiport._fit_voltage_output established when it
+    produced the rail's `err` block, so the model arrays we evaluate here equal the emitted model."""
     with FMP._fm_globals():
         FM.C, FM.RC = float(cout), float(esr)
         FM.CFT = 0.0
-        FM.NOISE_MODE = "norton"
+        FM.NOISE_MODE = nmode
         yield
 
 
-def _voltage_corner(P_il, nfk, sp, il, supplies, prim, err):
+def _voltage_corner(P_il, nfk, sp, il, supplies, prim, err, nmode="norton", nfkv=None):
     """Reproduce ONE load corner's GT + model overlay arrays + scores, exactly as the GUI
     Compare tab (gt_corner/predict_corner) and fit_multiport's per-corner err do.
 
@@ -151,7 +151,7 @@ def _voltage_corner(P_il, nfk, sp, il, supplies, prim, err):
 
     gn = sp[f"noise_{il}"]
     fn, Sg = gn[:, 0], gn[:, 1]
-    Sm = FM.noise_model_sv(P_il, fn, FM.zmodel(fn, *zf), nfk=nfk, nmode="norton")
+    Sm = FM.noise_model_sv(P_il, fn, FM.zmodel(fn, *zf), nfk=nfk, nfkv=nfkv, nmode=nmode)
 
     # scores: REUSE the fit_multiport err row (already model-vs-GT on these same arrays)
     scores = dict(zrms=float(err["zrms"]),
@@ -167,12 +167,14 @@ def _voltage_corner(P_il, nfk, sp, il, supplies, prim, err):
 def _voltage_view(o, fit, sp, supplies, prim):
     """Assemble one voltage rail's view dict (see module docstring / contract)."""
     P, nfk = fit["P"], fit["nfk"]
+    nmode, nfkv = fit.get("nmode", "norton"), fit.get("nfkv", [])
     loads = [e["il"] for e in fit["err"]]            # the actual fit corners, in fit order
     errmap = {e["il"]: e for e in fit["err"]}
     corners = {}
-    with _rail_context(fit["cout"], fit["esr"]):
+    with _rail_context(fit["cout"], fit["esr"], nmode):
         for il in loads:
-            corners[il] = _voltage_corner(P[il], nfk, sp, il, supplies, prim, errmap[il])
+            corners[il] = _voltage_corner(P[il], nfk, sp, il, supplies, prim, errmap[il],
+                                          nmode, nfkv)
     # worst-case rollup over this rail (PSRR worst over every supply)
     zr = [c["scores"]["zrms"] for c in corners.values()]
     pr = [v[0] for c in corners.values() for v in c["scores"]["psrr"].values()]
@@ -596,9 +598,10 @@ def _rail_diagnosis(result, npz_path, manifest, o):
         ref = IM.load_multiport(npz_path)
         sp = IM.split_ports(ref, manifest)[o]["npz"]      # in-memory z_/p_/noise_ single-port view
         nom = loads[len(loads) // 2]
-        # multi-port noise is fit Norton @vout with a per-corner bank baked into P[il]; predict
-        # with nmode="norton"/nfkv=None reads that bank straight off P (no module-global trap).
-        cs = [RPT._corner(sp, P[il], nfk, il, nmode="norton", nfkv=None) for il in loads]
+        # multi-port noise is fit Norton @vout (or the gated 'hybrid' series-voltage bank) with the
+        # per-corner bank baked into P[il]; predict with the rail's own nmode/nfkv (no module trap).
+        nmode, nfkv = fit.get("nmode", "norton"), (fit.get("nfkv") or None)
+        cs = [RPT._corner(sp, P[il], nfk, il, nmode=nmode, nfkv=nfkv) for il in loads]
         cnom = next(c for c in cs if c["il"] == nom)
         agg = dict(zrms=np.mean([c["zrms"] for c in cs]),
                    zband=np.mean([c["zband"] for c in cs]),
