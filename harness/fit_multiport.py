@@ -324,6 +324,7 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
     return dict(sink=c, il=op_label, pol=pol, vc=float(sink_dc),
                 idc55=idc55, didt=didt, g0=float(iv["g0"]),
                 gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
+                knee_side=iv["knee_side"], vhi=float(iv["vhi"]),
                 Cp=float(Cp), in_white=0.0, in_kf=0.0, tnom_c=float(tnom_c),
                 iv_r2=float(iv["iv_r2"]))
 

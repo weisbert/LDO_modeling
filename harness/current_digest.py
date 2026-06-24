@@ -26,6 +26,8 @@ import numpy as np
 import fit_isrc
 
 PREFIX = "iport_"
+CPSRR_OBS_GATE = 1e-3   # |gdd|/g0 below this => supply->Iout coupling is UNOBSERVABLE (noise floor)
+                        # -> the flat-gdd model is correct and the cPSRR rms is not graded/signed.
 # per-port namespaced keys in the flat ref npz
 _K = dict(iv="iv", idcT="idcT", y="y", psrr="psrr", noise="noise",
           vc="vc", vdd="vdd", pol="pol", pin="pin")
@@ -115,6 +117,24 @@ def diff_metrics(view, p):
     ptat_m = float(idcT_m[-1] / idcT_m[0]) if idcT_m[0] else float("nan")
     ptat_rms = float(np.sqrt(np.mean(((idcT_m - idcT_g) / (idcT_g + 1e-30)) ** 2)) * 100.0)
     gdd_gt = float(view["psrr_g"][0].real)
+    # OBSERVABILITY GATE for current-PSRR (supply->Iout coupling). A high-Z bias reference has a
+    # DC supply-coupling gdd that is ~0; the GT pi then RISES capacitively (jw*Ccouple) while the
+    # behavioral model is a flat real gdd, so an unweighted log-RMS explodes (~100dB) over a band
+    # where BOTH are negligible -- a metric artifact, not a model defect. Gate on the DIMENSIONLESS
+    # ratio |gdd|/g0: when the DC coupling is below ~1e-3 of the port's own output conductance it is
+    # UNOBSERVABLE and must not be graded (nor its sign flagged). Keys on a dimensionless physical
+    # ratio with ~6-decade margin -- generalizes to any chip, still grades a REAL (observable)
+    # coupling. The HF capacitive rise is reported SEPARATELY as a coupling cap so a genuinely
+    # significant one stays visible even when the DC term is gated.
+    g0a = abs(p["g0"])
+    gdd_g0 = (abs(p["gdd"]) / g0a) if g0a > 0 else float("inf")
+    cpsrr_observable = bool(gdd_g0 >= CPSRR_OBS_GATE)
+    pf = np.asarray(view["psrr_f"], float)
+    pg = np.asarray(view["psrr_g"])
+    ccouple_fF = (float(abs(pg[-1]) / (2 * np.pi * pf[-1])) * 1e15) if pf.size and pf[-1] > 0 else 0.0
+    coupling_ppm = (abs(p["gdd"]) / abs(p["idc"]) * 1e6) if p["idc"] else float("nan")
+    # sign is only meaningful when the coupling is observable (a sign at the noise floor is noise)
+    sign_ok = True if not cpsrr_observable else ((p["gdd"] >= 0) == (gdd_gt >= 0))
     return dict(
         pin=view["name"], pol=view["pol"], vc=view["vc"],
         idc_ua=p["idc"] * 1e6, ivrms=ivrms,
@@ -122,7 +142,9 @@ def diff_metrics(view, p):
         cp_fF=p["cp"] * 1e15, yrms=yrms,
         gdd_nS=p["gdd"] * 1e9, gdd_sign=("+" if p["gdd"] >= 0 else "-"),
         gt_sign=("+" if gdd_gt >= 0 else "-"),
-        sign_ok=((p["gdd"] >= 0) == (gdd_gt >= 0)), prms=prms,
+        sign_ok=sign_ok, prms=prms,
+        cpsrr_observable=cpsrr_observable, gdd_g0=float(gdd_g0),
+        ccouple_fF=ccouple_fF, coupling_ppm=float(coupling_ppm),
         in1k_fA=float(np.interp(1e3, view["nz_f"], view["nz_in"])) * 1e15, nrms=nrms,
         ptat_g=ptat_g, ptat_m=ptat_m, ptat_rms=ptat_rms,
         pole=p.get("psrr_pole_w"))
@@ -134,11 +156,18 @@ def _diagnose(m):
         d.append(f"port '{m['pin']}': behavioral I-V/knee misfits the device by "
                  f"{m['ivrms']:.1f}% RMS -- raise the knee sharpness p or widen the "
                  f"compliance sweep (the saturation->triode corner is under-resolved).")
-    if not m["sign_ok"]:
+    observable = m.get("cpsrr_observable", True)
+    if not observable and np.isfinite(m.get("prms", np.nan)):
+        d.append(f"port '{m['pin']}': supply->Iout coupling UNOBSERVABLE (|gdd|/g0="
+                 f"{m.get('gdd_g0', float('nan')):.1e} < {CPSRR_OBS_GATE:g}; DC coupling "
+                 f"~{m.get('coupling_ppm', float('nan')):.2g} ppm/V, HF parasitic "
+                 f"~{m.get('ccouple_fF', 0.0) * 1000:.2g} aF) -- NOT graded; a flat-gdd model is "
+                 f"correct here (the {m['prms']:.0f}dB cPSRR rms is a metric artifact, not a defect).")
+    elif not m["sign_ok"]:
         d.append(f"port '{m['pin']}': current-PSRR SIGN MISMATCH (model {m['gdd_sign']} "
                  f"vs GT {m['gt_sign']} dIpin/dVdd) -- the supply pushes this bias the "
                  f"OTHER way; check the gdd sign and the sink/source probe convention.")
-    elif m["prms"] > 3.0:
+    elif observable and m["prms"] > 3.0:
         d.append(f"port '{m['pin']}': current-PSRR magnitude off by {m['prms']:.1f}dB "
                  f"-- a 1-pole rolloff in band the flat gdd misses (fit a psrr_pole).")
     if m["nrms"] > 3.0:

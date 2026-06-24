@@ -24,12 +24,20 @@ def emit_isrc(p):
     cp = max(p["cp"], 1e-18)
     # sqrt-floored base -> the gate Jacobian kp*arg^(kp-1) stays finite at arg=0
     # (a bare (V/vk)**kp blows up the OP solver when kp<1 and the sweep hits 0).
-    if pol == "sink":
-        drive = "out 0"
+    # DRIVE follows pol; the compliance KNEE follows the data-detected side (a sink can have a
+    # high-side ceiling knee -- the real WuR refs; a flat reference has no knee in range). See
+    # fit_isrc.gate / _detect_knee. vhi is the FITTED ceiling (not assumed = VDD0).
+    side = p.get("knee_side") or ("lo" if pol == "sink" else "hi")
+    vhi = float(p.get("vhi", VDD0))
+    drive = "out 0" if pol == "sink" else "vdd out"
+    if side == "none":
+        gate_factor = "1"
+    elif side == "hi":
+        garg = f"(sqrt(({vhi:g}-V(out))*({vhi:g}-V(out))+1e-12)/{vk:.6g})"
+        gate_factor = f"tanh({garg}**{kp:.6g})"
+    else:                                                 # 'lo'
         garg = f"(sqrt(V(out)*V(out)+1e-12)/{vk:.6g})"
-    else:
-        drive = "vdd out"
-        garg = f"(sqrt(({VDD0:g}-V(out))*({VDD0:g}-V(out))+1e-12)/{vk:.6g})"
+        gate_factor = f"tanh({garg}**{kp:.6g})"
     # gdd was fit from the measured probe transfer dI(vout)/dVdd. For a sink the
     # probe reads i(vout) = -I_pin, so the coefficient inside I_pin is -gdd; for a
     # source (B drives vdd->out) i(vout) = +I_pin, so it is +gdd.
@@ -37,7 +45,7 @@ def emit_isrc(p):
     idc_t = f"({idc55:.6e}+({didt:.6e})*(temper-55))"
     core = (f"({idc_t}+({g0:.6e})*(V(out)-{vc:g})"
             f"+({gdd_eff:.6e})*(V(vdd)-{VDD0:g}))")
-    iexpr = f"{core}*tanh({garg}**{kp:.6g})"
+    iexpr = f"{core}*{gate_factor}"
     return (f".subckt isrc_model_{name} vdd out\n"
             f"Bout {drive} I = {iexpr}\n"
             f"Cpar out 0 {cp:.6g}\n"

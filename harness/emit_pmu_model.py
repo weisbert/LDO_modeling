@@ -389,23 +389,31 @@ def _current_block_largesignal(o, crow, supply, ground):
     inw2 = float(crow.get("in_white", 0.0)) ** 2
     kf = float(crow.get("in_kf", 0.0))
     tref_k = float(crow.get("tnom_c", 55.0)) + 273.15    # $temperature is KELVIN; user-set nominal
+    vhi = float(crow.get("vhi", 1.05))                   # fitted high-side compliance ceiling (VDD0 default)
+    # DRIVE direction follows pol (sink draws {o}->ground, source injects supply->{o}); the
+    # compliance KNEE follows the DATA-DETECTED side (decoupled from pol): a sink can have a
+    # high-side ceiling knee (the real WuR refs), and a flat ref has NO knee.
+    side = crow.get("knee_side") or ("lo" if pol == "sink" else "hi")
     rvars = [f"{pre}_idc55", f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
-             f"{pre}_vk", f"{pre}_kp", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"]
+             f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"]
     asg = (f"{pre}_idc55 = {idc55:.6e};  {pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
            f"{pre}_vc = {vc:.6g};  {pre}_gdd = {gdd_eff:.6e};  {pre}_vk = {vk:.6g};  "
-           f"{pre}_kp = {kp:.6g};  {pre}_Cp = {cp:.6e};  {pre}_inw2 = {inw2:.6e};  "
-           f"{pre}_kf = {kf:.6e};")
-    if pol == "sink":
+           f"{pre}_kp = {kp:.6g};  {pre}_vhi = {vhi:.6g};  {pre}_Cp = {cp:.6e};  "
+           f"{pre}_inw2 = {inw2:.6e};  {pre}_kf = {kf:.6e};")
+    drive = f"I({o}, {ground})" if pol == "sink" else f"I({supply}, {o})"
+    if side == "none":                                   # flat ref: no compliance knee in range
+        gate_expr = "1.0"
+    elif side == "hi":                                   # high-side ceiling knee at the fitted vhi
+        karg = f"sqrt(({pre}_vhi - V({o},{ground}))*({pre}_vhi - V({o},{ground})) + 1e-12)"
+        gate_expr = f"tanh(pow({karg}/{pre}_vk, {pre}_kp))"
+    else:                                                # 'lo': low-side knee (Vo->0), legacy NMOS sink
         karg = f"sqrt(V({o},{ground})*V({o},{ground}) + 1e-12)"
-        drive = f"I({o}, {ground})"
-    else:
-        karg = f"sqrt((vdc_{supply}-V({o},{ground}))*(vdc_{supply}-V({o},{ground})) + 1e-12)"
-        drive = f"I({supply}, {o})"
-    body = f"""    // ====== current bias {o} ({pol}: Idc(T)+I-V knee+g0+Cp+signed PSRR+noise) ======
+        gate_expr = f"tanh(pow({karg}/{pre}_vk, {pre}_kp))"
+    body = f"""    // ====== current bias {o} ({pol}, {side}-knee: Idc(T)+I-V knee+g0+Cp+signed PSRR+noise) ======
     {drive} <+ ({pre}_idc55 + {pre}_didt*($temperature - {tref_k:g})
                   + {pre}_g0*(V({o},{ground}) - {pre}_vc)
                   + {pre}_gdd*(V({supply},{ground}) - vdc_{supply}))
-                 * tanh(pow({karg}/{pre}_vk, {pre}_kp));
+                 * {gate_expr};
     I({o}, {ground}) <+ {pre}_Cp*ddt(V({o}, {ground}));   // output cap (Y imag part)
     I({o}, {ground}) <+ white_noise({pre}_inw2, "{pre}_wht");
     I({o}, {ground}) <+ flicker_noise({pre}_kf, 1.0, "{pre}_flk");

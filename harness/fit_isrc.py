@@ -28,37 +28,92 @@ VDD0 = 1.05
 TNOM = 55.0
 
 
-def gate(Vo, Vk, p, pol):
-    """Compliance knee, anchored at the dropout rail and ->1 in saturation:
-       sink:   tanh( (Vo/Vk)^p )           loses current as Vo->0
-       source: tanh( ((Vdd-Vo)/Vk)^p )     loses current as Vo->Vdd
+def gate(Vo, Vk, p, pol, side=None, vhi=None):
+    """Compliance knee, ->1 in saturation, ->0 at the compliance limit. The knee SIDE is
+    DECOUPLED from pol (a bias reference can be a current SINK whose compliance ceiling is at the
+    HIGH-Vo rail -- the real WuR refs -- not at Vo->0). `side` selects the orientation; when None
+    it falls back to the legacy pol map (sink->low-side, source->high-side at VDD0):
+       'lo'   : tanh( (Vo/Vk)^p )            loses current as Vo->0      (e.g. NMOS sink)
+       'hi'   : tanh( ((vhi-Vo)/Vk)^p )      loses current as Vo->vhi    (high-side ceiling; vhi
+                                             is a FITTED rail, not assumed = VDD0/supply)
+       'none' : 1                            no knee in the swept compliance (flat ref, e.g. PTAT)
     p sets knee SHARPNESS (p~1 soft simple-mirror knee; p>>1 hard cascode knee)."""
-    arg = (Vo / Vk) if pol == "sink" else ((VDD0 - Vo) / Vk)
+    Vo = np.asarray(Vo, float)
+    if side is None:
+        side = "lo" if pol == "sink" else "hi"
+        vhi = VDD0 if vhi is None else vhi
+    if side == "none":
+        return np.ones_like(Vo)
+    if side == "hi":
+        arg = ((VDD0 if vhi is None else vhi) - Vo) / Vk
+    else:                                                # 'lo'
+        arg = Vo / Vk
     return np.tanh(np.power(np.clip(arg, 0.0, None), p))
 
 
-def _fit_iv(Vo, I, vc, pol, rout):
-    """ANCHOR the operating point (Idc=I(vc)) and the small-signal conductance
-    (g0=1/rout, consistent with Y(s)), then estimate the knee (Vk,p) from the
-    10%/90% crossings -- a parameter-free 2-point gate fit, no optimizer fragility."""
-    Idc = float(np.interp(vc, Vo, I))
-    g0 = (1.0 if pol == "sink" else -1.0) / max(rout, 1.0)
-    Iplat = np.median(np.sort(I)[-8:])
+def _cross_from_top(Vs, Is, level):
+    """The Vo on the HIGH-Vo FALLING edge where I crosses `level` (I full below, collapses toward
+    the ceiling). Walks down from Vo_max and linear-interpolates the bracketing pair; if the curve
+    never falls to `level` within the sweep, returns Vo_max (a lower bound on the ceiling)."""
+    for k in range(Vs.size - 1, 0, -1):
+        a, b = Is[k - 1], Is[k]                          # a at lower Vo (higher I), b at higher Vo
+        if (b < level <= a) or (b <= level < a):
+            t = (level - a) / (b - a) if b != a else 0.0
+            return float(Vs[k - 1] + t * (Vs[k] - Vs[k - 1]))
+    return float(Vs[-1])
+
+
+def _detect_knee(Vs, Is, Iplat):
+    """Detect the compliance knee SIDE + params from the DATA (not from pol):
+      'lo'   current collapses as Vo->0   (rises from ~0; NMOS sink)          tanh((Vo/Vk)^p)
+      'hi'   current collapses as Vo->vhi  (flat then drops at a ceiling)      tanh(((vhi-Vo)/Vk)^p)
+      'none' flat across the whole swept compliance (no knee; e.g. PTAT)       1
+    Returns (side, vhi, Vk, p). Robust to the non-monotonic flat-then-collapse curve that the
+    legacy interp-on-I assumed away (the root cause of the 63% real-ref misfit)."""
     a10, a90 = np.arctanh(0.1), np.arctanh(0.9)
-    if pol == "sink":
-        x10 = float(np.interp(0.1 * Iplat, I, Vo))
-        x90 = float(np.interp(0.9 * Iplat, I, Vo))
-    else:
-        x10 = VDD0 - float(np.interp(0.1 * Iplat, I[::-1], Vo[::-1]))
-        x90 = VDD0 - float(np.interp(0.9 * Iplat, I[::-1], Vo[::-1]))
+    if Iplat <= 0 or Vs.size < 2:
+        return "none", float(Vs[-1]), max(float(Vs[-1]), 0.05), 1.0
+    flo, fhi = Is[0] / Iplat, Is[-1] / Iplat
+    lo_drop, hi_drop = flo < 0.9, fhi < 0.9
+    if not lo_drop and not hi_drop:                      # full current at BOTH ends -> no knee
+        return "none", float(Vs[-1]), max(float(Vs[-1]), 0.05), 1.0
+    if hi_drop and (not lo_drop or fhi <= flo):          # high-side ceiling collapse
+        vhi = _cross_from_top(Vs, Is, 0.02 * Iplat)      # where I->~0 near the top (the rail)
+        x90 = _cross_from_top(Vs, Is, 0.9 * Iplat)       # upper plateau edge (lower Vo)
+        x10 = _cross_from_top(Vs, Is, 0.1 * Iplat)       # closer to vhi (higher Vo)
+        u90, u10 = vhi - x90, vhi - x10                  # u = vhi-Vo (gate arg numerator)
+        if u90 > u10 > 0:
+            p = float(np.log(a90 / a10) / np.log(u90 / u10))
+            Vk = float(u90 / a90 ** (1.0 / p))
+        else:
+            p, Vk = 1.0, max(vhi - x90, 0.05)
+        return "hi", float(vhi), float(max(Vk, 1e-3)), float(np.clip(p, 0.3, 12.0))
+    # low-side knee (legacy NMOS-sink shape): I rises monotonically from ~0 at Vo=0
+    x10 = float(np.interp(0.1 * Iplat, Is, Vs))
+    x90 = float(np.interp(0.9 * Iplat, Is, Vs))
     if x10 > 0 and x90 > x10:
         p = float(np.log(a90 / a10) / np.log(x90 / x10))
         Vk = float(x90 / a90 ** (1.0 / p))
-    else:                                                          # degenerate -> soft default
+    else:
         p, Vk = 1.0, max(x90, 0.05)
-    m = (Idc + g0 * (Vo - vc)) * gate(Vo, Vk, p, pol)
-    ss = 1 - np.sum((I - m) ** 2) / np.sum((I - I.mean()) ** 2)
-    return dict(idc=Idc, g0=g0, vknee=Vk, knee_p=p, iv_r2=ss)
+    return "lo", float(Vs[-1]), float(max(Vk, 1e-3)), float(np.clip(p, 0.3, 12.0))
+
+
+def _fit_iv(Vo, I, vc, pol, rout):
+    """ANCHOR the operating point (Idc=I(vc)) and the small-signal conductance (g0=1/rout,
+    consistent with Y(s)), then DETECT the compliance knee side+params from the data (_detect_knee)
+    -- a flat ref gets NO gate, a high-side-ceiling ref gets a fitted-rail high-side knee, an
+    NMOS-sink-shaped ref gets the legacy low-side knee. No optimizer fragility (closed-form)."""
+    Vo = np.asarray(Vo, float); I = np.asarray(I, float)
+    order = np.argsort(Vo)
+    Vs, Is = Vo[order], I[order]
+    Idc = float(np.interp(vc, Vs, Is))
+    g0 = (1.0 if pol == "sink" else -1.0) / max(rout, 1.0)
+    Iplat = float(np.median(np.sort(Is)[-8:]))
+    side, vhi, Vk, p = _detect_knee(Vs, Is, Iplat)
+    m = (Idc + g0 * (Vs - vc)) * gate(Vs, Vk, p, pol, side=side, vhi=vhi)
+    ss = 1 - np.sum((Is - m) ** 2) / max(np.sum((Is - Is.mean()) ** 2), 1e-300)
+    return dict(idc=Idc, g0=g0, vknee=Vk, knee_p=p, knee_side=side, vhi=float(vhi), iv_r2=float(ss))
 
 
 def _fit_psrr(f, g):
@@ -118,9 +173,10 @@ def fit_isrc(npz_path):
 # simulator. (Emitted-netlist / VA fidelity incl. the probe-sign needs crossval_isrc /
 # isrc_spectre.py --sc; this analytic predictor cannot see an emit-side sign bug.)
 def predict_iv(p, Vo):
-    """DC I-V at TNOM: (Idc + g0*(Vo-vc)) * compliance-knee."""
+    """DC I-V at TNOM: (Idc + g0*(Vo-vc)) * compliance-knee (data-detected side/ceiling)."""
     Vo = np.asarray(Vo, float)
-    return (p["idc"] + p["g0"] * (Vo - p["vc"])) * gate(Vo, p["vknee"], p["knee_p"], p["pol"])
+    return (p["idc"] + p["g0"] * (Vo - p["vc"])) * gate(
+        Vo, p["vknee"], p["knee_p"], p["pol"], side=p.get("knee_side"), vhi=p.get("vhi"))
 
 
 def predict_idcT(p, T_C):

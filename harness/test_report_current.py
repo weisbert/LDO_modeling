@@ -105,3 +105,65 @@ if __name__ == "__main__":
         fn()
         print(f"  [ok] {fn.__name__}")
     print("all current-report tests passed")
+
+
+# ----------------------------------------------------------- cPSRR observability gate
+def _mk_isrc_view(psrr_g_fn, idc=0.5e-6, g0=1.25e-9):
+    """A minimal fit_isrc-schema view (clean sink I-V + given supply-coupling pi)."""
+    f = np.logspace(1, np.log10(5e8), 60)
+    Vo = np.linspace(0.0, 1.8, 19)
+    return dict(name="t", pol="sink", vc=1.28, vdd=1.0,
+                iv_v=Vo, iv_i=idc * np.tanh(np.clip(Vo / 0.15, 0, None) ** 2),
+                ac_f=f, ac_y=g0 + 1j * 2 * np.pi * f * 2e-15, rout=1.0 / g0, cp=2e-15,
+                psrr_f=f, psrr_g=psrr_g_fn(f), nz_f=f, nz_in=np.full_like(f, 1e-15),
+                temps=np.array([55.0]), idcT=np.array([idc]))
+
+
+def test_cpsrr_observability_gate_floor_not_graded():
+    """A high-Z bias ref: ~0 DC supply coupling + capacitive HF rise -> the flat-gdd model's
+    log-RMS explodes, but |gdd|/g0 << 1e-3 so it is UNOBSERVABLE -> not graded/signed, diagnosed
+    as a metric artifact (not a defect)."""
+    v = _mk_isrc_view(lambda f: 1e-13 + 1j * 2 * np.pi * f * 2e-15)   # ~0 DC, jw*2fF rise
+    m = CD.diff_metrics(v, fit_isrc.fit_isrc(v))
+    assert m["cpsrr_observable"] is False and m["gdd_g0"] < CD.CPSRR_OBS_GATE
+    assert m["sign_ok"] is True                                   # no sign flag at the floor
+    assert m["prms"] > 50.0                                       # raw rms IS huge...
+    dg = CD._diagnose(m)
+    assert any("UNOBSERVABLE" in s for s in dg)                  # ...but flagged as not-a-defect
+    assert not any("magnitude off by" in s for s in dg)
+
+
+def test_cpsrr_observability_gate_real_coupling_still_graded():
+    """A genuinely observable supply coupling (|gdd|/g0 >> 1e-3) stays graded + signed."""
+    v = _mk_isrc_view(lambda f: np.full(f.shape, 5e-10) + 0j)     # gdd=0.5nS vs g0=1.25nS
+    m = CD.diff_metrics(v, fit_isrc.fit_isrc(v))
+    assert m["cpsrr_observable"] is True and m["gdd_g0"] >= CD.CPSRR_OBS_GATE
+
+
+# ----------------------------------------------------------- data-driven I-V knee side
+def test_iv_knee_side_detected_from_data():
+    """The compliance knee SIDE is detected from the curve, DECOUPLED from pol: a flat-then-
+    collapse-at-rail reference (the real WuR shape) is 'hi' (not the legacy low-side), a flat
+    reference is 'none', a rise-from-zero NMOS-sink shape is 'lo'. idc + low IVrms in all cases."""
+    Vo = np.linspace(0.0, 1.8, 19)
+    idc = 0.5e-6
+
+    def _fit(I, vc):                                      # _fit_iv + the vc/pol predict_iv needs
+        return {**fit_isrc._fit_iv(Vo, I, vc=vc, pol="sink", rout=8e8), "vc": vc, "pol": "sink"}
+    # (a) high-side ceiling: flat ~idc, collapses to 0 near 1.78 (real WuR ref shape)
+    hi = idc * (1.0 - 1.0 / (1.0 + np.exp(-(Vo - 1.74) / 0.02)))
+    p_hi = _fit(hi, 1.28)
+    assert p_hi["knee_side"] == "hi" and 1.6 < p_hi["vhi"] <= 1.8
+    assert abs(p_hi["idc"] - idc) / idc < 0.05
+    # (b) flat reference within compliance -> NO knee
+    p_fl = fit_isrc._fit_iv(np.linspace(0, 0.8, 9), np.full(9, idc), vc=0.667, pol="sink", rout=3e9)
+    assert p_fl["knee_side"] == "none"
+    # (c) NMOS-sink rise-from-zero -> low-side knee (legacy)
+    lo = idc * np.tanh((Vo / 0.1) ** 2)
+    p_lo = _fit(lo, 1.0)
+    assert p_lo["knee_side"] == "lo"
+    # the model reproduces each shape tightly (the whole point: 63% -> <2%)
+    for p, I in ((p_hi, hi), (p_lo, lo)):
+        m = fit_isrc.predict_iv(p, Vo)
+        rms = np.sqrt(np.mean(((m - I) / (np.median(np.sort(I)[-8:]) + 1e-30)) ** 2)) * 100
+        assert rms < 3.0, f"{p['knee_side']} knee IVrms {rms:.1f}%"
