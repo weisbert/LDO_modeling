@@ -57,10 +57,47 @@ def test_backward_compat_legacy():
     assert "i1_idc55" not in "".join(blk["rvars"])           # NOT the large-signal path
 
 
+def _ls_crow(pin="IB_Q", d2=0.0):
+    """A minimal large-signal crow (carries idc55 -> the large-signal VA block)."""
+    return dict(sink=pin, pin=pin, pol="sink", idc55=2.0e-4, didt=1e-7, d2=d2,
+                g0=1e-7, vc=0.4, gdd=2e-7, vknee=0.05, knee_p=1.0, knee_side="lo",
+                vhi=1.05, Cp=1e-15, in_white=1e-12, in_kf=1e-24, tnom_c=55.0)
+
+
+def test_emit_d2_absent_when_zero():
+    """d2==0.0 -> NO _d2 rvar/asg/term and NO '+ 0.0*' tail: the .va is substring-identical
+    to the pre-curvature emit (the linear temp law '$temperature - 328.15' survives)."""
+    blk = _current_block("IB_Q", _ls_crow(d2=0.0), "AVDD1P0", "VSS")
+    whole = blk["body"] + blk["asg"] + "".join(blk["rvars"])
+    assert "IB_Q_d2" not in whole
+    assert "+ 0.0*" not in blk["body"]
+    assert "$temperature - 328.15" in blk["body"]            # linear law substring preserved
+
+
+def test_emit_d2_present_when_nonzero():
+    """d2!=0.0 -> the curvature rvar/asg + the squared Kelvin term are emitted, and the term
+    measurably shifts the modeled current off the nominal temp (vs the d2=0 twin)."""
+    d2 = 3e-9
+    crow = _ls_crow(d2=d2)
+    blk = _current_block("IB_Q", crow, "AVDD1P0", "VSS")
+    assert f"IB_Q_d2 = {d2:.6e};" in blk["asg"]
+    assert "IB_Q_d2" in "".join(blk["rvars"])
+    assert "IB_Q_d2*($temperature - 328.15)*($temperature - 328.15)" in blk["body"]
+    # curvature changes the modeled current away from TNOM (mirror agrees with predict_idcT)
+    curved = _va_eval_Ipin(crow, crow["vc"], VDC, 125.0)
+    linear = _va_eval_Ipin(_ls_crow(d2=0.0), crow["vc"], VDC, 125.0)
+    assert curved != linear
+    from fit_isrc import predict_idcT
+    dT = (125.0 + 273.15) - 328.15
+    assert abs((crow["idc55"] + crow["didt"]*dT + crow["d2"]*dT*dT)
+               - predict_idcT(crow, 125.0)) < 1e-18
+
+
 def _va_eval_Ipin(crow, Vo, Vsup, Tc):
     """Mirror of the emitted VA current math (Kelvin temp, sqrt-floored gate, gdd sign)."""
     pol = crow["pol"]
-    idcT = crow["idc55"] + crow["didt"] * ((Tc + 273.15) - 328.15)
+    dT = (Tc + 273.15) - 328.15
+    idcT = crow["idc55"] + crow["didt"] * dT + crow.get("d2", 0.0) * dT * dT
     gdd_eff = -crow["gdd"] if pol == "sink" else crow["gdd"]
     core = idcT + crow["g0"] * (Vo - crow["vc"]) + gdd_eff * (Vsup - VDC)
     karg = np.sqrt(Vo * Vo + 1e-12) if pol == "sink" else np.sqrt((VDC - Vo) ** 2 + 1e-12)

@@ -324,8 +324,10 @@ def build_manifest(gui, netmap):
     # The RUN axis is coverage.temps (manifest.temps()/pmu_corner read ONLY there); a top-level
     # m['temps'] is invisible to the runner -> write the consumed location so the Extract-tab
     # temperature field actually drives the per-temperature sims. tnom_c stays top-level (emit reads it).
-    if gui.get("temps"):
-        tps = [float(t) for t in gui["temps"]]
+    # expand_temp_set accepts a comma-string OR a list and is idempotent on an already-expanded
+    # float list (the GUI pre-expands), so a CLI caller may pass "-40:10:120, 125" directly.
+    tps = _manifest.expand_temp_set(gui.get("temps"))
+    if tps:
         m.setdefault("coverage", {})["temps"] = tps
         m["tnom_c"] = float(gui.get("tnom_c", tps[len(tps) // 2]))
     elif gui.get("tnom_c") is not None:

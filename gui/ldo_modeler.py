@@ -2476,14 +2476,10 @@ if _HAVE_QT:
 
             tier = self.f_cov_tier.currentText().strip() or "T4"
             cov["tier"] = tier
-            temps = []
-            for tok in self.f_cov_temps.text().split(","):
-                tok = tok.strip()
-                if tok:
-                    try:
-                        temps.append(self._num(tok))
-                    except ValueError:
-                        pass
+            # temps: explicit floats AND Cadence start:step:stop ranges (inclusive of stop),
+            # comma-mixed -- via the one shared grammar (manifest.expand_temp_set).
+            from insitu import manifest as M
+            temps = M.expand_temp_set(self.f_cov_temps.text())
             if temps:
                 cov["temps"] = temps
             else:
@@ -3332,9 +3328,12 @@ if _HAVE_QT:
                                        "only (no knee). User-defined so the harness serves any project's pins.")
             gf.addRow("I-out I-V sweep", self.xf_ivsweep)
             self.xf_temps = QLineEdit()
-            self.xf_temps.setPlaceholderText("optional: -40, 55, 125   (°C; middle = nominal)")
-            self.xf_temps.setToolTip("Temperature points for Idc(T)/PTAT/noise(T). Blank → nominal "
-                                     "only. The middle point is the model-bake nominal temp.")
+            self.xf_temps.setPlaceholderText("optional: -40:10:120, 125   (°C; start:step:stop inclusive, comma-mixed; middle = nominal)")
+            self.xf_temps.setToolTip("Temperature points for Idc(T)/PTAT/noise(T). Accepts explicit "
+                                     "values AND Cadence start:step:stop ranges (inclusive of stop), "
+                                     "comma-mixed (e.g. -40:10:120, 125). Blank → nominal only. The "
+                                     "middle point is the model-bake nominal temp; ≥5 points enable "
+                                     "the 2nd-order Idc(T) curvature fit.")
             gf.addRow("Temperatures [°C]", self.xf_temps)
             self.xf_inoise = QCheckBox("measure current-output noise (Idc-sink In(f))")
             self.xf_inoise.setToolTip(
@@ -3678,15 +3677,10 @@ if _HAVE_QT:
                         ivsw[k] = [start, stop, step]
                     else:
                         ivsw[k] = nums                       # 2-token / non-standard: keep as typed
-            # temperature points (°C)
-            temps = []
-            for t in self.xf_temps.text().split(","):
-                t = t.strip()
-                if t:
-                    try:
-                        temps.append(float(t))
-                    except ValueError:
-                        pass
+            # temperature points (°C): explicit floats AND Cadence start:step:stop ranges
+            # (inclusive of stop), comma-mixed -- via the one shared grammar.
+            from insitu import manifest as M
+            temps = M.expand_temp_set(self.xf_temps.text())
             # supplies: comma list of 'pin@dc' (one or many). A bare 'pin' defaults dc=1.0.
             supplies = []
             for tok in self.xf_supplies.text().split(","):

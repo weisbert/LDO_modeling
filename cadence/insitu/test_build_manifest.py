@@ -368,6 +368,22 @@ def test_gui_inoise_flag_requests_current_noise():
     assert not [x for x in M.measurements(m_off) if x["key"].startswith("noise_i_")]
 
 
+def test_gui_temps_range_syntax_expands():
+    """The temps field accepts Cadence start:step:stop ranges; build_manifest expands them into
+    the explicit coverage.temps list and sets tnom_c = median of the sorted grid. The stored list
+    is plain numbers, so the manifest still validates (a string temps would be rejected)."""
+    nm = real_netmap()
+    m = B.build_manifest(real_gui(temps="-40:10:120, 125"), nm)
+    tps = M.temps(m)
+    assert tps[0] == -40.0 and tps[-1] == 125.0 and 120.0 in tps
+    assert len(tps) == 18                              # 17-pt range (incl 120) + explicit 125
+    assert m["tnom_c"] == tps[len(tps) // 2]           # median of the expanded+sorted grid
+    assert M.validate(m) is True
+    # a list input (the GUI pre-expands) is idempotent
+    m2 = B.build_manifest(real_gui(temps=[-40, 55, 125]), nm)
+    assert M.temps(m2) == [-40.0, 55.0, 125.0]
+
+
 def test_explicit_tnom_overrides_middle():
     nm = {p: f"net_{p}" for p in ["AVDD1P0", "VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO",
                                   "IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",

@@ -162,6 +162,44 @@ def _expand_sweep(sweep):
     return [a + (b - a) * i / (n - 1) for i in range(n)]
 
 
+def expand_temp_set(spec):
+    """Coverage-temp SET -> ascending, deduped list[float] (degC). Accepts EITHER a comma-string
+    OR a list/tuple; each token is an explicit float ('125') or a Cadence 'start:step:stop' range
+    INCLUSIVE of stop ('-40:10:120'). Comma-mixed. Reuses the I-V field's colon idiom but expands
+    INLINE (temps are stored as an explicit list, not a sweep dict). Degenerate step (0 or wrong
+    sign) -> [start]; malformed/blank tokens skipped; None/'' -> []. Idempotent on its own list
+    output (each float re-parses as an explicit token).
+    NB: round(v,9) dedup (NOT the house round(v,18) of load_points): 9 collapses step-accumulation
+    drift (119.999999999 vs 120.0) which 18 would not, and degC needs no finer resolution."""
+    if spec is None:
+        return []
+    toks = [str(x) for x in spec] if isinstance(spec, (list, tuple)) else str(spec).split(",")
+    vals = []
+    for tok in toks:
+        tok = tok.strip()
+        if not tok:
+            continue
+        if ":" in tok:
+            parts = tok.split(":")
+            if len(parts) != 3:                            # bare start:stop / junk -> skip
+                continue
+            try:
+                start, step, stop = (float(x) for x in parts)
+            except ValueError:
+                continue
+            if step == 0 or (stop - start) * step < 0:     # degenerate -> single point
+                vals.append(start)
+                continue
+            n = int(math.floor((stop - start) / step + 1e-9)) + 1   # inclusive on-grid
+            vals.extend(start + i * step for i in range(n))
+        else:
+            try:
+                vals.append(float(tok))
+            except ValueError:
+                continue
+    return sorted({round(v, 9) for v in vals})
+
+
 def load_points(m, o):
     """Merged ascending, deduped iload values for v_out o: _expand_sweep(loads[o].sweep)
     UNION loads[o].points UNION nominal/holdout if given. [] when nothing declared (=> the

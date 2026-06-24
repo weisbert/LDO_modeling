@@ -38,19 +38,22 @@ def _ac(R=0.05, g=1e-3):
             np.c_[f, 1e-9 + 0 * f])                 # noise
 
 
-def _sweep_npz(tmp_path, *, with_iv=True, with_temp=False, name="sweep"):
+def _sweep_npz(tmp_path, *, with_iv=True, with_temp=False, name="sweep", temps=None, curve=0.0):
     """A multi-load (x temp) npz shaped like pmu_corner's sweep output: per-load z/p/noise
     under swept labels + a once-cell 'Lnom_T..' carrying the sink I-V, plus meta_iload_<o>
-    (real per-LABEL rail current, NaN on the once-cell) and meta_temp."""
-    temps = [-40.0, 55.0, 125.0] if with_temp else [55.0]
+    (real per-LABEL rail current, NaN on the once-cell) and meta_temp.
+    `temps` overrides the corner list; `curve` adds an A/degC^2 quadratic to the sink Idc(T)
+    (0.0 = the default linear PTAT) so the 2nd-order temp fit can be exercised."""
+    temps = temps if temps is not None else ([-40.0, 55.0, 125.0] if with_temp else [55.0])
     loadcur = {"L0": 50e-6, "L1": 580e-6, "L2": 2000e-6}
     rec, labels, mi_pll, mtemp = {}, [], [], []
     for T in temps:
         once = f"Lnom_T{T:g}"
         labels.append(once); mi_pll.append(float("nan")); mtemp.append(T)
         # the sink I-V sweep lives on the once-cell (one per temp); Idc has a small PTAT slope
+        # (+ an optional quadratic curvature for the 2nd-order-fit tests)
         Vo = np.linspace(0.0, 0.8, 40)
-        idc = 200e-6 * (1.0 + 0.001 * (T - 55.0))
+        idc = 200e-6 * (1.0 + 0.001 * (T - 55.0)) + curve * (T - 55.0) ** 2
         I = (idc + 1e-7 * (Vo - 0.4)) * np.tanh((Vo / 0.05) ** 1.0)
         rec[f"iv_i500n_{once}"] = np.c_[Vo, I]
         for lbl, cur in loadcur.items():
@@ -174,7 +177,21 @@ def test_current_largesignal_temp_didt(tmp_path):
     r = next(r for r in res["current"] if r["sink"] == "i500n")
     assert r["didt"] != 0.0                            # PTAT slope across -40/55/125
     assert abs(r["idc55"] - 200e-6) < 5e-6             # referenced to 55 C
+    assert r.get("d2", 0.0) == 0.0                     # 3 temps -> quadratic gate not met
     assert res["meta"]["tnom_c"] == 55.0               # middle of the temps
+
+
+def test_current_largesignal_quadratic_temp(tmp_path):
+    """The IN-SITU/on-silicon crow path must carry d2: a >=5-temp sweep with genuine curvature
+    -> the row's d2 != 0 (guards the fit_multiport wiring), while a >=5-temp PURE-LINEAR sweep
+    keeps d2 == 0 (adversarial keep-best reject -> no spurious curvature)."""
+    temps = [-40.0, -10.0, 20.0, 55.0, 90.0, 125.0]
+    npz, m = _sweep_npz(tmp_path, with_temp=True, temps=temps, curve=2e-9, name="curv")
+    r = next(r for r in FMP.fit_multiport(str(npz), m)["current"] if r["sink"] == "i500n")
+    assert "d2" in r and r["d2"] != 0.0                # curvature engaged AND carried in the crow
+    npz2, m2 = _sweep_npz(tmp_path, with_temp=True, temps=temps, curve=0.0, name="lin5")
+    r2 = next(r for r in FMP.fit_multiport(str(npz2), m2)["current"] if r["sink"] == "i500n")
+    assert r2["d2"] == 0.0                             # 5+ linear temps -> keep-best rejects
 
 
 def test_no_iv_keeps_legacy_current(tmp_path):

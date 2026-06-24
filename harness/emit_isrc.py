@@ -21,6 +21,7 @@ def emit_isrc(p):
     name, pol = p["name"], p["pol"]
     vk, kp, vc = p["vknee"], p["knee_p"], p["vc"]
     g0, gdd, idc55, didt = p["g0"], p["gdd"], p["idc55"], p["didt"]
+    d2 = p.get("d2", 0.0)                                 # 2nd-order Idc(T) curvature [A/degC^2]
     cp = max(p["cp"], 1e-18)
     # sqrt-floored base -> the gate Jacobian kp*arg^(kp-1) stays finite at arg=0
     # (a bare (V/vk)**kp blows up the OP solver when kp<1 and the sweep hits 0).
@@ -42,7 +43,10 @@ def emit_isrc(p):
     # probe reads i(vout) = -I_pin, so the coefficient inside I_pin is -gdd; for a
     # source (B drives vdd->out) i(vout) = +I_pin, so it is +gdd.
     gdd_eff = -gdd if pol == "sink" else gdd
-    idc_t = f"({idc55:.6e}+({didt:.6e})*(temper-55))"
+    idc_t = f"({idc55:.6e}+({didt:.6e})*(temper-55))"      # linear; d2 tail appended only if != 0
+    if d2 != 0.0:
+        idc_t = (f"({idc55:.6e}+({didt:.6e})*(temper-55)"
+                 f"+({d2:.6e})*(temper-55)*(temper-55))")
     core = (f"({idc_t}+({g0:.6e})*(V(out)-{vc:g})"
             f"+({gdd_eff:.6e})*(V(vdd)-{VDD0:g}))")
     iexpr = f"{core}*{gate_factor}"

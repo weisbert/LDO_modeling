@@ -355,7 +355,7 @@ def current_crow_from_isrc_fit(p, pin=None, tnom_c=55.0):
     fit_multiport will produce the same fields on the box. `tnom_c` = the nominal temp the
     Idc/didt fit is referenced to (the manifest's tnom_c / middle of its temps)."""
     return dict(sink=p["name"], pin=pin or p["name"], pol=p["pol"],
-                idc55=p["idc55"], didt=p["didt"], g0=p["g0"], vc=p["vc"],
+                idc55=p["idc55"], didt=p["didt"], d2=p.get("d2", 0.0), g0=p["g0"], vc=p["vc"],
                 gdd=p["gdd"], vknee=p["vknee"], knee_p=p["knee_p"],
                 knee_side=p.get("knee_side"), vhi=p.get("vhi"),   # carry the data-detected knee
                 Cp=p["cp"], in_white=p["in_white"], in_kf=p["in_kf"], tnom_c=tnom_c)
@@ -383,6 +383,7 @@ def _current_block_largesignal(o, crow, supply, ground):
     pre = o
     pol = crow.get("pol", "sink")
     idc55 = float(crow["idc55"]); didt = float(crow.get("didt", 0.0))
+    d2 = float(crow.get("d2", 0.0))                       # 2nd-order Idc(T) curvature [A/K^2]
     g0 = float(crow.get("g0", 0.0)); vc = float(crow.get("vc", 0.0))
     vk = float(crow.get("vknee", 0.1)); kp = float(crow.get("knee_p", 1.0))
     cp = float(crow.get("Cp", 0.0)); gdd = float(crow.get("gdd", 0.0))
@@ -395,12 +396,21 @@ def _current_block_largesignal(o, crow, supply, ground):
     # compliance KNEE follows the DATA-DETECTED side (decoupled from pol): a sink can have a
     # high-side ceiling knee (the real WuR refs), and a flat ref has NO knee.
     side = crow.get("knee_side") or ("lo" if pol == "sink" else "hi")
+    # Idc(T) law: linear by default; the 2nd-order term is emitted ONLY when d2 != 0 so a
+    # linear model stays SUBSTRING-IDENTICAL to the pre-curvature .va (no _d2 var, no '+ 0.0*' tail).
+    trefs = f"{tref_k:g}"
+    temp_term = f"{pre}_idc55 + {pre}_didt*($temperature - {trefs})"
+    d2_var, d2_asg = [], ""
+    if d2 != 0.0:
+        d2_var = [f"{pre}_d2"]
+        d2_asg = f"  {pre}_d2 = {d2:.6e};"
+        temp_term += f" + {pre}_d2*($temperature - {trefs})*($temperature - {trefs})"
     rvars = [f"{pre}_idc55", f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
-             f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"]
+             f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"] + d2_var
     asg = (f"{pre}_idc55 = {idc55:.6e};  {pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
            f"{pre}_vc = {vc:.6g};  {pre}_gdd = {gdd_eff:.6e};  {pre}_vk = {vk:.6g};  "
            f"{pre}_kp = {kp:.6g};  {pre}_vhi = {vhi:.6g};  {pre}_Cp = {cp:.6e};  "
-           f"{pre}_inw2 = {inw2:.6e};  {pre}_kf = {kf:.6e};")
+           f"{pre}_inw2 = {inw2:.6e};  {pre}_kf = {kf:.6e};" + d2_asg)
     drive = f"I({o}, {ground})" if pol == "sink" else f"I({supply}, {o})"
     if side == "none":                                   # flat ref: no compliance knee in range
         gate_expr = "1.0"
@@ -411,7 +421,7 @@ def _current_block_largesignal(o, crow, supply, ground):
         karg = f"sqrt(V({o},{ground})*V({o},{ground}) + 1e-12)"
         gate_expr = f"tanh(pow({karg}/{pre}_vk, {pre}_kp))"
     body = f"""    // ====== current bias {o} ({pol}, {side}-knee: Idc(T)+I-V knee+g0+Cp+signed PSRR+noise) ======
-    {drive} <+ ({pre}_idc55 + {pre}_didt*($temperature - {tref_k:g})
+    {drive} <+ ({temp_term}
                   + {pre}_g0*(V({o},{ground}) - {pre}_vc)
                   + {pre}_gdd*(V({supply},{ground}) - vdc_{supply}))
                  * {gate_expr};

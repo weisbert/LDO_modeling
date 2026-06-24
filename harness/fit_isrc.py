@@ -26,6 +26,11 @@ sys.path.insert(0, str(HERE))
 
 VDD0 = 1.05
 TNOM = 55.0
+TEMP_QUAD_MIN_PTS = 5       # >=5 UNIQUE temps before a quadratic Idc(T) is even attempted
+TEMP_QUAD_MIN_GAIN = 0.10   # quadratic must cut SSE by >=10% vs linear (adversarial keep-best)
+TEMP_QUAD_RESID_FLOOR = 1e-4  # ...AND the linear fit must miss by >=0.01% RMS (rel. to mean Idc):
+                              # below this the data IS linear and the relative-SSE test would
+                              # otherwise engage a meaningless curvature term on float-point dust
 
 
 def gate(Vo, Vk, p, pol, side=None, vhi=None):
@@ -157,13 +162,37 @@ def _fit_noise(f, In):
     return dict(in_white=np.sqrt(iw2), in_kf=kf, in_r2=float(r2))
 
 
-def _fit_temp(temps, idcT):
-    Tk = np.asarray(temps) + 273.15
-    b, a = np.polyfit(Tk, idcT, 1)                              # idc = a + b*Tk
+def _fit_temp(temps, idcT, min_quad_pts=TEMP_QUAD_MIN_PTS, quad_improve=TEMP_QUAD_MIN_GAIN):
+    """Idc(T) law referenced to TNOM. LINEAR by default (idc55 + didt*(T-TNOM)); engages a
+    2nd-order curvature term d2 ONLY with >=min_quad_pts UNIQUE temps AND an adversarial
+    keep-best win (quadratic cuts SSE by >=quad_improve). <5 pts / no-curvature -> d2=0.0 and
+    idc55/didt come from the EXACT linear code (byte-identical to the pre-2nd-order model)."""
+    temps = np.asarray(temps, float)
+    idcT = np.asarray(idcT, float)
+    Tk = temps + 273.15
+    b, a = np.polyfit(Tk, idcT, 1)                              # idc = a + b*Tk  (UNCHANGED)
     idc55 = a + b * (TNOM + 273.15)
     didt = b                                                    # dIdc/dT [A/K] = [A/degC]
+    d2 = 0.0
+    # 2nd-order only with enough UNIQUE pts AND a clear keep-best win (real PTAT has bandgap/beta
+    # curvature; <5 pts a quadratic is exactly/over-determined -> oscillates). np.unique guards
+    # duplicate temps from satisfying the gate.
+    if np.unique(temps).size >= int(min_quad_pts):
+        x = Tk - (TNOM + 273.15)                               # centered -> VA/predict form
+        c2, c1, c0 = np.polyfit(x, idcT, 2)
+        lin = a + b * Tk
+        quad = c0 + c1 * x + c2 * x * x
+        sse_lin = float(np.sum((idcT - lin) ** 2))
+        sse_quad = float(np.sum((idcT - quad) ** 2))
+        # the linear residual must be physically REAL (>= TEMP_QUAD_RESID_FLOOR RMS-relative to the
+        # mean Idc), not float-point/interp dust -- else the relative-SSE keep-best can engage a
+        # negligible curvature term on essentially-linear silicon data.
+        resid_rms_rel = np.sqrt(sse_lin / idcT.size) / (abs(np.mean(idcT)) + 1e-30)
+        if (np.isfinite(c2) and resid_rms_rel > TEMP_QUAD_RESID_FLOOR
+                and sse_quad < (1.0 - float(quad_improve)) * sse_lin):
+            idc55, didt, d2 = float(c0), float(c1), float(c2)  # quadratic wins (anchored at TNOM)
     ptat = idcT[-1] / idcT[0]
-    return dict(idc55=idc55, didt=didt, ptat=ptat)
+    return dict(idc55=idc55, didt=didt, d2=d2, ptat=ptat)
 
 
 def fit_isrc(npz_path):
@@ -197,8 +226,10 @@ def predict_iv(p, Vo):
 
 
 def predict_idcT(p, T_C):
-    """Idc temperature law (PTAT/CTAT slope), T in degC."""
-    return p["idc55"] + p["didt"] * (np.asarray(T_C, float) - TNOM)
+    """Idc temperature law (PTAT/CTAT slope + optional 2nd-order curvature), T in degC.
+    p.get('d2',0.0) keeps legacy (linear-only) param dicts valid; d2=0 -> the exact linear law."""
+    dT = np.asarray(T_C, float) - TNOM
+    return p["idc55"] + p["didt"] * dT + p.get("d2", 0.0) * dT * dT
 
 
 def predict_y(p, f):
@@ -226,7 +257,8 @@ def _fmt(p):
     return (f"{p['name']:<16} {p['pol']:<6} idc55={p['idc55']*1e6:7.3f}uA "
             f"g0={p['g0']*1e9:+8.3f}nS vk={p['vknee']:.3f} kp={p['knee_p']:5.2f} "
             f"gdd={p['gdd']*1e9:+9.3f}nS cp={p['cp']*1e15:5.1f}fF "
-            f"didt={p['didt']*1e9:+7.3f}nA/C ptat={p['ptat']:.3f} ivR2={p['iv_r2']:.4f}")
+            f"didt={p['didt']*1e9:+7.3f}nA/C d2={p.get('d2',0.0)*1e9:+7.3f}nA/C2 "
+            f"ptat={p['ptat']:.3f} ivR2={p['iv_r2']:.4f}")
 
 
 if __name__ == "__main__":

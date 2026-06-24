@@ -325,9 +325,9 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
         Tlist.append(t); idcT.append(idc_l)
     if len(Tlist) >= 2:
         tp = ISR._fit_temp(np.asarray(Tlist), np.asarray(idcT))
-        idc55, didt = float(tp["idc55"]), float(tp["didt"])
+        idc55, didt, d2 = float(tp["idc55"]), float(tp["didt"]), float(tp["d2"])
     else:                                              # single temp -> flat in T
-        idc55, didt = float(iv["idc"]), 0.0
+        idc55, didt, d2 = float(iv["idc"]), 0.0, 0.0
 
     # gdd (SIGNED current-PSRR): g = dI/dVsup = -pi (pi = -I/Vsup from importmp). Use the
     # model's primary current-PSRR supply (first pi key present); 0 when no pi was measured.
@@ -365,7 +365,7 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
         nz = ISR._fit_noise(narr[:, 0], narr[:, 1])
         in_white, in_kf = float(nz["in_white"]), float(nz["in_kf"])
     return dict(sink=c, il=op_label, pol=pol, vc=float(sink_dc),
-                idc55=idc55, didt=didt, g0=float(iv["g0"]),
+                idc55=idc55, didt=didt, d2=d2, g0=float(iv["g0"]),
                 gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
                 knee_side=iv["knee_side"], vhi=float(iv["vhi"]),
                 Cp=float(Cp), in_white=in_white, in_kf=in_kf, tnom_c=float(tnom_c),
