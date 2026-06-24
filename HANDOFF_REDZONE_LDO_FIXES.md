@@ -1,5 +1,59 @@
 # HANDOFF — Red-zone real-LDO (WuR_PMU) modeling fixes
 
+**Date:** 2026-06-24 · **Branch:** main (all pushed) · **Suite:** 373 green
+
+---
+## ⏩ SESSION-2 UPDATE (read this first) — box re-validate confirmed + 3 new fixes
+
+The user did `bash apply` and pasted the REAL re-run report. **The session-1 fixes LANDED on
+silicon**: VDD0P8_VCO is now `[OK]` (Zout 0.86 / PSRR 0.25 / noise 0.49), 3 current sinks `[OK]/[~]`,
+pll still `[!!]` (PSRR 5.85 the blocker). Then 3 more commits shipped this session:
+
+- **`da23e5c` Report-tab fixes** — the current-noise panel was wired in the backend (f2ba77f) but
+  the GUI's `_render_report_current` left grid slot `[1,1]` hardcoded-blank → now draws the noise
+  In(f) overlay when measured, else "enable coverage.inoise + re-extract". Idc(T) empty-state now
+  says "needs ≥2 temperature corners, have N". + a `coverage.enable.inoise` CHECKBOX in the
+  manifest editor (parallel to slew_en/lin_gate, full round-trip).
+- **`a02ffaf` temperature setup** — user asked why a PTAT ref ran at one temp. ROOT CAUSE:
+  `coverage.temps` was empty (tier T4 ≠ declared temps). LATENT BUG fixed: `build_manifest` wrote
+  top-level `m['temps']` which NO consumer reads (Extract-tab temp field was dead) → now writes
+  `coverage.temps`. Guardrail: `manifest.summary()` shouts when i_out present + no temps, naming
+  the PTAT ref (verified fires on the real manifest).
+- **`ac90cfb` digest voltage-fidelity** — the self-contained report reproduced CURRENT ports
+  exactly but MIS-FIT VOLTAGE Zout off-box (local refit zrms 7/9.6 vs box 1.84/0.86). The real
+  pll/vco are NEAR-CAPLESS (resistive |Z| plateau, no cap signature) → `fit_cout_esr` is ill-
+  conditioned → refitting a lossy subsample lands on envelope fallback. Densifying does NOT fix it
+  (proven: smooth synthetic rails reproduce at ppd=6; only ill-conditioned real silicon diverges).
+  FIX: CARRY the box's fitted voltage model in the digest (`@zmodel/@psrrmodel/@noisemodel`);
+  `report_multiport.voltage_views_from_digest(text, m)` reproduces the voltage overlay WITHOUT
+  refit. Current ports still refit (reproduce exactly). Backward-compatible (model → `m_*` keys).
+
+### HONEST per-port status (NOT "all OK" — the user pushed on this, correctly)
+- **Solid**: current DC/I-V (i500n 0.30% · i3p6u 1.18% · i1p5u 0.02%), voltage noise, vco PSRR.
+- **Real gaps**: current |Y| 4–7dB (g0+sCp misses cascode/Wilson zero — in-family); **BOTH voltage
+  rails' Zout RESONANCE is MISLOCATED** (model peak freq ≠ GT 10MHz; the low broadband RMS masks
+  it — this is a genuine structural miss, not just a score); **pll PSRR 5.85 non-min-phase** = blocker.
+- **Missing**: current noise + temperature/PTAT (not measured this run).
+
+### WHAT THE USER IS DOING NOW (then will paste a NEW report)
+`bash apply` → enable `coverage.enable.inoise` (new checkbox) + set temps `-40,25,125` → re-extract.
+
+### WHEN THE NEW REPORT ARRIVES — do this
+1. `python3 results/redzone/plot_report.py <new_report.txt>` (local, gitignored). It now uses the
+   CARRIED voltage model → **faithful** voltage GT-vs-model overlay (prints `voltage carried-model: True`).
+   Verify the Zout resonance location, and that the current-noise + Idc(T) panels are now populated.
+2. Then attack the TWO real modeling problems (these are the actual work left):
+   - **Zout resonance MISLOCATION** on both rails (near-capless plateau; the fitted pole sits at the
+     wrong freq). Look at `fit_model.fit_zout` / `fit_cout_esr` for capless/plateau rails.
+   - **pll PSRR non-minimum-phase** (the long-standing residual): `fit_model._bank_fit`/`_aaa_conj`
+     complex-section initializer fails on the sparse ~47-pt silicon AC sweep (complex resid 3.16 >
+     shelf 1.06). `analyze_psrr_phase.py` exists.
+
+### Local repro / tools (results/redzone/ — gitignored, real-chip GT stays LOCAL)
+`plot_report.py <report>` (5-port overlays), `_score_real.py` (re-score), saved report + baseline.
+
+---
+### Session-1 record (original handoff below)
 **Date:** 2026-06-24 · **Branch:** main (6 commits, all pushed) · **Suite:** 369 green
 
 ## TL;DR
