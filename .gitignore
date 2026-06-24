@@ -69,3 +69,6 @@ cadence/insitu/__pycache__/
 # --- OS cruft ---
 .DS_Store
 Thumbs.db
+
+# red-zone real-chip GT (characterization data) — keep LOCAL, never push
+results/redzone/
