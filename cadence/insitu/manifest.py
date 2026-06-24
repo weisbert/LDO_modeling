@@ -54,7 +54,7 @@ ROLES = ("supply", "v_out", "i_out", "bias", "leave_alone")
 # The coverage tier ladder (§2 of HANDOFF_MODELING_COVERAGE): nested additive presets.
 # A tier turns ITS items on plus every lower tier's; T0 (ac/noise) is always on.
 TIERS = ("T0", "T1", "T2", "T3", "T4")
-COVERAGE_ITEMS = ("ac", "noise", "slew", "iv", "dropout", "load_schedule", "temp")
+COVERAGE_ITEMS = ("ac", "noise", "slew", "iv", "dropout", "load_schedule", "temp", "inoise")
 _TIER_ITEMS = {"T0": ("ac", "noise"), "T1": ("slew",), "T2": ("iv", "dropout"),
                "T3": ("load_schedule",), "T4": ("temp",)}
 
@@ -230,7 +230,7 @@ def validate(m):
     for c, v in m["i_out"].items():
         claim(v.get("net"), f"i_out.{c}")
         v.setdefault("dc", 0.0)
-        _validate_analysis_override(v, f"i_out.{c}", {"ac"})
+        _validate_analysis_override(v, f"i_out.{c}", {"ac", "noise"})   # noise: opt-in inoise
     for b, v in m["bias"].items():
         claim(v.get("net"), f"bias.{b}")
     for s in m["current_psrr_supplies"]:
@@ -389,6 +389,18 @@ def measurements(m):
                           reads=[("i", probe)], derive="iv", key=f"iv_{c}",
                           save=[("i", probe)], sweep=spec.get("sweep"),
                           points=spec.get("points")))
+
+    # current-bias OUTPUT-CURRENT noise (analysis 'noise', probe-form oprobe) -- one per sink.
+    # OPT-IN via coverage.enable.inoise (no tier auto-enables it) because the `oprobe=<probe>`
+    # current-noise netlist is box-validate-pending; the model FORM/fit/emit are validated. Reads
+    # the probe vsource's current-noise PSD (A/rtHz, the sink's output-current noise) -> feeds
+    # fit_isrc._fit_noise (in_white/in_kf). 'oprobe_src' marks the group as a current-noise group.
+    if coverage_enabled(m, "inoise"):
+        for c in sinks:
+            probe = _probe_name(m, c)
+            M.append(dict(tag=f"ni_{c}", analysis="noise", hot=[], reads=[("inoise", probe)],
+                          derive="noise_i", key=f"noise_i_{c}", save=[("i", probe)],
+                          oprobe_src=probe))
 
     # T2: v_out DC iload sweep -> dropout / load-reg (analysis 'dc') -- sweep the reused load
     #     isource, read Vout. Uses coverage.dropout[o].sweep, else coverage.loads[o].sweep.

@@ -93,6 +93,17 @@ def _read_current(d, probe, where, probe_alias):
                    f"save, not allpub). available: {[k for k in d if k.endswith(':p')]}")
 
 
+def _read_noise_out(d, probe, where):
+    """Read the current-output noise PSD of a probe-form `.noise` analysis. Spectre may name the
+    output the conventional 'out' (the oprobe output signal) or a probe-named key -> try in order.
+    Box-confirm which the run actually writes (the only unknown in this read path)."""
+    for key in ("out", f"{probe}:p", probe):
+        if key and key in d:
+            return np.asarray(d[key])
+    raise KeyError(f"{where}: current-noise output not saved (need 'out' or '{probe}'). "
+                   f"available: {[k for k in d if k != '_sweep']}")
+
+
 def _sweep_axis(d, where, swept=None, kinds=("dc", "sweep")):
     """The swept independent variable of a DC sweep PSF (the I-V vdc voltage / dropout iload).
 
@@ -214,6 +225,13 @@ def _derive(point, d, probe_alias=None):
     if kind == "noise":
         Sv = _signal(d, "out", point["tag"]).real
         return np.c_[f, Sv]
+    if kind == "noise_i":                             # current-output noise PSD (probe-form .noise)
+        # a current bias port's OUTPUT-CURRENT noise (A/rtHz): the probe vsource that holds the
+        # sink pin reads the sink's output current, so a `noise ... oprobe=<probe>` analysis emits
+        # its current noise. Spectre may surface that under the conventional 'out' key (the oprobe
+        # output) or a probe-named key -> try 'out' first, then the probe's own key (box-confirm).
+        In = _read_noise_out(d, rd[0][1], point["tag"]).real
+        return np.c_[f, In]
     if kind == "psrr":
         Vo = _signal(d, rd[0][1], point["tag"])
         Vs = _signal(d, rd[1][1], point["tag"])

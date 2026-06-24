@@ -228,6 +228,21 @@ def _iv_for_sink(ref, c):
     return out
 
 
+def _noise_i_for_sink(ref, c):
+    """Every in-situ current-noise PSD present for sink c, keyed by load LABEL:
+    {label: [f, In]} from ref['noise_i_<c>_<label>'] (A/rtHz). {} when none measured
+    (coverage.inoise off / legacy npz) -> the fit keeps in_white=in_kf=0 (the honest stub)."""
+    pre = f"noise_i_{c}_"
+    files = ref if isinstance(ref, dict) else getattr(ref, "files", [])
+    out = {}
+    for k in files:
+        if str(k).startswith(pre):
+            arr = np.asarray(ref[k], float)
+            if arr.ndim == 2 and arr.shape[0] >= 2 and arr.shape[1] >= 2:
+                out[str(k)[len(pre):]] = arr
+    return out
+
+
 def _temp_of_label(ref, label):
     """The temperature (degC) stamped on a load LABEL via meta_temp (positionally aligned
     with ref['loads']); NaN when absent / not stamped. The DC/iv once-cells are labeled
@@ -321,11 +336,22 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
         g = cp["y"][il_y]; f = g[:, 0]; Y = g[:, 1] + 1j * g[:, 2]
         _, Cp, _ = _fit_admittance(f, Y)
 
+    # current-output noise (in_white/in_kf): fit the in-situ noise_i_<c>_<load> (A/rtHz, the probe
+    # current noise) via the VALIDATED fit_isrc._fit_noise (white + 1/f). Absent (coverage.inoise
+    # off / legacy npz) -> 0.0, the honest stub (req 1: current modeling now CARRIES noise when
+    # measured). Prefer the OP-label curve, else any.
+    in_white, in_kf = 0.0, 0.0
+    nik = _noise_i_for_sink(ref, c) if ref is not None else {}
+    if nik:
+        nlbl = op_label if op_label in nik else next(iter(nik))
+        narr = nik[nlbl]
+        nz = ISR._fit_noise(narr[:, 0], narr[:, 1])
+        in_white, in_kf = float(nz["in_white"]), float(nz["in_kf"])
     return dict(sink=c, il=op_label, pol=pol, vc=float(sink_dc),
                 idc55=idc55, didt=didt, g0=float(iv["g0"]),
                 gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
                 knee_side=iv["knee_side"], vhi=float(iv["vhi"]),
-                Cp=float(Cp), in_white=0.0, in_kf=0.0, tnom_c=float(tnom_c),
+                Cp=float(Cp), in_white=in_white, in_kf=in_kf, tnom_c=float(tnom_c),
                 iv_r2=float(iv["iv_r2"]))
 
 

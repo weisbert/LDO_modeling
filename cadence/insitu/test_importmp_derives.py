@@ -287,3 +287,20 @@ def test_find_psf_file_missing_dc_raises(tmp_path):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# =====================================================================================
+# (3c) current-output noise derive (probe-form .noise): noise_i -> [f, In]
+# =====================================================================================
+def test_noise_i_derive_reads_current_noise():
+    """A bias port's output-current noise: derive 'noise_i' reads the probe-form .noise output
+    (A/rtHz). Robust to the PSF key: 'out' (the oprobe output) or a probe-named key."""
+    f = np.logspace(1, 8, 12)
+    In = np.sqrt((2e-14) ** 2 + 1e-30 / f)
+    pt = dict(tag="ni_i500n", derive="noise_i", reads=[("inoise", "V10")])
+    # conventional 'out' key
+    arr = IMP._derive(pt, {"freq": f, "out": In})
+    assert arr.shape == (12, 2) and np.allclose(arr[:, 1], In)
+    # probe-named fallback key
+    arr2 = IMP._derive(pt, {"freq": f, "V10:p": In})
+    assert np.allclose(arr2[:, 1], In)

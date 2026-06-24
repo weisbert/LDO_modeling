@@ -268,9 +268,18 @@ def _insitu_current_view(ref, c, cp, row, manifest, tnom_c):
         psrr_f = ac_f.copy(); psrr_g = np.zeros(psrr_f.shape, complex)
         notes.append("current-PSRR: no pi_<port> measured")
 
-    # current-noise: never measured in-situ -> placeholder arrays, never a panel/metric
-    notes.append("current-noise: not measured in-situ (no GT)")
-    nz_f = ac_f.copy(); nz_in = np.full(nz_f.shape, 1e-15)
+    # current-noise: measured ONLY when coverage.inoise ran (noise_i_<c>_<load>, A/rtHz). When
+    # present -> a real 'noise' panel + a graded-for-DISPLAY nrms (kept OUT of the pass/fail grade
+    # composite until cross-validated -- grade_port does not read nrms). Absent -> placeholder +
+    # nulled nrms (the honest stub), exactly as before.
+    nik = FMP._noise_i_for_sink(ref, c)
+    if nik:
+        nlbl = op_load if op_load in nik else next(iter(nik))
+        na = nik[nlbl]; nz_f = na[:, 0]; nz_in = na[:, 1]
+        present.add("noise")
+    else:
+        notes.append("current-noise: not measured in-situ (enable coverage.inoise to measure)")
+        nz_f = ac_f.copy(); nz_in = np.full(nz_f.shape, 1e-15)
 
     rout = 1.0 / abs(ac_y[0].real) if ac_y[0].real != 0 else float("inf")
     cpar = abs(ac_y[-1].imag) / (2 * np.pi * ac_f[-1]) if ac_f[-1] > 0 else 0.0
@@ -283,7 +292,8 @@ def _insitu_current_view(ref, c, cp, row, manifest, tnom_c):
                   idcT=ISR.predict_idcT(p, temps))
     metrics = CD.diff_metrics(view, p)
     # null channels with no in-situ GT so the diagnosis never fires on placeholder data
-    metrics["nrms"] = float("nan")
+    if "noise" not in present:
+        metrics["nrms"] = float("nan")          # no current-noise GT -> not reported/diagnosed
     if "iv" not in present:
         metrics["ivrms"] = float("nan")
     if "idcT" not in present:

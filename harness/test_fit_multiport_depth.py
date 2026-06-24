@@ -207,3 +207,39 @@ def test_emit_dispatches_largesignal(tmp_path):
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
+
+
+# =============================================== current-output NOISE (req 1) wiring
+def test_current_noise_fit_emit_report_when_measured(tmp_path):
+    """coverage.inoise measured noise_i_<c>_<load> -> the sink fit carries REAL in_white/in_kf
+    (not the hardcoded 0), emit ships a non-zero white_noise, the report shows a 'noise' panel
+    with a finite nrms that is KEPT OUT of the pass/fail grade composite."""
+    import report_multiport as RMP
+    npz, m = _sweep_npz(tmp_path, with_temp=False, name="cn")
+    ref = dict(np.load(npz, allow_pickle=True))
+    f = np.logspace(1, 8, 40)
+    In = np.sqrt((2e-14) ** 2 + 1e-30 / f)               # white 20 fA/rtHz + a 1/f corner
+    for lbl in [str(x) for x in ref["loads"]]:
+        ref[f"noise_i_i500n_{lbl}"] = np.c_[f, In]
+    p2 = tmp_path / "cn2.npz"; np.savez(p2, **ref)
+    res = FMP.fit_multiport(str(p2), m)
+    row = next(r for r in res["current"] if r["sink"] == "i500n")
+    assert row["in_white"] > 0 and abs(row["in_white"] - 2e-14) / 2e-14 < 0.05
+    blk = D._current_block_largesignal("i500n", row, "AVDD1P0", "VSS")
+    assert "white_noise(i500n_inw2" in blk["body"] and "i500n_inw2 = 0.000000e+00" not in blk["asg"]
+    cv = next(v for v in RMP.port_views(res, str(p2), m)
+              if v["kind"] == "current" and v["name"] == "i500n")
+    assert "noise" in cv["present"] and np.isfinite(cv["metrics"]["nrms"])
+    assert "noise" not in [n for n, *_ in cv["grade"]["metrics"]]   # NOT in the grade composite
+
+
+def test_current_noise_absent_keeps_honest_zero_stub(tmp_path):
+    """No noise_i -> in_white=in_kf=0 (the honest stub), no 'noise' panel, nrms NaN. Byte-compat
+    with every npz that did not run coverage.inoise."""
+    import report_multiport as RMP
+    npz, m = _sweep_npz(tmp_path, with_temp=False, name="cn0")
+    res = FMP.fit_multiport(str(npz), m)
+    row = next(r for r in res["current"] if r["sink"] == "i500n")
+    assert row["in_white"] == 0.0 and row["in_kf"] == 0.0
+    cv = next(v for v in RMP.port_views(res, str(npz), m) if v["kind"] == "current")
+    assert "noise" not in cv["present"] and not np.isfinite(cv["metrics"]["nrms"])

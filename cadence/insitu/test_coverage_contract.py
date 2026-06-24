@@ -142,7 +142,13 @@ def test_unknown_tier_defensive_degrade_on_unvalidated_dict():
     # dict that bypassed validate(): a junk tier degrades to full rather than raising IndexError.
     m = _resolved_wur()
     m["coverage"]["tier"] = "T9_bogus"                    # bypasses validate() -> defensive full
+    # every TIER-LADDER item degrades to on; 'inoise' is OPT-IN only (no tier introduces it,
+    # because the oprobe current-noise netlist is box-validate-pending) so it stays OFF until
+    # coverage.enable.inoise is set -- assert that opt-in contract explicitly.
     for item in M.COVERAGE_ITEMS:
+        if item == "inoise":
+            assert not M.coverage_enabled(m, item), "inoise must be opt-in, never tier-auto-on"
+            continue
         assert M.coverage_enabled(m, item), item
 
 
@@ -396,3 +402,20 @@ def test_validate_accepts_absent_coverage():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_inoise_optin_measurements_and_netlist_oprobe_form():
+    """coverage.enable.inoise adds ONE current-noise point per sink (probe-form), and NONE when
+    off (opt-in). The netlist emits the `oprobe=<probe>` current-noise statement, not the
+    (net ground) voltage-noise form -- box-validate-pending but text-pinned here."""
+    from insitu import run as R
+    from cluster import netlist_augment as NA
+    m = _resolved_wur()
+    m["coverage"]["enable"] = {}                          # opt-in: OFF by default
+    assert not [p for p in M.measurements(m) if p["derive"] == "noise_i"]
+    m["coverage"]["enable"] = {"inoise": True}            # ON
+    ni = [p for p in M.measurements(m) if p["derive"] == "noise_i"]
+    assert len(ni) == len(m["i_out"]) and all(p.get("oprobe_src") for p in ni)
+    g = next(g for g in R.groups(m) if g.get("oprobe_src"))
+    line = NA._analysis_line(m, g)
+    assert "oprobe=" in line and " noise " in f" {line} " and "(" not in line
