@@ -73,6 +73,10 @@ def _detect_knee(Vs, Is, Iplat):
     a10, a90 = np.arctanh(0.1), np.arctanh(0.9)
     if Iplat <= 0 or Vs.size < 2:
         return "none", float(Vs[-1]), max(float(Vs[-1]), 0.05), 1.0
+    # A knee SIDE is PROPOSED from the endpoint fractions (sensitive to a sharp end-collapse like
+    # the real WuR refs, where only the last point hits 0). Endpoint NOISE can over-propose a
+    # spurious knee on a flat ref -> _fit_iv's KEEP-BEST-vs-'none' rejects it on fit quality, so the
+    # proposal can stay sensitive here without smoothing away a real sharp collapse.
     flo, fhi = Is[0] / Iplat, Is[-1] / Iplat
     lo_drop, hi_drop = flo < 0.9, fhi < 0.9
     if not lo_drop and not hi_drop:                      # full current at BOTH ends -> no knee
@@ -111,6 +115,19 @@ def _fit_iv(Vo, I, vc, pol, rout):
     g0 = (1.0 if pol == "sink" else -1.0) / max(rout, 1.0)
     Iplat = float(np.median(np.sort(Is)[-8:]))
     side, vhi, Vk, p = _detect_knee(Vs, Is, Iplat)
+
+    def _sse(sd, vh, vk, pp):
+        m = (Idc + g0 * (Vs - vc)) * gate(Vs, vk, pp, pol, side=sd, vhi=vh)
+        return float(np.sum((Is - m) ** 2))
+    # KEEP-BEST vs NO-KNEE: a genuine knee beats 'none' by a wide margin (the real chip), but a
+    # spurious knee from endpoint noise (flat ref) or a high-side collapse that does not COMPLETE
+    # in the sweep (vhi falls back to Vs[-1]) fits WORSE than no gate -> 'none' wins. This makes
+    # the detector self-correcting instead of trusting a hard threshold / a fallback ceiling.
+    cand = [(side, vhi, Vk, p)]
+    if side != "none":
+        cand.append(("none", float(Vs[-1]), max(float(Vs[-1]), 0.05), 1.0))
+    side, vhi, Vk, p = min(cand, key=lambda c: _sse(*c))
+
     m = (Idc + g0 * (Vs - vc)) * gate(Vs, Vk, p, pol, side=side, vhi=vhi)
     ss = 1 - np.sum((Is - m) ** 2) / max(np.sum((Is - Is.mean()) ** 2), 1e-300)
     return dict(idc=Idc, g0=g0, vknee=Vk, knee_p=p, knee_side=side, vhi=float(vhi), iv_r2=float(ss))

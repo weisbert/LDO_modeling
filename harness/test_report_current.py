@@ -167,3 +167,39 @@ def test_iv_knee_side_detected_from_data():
         m = fit_isrc.predict_iv(p, Vo)
         rms = np.sqrt(np.mean(((m - I) / (np.median(np.sort(I)[-8:]) + 1e-30)) ** 2)) * 100
         assert rms < 3.0, f"{p['knee_side']} knee IVrms {rms:.1f}%"
+
+
+def test_iv_knee_keepbest_rejects_spurious_and_partial():
+    """KEEP-BEST vs no-knee hardening (adversarial-verify findings): a noisy FLAT ref never flaps
+    to a spurious knee, and a high-side collapse that does NOT complete in the sweep prefers 'none'
+    over a broken fitted-ceiling fit."""
+    rng = np.random.default_rng(1)
+    Vo = np.linspace(0.0, 0.8, 9)
+    for _ in range(20):                                  # flat + 6% noise -> stable 'none' (no flap)
+        I = 1.5e-6 * (1 + 0.06 * rng.standard_normal(9))
+        p = fit_isrc._fit_iv(Vo, I, vc=0.667, pol="sink", rout=3e9)
+        assert p["knee_side"] == "none"
+    Vs = np.linspace(0.0, 1.05, 120)                     # ceiling (1.10) ABOVE the sweep top
+    Is = 1e-6 * np.tanh(((1.10 - Vs) / 0.05) ** 1.5)     # only PARTIALLY collapses (to ~0.3)
+    p = {**fit_isrc._fit_iv(Vs, Is, vc=0.5, pol="sink", rout=8e8), "vc": 0.5, "pol": "sink"}
+    m = fit_isrc.predict_iv(p, Vs)
+    assert np.sqrt(np.mean(((m - Is) / np.median(np.sort(Is)[-8:])) ** 2)) * 100 < 5.0
+
+
+def test_emit_bridge_carries_decoupled_knee():
+    """current_crow_from_isrc_fit must carry knee_side/vhi so the spectre cross-val VA emits the
+    SAME decoupled knee as production: a sink with a HIGH-side ceiling emits the hi gate, not lo."""
+    import emit_pmu_model as EPM
+    f = np.logspace(1, 8, 40)
+    Vo = np.linspace(0.0, 1.8, 19); idc = 0.5e-6
+    hi = idc * (1.0 - 1.0 / (1.0 + np.exp(-(Vo - 1.74) / 0.02)))
+    view = dict(name="t", pol="sink", vc=1.28, vdd=1.0, iv_v=Vo, iv_i=hi,
+                ac_f=f, ac_y=1.25e-9 + 0j, rout=8e8, cp=2e-15,
+                psrr_f=f, psrr_g=np.zeros(40, complex), nz_f=f, nz_in=np.full(40, 1e-15),
+                temps=np.array([55.0]), idcT=np.array([idc]))
+    p = fit_isrc.fit_isrc(view)
+    assert p["knee_side"] == "hi"
+    crow = EPM.current_crow_from_isrc_fit(p, pin="IB", tnom_c=25.0)
+    assert crow["knee_side"] == "hi" and crow["vhi"] > 1.6
+    blk = EPM._current_block_largesignal("IB", crow, "AVDD", "VSS")
+    assert "IB_vhi - V(IB,VSS)" in blk["body"]            # HIGH-side gate (was silently low-side)

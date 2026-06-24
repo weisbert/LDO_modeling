@@ -356,8 +356,9 @@ def current_crow_from_isrc_fit(p, pin=None, tnom_c=55.0):
     Idc/didt fit is referenced to (the manifest's tnom_c / middle of its temps)."""
     return dict(sink=p["name"], pin=pin or p["name"], pol=p["pol"],
                 idc55=p["idc55"], didt=p["didt"], g0=p["g0"], vc=p["vc"],
-                gdd=p["gdd"], vknee=p["vknee"], knee_p=p["knee_p"], Cp=p["cp"],
-                in_white=p["in_white"], in_kf=p["in_kf"], tnom_c=tnom_c)
+                gdd=p["gdd"], vknee=p["vknee"], knee_p=p["knee_p"],
+                knee_side=p.get("knee_side"), vhi=p.get("vhi"),   # carry the data-detected knee
+                Cp=p["cp"], in_white=p["in_white"], in_kf=p["in_kf"], tnom_c=tnom_c)
 
 
 def _current_block(o, crow, supply, ground):
