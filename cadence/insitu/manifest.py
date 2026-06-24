@@ -457,6 +457,19 @@ def summary(m):
     L.append(f"  i_out    : " + ", ".join(f"{c}={v['net']}" for c, v in m["i_out"].items()))
     if m["leave_alone"]:
         L.append(f"  leave_alone: " + ", ".join(m["leave_alone"]))
+    # temperature guardrail: a current reference's Idc(T)/PTAT slope + noise(T) are characterized
+    # ONLY across coverage.temps. With current outputs present but no temps declared, every ref is
+    # measured at the single session temp -- a PTAT/CTAT ref then has NO temperature coefficient
+    # fitted. The tier alone never adds temps (the points must be declared) -> make the gap LOUD.
+    if m["i_out"] and not temps(m):
+        ptat = [c for c, v in m["i_out"].items()
+                if any(k in c.lower() or k in str(v.get("net", "")).lower()
+                       or k in str(v.get("pin", "")).lower()
+                       for k in ("ptat", "ctat"))]
+        nmnote = (" incl. temperature-defined ref(s): " + ", ".join(ptat)) if ptat else ""
+        L.append("  ! NO temperature corners (coverage.temps empty): current refs" + nmnote
+                 + " run at the single session temp only -> Idc(T)/PTAT slope + current-noise(T) "
+                 "NOT characterized. Declare coverage.temps (e.g. -40,25,125) to sweep temperature.")
     meas = measurements(m)
     L.append(f"  -> {len(meas)} measurement points: "
              + ", ".join(x["tag"] for x in meas))

@@ -334,7 +334,10 @@ def test_user_defined_iv_sweep_and_temps():
         temps=[-40, 55, 125],
     )
     m = B.build_manifest(gui, nm)
-    assert m["temps"] == [-40.0, 55.0, 125.0]
+    # temps must land in the CONSUMED location (coverage.temps); a top-level m['temps'] is
+    # invisible to manifest.temps()/pmu_corner -> the Extract-tab field would silently no-op.
+    assert M.temps(m) == [-40.0, 55.0, 125.0]
+    assert m.get("coverage", {}).get("temps") == [-40.0, 55.0, 125.0]
     assert m["tnom_c"] == 55.0                          # middle point = nominal
     i1p8 = next(c for c in m["i_out"].values() if c["pin"] == "IBP_POLY_1P8U_VCO")
     iptat = next(c for c in m["i_out"].values() if c["pin"] == "IBP_PTAT_TUNE_1P5U_VCO")
@@ -352,6 +355,30 @@ def test_explicit_tnom_overrides_middle():
                                   "IBP_PTAT_TUNE_1P5U_VCO"]}
     m = B.build_manifest(real_gui(temps=[-40, 27, 125], tnom_c=27), nm)
     assert m["tnom_c"] == 27.0
+    assert M.temps(m) == [-40.0, 27.0, 125.0]           # and the run axis is the consumed location
+
+
+def test_summary_warns_on_ptat_without_temps():
+    """A PTAT current ref characterized at a SINGLE temp is the defining gap (its current IS a
+    temperature function). summary() must shout it -- and name the PTAT ref -- when i_out is
+    present but coverage.temps is empty; the warning clears once temps are declared."""
+    gui = real_gui()                                    # no temps -> single session temp
+    m = B.build_manifest(gui, real_netmap(gui))
+    assert M.temps(m) == []                             # nothing declared
+    s = M.summary(m)
+    assert "NO temperature corners" in s, s
+    assert "ptat" in s.lower(), "the PTAT ref must be named in the temperature warning"
+    # declare temps -> the warning disappears
+    m2 = B.build_manifest(real_gui(temps=[-40, 25, 125]), real_netmap())
+    assert "NO temperature corners" not in M.summary(m2)
+
+
+def test_summary_no_temp_warning_without_current_refs():
+    """No current outputs -> the temperature warning is irrelevant (Idc(T)/PTAT is a current-ref
+    concern); a voltage-only manifest with no temps must NOT trigger it."""
+    gui = real_gui(i_outs=[])
+    m = B.build_manifest(gui, {p: f"net_{p}" for p in [gui["supply"]["pin"], *gui["v_outs"]]})
+    assert "NO temperature corners" not in M.summary(m)
 
 
 # ---------------------------------------------------------------------------

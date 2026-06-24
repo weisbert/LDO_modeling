@@ -321,9 +321,13 @@ def build_manifest(gui, netmap):
         m["analysis"] = dict(gui["analysis"])
     # temperature points (degC) for Idc(T)/PTAT/noise(T) -- user-defined per project / PDK;
     # the nominal (model-bake) temperature is the middle point (or m['tnom_c'] if given).
+    # The RUN axis is coverage.temps (manifest.temps()/pmu_corner read ONLY there); a top-level
+    # m['temps'] is invisible to the runner -> write the consumed location so the Extract-tab
+    # temperature field actually drives the per-temperature sims. tnom_c stays top-level (emit reads it).
     if gui.get("temps"):
-        m["temps"] = [float(t) for t in gui["temps"]]
-        m["tnom_c"] = float(gui.get("tnom_c", m["temps"][len(m["temps"]) // 2]))
+        tps = [float(t) for t in gui["temps"]]
+        m.setdefault("coverage", {})["temps"] = tps
+        m["tnom_c"] = float(gui.get("tnom_c", tps[len(tps) // 2]))
     elif gui.get("tnom_c") is not None:
         m["tnom_c"] = float(gui["tnom_c"])
 
