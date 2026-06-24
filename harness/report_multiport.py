@@ -348,6 +348,218 @@ def port_views(result, npz_path, manifest):
     return out
 
 
+# ============================================================ air-gap GT digest
+# The multi-port twin of report.py's [7] / current_digest's [8d]: serialize the RAW ref GT
+# arrays (log-resampled) into the report TEXT so a paste rebuilds an npz-equivalent ref and
+# fit_multiport reproduces the WHOLE report locally -- no npz crosses the air gap. We emit the
+# raw ref keys (not the port_views-derived arrays) so every downstream derivation/sign runs
+# identically on rebuild -- the parser restores byte-for-byte the keys fit_multiport reads.
+# Manifest-DRIVEN: a load label carries underscores (e.g. 'tt_25c'), so a raw key like
+# 'z_pll_tt_25c' cannot be split unambiguously; instead the rail/supply/sink names + the loads
+# array (all from the manifest) NAME each key, and the parser reconstructs it from `@`-tokens.
+_MPD_BEGIN = "[MPD1] MULTIPORT GT DIGEST"
+_MPD_END = "[MPD1-END]"
+
+
+def _z_resample(f, Z, ppd=6):
+    """log-resample a complex Zout, DENSIFYING around the |Z| resonance peak -- 5/dec would
+    step over a sharp on-chip peak and the digest is all the modeler gets across the gap (same
+    guard as report.py's [7])."""
+    import current_digest as CD
+    f = np.asarray(f, float)
+    g, Zg = CD._logresample_complex(f, Z, ppd=ppd)
+    zmag = np.abs(Z)
+    ipk = int(np.argmax(zmag))
+    if 0 < ipk < len(f) - 1 and zmag[ipk] > 2.0 * float(np.median(zmag)):
+        fpk = f[ipk]
+        extra = np.logspace(np.log10(max(fpk / 2.5, f[0])),
+                            np.log10(min(fpk * 2.5, f[-1])), 16)
+        # carry the ACTUAL sampled peak + its immediate neighbors VERBATIM (np.interp returns a
+        # node's value exactly): a log-grid step that straddles a high-Q peak would undershoot
+        # its magnitude by several dB, and a real on-chip pll/vco rail IS a high-Q peak -- the
+        # one feature the Zout fit is judged on. The neighbors keep the peak's curvature.
+        nbr = f[max(ipk - 2, 0):min(ipk + 3, len(f))]
+        g = np.unique(np.concatenate([g, extra, nbr]))
+        Zg = (np.interp(np.log(g), np.log(f), Z.real)
+              + 1j * np.interp(np.log(g), np.log(f), Z.imag))
+    return g, Zg
+
+
+def _emit_c(pr, header, f, Z):
+    pr(header + "   # f[Hz], re, im")
+    for a, b in zip(f, Z):
+        pr(f"  {a:.5e}, {b.real:.6e}, {b.imag:.6e}")
+
+
+def _emit_r(pr, header, f, y):
+    pr(header + "   # f[Hz], val")
+    for a, b in zip(f, y):
+        pr(f"  {a:.5e}, {b:.6e}")
+
+
+def emit_multiport_digest(ref, manifest):
+    """Serialize ref's GT arrays (log-resampled) -> the machine-readable [MPD1] digest lines
+    that parse_multiport_digest rebuilds into an npz-equivalent ref. Manifest-driven; emits a
+    block only for the keys actually present (a coverage-light run simply emits fewer)."""
+    import current_digest as CD
+    m = manifest
+    loads = [str(x) for x in ref["loads"]]
+    L = []
+    pr = L.append
+    pr(_MPD_BEGIN + "  (log-resampled ground truth; rebuilds an npz-equivalent ref so")
+    pr("       fit_multiport reproduces this report from the PASTE alone -- no npz needed)")
+    pr("-" * 78)
+    # ---- meta: loads + per-label rail current / temp / Cout / ESR (verbatim; authoritative) --
+    pr("@meta loads = " + " | ".join(loads))
+    for o in m["v_out"]:
+        k = f"meta_iload_{o}"
+        if k in ref:
+            pr(f"@meta {k} = " + " | ".join(f"{v:.6e}" for v in np.asarray(ref[k], float).ravel()))
+    for k in ("meta_temp", "meta_cout", "meta_esr"):
+        if k in ref:
+            pr(f"@meta {k} = " + " | ".join(f"{v:.6g}" for v in np.asarray(ref[k], float).ravel()))
+    # ---- voltage rails: z (peak-densified) / psrr per supply / noise, per corner ----
+    for o in m["v_out"]:
+        for il in loads:
+            k = f"z_{o}_{il}"
+            if k in ref:
+                g = np.asarray(ref[k], float)
+                fr, Zr = _z_resample(g[:, 0], g[:, 1] + 1j * g[:, 2])
+                _emit_c(pr, f"@z {o} {il}", fr, Zr)
+        for s in m["supplies"]:
+            for il in loads:
+                k = f"p_{o}_{s}_{il}"
+                if k in ref:
+                    g = np.asarray(ref[k], float)
+                    fr, Hr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
+                    _emit_c(pr, f"@psrr {o} {s} {il}", fr, Hr)
+        for il in loads:
+            k = f"noise_{o}_{il}"
+            if k in ref:
+                g = np.asarray(ref[k], float)
+                fr, Sr = CD._logresample_real(g[:, 0], g[:, 1])
+                _emit_r(pr, f"@noise {o} {il}", fr, Sr)
+    # ---- current sinks: y / pi per supply, per corner + I-V sweeps (kept whole) ----
+    for c in m["i_out"]:
+        for il in loads:
+            k = f"y_{c}_{il}"
+            if k in ref:
+                g = np.asarray(ref[k], float)
+                fr, Yr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
+                _emit_c(pr, f"@y {c} {il}", fr, Yr)
+        for s in m["current_psrr_supplies"]:
+            for il in loads:
+                k = f"pi_{c}_{s}_{il}"
+                if k in ref:
+                    g = np.asarray(ref[k], float)
+                    fr, Pr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
+                    _emit_c(pr, f"@pi {c} {s} {il}", fr, Pr)
+        for k in sorted(x for x in ref if str(x).startswith(f"iv_{c}_")):
+            g = np.asarray(ref[k], float)
+            Vo, I = CD._iv_subsample(g[:, 0], g[:, 1])
+            pr(f"@iv {c} {k[len(f'iv_{c}_'):]}   # Vo[V], I[A]")
+            for a, b in zip(Vo, I):
+                pr(f"  {a:.6e}, {b:.6e}")
+    pr(_MPD_END)
+    return L
+
+
+def parse_multiport_digest(text):
+    """Rebuild an npz-equivalent ref dict from a pasted debug report's [MPD1] block (the inverse
+    of emit_multiport_digest). Returns {key: np.ndarray} -- the exact keys fit_multiport reads
+    (z_<o>_<il>, p_<o>_<s>_<il>, noise_<o>_<il>, y_<c>_<il>, pi_<c>_<s>_<il>, iv_<c>_<label>,
+    loads, meta_*). Ignores everything outside the block."""
+    ref = {}
+    inblock = False
+    kind = toks = None
+    rows = []
+
+    def _flush():
+        nonlocal kind, toks, rows
+        if kind is not None and rows:
+            arr = np.array(rows, float)
+            if kind == "z" and len(toks) >= 2:
+                ref[f"z_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "psrr" and len(toks) >= 3:
+                ref[f"p_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
+            elif kind == "noise" and len(toks) >= 2:
+                ref[f"noise_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "y" and len(toks) >= 2:
+                ref[f"y_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "pi" and len(toks) >= 3:
+                ref[f"pi_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
+            elif kind == "iv" and len(toks) >= 2:
+                ref[f"iv_{toks[0]}_{toks[1]}"] = arr
+        kind, toks, rows = None, None, []
+
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.startswith(_MPD_BEGIN):
+            inblock = True
+            continue
+        if line.startswith(_MPD_END):
+            _flush()
+            inblock = False
+            continue
+        if not inblock:
+            continue
+        if line.startswith("@meta"):
+            _flush()
+            key, _, vals = line[len("@meta"):].strip().partition("=")
+            key = key.strip()
+            parts = [p.strip() for p in vals.split("|")] if vals.strip() else []
+            if key == "loads":
+                ref["loads"] = np.array([str(p) for p in parts])
+            elif len(parts) == 1:
+                ref[key] = np.array(float(parts[0]))          # scalar meta (Cout/ESR)
+            elif parts:
+                ref[key] = np.array([float(p) for p in parts], float)
+            continue
+        if line.startswith("@"):
+            _flush()
+            hdr = line[1:].split("#")[0].split()
+            kind, toks, rows = (hdr[0] if hdr else None), hdr[1:], []
+            continue
+        if kind is not None and line and not line.startswith("#"):
+            try:
+                rows.append([float(t) for t in line.split(",")])
+            except ValueError:                                # left the data block
+                _flush()
+    _flush()
+    return ref
+
+
+def parse_manifest(text):
+    """Extract the inlined manifest JSON from a pasted debug report -> dict (the @meta-free
+    companion to parse_multiport_digest, so a paste reproduces with NO attachments)."""
+    import json
+    i = text.find("manifest JSON (inlined")
+    start = text.find("{", i if i >= 0 else 0)
+    if start < 0:
+        raise ValueError("no inlined manifest JSON found in the pasted report")
+    depth = 0
+    for j in range(start, len(text)):
+        ch = text[j]
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(text[start:j + 1])
+    raise ValueError("unterminated manifest JSON block in the pasted report")
+
+
+def digest_to_npz(text, path):
+    """Parse a pasted report's [MPD1] GT digest and write it as an npz that fit_multiport /
+    debug_report consume UNCHANGED (fit_multiport takes a path; this rebuilds one). Returns the
+    path as a str."""
+    ref = parse_multiport_digest(text)
+    if "loads" not in ref:
+        raise ValueError("no [MPD1] MULTIPORT GT DIGEST block found in the pasted text")
+    np.savez(path, **ref)
+    return str(path)
+
+
 # --------------------------------------------------------------- voltage diagnosis
 def _rail_diagnosis(result, npz_path, manifest, o):
     """Plain-language findings for one voltage rail, REUSING report._diagnose. Computed IN
@@ -517,20 +729,20 @@ def debug_report(result, npz_path, manifest):
        f"  noise {max(vn, default=0.0):.2f}dB")
     pr(f"worst CURRENT : Y {max(cy, default=0.0):.2f}dB  current-PSRR {max(cp, default=0.0):.2f}dB")
 
-    # ---- reproduce footer: self-contained so a pasted report is actually reproducible.
-    # The manifest is INLINED (it travels with the text); the npz is named to ATTACH (binary
-    # GT arrays can't be inlined). Avoids the old `M.load(<bare name>)`, which only resolves
-    # PACKAGED manifests and fails for every GUI-built in-situ run.
+    # ---- reproduce footer: SELF-CONTAINED. The manifest is INLINED and the GT travels as the
+    # log-resampled [MPD1] digest emitted right after this block, so a paste rebuilds the npz and
+    # fit_multiport reproduces the whole report locally -- NO npz crosses the air gap (the
+    # single-port [7]/[8d] design, now extended to multi-port). The npz path is named for
+    # REFERENCE only (not needed to reproduce).
     pr("")
     pr("=" * 78)
-    pr("TO REPRODUCE — paste this whole block AND attach the npz named below (it holds the GT):")
-    npz_base = pathlib.Path(npz_path).name
+    pr("TO REPRODUCE — paste this WHOLE report; NO attachment needed. The GT travels as the")
+    pr("log-resampled [MPD1] digest below; rebuild + reproduce locally with:")
     mpath = manifest.get("_path") if isinstance(manifest, dict) else None
-    pr(f"  npz to attach : {npz_base}")
-    pr(f"  npz full path : {npz_path}   (on the run box)")
     if mpath:
-        pr(f"  manifest file : {mpath}   (on the run box)")
-    pr("  manifest JSON (inlined — copy into a .json, or json.loads the block):")
+        pr(f"  origin manifest (run box, reference only) : {mpath}")
+    pr(f"  origin npz (run box, NOT needed to reproduce): {npz_path}")
+    pr("  manifest JSON (inlined — copy into a .json, or report_multiport.parse_manifest(text)):")
     try:
         import json as _json
         mclean = ({k: v for k, v in manifest.items() if not str(k).startswith("_")}
@@ -539,11 +751,24 @@ def debug_report(result, npz_path, manifest):
             pr("    " + line)
     except Exception:                                  # noqa: BLE001 -- footer must never raise
         pr(f"    (manifest not JSON-serializable; name={mname})")
-    pr("  # then, from the repo root (harness/ + cadence/ on sys.path):")
+    pr("  # from the repo root (harness/ + cadence/ on sys.path); text = this whole report:")
     pr("  import fit_multiport, report_multiport")
-    pr("  from insitu import manifest as M")
-    pr("  m = M.load('<the-manifest-json-you-saved>.json')   # the inlined block above")
-    pr(f"  res = fit_multiport.fit_multiport('<path-to-{npz_base}>', m)")
-    pr("  print(report_multiport.debug_report(res, '<npz>', m))")
+    pr("  ref = report_multiport.digest_to_npz(text, 'repro.npz')  # rebuild npz from [MPD1] below")
+    pr("  m   = report_multiport.parse_manifest(text)              # the inlined manifest above")
+    pr("  res = fit_multiport.fit_multiport(ref, m)")
+    pr("  print(report_multiport.debug_report(res, ref, m))        # == this report, reproduced")
     pr("=" * 78)
+    # ---- the GT itself: log-resampled, machine-readable; digest_to_npz rebuilds the npz from it.
+    # Loaded fresh from the npz (raw arrays) so every downstream sign/derivation re-runs on the
+    # rebuild exactly as here. Guarded: the digest must never kill the report.
+    try:
+        from insitu import importmp as IM
+        ref_full = IM.load_multiport(npz_path)
+        pr("")
+        for line in emit_multiport_digest(ref_full, manifest):
+            pr(line)
+    except Exception as e:                             # noqa: BLE001 -- digest is best-effort
+        pr("")
+        pr(f"{_MPD_BEGIN}  (UNAVAILABLE: {type(e).__name__}: {e})")
+        pr(_MPD_END)
     return "\n".join(L)
