@@ -98,7 +98,9 @@ def test_current_view_insitu_panels(tmp_path):
     assert len(cv) == 1
     v = cv[0]
     assert v["pol"] in ("sink", "source")
-    # every measured panel present; current-noise NEVER a panel
+    # every measured panel present; this fixture ran no coverage.inoise -> no 'noise' panel
+    # (the measured-noise case is locked in test_fit_multiport_depth.
+    #  test_current_noise_fit_emit_report_when_measured)
     assert set(v["present"]) == {"iv", "y", "psrr", "idcT"}
     assert "noise" not in v["present"]
     # model arrays align to the view's axes (same as ModelerCore.current_compare)

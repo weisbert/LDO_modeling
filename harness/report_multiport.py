@@ -196,9 +196,10 @@ def _insitu_current_view(ref, c, cp, row, manifest, tnom_c):
     downstream math). The air-gap digest registry (current_digest.list_iports) is NOT used --
     a real extraction never populates it; the current ports come from manifest['i_out'].
 
-    Current-NOISE is not measured in-situ (no GT) -> never a panel. I-V / Idc(T) are panels
-    only when their coverage measurements ran (iv_<c>_<label> present, >=2 temps). `present`
-    names the panels that have REAL in-situ GT so the GUI draws exactly those.
+    Current-NOISE is a panel ONLY when coverage.inoise measured noise_i_<c>_<load> (A/rtHz);
+    absent otherwise (the honest stub -> nrms NaN, kept OUT of the grade). I-V / Idc(T) are
+    panels only when their coverage measurements ran (iv_<c>_<label> present, >=2 temps).
+    `present` names the panels that have REAL in-situ GT so the GUI draws exactly those.
 
     `cp` = importmp.current_ports(ref, manifest)[c] = {loads, y:{il:arr}, pi:{(s,il):arr}}.
     `row` = the matching result['current'] row (for the designer pin); may be None."""
@@ -334,11 +335,11 @@ def port_views(result, npz_path, manifest):
        "view":<fit_isrc-schema dict assembled from the npz y_/pi_/iv_ keys>,
        "params":<fit_isrc params>, "models":{"iv","y","psrr","noise","idcT"},
        "metrics":<current_digest.diff_metrics dict; channels with no in-situ GT are NaN>,
-       "present":[panels with REAL in-situ GT, subset of iv/y/psrr/idcT -- NEVER noise],
+       "present":[panels with REAL in-situ GT, subset of iv/y/psrr/idcT/noise],
        "psrr_supplies":{ s:{"f","Gg","Gm","rms_db"} },   # per-supply current-PSRR panels
        "notes":[absent-channel notes incl. "current-noise: not measured in-situ"]}
     The GUI draws exactly the panels named in `present` (+ one current-PSRR sub-panel per
-    psrr_supplies entry); current-noise is never drawn (no in-situ GT).
+    psrr_supplies entry); current-noise is drawn only when coverage.inoise measured it.
     """
     from insitu import importmp as IM
     ref = IM.load_multiport(npz_path)

@@ -1055,6 +1055,13 @@ if _HAVE_QT:
                 "coverage.lin_gate: rerun one AC point at 2× drive amplitude; ratio-invariance "
                 "certifies the OP is linear (the one-hot superposition assumption holds). Default OFF.")
             covf.addRow("lin_gate", self.f_cov_lin)
+            self.f_cov_inoise = QCheckBox("measure current-output noise (coverage.enable.inoise)")
+            self.f_cov_inoise.setToolTip(
+                "OPT-IN current-output NOISE: adds a probe-form .noise on each i_out so the Report "
+                "tab's current-noise panel (In vs f) has GT to fit + emit. NO tier auto-enables it "
+                "(the extra .noise costs one analysis per current port). Needed for the bias refs' "
+                "output-current noise → VCO phase-noise / PLL jitter. Default OFF.")
+            covf.addRow("current noise", self.f_cov_inoise)
             cov_help = QLabel(
                 "<span style='color:#678'>Per-rail load sweeps live in the Voltage-outputs "
                 "<b>“iload sweep”</b> + <b>“trans”</b> columns; per-sink I-V lives in the "
@@ -1617,6 +1624,7 @@ if _HAVE_QT:
             self.f_cov_temps.setText(", ".join(self._fmt_num(t) for t in tps))
             self.f_cov_slew.setChecked(bool(int(cov.get("slew_en", 0) or 0)))
             self.f_cov_lin.setChecked(bool(cov.get("lin_gate", False)))
+            self.f_cov_inoise.setChecked(bool((cov.get("enable") or {}).get("inoise", False)))
             # per-rail / per-sink cells -- keyed by the row's key text.
             loads = cov.get("loads") or {}
             trans = cov.get("transient") or {}
@@ -2488,6 +2496,17 @@ if _HAVE_QT:
                 cov["lin_gate"] = True
             else:
                 cov.pop("lin_gate", None)
+            # current-output noise lives under the nested coverage.enable; preserve any OTHER
+            # enable overrides the form does not surface, drop the whole dict when it empties.
+            en = dict(cov.get("enable") or {})
+            if self.f_cov_inoise.isChecked():
+                en["inoise"] = True
+            else:
+                en.pop("inoise", None)            # off -> drop the override (no tier auto-enables it)
+            if en:
+                cov["enable"] = en
+            else:
+                cov.pop("enable", None)
 
             # per-rail / per-sink cells overlay their sub-dicts; a blank cell DROPS that key so the
             # sub-dict shrinks (and disappears when empty) -- no stale {} survives a cleared cell.
@@ -4066,9 +4085,10 @@ if _HAVE_QT:
                 f"noise {view['worst']['nrms']:.2f} dB")
 
         def _render_report_current(self, view):
-            """Current sink detail: draw ONLY the panels named in view['present'] (iv/y/psrr/idcT)
-            in the fixed 2x3 grid; blank the cells with no panel; always show the metrics box +
-            the notes (esp. 'current-noise: not measured in-situ')."""
+            """Current sink detail: draw the panels named in view['present']
+            (iv/y/idcT/psrr/noise) in the fixed 2x3 grid; blank the cells with no panel with a
+            note on what coverage to enable; always show the metrics box + the notes
+            (esp. 'current-noise: not measured in-situ')."""
             if hasattr(self, "rep_corner"):              # current ports have no corner picker
                 self.rep_corner_label.setVisible(False)  # hide the whole row (label + combo)
                 self.rep_corner.setVisible(False)
@@ -4106,7 +4126,9 @@ if _HAVE_QT:
                 a.set_title("Idc(T) [µA]"); a.set_xlabel("T [°C]")
                 a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
             else:
-                self._report_blank(a, "no Idc(T) panel")
+                nt = int(np.atleast_1d(vw.get("temps", [])).size)
+                self._report_blank(a, "no Idc(T) panel\n(needs ≥2 temperature\n"
+                                       f"corners, have {nt})")
 
             # current-PSRR per supply  (bottom-left)
             a = ax[1, 0]
@@ -4119,8 +4141,17 @@ if _HAVE_QT:
             else:
                 self._report_blank(a, "no current-PSRR panel")
 
-            # blank the unused bottom-mid cell
-            self._report_blank(ax[1, 1], "")
+            # current-noise In(f)  (bottom-mid) -- drawn ONLY when coverage.inoise measured
+            # noise_i_<port> (A/√Hz). Absent otherwise: tell the user exactly how to populate it.
+            a = ax[1, 1]
+            if "noise" in present:
+                a.loglog(vw["nz_f"], np.asarray(vw["nz_in"]) * 1e15, label="GT", lw=2)
+                a.loglog(vw["nz_f"], np.asarray(mo["noise"]) * 1e15, "--", label="model")
+                a.set_title("current noise In [fA/√Hz]"); a.set_xlabel("Hz")
+                a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+            else:
+                self._report_blank(a, "no current-noise panel\n(enable coverage.inoise\n"
+                                       "+ re-extract)")
 
             # metrics text box  (bottom-right, always)
             def _f(x, fmt):
@@ -5917,6 +5948,26 @@ def _selftest_report_tab(win, tmp, app):
     if win.rep_corner.count() > 1:
         win.rep_corner.setCurrentIndex(1); app.processEvents()
 
+    # current-noise panel: ABSENT (this fixture ran no coverage.inoise) -> [1,1] blanks (no lines)
+    av = next(v for v in win._report_views if v["kind"] == "current")
+    assert "noise" not in set(av.get("present", [])), "fixture should carry no current-noise"
+    win._render_report_current(av); app.processEvents()
+    assert len(win.rep_canvas.axes[1, 1].get_lines()) == 0, \
+        "no coverage.inoise -> current-noise cell must be blank (no GT/model lines)"
+    # MEASURED (coverage.inoise wrote noise_i_<port>) -> [1,1] draws GT+model In(f)
+    nref = dict(np.load(npz, allow_pickle=True))
+    nf = np.logspace(1, 8, 40); nIn = np.sqrt((2e-14) ** 2 + 1e-30 / nf)   # 20 fA/√Hz + 1/f corner
+    for _lbl in [str(x) for x in nref["loads"]]:
+        nref[f"noise_i_i500n_{_lbl}"] = np.c_[nf, nIn]
+    npz_n = rep_dir / "rpttab_inoise.npz"; np.savez(npz_n, **nref)
+    res_n = _FMP.fit_multiport(str(npz_n), m)
+    nv = next(v for v in _RMP.port_views(res_n, str(npz_n), m)
+              if v["kind"] == "current" and "noise" in set(v.get("present", [])))
+    win._render_report_current(nv); app.processEvents()
+    assert len(win.rep_canvas.axes[1, 1].get_lines()) >= 2, \
+        "coverage.inoise measured -> current-noise cell must plot GT + model"
+    assert "noise" in (win.rep_canvas.axes[1, 1].get_title() or "").lower()
+
     # screenshot the whole window on the Report tab + the detail canvas figure
     win.tabs.setCurrentWidget(win.report_tab); app.processEvents()
     out = ROOT / "work" / "gui_selftest_out"; out.mkdir(parents=True, exist_ok=True)
@@ -6523,6 +6574,7 @@ def _selftest_manifest_editor(win, tmp):
         "temps": [-40, 55, 125],
         "slew_en": 1,
         "lin_gate": True,
+        "enable": {"inoise": True},
         "loads": {"vco": {"sweep": {"type": "log", "start": 200e-6, "stop": 6e-3, "n": 4},
                           "points": [3e-3]}},
         "transient": {"vco": {"steps": [{"from": 0.0, "to": 6e-3, "label": "slew"},
@@ -6535,6 +6587,7 @@ def _selftest_manifest_editor(win, tmp):
     assert dlgc.f_cov_tier.currentText() == "T2", "coverage tier did not populate the combo"
     assert dlgc.f_cov_slew.isChecked(), "slew_en did not populate the checkbox"
     assert dlgc.f_cov_lin.isChecked(), "lin_gate did not populate the checkbox"
+    assert dlgc.f_cov_inoise.isChecked(), "coverage.enable.inoise did not populate the checkbox"
     assert [s.strip() for s in dlgc.f_cov_temps.text().split(",")] == ["-40", "55", "125"], \
         f"temps did not populate, got {dlgc.f_cov_temps.text()!r}"
     # the per-rail / per-sink CELLS populate (compact strings) -- find the vco / i3p6u_vco rows
@@ -6552,6 +6605,8 @@ def _selftest_manifest_editor(win, tmp):
     # ROUND-TRIP: _form_to_dict must rebuild the same coverage section
     cd = dlgc._form_to_dict()["coverage"]
     assert cd["tier"] == "T2" and cd["slew_en"] == 1 and cd["lin_gate"] is True
+    assert cd.get("enable", {}).get("inoise") is True, \
+        f"coverage.enable.inoise did not round-trip: {cd.get('enable')}"
     assert cd["temps"] == [-40, 55, 125], f"temps did not round-trip: {cd.get('temps')}"
     lsw = cd["loads"]["vco"]["sweep"]
     assert lsw["type"] == "log" and abs(lsw["start"] - 200e-6) < 1e-12 \
@@ -6581,7 +6636,8 @@ def _selftest_manifest_editor(win, tmp):
     dlgn = _ManifestEditorDialog(win, nocov, None)
     assert dlgn.f_cov_tier.currentText() == "T4", "no-coverage manifest must default the tier to T4"
     assert dlgn.f_cov_temps.text() == "" and not dlgn.f_cov_slew.isChecked() \
-        and not dlgn.f_cov_lin.isChecked(), "no-coverage manifest must open with empty coverage knobs"
+        and not dlgn.f_cov_lin.isChecked() and not dlgn.f_cov_inoise.isChecked(), \
+        "no-coverage manifest must open with empty coverage knobs"
     n_out = dlgn._form_to_dict()
     assert "coverage" not in n_out, "a no-coverage manifest must NOT emit a coverage key (byte-clean)"
     # ... but flipping ONE knob (tier T4->T1) does emit a minimal, valid coverage section.
