@@ -142,6 +142,34 @@ def _time_axis(d, where):
                    f"_sweep; refusing a non-time axis). available: {[k for k in d if k != '_sweep']}")
 
 
+def _passivity_sign(f, Z):
+    """Sign that makes a driving-point impedance PHYSICAL: +1 if Re(Z(s->0)) >= 0 already, -1 if
+    the array must be flipped. A STABLE regulator's closed-loop Zout is positive-real, so
+    Re(Zout(s->0)) >= 0 is mandatory -- the orientation-agnostic discriminator for the
+    reused-LOAD-source injection vs a dedicated/inserted injector. The unified source-reuse
+    refactor (d0a9cf9) drives the rail's existing LOAD isource ('Iload (out ground)', which DRAWS
+    +1A from the node) instead of the old inserted 'Iext (ground out)' / synthetic 'Iac (0 out)'
+    (which PUSH +1A in); the raw V/I then differs by a GLOBAL sign and only the draw orientation
+    comes out negative-real. The y/pi derives already absorb this same reused-vsource flip (Y=-I,
+    PI=-I/Vsup); the z derive was missed.
+
+    Anchored on the LOW-FREQUENCY real part (the clean positive resistive floor) via a median over
+    the lowest ~decade -- robust to one noisy point, and immune to the HF phase wrap (|phase|->180
+    near the output resonance) that a band-average would trip on. Inject-orientation GT (synthetic
+    + open-pin insert path) is already positive-real -> +1 (UNTOUCHED, so the 220-test synthetic
+    suite is unaffected); reuse-draw real-chip GT -> -1 (corrected). Keys on a physical invariant,
+    NOT on port names / manifest / source ids -- so it generalizes to any chip and any draw
+    orientation, and a genuinely positive-real array is never altered."""
+    f = np.asarray(f).real
+    Z = np.asarray(Z)
+    if f.size == 0:
+        return 1.0
+    order = np.argsort(f)
+    fo, Zo = f[order], Z[order]
+    cut = max(fo[0] * 10.0, fo[min(4, fo.size - 1)])      # lowest decade, but at least 5 points
+    return -1.0 if float(np.median(Zo[fo <= cut].real)) < 0.0 else 1.0
+
+
 def _derive(point, d, probe_alias=None):
     """Apply one measurement point's derive rule to its parsed PSF dict -> npz array."""
     kind = point["derive"]
@@ -169,7 +197,18 @@ def _derive(point, d, probe_alias=None):
         V = _signal(d, rd[0][1], point["tag"]).real
         return np.c_[t, V]
     f = _signal(d, "freq", point["tag"]).real
-    if kind in ("z", "couple"):                       # V at the read net (1 A injected)
+    if kind == "z":                                   # driving-point Zout: V at out (|1 A| in)
+        V = _signal(d, rd[0][1], point["tag"])
+        sgn = _passivity_sign(f, V)                   # enforce Re(Zout(s->0)) >= 0 (see helper)
+        if sgn < 0:
+            print(f"  importmp: z '{point['tag']}' was negative-real at DC (reused-load source "
+                  f"draws from the node) -> sign-normalized to a passive Zout")
+        return np.c_[f, sgn * V.real, sgn * V.imag]
+    if kind == "couple":                              # transfer impedance V_b / I_a (out a->b)
+        # The SAME reused-source injection sign applies as for z, but a TRANSFER impedance is not
+        # constrained positive-real, so the passivity auto-detect (valid only for the driving-point
+        # z) must NOT be used here. couple_<a>_<b> is not consumed by fit_multiport/report today;
+        # when it is, carry the INJECTING port a's inject-sign (source node order) through to here.
         V = _signal(d, rd[0][1], point["tag"])
         return np.c_[f, V.real, V.imag]
     if kind == "noise":

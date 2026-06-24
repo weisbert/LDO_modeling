@@ -150,6 +150,47 @@ def test_cpsrr_derive_preserves_sign_not_magnitude():
 
 
 # =====================================================================================
+# (3b) z-derive PASSIVITY sign-normalize (reused-LOAD-source injection draws from the node)
+# =====================================================================================
+def test_z_derive_passivity_sign_normalizes_negative_real():
+    """A reused LOAD source DRAWS +1A from the rail (Iload '(out ground)') so the raw V/I is
+    -Zout -> negative-real. The z derive must sign-normalize to a PASSIVE Zout (Re(s->0)>=0).
+    An inject-orientation array (Iext/Iac '(ground out)', synthetic + insert path) is already
+    positive-real and must be left BYTE-IDENTICAL (that is why the synthetic 220-suite is safe)."""
+    f = np.logspace(1, 8, 40)
+    Z = 0.1 + 1j * 1e-9 * f                              # the physical passive Zout (+real)
+    pt = dict(tag="z_pll", derive="z", reads=[("v", "VOUT")])
+    out_neg = IMP._derive(pt, {"freq": f, "VOUT": -Z})   # reuse-draw: raw = -Zout
+    out_pos = IMP._derive(pt, {"freq": f, "VOUT": Z})    # inject:     raw = +Zout
+    assert out_neg[0, 1] > 0 and out_pos[0, 1] > 0       # both come out positive-real at DC
+    assert np.allclose(out_neg, out_pos)                 # the flip recovered the same physical Zout
+    assert np.allclose(out_pos[:, 1], Z.real) and np.allclose(out_pos[:, 2], Z.imag)  # +real untouched
+
+
+def test_z_derive_passivity_anchors_on_dc_not_hf():
+    """Anchor is the LOW-FREQ real part: a physical Zout whose Re goes NEGATIVE at HF (phase wraps
+    past +/-90 near the output resonance) must NOT be flipped -- only the DC floor decides. (The
+    real WuR Zout's Re happens to stay negative across the band, but a band-average rule would
+    misfire on a chip whose HF Re wraps positive while DC is the real discriminator -- guard it.)"""
+    f = np.logspace(1, 8, 60)
+    Zhf = (0.1 + 1j * 2e-9 * f).astype(complex)         # +real at DC
+    Zhf.real[f > 3e7] = -50.0                            # force HF real strongly NEGATIVE
+    pt = dict(tag="z_vco", derive="z", reads=[("v", "VOUT")])
+    out = IMP._derive(pt, {"freq": f, "VOUT": Zhf})
+    assert out[0, 1] > 0                                 # DC floor is +real -> NOT flipped
+    assert np.allclose(out[:, 1], Zhf.real)             # left as-is despite HF Re<0
+
+
+def test_couple_derive_not_passivity_normalized():
+    """couple is a TRANSFER impedance (not constrained positive-real) -> left raw, NOT flipped."""
+    f = np.logspace(1, 8, 20)
+    Zneg = -(0.1 + 1j * 1e-9 * f)
+    ptc = dict(tag="couple_pll_vco", derive="couple", reads=[("v", "VB")])
+    out = IMP._derive(ptc, {"freq": f, "VB": Zneg})
+    assert out[0, 1] < 0                                 # unchanged negative real (by design)
+
+
+# =====================================================================================
 # (4) GUARDRAIL-3: check_zout_dc_consistency (Zout(s->0) <-> DC load-reg slope)
 # =====================================================================================
 def _z_array(f, rout):
