@@ -417,15 +417,40 @@ def _emit_r(pr, header, f, y):
         pr(f"  {a:.5e}, {b:.6e}")
 
 
-def emit_multiport_digest(ref, manifest):
+def emit_multiport_digest(ref, manifest, views=None):
     """Serialize ref's GT arrays (log-resampled) -> the machine-readable [MPD1] digest lines
     that parse_multiport_digest rebuilds into an npz-equivalent ref. Manifest-driven; emits a
-    block only for the keys actually present (a coverage-light run simply emits fewer)."""
+    block only for the keys actually present (a coverage-light run simply emits fewer).
+
+    When `views` (port_views output) is given, ALSO carry the VOLTAGE rails' fitted MODEL curves
+    (@zmodel/@psrrmodel/@noisemodel) at the same resampled freqs. Why: a near-capless silicon rail
+    (resistive |Z| plateau, no output-cap signature) has an ill-conditioned Zout fit that a lossy
+    log-resampled subsample does NOT refit to the same answer -- so a paste-only `digest_to_npz ->
+    fit_multiport` reproduces the report's CURRENT ports exactly but mis-fits the VOLTAGE Zout
+    (envelope-cap fallback -> wrong pole). Carrying the box's model makes the voltage GT-vs-model
+    overlay faithful without trusting the refit. Current ports DO refit faithfully -> not carried."""
     import current_digest as CD
     m = manifest
     loads = [str(x) for x in ref["loads"]]
     L = []
     pr = L.append
+    # voltage MODEL curves carried verbatim (keyed (kind,o[,s],il) -> (src_f, model_array))
+    vm = {}
+    for v in (views or []):
+        if v.get("kind") != "voltage":
+            continue
+        for il, c in v["corners"].items():
+            vm[("z", v["name"], il)] = (np.asarray(c["fz"], float), np.asarray(c["Zm"]))
+            vm[("noise", v["name"], il)] = (np.asarray(c["fn"], float), np.asarray(c["Sm"]))
+            for s, sp in c.get("psrr_supplies", {}).items():
+                vm[("psrr", v["name"], s, il)] = (np.asarray(c["fp"], float), np.asarray(sp["Hm"]))
+
+    def _on(fr, src_f, arr):
+        """the carried model, resampled onto the SAME fr as its GT block (model is smooth)."""
+        lf, ls = np.log(fr), np.log(np.asarray(src_f, float))
+        if np.iscomplexobj(arr):
+            return np.interp(lf, ls, arr.real) + 1j * np.interp(lf, ls, arr.imag)
+        return np.interp(lf, ls, np.asarray(arr, float))
     pr(_MPD_BEGIN + "  (log-resampled ground truth; rebuilds an npz-equivalent ref so")
     pr("       fit_multiport reproduces this report from the PASTE alone -- no npz needed)")
     pr("-" * 78)
@@ -446,6 +471,8 @@ def emit_multiport_digest(ref, manifest):
                 g = np.asarray(ref[k], float)
                 fr, Zr = _z_resample(g[:, 0], g[:, 1] + 1j * g[:, 2])
                 _emit_c(pr, f"@z {o} {il}", fr, Zr)
+                if ("z", o, il) in vm:
+                    _emit_c(pr, f"@zmodel {o} {il}", fr, _on(fr, *vm[("z", o, il)]))
         for s in m["supplies"]:
             for il in loads:
                 k = f"p_{o}_{s}_{il}"
@@ -453,12 +480,16 @@ def emit_multiport_digest(ref, manifest):
                     g = np.asarray(ref[k], float)
                     fr, Hr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
                     _emit_c(pr, f"@psrr {o} {s} {il}", fr, Hr)
+                    if ("psrr", o, s, il) in vm:
+                        _emit_c(pr, f"@psrrmodel {o} {s} {il}", fr, _on(fr, *vm[("psrr", o, s, il)]))
         for il in loads:
             k = f"noise_{o}_{il}"
             if k in ref:
                 g = np.asarray(ref[k], float)
                 fr, Sr = CD._logresample_real(g[:, 0], g[:, 1])
                 _emit_r(pr, f"@noise {o} {il}", fr, Sr)
+                if ("noise", o, il) in vm:
+                    _emit_r(pr, f"@noisemodel {o} {il}", fr, _on(fr, *vm[("noise", o, il)]).real)
     # ---- current sinks: y / pi per supply, per corner + I-V sweeps (kept whole) ----
     for c in m["i_out"]:
         for il in loads:
@@ -510,6 +541,15 @@ def parse_multiport_digest(text):
                 ref[f"pi_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
             elif kind == "iv" and len(toks) >= 2:
                 ref[f"iv_{toks[0]}_{toks[1]}"] = arr
+            # carried VOLTAGE MODEL curves -> m_* keys (fit_multiport never reads these; the
+            # verification path uses them so the voltage GT-vs-model overlay is the BOX's actual
+            # model, not a refit of the lossy digest). zmodel->m_z, psrrmodel->m_p, noisemodel->m_noise.
+            elif kind == "zmodel" and len(toks) >= 2:
+                ref[f"m_z_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "psrrmodel" and len(toks) >= 3:
+                ref[f"m_p_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
+            elif kind == "noisemodel" and len(toks) >= 2:
+                ref[f"m_noise_{toks[0]}_{toks[1]}"] = arr
         kind, toks, rows = None, None, []
 
     for raw in text.splitlines():
@@ -578,6 +618,53 @@ def digest_to_npz(text, path):
         raise ValueError("no [MPD1] MULTIPORT GT DIGEST block found in the pasted text")
     np.savez(path, **ref)
     return str(path)
+
+
+def voltage_views_from_digest(text, manifest):
+    """FAITHFUL voltage GT-vs-MODEL views from a pasted [MPD1] digest WITHOUT refitting -- uses the
+    carried @zmodel/@psrrmodel/@noisemodel (the BOX's actual model). A refit of the lossy digest
+    mis-fits near-capless Zout (see emit_multiport_digest), so this is the honest off-box voltage
+    check. Returns {rail: {il: {fz,Zg,Zm, supplies:{s:{fp,Hg,Hm,rms_db}}, fn,Sg,Sm,
+    scores:{zrms,prms,nrms}}}}; EMPTY if the report carried no model (pre-model-carry digest)."""
+    ref = parse_multiport_digest(text)
+    loads = [str(x) for x in ref.get("loads", [])]
+
+    def _logrms(num, den):
+        num, den = np.abs(num) + 1e-30, np.abs(den) + 1e-30
+        return float(np.sqrt(np.mean((20 * np.log10(num / den)) ** 2)))
+
+    out = {}
+    for o in manifest.get("v_out", {}):
+        rail = {}
+        for il in loads:
+            kz, kzm = f"z_{o}_{il}", f"m_z_{o}_{il}"
+            if kz not in ref or kzm not in ref:
+                continue
+            gz, mz = ref[kz], ref[kzm]
+            Zg, Zm = gz[:, 1] + 1j * gz[:, 2], mz[:, 1] + 1j * mz[:, 2]
+            sel = gz[:, 0] >= 1e3                          # score band (== score.py zrms)
+            zrms = _logrms(Zm[sel], Zg[sel]) if sel.any() else float("nan")
+            sup, prms = {}, []
+            for s in manifest.get("supplies", {}):
+                kp, kpm = f"p_{o}_{s}_{il}", f"m_p_{o}_{s}_{il}"
+                if kp in ref and kpm in ref:
+                    gp, mp = ref[kp], ref[kpm]
+                    Hg, Hm = gp[:, 1] + 1j * gp[:, 2], mp[:, 1] + 1j * mp[:, 2]
+                    r = _logrms(Hm, Hg); prms.append(r)
+                    sup[s] = dict(fp=gp[:, 0], Hg=Hg, Hm=Hm, rms_db=r)
+            fn = Sg = Sm = None
+            nrms = float("nan")
+            kn, knm = f"noise_{o}_{il}", f"m_noise_{o}_{il}"
+            if kn in ref and knm in ref:
+                gn, mn = ref[kn], ref[knm]
+                fn, Sg, Sm = gn[:, 0], gn[:, 1], mn[:, 1]
+                nrms = _logrms(Sm, Sg)
+            rail[il] = dict(fz=gz[:, 0], Zg=Zg, Zm=Zm, supplies=sup, fn=fn, Sg=Sg, Sm=Sm,
+                            scores=dict(zrms=zrms, prms=(max(prms) if prms else float("nan")),
+                                        nrms=nrms))
+        if rail:
+            out[o] = rail
+    return out
 
 
 # --------------------------------------------------------------- voltage diagnosis
@@ -786,8 +873,12 @@ def debug_report(result, npz_path, manifest):
     try:
         from insitu import importmp as IM
         ref_full = IM.load_multiport(npz_path)
+        try:                                              # carry voltage MODEL curves (best-effort)
+            _views = port_views(result, npz_path, manifest)
+        except Exception:                                 # noqa: BLE001 -- model-carry is optional
+            _views = None
         pr("")
-        for line in emit_multiport_digest(ref_full, manifest):
+        for line in emit_multiport_digest(ref_full, manifest, views=_views):
             pr(line)
     except Exception as e:                             # noqa: BLE001 -- digest is best-effort
         pr("")

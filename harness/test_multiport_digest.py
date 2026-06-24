@@ -133,6 +133,53 @@ def test_zout_resonance_survives_digest():
         assert loss < 0.6, f"Q={Q}: peak magnitude lost ({loss:.2f} dB)"
 
 
+def test_voltage_model_carried_for_faithful_verify(tmp_path):
+    """A near-capless / messy silicon rail has an ill-conditioned Zout fit that a REFIT of the
+    lossy digest does NOT reproduce (envelope-cap fallback -> wrong pole). The digest therefore
+    CARRIES the box's voltage MODEL (@zmodel/@psrrmodel/@noisemodel) so voltage_views_from_digest
+    reproduces the report's scores WITHOUT refitting -- and demonstrably closer than the refit."""
+    npz, m = _sweep_npz(tmp_path, with_temp=False, name="vmcarry")
+    ref = dict(np.load(npz, allow_pickle=True))
+    f = np.logspace(1, np.log10(5e8), 160)
+    w = 2 * np.pi * f
+    Z = (1j * w * 0.02) / (1 - (w / (2 * np.pi * 10e6)) ** 2 + 1j * w / (9 * 2 * np.pi * 10e6)) + 0.1
+    Z = Z * (1 + 0.04 * np.sin(np.log(f) * 7))                  # measurement-like ripple
+    for k in [k for k in ref if k.startswith("z_pll_")]:
+        ref[k] = np.c_[f, Z.real, Z.imag]
+    p = tmp_path / "vmcarry.npz"
+    np.savez(p, **ref)
+    res = FMP.fit_multiport(str(p), m)
+    il = list({e["il"] for e in res["voltage"]["pll"]["err"]})[0]
+    box = next(v for v in RMP.port_views(res, str(p), m) if v["name"] == "pll")
+    box_zrms = box["corners"][il]["scores"]["zrms"]
+
+    txt = RMP.debug_report(res, str(p), m)
+    assert "@zmodel pll" in txt and "@psrrmodel pll" in txt and "@noisemodel pll" in txt
+
+    # carried model reproduces the box score (no refit); old digests carry none -> empty
+    vv = RMP.voltage_views_from_digest(txt, m)
+    assert "pll" in vv and il in vv["pll"]
+    carr = vv["pll"][il]["scores"]["zrms"]
+    assert abs(carr - box_zrms) < 0.4, f"carried-model zrms {carr} != box {box_zrms}"
+    assert np.all(np.isfinite(np.abs(vv["pll"][il]["Zm"])))
+
+    # and it is CLOSER to the box than refitting the lossy digest would be
+    RMP.digest_to_npz(txt, str(tmp_path / "rebuilt.npz"))
+    res2 = FMP.fit_multiport(str(tmp_path / "rebuilt.npz"), m)
+    refit = next(v for v in RMP.port_views(res2, str(tmp_path / "rebuilt.npz"), m)
+                 if v["name"] == "pll")["corners"][il]["scores"]["zrms"]
+    assert abs(carr - box_zrms) <= abs(refit - box_zrms), "carried model must beat the refit"
+
+
+def test_voltage_views_empty_without_carried_model(tmp_path):
+    """A digest with NO carried model (emit called without views, e.g. a pre-fix report) -> the
+    faithful-verify accessor returns {} rather than guessing. Backward-compatible."""
+    npz, m = _sweep_npz(tmp_path, with_temp=False, name="nomodel")
+    digest = "\n".join(RMP.emit_multiport_digest(np.load(npz, allow_pickle=True), m))  # views=None
+    assert "@zmodel" not in digest
+    assert RMP.voltage_views_from_digest(digest, m) == {}
+
+
 # ----------------------------------------------------------------- degenerate / empty inputs
 def test_parse_ignores_non_digest_text():
     assert RMP.parse_multiport_digest("hello\nno digest here\n") == {}
