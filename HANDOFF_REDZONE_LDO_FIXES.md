@@ -1,9 +1,49 @@
 # HANDOFF — Red-zone real-LDO (WuR_PMU) modeling fixes
 
-**Date:** 2026-06-24 · **Branch:** main (all pushed) · **Suite:** 373 green
+**Date:** 2026-06-24 · **Branch:** main (all pushed) · **Suite:** 374 green
 
 ---
-## ⏩ SESSION-2 UPDATE (read this first) — box re-validate confirmed + 3 new fixes
+## ⏩ SESSION-3 UPDATE (read this FIRST) — the two missing sims were never REQUESTED
+
+User re-ran but **Idc(T) + current-noise panels STILL blank**. Root cause is NOT a code gap — an
+ultracode audit (5 agents, adversarially verified) confirmed **both paths are fully wired
+end-to-end**: knob → measurement → deck statement actually emitted → PSF read → npz key → fit →
+Report panel. The blank panels were a pure **manifest-data omission**: `REAL_wur_pmu_top.json`'s
+`coverage` block had **no `temps` and no `enable`**, so neither sim was ever requested. (The GUI
+checkbox added in SESSION-2 writes the *GUI-built* manifest, but the box runs this hand-edited file
+directly — the toggle never reached it.)
+
+**Fixes shipped this session:**
+- **Manifest (the actual fix)** — `REAL_wur_pmu_top.json` `coverage` now declares
+  `"temps": [-40, 25, 125]`, `"enable": {"inoise": true}`, and top-level `"tnom_c": 25`. Verified
+  live: `M.validate` ✓, `M.temps` → `[-40,25,125]`, `coverage_enabled(inoise)` ✓, **3
+  `noise_i_<sink>` measurements** emitted (each `oprobe=Vbias_*`), the deck line is real
+  (`nz oprobe=Vbias_500n_lpf noise start=10 stop=100M dec=20`), and the temp guardrail clears.
+- **`build_manifest.py`** — closed the root-cause secondary gap: it wrote `coverage.temps` but had
+  **zero `enable.inoise` handling**, so a GUI-built manifest could never request current-noise.
+  Added the symmetric `gui['inoise'] → coverage.enable.inoise` write (off ⇒ key omitted).
+- **GUI Extract tab** — added a "Current noise" checkbox (`xf_inoise`) next to Temperatures,
+  persisted (QCheckBox now handled in `_collect_config`/`_apply_config`), wired into `_form_gui`.
+  Selftest asserts checkbox → `gui['inoise']` and the persistence round-trip.
+- Test `test_gui_inoise_flag_requests_current_noise` (suite 373 → 374).
+
+### ⚠️ BOX SANITY CHECK after re-extract (the ONE genuine residual — runtime, not code)
+The deck statements are **Spectre-18.1-validated but ALPS-keyword-UNVERIFIED** (see
+`netlist_augment.py:592,607`). On the real ALPS run, if either keyword silently no-ops the panel
+comes up wrong with **no error**. So when the new report arrives, confirm:
+1. **`i1p5u_ptat` Idc(T) actually SLOPES** across −40/25/125 (flat ⇒ ALPS ignored `options temp=`).
+2. **current-noise `[1,1]` panels are non-blank** (blank ⇒ ALPS wrote the `noise oprobe=` PSD under
+   a PSF key `importmp._read_noise_out` doesn't recognize → point silently skipped, `strict=False`).
+3. Sim-budget note: current-noise groups are load- **and** temp-swept, so ~3 sinks × N_loads × 3
+   temps current-noise runs are emitted (fit/report use only the op-load/nearest-tnom array per sink).
+
+If (1)/(2) fail, the fix is in `netlist_augment` (ALPS temp directive / PSF key alias), NOT the manifest.
+
+*(The SESSION-2 modeling gaps — Zout resonance mislocation on both rails, pll PSRR non-min-phase —
+are unchanged and still the next real modeling work after these panels populate.)*
+
+---
+## ⏩ SESSION-2 UPDATE — box re-validate confirmed + 3 new fixes
 
 The user did `bash apply` and pasted the REAL re-run report. **The session-1 fixes LANDED on
 silicon**: VDD0P8_VCO is now `[OK]` (Zout 0.86 / PSRR 0.25 / noise 0.49), 3 current sinks `[OK]/[~]`,

@@ -330,6 +330,13 @@ def build_manifest(gui, netmap):
         m["tnom_c"] = float(gui.get("tnom_c", tps[len(tps) // 2]))
     elif gui.get("tnom_c") is not None:
         m["tnom_c"] = float(gui["tnom_c"])
+    # current-output noise (coverage.enable.inoise) is OPT-IN: no tier auto-enables it, so the
+    # from-scratch GUI builder MUST request it explicitly or a GUI-built manifest can never measure
+    # the bias sinks' output-current noise (the Report tab's current-noise panel stays blank). This
+    # is the symmetric write to coverage.temps above. Off -> leave the override out entirely (never
+    # write inoise:false, which would mask a future tier default); coverage_enabled() reads the key.
+    if gui.get("inoise"):
+        m.setdefault("coverage", {}).setdefault("enable", {})["inoise"] = True
 
     warnings = []
     # in-situ compliance warning: current outputs whose compliance vdc was not supplied get

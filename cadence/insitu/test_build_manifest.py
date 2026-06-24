@@ -349,6 +349,25 @@ def test_user_defined_iv_sweep_and_temps():
     M.validate(m)
 
 
+def test_gui_inoise_flag_requests_current_noise():
+    """The from-scratch GUI builder must be able to request current-output noise. inoise is
+    OPT-IN (no tier auto-enables it), so build_manifest writes coverage.enable.inoise only when
+    the GUI passes inoise=True -- and that ACTUALLY turns the measurement on (coverage_enabled +
+    one noise_i_<sink> measurement per sink). Without the flag the key is ABSENT (not False)."""
+    gui = real_gui(inoise=True)
+    m = B.build_manifest(gui, real_netmap(gui))
+    assert (m.get("coverage", {}).get("enable") or {}).get("inoise") is True
+    assert M.coverage_enabled(m, "inoise") is True
+    ni = [x for x in M.measurements(m) if x["key"].startswith("noise_i_")]
+    assert len(ni) == 3, "one output-current-noise point per sink"
+    assert all(x["analysis"] == "noise" and x.get("oprobe_src") for x in ni)
+    # no flag -> the override is omitted entirely (so a future tier default is never masked)
+    m_off = B.build_manifest(real_gui(), real_netmap())
+    assert "inoise" not in ((m_off.get("coverage", {}).get("enable")) or {})
+    assert M.coverage_enabled(m_off, "inoise") is False
+    assert not [x for x in M.measurements(m_off) if x["key"].startswith("noise_i_")]
+
+
 def test_explicit_tnom_overrides_middle():
     nm = {p: f"net_{p}" for p in ["AVDD1P0", "VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO",
                                   "IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",

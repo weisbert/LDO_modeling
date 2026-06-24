@@ -2919,7 +2919,7 @@ if _HAVE_QT:
                 "dut_inst": self.xf_inst, "dut_lib": self.xf_dutlib, "dut_cell": self.xf_dutcell,
                 "supplies": self.xf_supplies, "cpsrr": self.xf_cpsrr,
                 "vouts": self.xf_vouts, "iouts": self.xf_iouts, "vdc": self.xf_vdc,
-                "ivsweep": self.xf_ivsweep, "temps": self.xf_temps,
+                "ivsweep": self.xf_ivsweep, "temps": self.xf_temps, "inoise": self.xf_inoise,
                 "ground": self.xf_ground, "corner": self.xf_corner, "src_test": self.xf_srctest,
                 "manifest": self.x_manifest, "session": self.x_session, "backend": self.x_backend,
                 "mode": self.x_mode, "location": self.x_location,
@@ -2939,6 +2939,8 @@ if _HAVE_QT:
                     out[k] = d if d is not None else wd.currentText()
                 elif isinstance(wd, QtWidgets.QSpinBox):
                     out[k] = wd.value()
+                elif isinstance(wd, QCheckBox):
+                    out[k] = wd.isChecked()
                 else:
                     out[k] = wd.text()
             return out
@@ -2965,6 +2967,8 @@ if _HAVE_QT:
                         wd.setValue(int(v))
                     except (TypeError, ValueError):
                         pass
+                elif isinstance(wd, QCheckBox):
+                    wd.setChecked(bool(v))
                 else:
                     wd.setText("" if v is None else str(v))
             if "p_loads" in data and "p_nom" in data:        # rebuild nominal dropdown from saved loads
@@ -3332,6 +3336,12 @@ if _HAVE_QT:
             self.xf_temps.setToolTip("Temperature points for Idc(T)/PTAT/noise(T). Blank → nominal "
                                      "only. The middle point is the model-bake nominal temp.")
             gf.addRow("Temperatures [°C]", self.xf_temps)
+            self.xf_inoise = QCheckBox("measure current-output noise (Idc-sink In(f))")
+            self.xf_inoise.setToolTip(
+                "Adds a per-current-sink output-current-noise (In) measurement to each bias sink "
+                "(coverage.enable.inoise). OPT-IN: no tier turns it on. Required to populate the "
+                "Report tab's current-noise panel. Costs one extra noise analysis per sink.")
+            gf.addRow("Current noise", self.xf_inoise)
             gnrow = QHBoxLayout()
             self.xf_ground = QLineEdit("VSS"); self.xf_corner = QLineEdit("tt_25c")
             gnrow.addWidget(QLabel("ground")); gnrow.addWidget(self.xf_ground)
@@ -3716,6 +3726,8 @@ if _HAVE_QT:
                 gui["iv_sweep"] = ivsw
             if temps:
                 gui["temps"] = temps
+            if self.xf_inoise.isChecked():
+                gui["inoise"] = True
             if self.xf_srctest.text().strip():
                 gui["ade_src_test"] = self.xf_srctest.text().strip()
             return gui
@@ -6947,6 +6959,7 @@ def _selftest(require_qt=False):
         win.x_backend.setCurrentIndex(win.x_backend.findData("spectre_cli"))
         win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
         win.xb_netlist["edit"].setText("/tmp/net"); win.xd_cpu.setValue(32)
+        win.xf_inoise.setChecked(True)              # current-output noise opt-in (Report panel)
         win._save_autosave()
         win2 = MainWindow(ModelerCore())            # __init__ -> _load_autosave restores entries
         assert win2.xf_dutlib.text() == "PMU_TOP" and win2.xf_dutcell.text() == "pmu_top", \
@@ -6960,6 +6973,12 @@ def _selftest(require_qt=False):
         assert win2.x_mode.currentData() == "import", "autosave did not restore the mode"
         assert win2.xb_netlist["edit"].text() == "/tmp/net", "autosave did not restore Mode-B netlist path"
         assert win2.xd_cpu.value() == 32, "autosave did not restore the Donau cpu spinbox"
+        assert win2.xf_inoise.isChecked(), "autosave did not restore the current-noise checkbox"
+        # the checkbox actually drives the build_manifest gui dict (checked -> gui['inoise']=True;
+        # unchecked -> key absent, since no tier auto-enables current-output noise)
+        assert win2._form_gui().get("inoise") is True, "xf_inoise did not feed gui['inoise']"
+        win2.xf_inoise.setChecked(False)
+        assert "inoise" not in win2._form_gui(), "cleared current-noise checkbox must omit gui['inoise']"
         named = pathlib.Path(tmp) / "cfg" / "named_demo.json"
         named.parent.mkdir(parents=True, exist_ok=True)
         named.write_text(json.dumps(dict(win._collect_config(), dut_cell="ROUNDTRIP")), encoding="utf-8")
