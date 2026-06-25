@@ -346,12 +346,15 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
             ps = ISR._fit_psrr(f, g.real if np.allclose(g.imag, 0) else g)
             gdd = float(ps["gdd"])
 
-    # Cp from the AC admittance imag part (output cap), 0 when no y was measured.
-    Cp = 0.0
+    # Cp + the 2nd-order cascode/Wilson zero (y_wz/y_wp) from the AC admittance, via the SAME
+    # fit_isrc._fit_admittance the report path uses (report<->emit consistency), anchored to the
+    # I-V conductance g0. y_wz/y_wp stay None on a flat g0+sCp admittance -> emit is byte-identical.
+    Cp, y_wz, y_wp = 0.0, None, None
     if cp.get("y"):
         il_y = op_label if op_label in cp["y"] else next(iter(cp["y"]))
         g = cp["y"][il_y]; f = g[:, 0]; Y = g[:, 1] + 1j * g[:, 2]
-        _, Cp, _ = _fit_admittance(f, Y)
+        af = ISR._fit_admittance(f, Y, float(iv["g0"]))
+        Cp, y_wz, y_wp = float(af["cp"]), af["y_wz"], af["y_wp"]
 
     # current-output noise (in_white/in_kf): fit the in-situ noise_i_<c>_<load> (A/rtHz, the probe
     # current noise) via the VALIDATED fit_isrc._fit_noise (white + 1/f). Absent (coverage.inoise
@@ -368,7 +371,8 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
                 idc55=idc55, didt=didt, d2=d2, g0=float(iv["g0"]),
                 gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
                 knee_side=iv["knee_side"], vhi=float(iv["vhi"]),
-                Cp=float(Cp), in_white=in_white, in_kf=in_kf, tnom_c=float(tnom_c),
+                Cp=float(Cp), y_wz=y_wz, y_wp=y_wp,
+                in_white=in_white, in_kf=in_kf, tnom_c=float(tnom_c),
                 iv_r2=float(iv["iv_r2"]))
 
 

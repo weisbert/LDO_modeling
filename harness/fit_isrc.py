@@ -33,6 +33,10 @@ TEMP_QUAD_RESID_FLOOR = 1e-4  # ...AND the linear fit must miss by >=0.01% RMS (
                               # below this the data IS linear and the relative-SSE test would
                               # otherwise engage a meaningless curvature term on float-point dust
 
+Y_PZ_MIN_PTS = 6        # need a few decades of the @y curve before a 2nd-order zero is fittable
+Y_PZ_KEEP_DB = 0.5      # adopt the pole-zero ONLY if it cuts |Y| rms by >= this vs g0+sCp
+Y_PZ_MIN_SEP = 1.05     # wp/wz below this == no real zero -> degenerate, fall back to g0+sCp
+
 
 def gate(Vo, Vk, p, pol, side=None, vhi=None):
     """Compliance knee, ->1 in saturation, ->0 at the compliance limit. The knee SIDE is
@@ -220,6 +224,76 @@ def _fit_temp(temps, idcT, min_quad_pts=TEMP_QUAD_MIN_PTS, quad_improve=TEMP_QUA
     return dict(idc55=idc55, didt=didt, d2=d2, ptat=ptat)
 
 
+def _y_rms_db(model, gt):
+    return float(np.sqrt(np.mean(
+        (20 * np.log10((np.abs(model) + 1e-30) / (np.abs(gt) + 1e-30))) ** 2)))
+
+
+def _fit_admittance(f, Y, g0):
+    """Output admittance Y(s) = g0*(1+s/wz)/(1+s/wp) + jw*Cp fit to the GT @y curve.
+
+    The g0+sCp form misses the cascode/Wilson SECOND-ORDER zero: real silicon current
+    refs show Re(Y) RISING with frequency and an effective output cap that DROPS from
+    mid-band to HF (i3p6u_vco 4.3dB, i1p5u_ptat 7.0dB on the real WuR PMU) -- a single
+    zero/pole pair captures both (the zero lifts Re(Y) + the mid-band cap, the pole
+    settles it to the HF Cp). Equivalent to a passive lossy series-RC branch in parallel
+    with g0+sCp, so the emit (emit_pmu_model) realizes it with a physical internal node.
+
+    g0 is ANCHORED to the I-V/rout conductance (LF real) so report<->emit stay consistent;
+    only wz, wp, Cp are optimized, in dB-magnitude space (matches the yrms metric). wp is
+    parameterized wz*(1+exp(r)) so wz<wp BY CONSTRUCTION -> zero-before-pole, Re(Y)>=0
+    (passive). KEEP-BEST: the pole-zero is adopted only when it beats the g0+sCp baseline
+    by >= Y_PZ_KEEP_DB AND the pair is non-degenerate (wp/wz >= Y_PZ_MIN_SEP); otherwise
+    returns (y_wz=y_wp=None, cp=HF-cap) and predict_y stays byte-identical to g0+sCp.
+    Returns dict(y_wz, y_wp, cp)."""
+    f = np.asarray(f, float)
+    Y = np.atleast_1d(np.asarray(Y, complex))
+    if f.shape != Y.shape:               # malformed/scalar @y (e.g. a flat-admittance stub view):
+        return dict(y_wz=None, y_wp=None, cp=0.0)   # no curve to fit -> caller keeps its scalar cp
+    ok = np.isfinite(f) & (f > 0) & np.isfinite(Y)
+    f, Y = f[ok], Y[ok]
+    w = 2 * np.pi * f
+    cp_hf = max(float(Y[-1].imag / w[-1]), 0.0) if f.size and w[-1] > 0 else 0.0
+    none = dict(y_wz=None, y_wp=None, cp=cp_hf)
+    if f.size < Y_PZ_MIN_PTS or g0 == 0.0:
+        return none
+    g0a = abs(g0)
+    base_db = _y_rms_db(g0a + 1j * w * cp_hf, Y)
+
+    def _model(x):
+        wz = np.exp(x[0]); wp = wz * (1.0 + np.exp(x[1])); cp = np.exp(x[2])
+        s = 1j * w
+        return g0a * (1.0 + s / wz) / (1.0 + s / wp) + s * cp
+
+    def _resid(x):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            m = _model(x)
+        return 20 * np.log10((np.abs(m) + 1e-30) / (np.abs(Y) + 1e-30))
+
+    cp0 = max(cp_hf, 1e-18)
+    best = None
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        for fz in (1e3, 1e4, 1e5, 1e6):                 # multi-start over the zero corner
+            for sep in (3.0, 10.0, 30.0, 100.0):        # ...and the zero->pole spacing
+                x0 = [np.log(2 * np.pi * fz), np.log(sep), np.log(cp0)]
+                try:
+                    s = least_squares(_resid, x0, method="lm", max_nfev=4000)
+                except Exception:
+                    continue
+                db = _y_rms_db(_model(s.x), Y)
+                if np.isfinite(db) and (best is None or db < best[0]):
+                    best = (db, s.x)
+    if best is None:
+        return none
+    db, x = best
+    wz = float(np.exp(x[0])); wp = float(wz * (1.0 + np.exp(x[1]))); cp = float(np.exp(x[2]))
+    if not (np.isfinite(wz) and np.isfinite(wp) and np.isfinite(cp)):
+        return none
+    if (base_db - db) < Y_PZ_KEEP_DB or (wp / wz) < Y_PZ_MIN_SEP:   # keep-best + non-degenerate
+        return none
+    return dict(y_wz=wz, y_wp=wp, cp=max(cp, 0.0))
+
+
 def fit_isrc(npz_path):
     # accept a path OR an already-loaded mapping (npz/dict view) -- report.py and the
     # air-gap digest_import feed a per-port dict view without round-tripping to disk.
@@ -234,8 +308,23 @@ def fit_isrc(npz_path):
     nz = _fit_noise(np.asarray(d["nz_f"], float), np.asarray(d["nz_in"], float))
     tp = _fit_temp(np.asarray(d["temps"], float), np.asarray(d["idcT"], float))
     cp = float(d["cp"])
+    # output admittance: fit the 2nd-order cascode/Wilson zero from the @y curve when it is
+    # carried (report_multiport view / isrc_char npz both carry ac_f+ac_y). g0 anchors to the
+    # I-V conductance for report<->emit consistency. Absent / too-short curve -> the scalar cp
+    # stays and y_wz/y_wp are None (predict_y == the legacy g0+sCp form, byte-identical).
+    yfit = dict(y_wz=None, y_wp=None)
+    if "ac_f" in d and "ac_y" in d:
+        ac_f = np.asarray(d["ac_f"], float)
+        ac_y = np.atleast_1d(np.asarray(d["ac_y"], complex))
+        # only fit the zero (and override the scalar cp) when a REAL curve is present:
+        # a 1-D @y the same length as ac_f. A scalar/0-D ac_y (flat-admittance stub views)
+        # or too-short curve -> keep the precomputed scalar cp + y_wz/y_wp=None (legacy form).
+        if ac_f.size >= Y_PZ_MIN_PTS and ac_y.shape == ac_f.shape:
+            af = _fit_admittance(ac_f, ac_y, iv["g0"])
+            cp = af["cp"]
+            yfit = dict(y_wz=af["y_wz"], y_wp=af["y_wp"])
     return dict(name=str(d["name"]), pol=pol, vc=vc, cp=cp,
-                **iv, **ps, **nz, **tp)
+                **iv, **ps, **nz, **tp, **yfit)
 
 
 # --------------------------------------------------------------------------- predict
@@ -258,8 +347,14 @@ def predict_idcT(p, T_C):
 
 
 def predict_y(p, f):
-    """Output admittance Y(s) = g0 + s*Cp (magnitude is what report diffs)."""
+    """Output admittance |Y(s)| (magnitude is what report diffs). The 2nd-order cascode/Wilson
+    form g0*(1+s/wz)/(1+s/wp) + s*Cp when a zero was fitted (y_wz/y_wp), else the legacy
+    g0 + s*Cp (BYTE-IDENTICAL when y_wz/y_wp absent or None -> back-compat with old param dicts)."""
     w = 2 * np.pi * np.asarray(f, float)
+    wz = p.get("y_wz"); wp = p.get("y_wp")
+    if wz and wp:
+        s = 1j * w
+        return p["g0"] * (1.0 + s / wz) / (1.0 + s / wp) + s * p["cp"]
     return p["g0"] + 1j * w * p["cp"]
 
 

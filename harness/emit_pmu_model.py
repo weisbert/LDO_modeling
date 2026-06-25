@@ -358,7 +358,8 @@ def current_crow_from_isrc_fit(p, pin=None, tnom_c=55.0):
                 idc55=p["idc55"], didt=p["didt"], d2=p.get("d2", 0.0), g0=p["g0"], vc=p["vc"],
                 gdd=p["gdd"], vknee=p["vknee"], knee_p=p["knee_p"],
                 knee_side=p.get("knee_side"), vhi=p.get("vhi"),   # carry the data-detected knee
-                Cp=p["cp"], in_white=p["in_white"], in_kf=p["in_kf"], tnom_c=tnom_c)
+                Cp=p["cp"], y_wz=p.get("y_wz"), y_wp=p.get("y_wp"),  # 2nd-order admittance zero
+                in_white=p["in_white"], in_kf=p["in_kf"], tnom_c=tnom_c)
 
 
 def _current_block(o, crow, supply, ground):
@@ -405,12 +406,31 @@ def _current_block_largesignal(o, crow, supply, ground):
         d2_var = [f"{pre}_d2"]
         d2_asg = f"  {pre}_d2 = {d2:.6e};"
         temp_term += f" + {pre}_d2*($temperature - {trefs})*($temperature - {trefs})"
+    # 2nd-order output-admittance zero (cascode/Wilson): the fitted Y=g0*(1+s/wz)/(1+s/wp)+sCp
+    # is realized as a PASSIVE lossy series-RC branch (cap Cz to an internal node, resistor Rz
+    # to ground) in parallel with g0+sCp -- both Cz,Rz>0 when wp>wz, so it stays passive and
+    # converges. Emitted ONLY when y_wz/y_wp are present (so a flat g0+sCp sink is byte-identical:
+    # no _nz node, no Cz/Rz vars, no extra cards). Same opt-in pattern as the d2 Idc(T) term.
+    ywz = crow.get("y_wz"); ywp = crow.get("y_wp")
+    zero_node, zero_var, zero_asg, zero_body = [], [], "", ""
+    if ywz and ywp and ywp > ywz and g0 != 0.0:
+        g0a = abs(g0)
+        Rz = 1.0 / (g0a * (ywp / ywz - 1.0))             # branch loss: Re(Y) HF rise = 1/Rz
+        Cz = g0a * (ywp - ywz) / (ywz * ywp)             # branch cap: pole wp = 1/(Cz*Rz)
+        zero_node = [f"{pre}_nz"]
+        zero_var = [f"{pre}_Cz", f"{pre}_Rz"]
+        zero_asg = f"  {pre}_Cz = {Cz:.6e};  {pre}_Rz = {Rz:.6e};"
+        zero_body = (
+            f"    I({o}, {pre}_nz) <+ {pre}_Cz*ddt(V({o}, {pre}_nz));"
+            f"        // 2nd-order admittance zero (cascode/Wilson): lossy series C-R\n"
+            f"    I({pre}_nz, {ground}) <+ V({pre}_nz, {ground})/{pre}_Rz;\n")
     rvars = [f"{pre}_idc55", f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
-             f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"] + d2_var
+             f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"] \
+        + d2_var + zero_var
     asg = (f"{pre}_idc55 = {idc55:.6e};  {pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
            f"{pre}_vc = {vc:.6g};  {pre}_gdd = {gdd_eff:.6e};  {pre}_vk = {vk:.6g};  "
            f"{pre}_kp = {kp:.6g};  {pre}_vhi = {vhi:.6g};  {pre}_Cp = {cp:.6e};  "
-           f"{pre}_inw2 = {inw2:.6e};  {pre}_kf = {kf:.6e};" + d2_asg)
+           f"{pre}_inw2 = {inw2:.6e};  {pre}_kf = {kf:.6e};" + d2_asg + zero_asg)
     drive = f"I({o}, {ground})" if pol == "sink" else f"I({supply}, {o})"
     if side == "none":                                   # flat ref: no compliance knee in range
         gate_expr = "1.0"
@@ -426,10 +446,10 @@ def _current_block_largesignal(o, crow, supply, ground):
                   + {pre}_gdd*(V({supply},{ground}) - vdc_{supply}))
                  * {gate_expr};
     I({o}, {ground}) <+ {pre}_Cp*ddt(V({o}, {ground}));   // output cap (Y imag part)
-    I({o}, {ground}) <+ white_noise({pre}_inw2, "{pre}_wht");
+{zero_body}    I({o}, {ground}) <+ white_noise({pre}_inw2, "{pre}_wht");
     I({o}, {ground}) <+ flicker_noise({pre}_kf, 1.0, "{pre}_flk");
 """
-    return dict(rvars=rvars, asg=asg, body=body)
+    return dict(rvars=rvars, asg=asg, body=body, nodes=zero_node)
 
 
 def _current_block_legacy(o, crow, supply, ground):
@@ -606,6 +626,8 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
     internal_nodes = []
     for vb in vblocks:
         internal_nodes += vb["nodes"]
+    for cb in cblocks:                         # current-block 2nd-order admittance-zero node(s)
+        internal_nodes += cb.get("nodes", [])
     all_elec = all_ports + internal_nodes
 
     rvars = []
