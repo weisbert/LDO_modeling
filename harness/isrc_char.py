@@ -26,6 +26,12 @@ from isrc_variants import VARIANTS, ISRC_LIB, VDD                      # noqa: E
 WORK = ng.ROOT / "work_isrc"
 TEMPS = (-40.0, 55.0, 125.0)        # confirmed PDK points; 55 = nominal
 TNOM = 55.0
+# --- held-out characterization for the adversarial overfit-probe gates (HANDOFF_ADVERSARIAL_
+# OVERFIT_PROBE.md, §C). These are NEVER fed to the fitter (fit_isrc reads only the 3-temp idcT /
+# the single-vc psrr_g / the iv_v|iv_i at TNOM); they are extra npz fields the crossval_isrc gates
+# diff the EMITTED model against -> the existing 8 baselines re-fit byte-identical (additive only).
+HELDOUT_IDC_TEMPS = (25.0, 85.0)    # interior temps: the 3-temp line through (-40,55,125) misses them (B1)
+PSRR_OFFVC_DELTA = 0.2              # off-compliance offset for the bias-dependent PSRR-sign gate (B3)
 
 
 def _deck(body):
@@ -97,6 +103,22 @@ wrdata p.data i(vout)
     return f, g
 
 
+def psrr_at(name, v, vo, temp=TNOM):
+    """LF dIout/dVdd [S, complex] at an EXPLICIT compliance voltage `vo` (vs psrr() which uses
+    the nominal vc). Used to capture the off-compliance PSRR sign for the B3 gate (held-out)."""
+    head = _head(v["subckt"], temp).replace(
+        f"Vdd vdd 0 DC {VDD}\n", f"Vdd vdd 0 DC {VDD} AC 1\n")
+    body = head + f"""Vout out 0 DC {vo:g} AC 0
+.control
+ac dec 20 10 500meg
+wrdata p.data i(vout)
+.endc
+.end
+"""
+    arr = _run(name, f"psrr_{vo:.2f}", body, "p.data")
+    return complex(arr[0, 1] + 1j * arr[0, 2])           # LF dIout/dVdd
+
+
 def noise(name, v, yf, y, temp=TNOM):
     body = _head(v["subckt"], temp) + f"""Lbias out ncc 1e9
 Vcc ncc 0 DC {v['vc']:g} AC 1
@@ -138,12 +160,27 @@ def characterize(name):
     In_1k = float(np.interp(1e3, fn, In))
     In_100k = float(np.interp(1e5, fn, In))
     idcT, slope, ptat = tempco(name, v)
+    # --- HELD-OUT probe data (additive; never fitted -- see HELDOUT_IDC_TEMPS / PSRR_OFFVC_DELTA) ---
+    # B1: Idc at the interior held-out temps -> 3-temp straight-line miss
+    idcT_held = np.array([float(np.interp(v["vc"], *iv_curve(name, v, temp=T)))
+                          for T in HELDOUT_IDC_TEMPS])
+    # B3: off-compliance LF PSRR sign (dIout/dVdd at vc +- delta, clamped to the rail)
+    vlo = max(0.0, v["vc"] - PSRR_OFFVC_DELTA)
+    vhi = min(VDD, v["vc"] + PSRR_OFFVC_DELTA)
+    g_lf_lo = psrr_at(name, v, vlo)
+    g_lf_hi = psrr_at(name, v, vhi)
+    # B4: full IV(Vo) at each fit temp on the shared `vo` grid -> compliance-knee-vs-T
+    iv_i_temps = np.array([np.interp(vo, *iv_curve(name, v, temp=T)) for T in TEMPS]).T
     return dict(name=name, pol=v["pol"], idc=idc_vc, knee_lo=klo, knee_hi=khi,
                 rout=rout, cp=cp, g_lf=glf, In_1k=In_1k, In_100k=In_100k,
                 idcT=idcT, dIdT=slope, ptat=ptat, note=v["note"],
                 # raw curves (modeling input for the behavioral fit step)
                 iv_v=vo, iv_i=I, ac_f=f, ac_y=y, psrr_f=fp, psrr_g=g,
-                nz_f=fn, nz_in=In, temps=np.array(TEMPS), vc=v["vc"])
+                nz_f=fn, nz_in=In, temps=np.array(TEMPS), vc=v["vc"],
+                # held-out probe grids (crossval_isrc gates diff the EMITTED model vs these)
+                idcT_held=idcT_held, temps_held=np.array(HELDOUT_IDC_TEMPS),
+                g_lf_lo=g_lf_lo, g_lf_hi=g_lf_hi, vc_lo=float(vlo), vc_hi=float(vhi),
+                iv_i_temps=iv_i_temps)
 
 
 def save_npz(name, r):

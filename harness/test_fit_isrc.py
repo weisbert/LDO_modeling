@@ -9,7 +9,7 @@ import pathlib
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from isrc_variants import VARIANTS                                     # noqa: E402
+from isrc_variants import VARIANTS, BASELINE_VARIANTS                  # noqa: E402
 from fit_isrc import fit_isrc                                          # noqa: E402
 import crossval_isrc as xv                                            # noqa: E402
 
@@ -17,14 +17,16 @@ WORK = HERE.parent / "work_isrc"
 
 
 def test_iv_and_noise_fit_quality():
-    for name in VARIANTS:
+    # the anti-overfit guard covers the 8 BASELINE archetypes; the round-3 adversarial probes are
+    # DESIGNED to fit poorly (the finding) -> excluded here (see test_adv_probe_gates.py for them).
+    for name in BASELINE_VARIANTS:
         p = fit_isrc(WORK / f"{name}.npz")
         assert p["iv_r2"] > 0.90, f"{name}: I-V fit R2={p['iv_r2']:.3f} too low"
         assert p["in_r2"] > 0.80, f"{name}: noise fit R2={p['in_r2']:.3f} too low"
 
 
 def test_template_reproduces_all_archetypes():
-    rows = [xv.crossval(n) for n in VARIANTS]
+    rows = [xv.crossval(n) for n in BASELINE_VARIANTS]      # the 8 anti-overfit archetypes only
     bad = [r["name"] for r in rows if not r["ok"]]
     assert not bad, f"behavioral template failed to reproduce: {bad}"
     assert len(rows) >= 6

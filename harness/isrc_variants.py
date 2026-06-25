@@ -37,7 +37,32 @@ VARIANTS = {
                             note="resistor-biased NMOS: strong dIout/dVdd (poor +sign PSRR), CTAT-leaning"),
     "v8_wilson":       dict(subckt="isrc_v8_wilson",       pol="sink",   idc=0.6e-6, vc=0.5,
                             note="Wilson mirror: feedback-boosted rout, distinct PSRR/noise"),
+
+    # ---- ADVERSARIAL OVERFIT PROBES (round 3): engineered to drive the current-path keep-best
+    # gates + the held-out crossval_isrc gates to FAILURE (HANDOFF_ADVERSARIAL_OVERFIT_PROBE.md §B).
+    # A poor reproduction here IS the finding; they re-fit/register additively (8 baselines untouched).
+    "inflect_ctat_ptat": dict(subckt="isrc_inflect_ctat_ptat", pol="sink", idc=0.92e-6, vc=0.5,
+                              note="B1: PTAT mirror + subthreshold device -> U/convex Idc(T); 3-temp line "
+                                   "misses 25/85C by 15/10% (d2 quad gate never fires at 3 temps)"),
+    "double_cascode_2zero": dict(subckt="isrc_double_cascode_2zero", pol="sink", idc=1.0e-6, vc=0.5,
+                                 note="B2: triple-stacked sink -> TWO separated output-admittance zeros "
+                                      "(~1.2e5 & 1.3e7 Hz); the single zero-pole keep-best can't hold both"),
+    "bias_dependent_psrr_flip": dict(subckt="isrc_bias_dependent_psrr_flip", pol="sink", idc=1.1e-6, vc=0.5,
+                                     note="B3: competing supply paths -> dIout/dVdd SIGN flips +8340nS@0.3 "
+                                          "-> -1490nS@0.7 (single-vc gdd is self-fulfilling)"),
+    "tempload_xterm": dict(subckt="isrc_tempload_xterm", pol="sink", idc=1.69e-6, vc=0.5,
+                           note="B4: PTAT source-degenerated sink -> compliance knee climbs 54->100mV with T "
+                                "while Idc@vc ~flat (separable Idc(T)*knee(Vo) model can't bend)"),
 }
+
+# The 8 ORIGINAL anti-overfit archetypes -- the set the single behavioral template MUST reproduce
+# (the "one template, all archetypes" regression guard iterates THIS, not the adversarial probes).
+BASELINE_VARIANTS = ("v1_nmos_simple", "v2_nmos_cascode", "v3_nmos_long", "v4_pmos_simple",
+                     "v5_pmos_cascode", "v6_ptat", "v7_nmos_rbias", "v8_wilson")
+# The round-3 ADVERSARIAL OVERFIT PROBES -- DESIGNED to break the template / trip the held-out gates.
+# A poor reproduction here IS the finding; they are EXCLUDED from the anti-overfit regression guard.
+ADVERSARIAL_VARIANTS = ("inflect_ctat_ptat", "double_cascode_2zero",
+                        "bias_dependent_psrr_flip", "tempload_xterm")
 
 # The 3 real PMU contract pins map onto archetypes (for the eventual real fit):
 REAL_PIN_ARCHETYPE = {

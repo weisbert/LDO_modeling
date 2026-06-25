@@ -91,6 +91,26 @@ VARIANTS = {
     "v10_3lc": dict(libs=[GROUND / "ldo_v10_3lc.lib"], subckt="ldo_v10_3lc", xparams="",
                     biasnode="nb", cout=200e-12, esr=0.1, hf_stop=1e9,
                     note="multi-stage PDN (3-cap ladder): >2 Zout resonances -> exceeds the 2-branch RLC order"),
+
+    # ---- ADVERSARIAL OVERFIT PROBES (round 3): engineered to drive the load-interp overfit locus +
+    # the LTI/composite blind spots to FAILURE (HANDOFF_ADVERSARIAL_OVERFIT_PROBE.md §A). A poor fit
+    # (or held-out crossval miss) IS the finding; registered additively (the 14 baselines untouched).
+    "qbow": dict(libs=[GROUND / "ldo_qbow.lib"], subckt="ldo_qbow", xparams="",
+                 biasnode="nb", cout=1e-9, esr=0.5,
+                 note="A1: NON-monotonic Zout resonance-Q vs load (Q 1.5/16.5/11.1) -> the 3-pt quad-in-ln(iload) "
+                      "Zout interp can't track the mid-corner bow (LOCO/offgrid Zout)"),
+    "pzmig": dict(libs=[GROUND / "ldo_pzmig.lib"], subckt="ldo_pzmig", xparams="",
+                  biasnode="nb", cout=12e-9, esr=0.01,
+                  note="A2: PSRR corner migrates NON-log-linearly with load (convex, ln-mid dev +0.535) -> "
+                       "the load-interp PSRR fitter (the proven weak axis) overshoots the interior"),
+    "swbleed": dict(libs=[GROUND / "ldo_swbleed.lib"], subckt="ldo_swbleed", xparams="",
+                    biasnode="nb", cout=1e-9, esr=0.5,
+                    note="A3: load-threshold MODE SWITCH -- a DC-blocked LC damper notch (150kHz) appears ONLY "
+                         "at 250u -> the Zout fitter selects branch-B only at one corner (structloco flip)"),
+    "classab": dict(libs=[GROUND / "ldo_classab.lib"], subckt="ldo_classab", xparams="",
+                    biasnode="nb", cout=2e-9, esr=15.0,
+                    note="A4: class-AB push-pull, swing-dependent gm, NO dropout -> small-signal fits base-like "
+                         "(fools composite) but large steps are asymmetric (LTI-foundation breaker)"),
 }
 
 

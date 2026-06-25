@@ -100,9 +100,32 @@ def _trans_metrics(t, vg, vm):
     aw = (t >= 5e-6) & (t < 25e-6)
     eg, em = vg[aw] - preg, vm[aw] - prem
     wrms = np.sqrt(np.mean((em - eg) ** 2)) / (np.sqrt(np.mean(eg ** 2)) + 1e-15) * 100
+    # droop-vs-recovery ASYMMETRY (additive diagnostic for the A4 class-AB probe; not in the
+    # composite). A symmetric linear output has |down-step recovery overshoot| ~ |up-step droop|;
+    # a class-AB (swing-dependent gm) output does not -> the model's asym cannot match the GT's.
+    rw = (t >= 15e-6) & (t < 23e-6)
+    recovg = (vg[rw].max() - preg) if rw.any() else 0.0
+    recovm = (vm[rw].max() - prem) if rw.any() else 0.0
+    asymg = abs(droopg - recovg) / (abs(droopg) + 1e-15)
+    asymm = abs(droopm - recovm) / (abs(droopm) + 1e-15)
     return dict(droopg=droopg * 1e3, droopm=droopm * 1e3,
                 drerr=(droopm - droopg) * 1e3, seterr=(setm - setg) * 1e3,
-                wrms=wrms, ringg=bench.ring_freq(t, vg), ringm=bench.ring_freq(t, vm))
+                wrms=wrms, ringg=bench.ring_freq(t, vg), ringm=bench.ring_freq(t, vm),
+                recovg=recovg * 1e3, recovm=recovm * 1e3, asymg=asymg, asymm=asymm)
+
+
+def a4_verdict(extra, wrms_lim=15.0, asym_lim=20.0):
+    """Large-signal class-AB EXPOSURE (probe A4). OBSERVATIONAL -- never folded into the composite.
+    Exposed when the model fails a large load-step waveform: big OR slew wrms > wrms_lim %, OR the
+    GT's droop-vs-recovery asymmetry the symmetric linear model cannot reproduce
+    (|asym_GT - asym_model|) exceeds asym_lim points. False when the ref carries no big/slew step."""
+    bad = False
+    for tag in ("big", "slew"):
+        if tag in extra:
+            e = extra[tag]
+            if e["wrms"] > wrms_lim or abs(e["asymg"] - e["asymm"]) * 100 > asym_lim:
+                bad = True
+    return bad
 
 
 def _noise_metrics(fn, Sg, fm, Sm, fres=None):
@@ -287,6 +310,12 @@ def score(lib, subckt, xp="", refpath=None):
         spur16=float(spur_dbc[16e6]), spur24=float(spur_dbc[24e6]),
         big_wrms=float(extra["big"]["wrms"]) if "big" in extra else None,
         slew_wrms=float(extra["slew"]["wrms"]) if "slew" in extra else None,
+        # A4 large-signal class-AB probe (observational; not in the composite)
+        big_asym_gt=float(extra["big"]["asymg"]) if "big" in extra else None,
+        big_asym_md=float(extra["big"]["asymm"]) if "big" in extra else None,
+        slew_asym_gt=float(extra["slew"]["asymg"]) if "slew" in extra else None,
+        slew_asym_md=float(extra["slew"]["asymm"]) if "slew" in extra else None,
+        a4_exposed=bool(a4_verdict(extra)),
         spur_n=(spm["n_gt"] if spm else 0),
         spur_worst_db=(spm["worst_db"] if spm else None),
         spur_mean_db=(spm["mean_db"] if spm else None),
