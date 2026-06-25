@@ -417,10 +417,68 @@ def _emit_r(pr, header, f, y):
         pr(f"  {a:.5e}, {b:.6e}")
 
 
-def emit_multiport_digest(ref, manifest, views=None):
+def _temp_collapse(loads, meta_temp):
+    """Group sweep labels that differ ONLY in temperature (same load), for the temperature-
+    invariant small-signal digest. Returns (ss_loads, groups): ss_loads = the nominal-temp
+    member of each load group (the labels whose small-signal is carried), groups =
+    {nominal_label: [all sibling labels across temps]}. A non-temp sweep, a single corner, or
+    labels not shaped '<load>_T<temp>' collapse nothing -> ss_loads == loads (byte-identical)."""
+    loads = [str(x) for x in loads]
+    if meta_temp is None or len(loads) <= 1:
+        return loads, {l: [l] for l in loads}
+    mt = np.asarray(meta_temp, float).ravel()
+    if mt.size != len(loads) or np.unique(np.round(mt, 6)).size <= 1:
+        return loads, {l: [l] for l in loads}
+    temp_of = dict(zip(loads, mt))
+    utemps = np.unique(mt)
+    tnom = float(utemps[len(utemps) // 2])                 # == fit_multiport's nominal temp
+
+    def _stem(lbl):
+        suf = f"_T{temp_of[lbl]:g}"
+        return lbl[:-len(suf)] if lbl.endswith(suf) else lbl
+    import collections
+    bygrp = collections.OrderedDict()
+    for lbl in loads:
+        bygrp.setdefault(_stem(lbl), []).append(lbl)
+    groups = {}
+    for members in bygrp.values():
+        nom = min(members, key=lambda l: abs(temp_of[l] - tnom))
+        groups[nom] = members
+    ss_ordered = [l for l in loads if l in groups]
+    return ss_ordered, groups
+
+
+def _fanout_temp(ref):
+    """Inverse of emit_multiport_digest's temperature collapse: a temp-trimmed digest carries
+    small-signal at the nominal temp of each LOAD group only, so fan it across the group's
+    sibling temps -> fit_multiport (which reads one key per load) reproduces unchanged. @iv
+    stays per-temp. No-op when nothing was collapsed (single corner / load sweep / untrimmed)."""
+    if "loads" not in ref:
+        return
+    loads = [str(x) for x in ref["loads"]]
+    _, groups = _temp_collapse(loads, ref.get("meta_temp"))
+    pre = ("z_", "p_", "noise_", "noise_i_", "y_", "pi_", "m_z_", "m_p_", "m_noise_")
+    for nom, members in groups.items():
+        if len(members) <= 1:
+            continue
+        suf = f"_{nom}"
+        for k in [k for k in list(ref) if k.endswith(suf) and any(k.startswith(p) for p in pre)]:
+            stem = k[:-len(suf)]
+            for sib in members:
+                nk = f"{stem}_{sib}"
+                if nk not in ref:
+                    ref[nk] = ref[k]
+
+
+def emit_multiport_digest(ref, manifest, views=None, budget_kb=None):
     """Serialize ref's GT arrays (log-resampled) -> the machine-readable [MPD1] digest lines
     that parse_multiport_digest rebuilds into an npz-equivalent ref. Manifest-driven; emits a
     block only for the keys actually present (a coverage-light run simply emits fewer).
+
+    budget_kb (red-zone export cap): when set, GT blocks are emitted highest-value-first
+    (Idc(T) > current-noise > current Y/PSRR > voltage Zout/PSRR/noise) up to ~budget_kb of
+    digest; anything dropped is NAMED in a trailing note (never a silent truncation). A
+    temperature sweep already carries small-signal at the nominal temp only (see below).
 
     When `views` (port_views output) is given, ALSO carry the VOLTAGE rails' fitted MODEL curves
     (@zmodel/@psrrmodel/@noisemodel) at the same resampled freqs. Why: a near-capless silicon rail
@@ -432,6 +490,15 @@ def emit_multiport_digest(ref, manifest, views=None):
     import current_digest as CD
     m = manifest
     loads = [str(x) for x in ref["loads"]]
+    # TEMPERATURE-sweep collapse: the small-signal blocks (z/psrr/noise/y/pi/noise_i + models)
+    # are temperature-invariant in the emitted model (only Idc/I-V carries a temp coefficient),
+    # so carry them at the NOMINAL temp of each LOAD group only and keep @iv per temp.
+    # parse_multiport_digest fans them back across temps, so fit_multiport reproduces unchanged.
+    # A 3-temp report goes ~125->~46 KB with no modeled-information loss; a non-temp / load
+    # sweep collapses nothing (byte-identical).
+    _mt = ref["meta_temp"] if "meta_temp" in ref else None
+    ss_loads, _ = _temp_collapse(loads, _mt)
+    _is_tsweep = len(ss_loads) < len(loads)
     L = []
     pr = L.append
     # voltage MODEL curves carried verbatim (keyed (kind,o[,s],il) -> (src_f, model_array))
@@ -451,6 +518,14 @@ def emit_multiport_digest(ref, manifest, views=None):
         if np.iscomplexobj(arr):
             return np.interp(lf, ls, arr.real) + 1j * np.interp(lf, ls, arr.imag)
         return np.interp(lf, ls, np.asarray(arr, float))
+
+    def _bc(header, f, Z):                                # complex GT block -> lines
+        return ([header + "   # f[Hz], re, im"]
+                + [f"  {a:.5e}, {b.real:.6e}, {b.imag:.6e}" for a, b in zip(f, Z)])
+
+    def _br(header, f, y):                                # real GT block -> lines
+        return [header + "   # f[Hz], val"] + [f"  {a:.5e}, {b:.6e}" for a, b in zip(f, y)]
+
     pr(_MPD_BEGIN + "  (log-resampled ground truth; rebuilds an npz-equivalent ref so")
     pr("       fit_multiport reproduces this report from the PASTE alone -- no npz needed)")
     pr("-" * 78)
@@ -463,63 +538,85 @@ def emit_multiport_digest(ref, manifest, views=None):
     for k in ("meta_temp", "meta_cout", "meta_esr"):
         if k in ref:
             pr(f"@meta {k} = " + " | ".join(f"{v:.6g}" for v in np.asarray(ref[k], float).ravel()))
-    # ---- voltage rails: z (peak-densified) / psrr per supply / noise, per corner ----
-    for o in m["v_out"]:
-        for il in loads:
-            k = f"z_{o}_{il}"
-            if k in ref:
-                g = np.asarray(ref[k], float)
-                fr, Zr = _z_resample(g[:, 0], g[:, 1] + 1j * g[:, 2])
-                _emit_c(pr, f"@z {o} {il}", fr, Zr)
-                if ("z", o, il) in vm:
-                    _emit_c(pr, f"@zmodel {o} {il}", fr, _on(fr, *vm[("z", o, il)]))
-        for s in m["supplies"]:
-            for il in loads:
-                k = f"p_{o}_{s}_{il}"
-                if k in ref:
-                    g = np.asarray(ref[k], float)
-                    fr, Hr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
-                    _emit_c(pr, f"@psrr {o} {s} {il}", fr, Hr)
-                    if ("psrr", o, s, il) in vm:
-                        _emit_c(pr, f"@psrrmodel {o} {s} {il}", fr, _on(fr, *vm[("psrr", o, s, il)]))
-        for il in loads:
-            k = f"noise_{o}_{il}"
+    if _is_tsweep:
+        pr("# small-signal below carried at the nominal temp of each load only (it is "
+           "temperature-invariant in the model); @iv is per temp, fanned back on rebuild.")
+    # ---- build GT blocks with a PRIORITY (lower = kept first under a byte budget). The current
+    #      story (Idc(T) + current-noise + admittance) ranks above the larger, already-validated
+    #      voltage-rail blocks, so a tight red-zone export budget keeps the actionable data. ----
+    blocks = []                                          # (priority, [lines])
+    for c in m["i_out"]:
+        for k in sorted(x for x in ref if str(x).startswith(f"iv_{c}_")):
+            g = np.asarray(ref[k], float)
+            Vo, I = CD._iv_subsample(g[:, 0], g[:, 1])
+            lines = [f"@iv {c} {k[len(f'iv_{c}_'):]}   # Vo[V], I[A]"]
+            lines += [f"  {a:.6e}, {b:.6e}" for a, b in zip(Vo, I)]
+            blocks.append((1, lines))                    # Idc(T) -- essential, tiny, per temp
+        for il in ss_loads:
+            k = f"noise_i_{c}_{il}"                       # current-output noise GT (A/rtHz)
             if k in ref:
                 g = np.asarray(ref[k], float)
                 fr, Sr = CD._logresample_real(g[:, 0], g[:, 1])
-                _emit_r(pr, f"@noise {o} {il}", fr, Sr)
-                if ("noise", o, il) in vm:
-                    _emit_r(pr, f"@noisemodel {o} {il}", fr, _on(fr, *vm[("noise", o, il)]).real)
-    # ---- current sinks: y / pi per supply, per corner + I-V sweeps (kept whole) ----
-    for c in m["i_out"]:
-        for il in loads:
+                blocks.append((2, _br(f"@noise_i {c} {il}", fr, Sr)))
+        for il in ss_loads:
             k = f"y_{c}_{il}"
             if k in ref:
                 g = np.asarray(ref[k], float)
                 fr, Yr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
-                _emit_c(pr, f"@y {c} {il}", fr, Yr)
-        for il in loads:
-            # current-output noise GT (A/rtHz) -- only when coverage.inoise measured it. Carrying it
-            # makes a pasted report reproduce + RETUNE the current-noise fit (in_white/in_kf); without
-            # it the noise_i panel could not be rebuilt from a paste (the reproducibility gap).
-            k = f"noise_i_{c}_{il}"
-            if k in ref:
-                g = np.asarray(ref[k], float)
-                fr, Sr = CD._logresample_real(g[:, 0], g[:, 1])
-                _emit_r(pr, f"@noise_i {c} {il}", fr, Sr)
+                blocks.append((3, _bc(f"@y {c} {il}", fr, Yr)))
         for s in m["current_psrr_supplies"]:
-            for il in loads:
+            for il in ss_loads:
                 k = f"pi_{c}_{s}_{il}"
                 if k in ref:
                     g = np.asarray(ref[k], float)
                     fr, Pr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
-                    _emit_c(pr, f"@pi {c} {s} {il}", fr, Pr)
-        for k in sorted(x for x in ref if str(x).startswith(f"iv_{c}_")):
-            g = np.asarray(ref[k], float)
-            Vo, I = CD._iv_subsample(g[:, 0], g[:, 1])
-            pr(f"@iv {c} {k[len(f'iv_{c}_'):]}   # Vo[V], I[A]")
-            for a, b in zip(Vo, I):
-                pr(f"  {a:.6e}, {b:.6e}")
+                    blocks.append((3, _bc(f"@pi {c} {s} {il}", fr, Pr)))
+    for o in m["v_out"]:                                  # z(+model)/psrr(+model)/noise(+model)
+        for il in ss_loads:
+            k = f"z_{o}_{il}"
+            if k in ref:
+                g = np.asarray(ref[k], float)
+                fr, Zr = _z_resample(g[:, 0], g[:, 1] + 1j * g[:, 2])
+                lines = _bc(f"@z {o} {il}", fr, Zr)
+                if ("z", o, il) in vm:
+                    lines += _bc(f"@zmodel {o} {il}", fr, _on(fr, *vm[("z", o, il)]))
+                blocks.append((5, lines))
+        for s in m["supplies"]:
+            for il in ss_loads:
+                k = f"p_{o}_{s}_{il}"
+                if k in ref:
+                    g = np.asarray(ref[k], float)
+                    fr, Hr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
+                    lines = _bc(f"@psrr {o} {s} {il}", fr, Hr)
+                    if ("psrr", o, s, il) in vm:
+                        lines += _bc(f"@psrrmodel {o} {s} {il}", fr, _on(fr, *vm[("psrr", o, s, il)]))
+                    blocks.append((6, lines))
+        for il in ss_loads:
+            k = f"noise_{o}_{il}"
+            if k in ref:
+                g = np.asarray(ref[k], float)
+                fr, Sr = CD._logresample_real(g[:, 0], g[:, 1])
+                lines = _br(f"@noise {o} {il}", fr, Sr)
+                if ("noise", o, il) in vm:
+                    lines += _br(f"@noisemodel {o} {il}", fr, _on(fr, *vm[("noise", o, il)]).real)
+                blocks.append((7, lines))
+    # ---- assemble under the optional byte budget (red-zone export cap). Always keep the @meta
+    #      header; add GT blocks highest-priority-first until the budget; NAME anything dropped
+    #      (never a silent truncation -- the human grades above stay authoritative). ----
+    budget = int(budget_kb * 1024) if budget_kb else None
+    used = sum(len(x) + 1 for x in L)
+    dropped = []
+    for _pri, lines in sorted(blocks, key=lambda b: b[0]):
+        sz = sum(len(x) + 1 for x in lines)
+        if budget is not None and used + sz > budget and len(L) > 4:   # past the @meta header
+            dropped.append(lines[0].split("#")[0].strip())
+            continue
+        L.extend(lines)
+        used += sz
+    if dropped:
+        pr(f"# [digest trimmed to ~{budget_kb:g}KB export budget -- OMITTED {len(dropped)} "
+           "block(s): " + ", ".join(dropped) + ". The grades/scores above are authoritative; "
+           "re-emit with a larger budget_kb to carry these for local reproduction.]")
     pr(_MPD_END)
     return L
 
@@ -597,6 +694,7 @@ def parse_multiport_digest(text):
             except ValueError:                                # left the data block
                 _flush()
     _flush()
+    _fanout_temp(ref)               # temp-trimmed digest: fan nominal small-signal across temps
     return ref
 
 
@@ -719,13 +817,17 @@ def _rail_diagnosis(result, npz_path, manifest, o):
 
 
 # --------------------------------------------------------------------- public: report
-def debug_report(result, npz_path, manifest):
+def debug_report(result, npz_path, manifest, budget_kb=None):
     """A single copy-pasteable text debug report for the whole multi-port model.
 
     Header (port roster + fit-param digest) -> per voltage rail (scores table + per-rail
     diagnosis) -> per current sink (scores + current_digest._diagnose) -> worst-case rollup
     (voltage vs current kept separate) -> TO REPRODUCE footer (the 3-line python to
-    regenerate this report locally). Never raises on a degenerate/bad fit."""
+    regenerate this report locally). Never raises on a degenerate/bad fit.
+
+    budget_kb caps the WHOLE report (the red-zone export limit): the human grades/scores are
+    always emitted in full, and the [MPD1] GT digest is held to the remaining budget (see
+    emit_multiport_digest). None = no cap (full digest)."""
     import current_digest as CD
     import fit_isrc
 
@@ -889,7 +991,12 @@ def debug_report(result, npz_path, manifest):
         except Exception:                                 # noqa: BLE001 -- model-carry is optional
             _views = None
         pr("")
-        for line in emit_multiport_digest(ref_full, manifest, views=_views):
+        # the human grades/scores above are authoritative + always full; the digest gets
+        # whatever export budget remains (None => no cap).
+        _dbudget = None
+        if budget_kb:
+            _dbudget = max(1.0, float(budget_kb) - sum(len(x) + 1 for x in L) / 1024.0)
+        for line in emit_multiport_digest(ref_full, manifest, views=_views, budget_kb=_dbudget):
             pr(line)
     except Exception as e:                             # noqa: BLE001 -- digest is best-effort
         pr("")

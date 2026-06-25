@@ -81,6 +81,51 @@ def test_digest_round_trips_current_noise():
     assert abs(reb[k][-1, 1] / In[-1] - 1.0) < 0.3            # HF white floor preserved
 
 
+# --------------------------------------------------- temperature collapse + export budget
+def test_temp_sweep_collapses_small_signal_and_fans_back(tmp_path):
+    """A temperature sweep carries small-signal (z/psrr/noise/y/pi) at the NOMINAL temp of each
+    load only -- it is temperature-invariant in the model -- and @iv per temp; parse fans it back
+    across temps so fit_multiport reproduces unchanged. This is what keeps a 3-temp red-zone
+    report exportable (~Ntemp x smaller) with no modeled-information loss."""
+    npz, m = _sweep_npz(tmp_path, with_temp=True, name="tcol")          # 3 loads x 3 temps
+    res = FMP.fit_multiport(str(npz), m)
+    txt = RMP.debug_report(res, str(npz), m)
+    # z carried once per LOAD (3), NOT per load x temp (9); I-V stays per temp
+    assert txt.count("@z pll ") == 3, "small-signal must be carried at the nominal temp only"
+    assert txt.count("@iv ") >= 3, "I-V (Idc-vs-T) must stay per temp"
+    # parse fans it back to all 3 loads x 3 temps so fit_multiport reads a complete ref
+    reb = RMP.parse_multiport_digest(txt)
+    assert len([k for k in reb if k.startswith("z_pll_")]) == 9, "fan-out must restore every temp"
+    # grades reproduce across the air gap
+    ref_path = RMP.digest_to_npz(txt, str(tmp_path / "rt.npz"))
+    m2 = RMP.parse_manifest(txt)
+    res2 = FMP.fit_multiport(ref_path, m2)
+    g0 = {v["pin"]: v["grade"]["badge"] for v in RMP.port_views(res, str(npz), m)}
+    g2 = {v["pin"]: v["grade"]["badge"] for v in RMP.port_views(res2, ref_path, m2)}
+    assert g0 == g2, f"grades changed across the temp-collapsed air gap: {g0} vs {g2}"
+
+
+def test_digest_budget_drops_lowest_priority_named(tmp_path):
+    """A red-zone export budget caps the digest size: GT blocks are kept highest-value-first
+    (Idc(T) > current-noise > current Y/PSRR > voltage), and anything dropped is NAMED (never a
+    silent truncation). The Idc(T) story survives a tight budget; bulky voltage rails go first."""
+    npz, m = _sweep_npz(tmp_path, with_temp=True, name="tbud")
+    ref = dict(np.load(npz, allow_pickle=True))
+    res = FMP.fit_multiport(str(npz), m)
+    views = RMP.port_views(res, str(npz), m)
+    full = "\n".join(RMP.emit_multiport_digest(ref, m, views=views))
+    bud = len(full.encode()) / 1024 * 0.5                              # force trimming
+    trimmed = "\n".join(RMP.emit_multiport_digest(ref, m, views=views, budget_kb=bud))
+    assert len(trimmed.encode()) / 1024 <= bud + 0.3, "digest must respect the byte budget"
+    assert "digest trimmed" in trimmed and "OMITTED" in trimmed, "drops must be named, not silent"
+    assert "@iv " in trimmed, "Idc(T) is highest priority -- must survive the budget"
+    note = [l for l in trimmed.splitlines() if "digest trimmed" in l][0]
+    assert "@iv" not in note, "Idc(T) must never be the thing dropped"
+    assert any(t in note for t in ("@z ", "@psrr ", "@noise ")), "voltage blocks drop before current"
+    # no budget => nothing dropped (full digest, backward-compatible)
+    assert "digest trimmed" not in full
+
+
 # ----------------------------------------------------------------- manifest round-trips
 def test_parse_manifest_round_trips(tmp_path):
     _npz, m, _res, txt = _build(tmp_path)

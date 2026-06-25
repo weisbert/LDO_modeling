@@ -3910,6 +3910,18 @@ if _HAVE_QT:
             self.rep_summary.setWordWrap(True)
             self.rep_summary.setStyleSheet("color:#234; font-weight:bold;")
             top.addWidget(self.rep_summary, 1)
+            top.addWidget(QLabel("export cap:"))
+            self.rep_budget = QtWidgets.QSpinBox()
+            self.rep_budget.setRange(0, 100000)
+            self.rep_budget.setSingleStep(5)
+            self.rep_budget.setSuffix(" KB")
+            self.rep_budget.setSpecialValueText("none")          # 0 -> no cap
+            self.rep_budget.setToolTip(
+                "Cap the report size for a size-limited red-zone export (e.g. QR-code transfer). "
+                "0 = no cap. The grades/scores are ALWAYS kept in full; only the GT digest is "
+                "trimmed, highest-value-first (Idc(T) / current-noise before the bulky voltage "
+                "rails), and anything dropped is named in the report. Re-copy after changing it.")
+            top.addWidget(self.rep_budget)
             self.rep_copy = QPushButton("Copy debug report")
             self.rep_copy.setToolTip("Copy the copy-pasteable multi-port debug report to the clipboard.")
             self.rep_copy.clicked.connect(self._report_copy)
@@ -4275,7 +4287,9 @@ if _HAVE_QT:
             if getattr(self.extract, "result", None) is None:
                 return ""
             import report_multiport as RMP
-            return RMP.debug_report(self.extract.result, self.extract.npz_path, self.extract.manifest)
+            bud = self.rep_budget.value() or None             # 0 -> no cap
+            return RMP.debug_report(self.extract.result, self.extract.npz_path,
+                                    self.extract.manifest, budget_kb=bud)
 
         def _report_copy(self):
             txt = self._report_text()
