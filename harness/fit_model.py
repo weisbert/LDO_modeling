@@ -129,6 +129,30 @@ def fit_cft():
           f"(vin->vout cap enabled)")
 
 
+def _is_shelf(f, Z):
+    """A loop-ACTIVE output-impedance SHELF, not a passive LC resonance: |Z| climbs
+    ~monotonically to an HF plateau with NO post-peak rolloff, and Re(Z)<0 across the
+    band (the regulator loop sources current -> negative real part). The strictly
+    positive-real zmodel cannot represent this, so it is forced to fake an LC peak; we
+    instead fit |Z| magnitude-only with the output-cap branch held open. The
+    negative-real majority is the physical discriminator that a genuine HF LC peak
+    (whose rolloff merely falls off the right edge of the sweep) does NOT share."""
+    f = np.asarray(f, float); Z = np.asarray(Z)
+    if f.size < 5:
+        return False
+    mag = np.abs(Z)
+    R0 = float(mag[0])
+    if not np.isfinite(R0) or R0 <= 0:
+        return False
+    ipk = int(np.argmax(mag))
+    peak = float(mag[ipk])
+    plateau = float(np.median(mag[f >= 0.5 * f[-1]]))
+    Q = peak / R0
+    frac_neg = float(np.mean(Z.real < 0))            # physical: loop-active => Re Z<0
+    return (frac_neg >= 0.5 and Q > 3.0
+            and ipk >= 0.6 * f.size and plateau > 0.5 * peak)
+
+
 def fit_cout_esr():
     """Auto-extract the physical Cout/ESR (load-independent) from the CAPACITIVE
     HF TAIL of the wideband nominal Zout. Above all resonances the L-branch is
@@ -174,6 +198,15 @@ def fit_cout_esr():
     # ESR from the HF-tail real part (cap impedance smallest there -> Re Z -> ESR)
     tail = f > 0.3 * f[-1]
     Rc = float(max(np.median(Z[tail].real), 1e-3))
+    # SHELF rail: |Z| rises to an HF plateau with no rolloff (loop-active Zout) -> there
+    # is NO physical shunt output cap, and the envelope-fallback cap would clamp the
+    # plateau at HF. Hold the cap branch OPEN (tiny C) so fit_zout can realize the shelf
+    # as R_a + sL_a||R_pl. Decided on the same wideband nominal Zout fit_zout sees, BEFORE
+    # the ghost-cap logic (whose envelope cap is exactly what we must avoid here).
+    if _is_shelf(f, Z):
+        print(f"  shelf gate: Zout is a loop-active rising shelf (no output cap) -> "
+              f"Cout->0.10pF (cap branch held open), ESR={Rc:.3f}ohm")
+        return 1e-13, Rc
     # GHOST-CAP GATE: in the very band the C estimate came from, a real shunt cap
     # DOMINATES Z, so |Z| ~ |ESR+1/jwC| there (the extraction's own premise). On a
     # capless part (HF = rds/parasitics, not 1/jwC; or a near-real Im from a noisy
@@ -290,6 +323,29 @@ def fit_zout(f, Z):
     Lmin = 1.0 / ((TWO_PI * (f[-1] * 3)) ** 2 * C)  # ... no higher than 3*fmax
     Lpk = float(np.clip(1.0 / ((TWO_PI * fpk) ** 2 * C), Lmin, Lmax))
     Lflat = float(np.clip(1.0 / ((TWO_PI * f[-1]) ** 2 * C), Lmin, Lmax))
+
+    # ---- SHELF branch: a loop-active rising Zout (Re Z<0, |Z| -> HF plateau, no LC
+    #      tank). The positive-real zmodel cannot match the negative-real phase, so fit
+    #      |Z| MAGNITUDE-ONLY (the zrms score is magnitude-only) with the cap branch held
+    #      open by fit_cout_esr's clamp. Realizes R_a (LF floor) + sL_a||R_pl (rise to the
+    #      R_a+R_pl plateau, corner at wz=R_pl/L_a). The gate cannot fire on a real LC peak
+    #      (plateau<<peak there, Re Z>=0), so the resonant path below stays byte-identical.
+    if _is_shelf(f, Z):
+        plateau = float(np.median(mag[f >= 0.5 * f[-1]]))
+        R_pl0 = max(plateau - R0, R0)
+        zc = np.sqrt(R0 * max(plateau, R0 * 1.01))           # geomean(floor, plateau)
+        wz = TWO_PI * f[int(np.argmin(np.abs(mag - zc)))]
+        La0 = float(np.clip(R_pl0 / max(wz, TWO_PI * f[0]), Lmin, Lmax))
+
+        def resid_shelf(p):
+            Zm = zmodel(f, np.exp(p[0]), np.exp(p[1]), np.exp(p[2]))
+            return np.log(np.abs(Zm)) - np.log(mag)          # magnitude-only
+        bnds_s = ([np.log(R0 / 5), np.log(Lmin), np.log(R0 / 3)],
+                  [np.log(R0 * 5), np.log(Lmax), np.log(1e9)])
+        ss = least_squares(resid_shelf, [np.log(R0), np.log(La0), np.log(R_pl0)],
+                           method="trf", bounds=bnds_s, max_nfev=4000)
+        Ra, La, Rpl = np.exp(ss.x)
+        return (Ra, La, Rpl, 1e9, 1e-12)                     # branch B off, cap open
 
     def err_x(resid, inits, bnds):
         best = None
@@ -584,29 +640,39 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
     if bank is not None:
         Gb, Qb = bank
         cands.append(("complex", Gb, Qb, _psrr_resid(f, H, zf, Gb, Qb)))
-    # GATED full-real-bank polish (feedthrough parts only): with C_ft enabled the
-    # de-tailed i_c keeps a +90deg LF high-pass character (G0 ~ -G1 cancellation)
-    # that the 1-section shelf cannot carry, SK refuses (complex poles) and the
-    # AAA-init complex bank degenerates on (Target B: shelf 6.3deg -> 2.3deg).
-    # Polish all NPS real sections from the shelf init on the exact realizable
-    # form; keep-best decides. Gated on CFT -> legacy path byte-identical.
-    if CFT > 0.0:
-        w0lo, w0hi = TWO_PI * f[0] / 10.0, TWO_PI * f[-1] * 10.0
+    # MULTI-START full-real-bank polish (always a candidate). Polish all NPS real
+    # sections on the EXACT realizable form, from several decade-spread pole seeds so the
+    # fit is not trapped at the shelf's single corner. Originally gated to feedthrough
+    # parts (CFT>0); now always-on because a loop-active rail (CFT=0, e.g. the real WuR
+    # pll/vco) has a PSRR roll the 1-section shelf / SK / complex bank all miss (5.7->0.2
+    # dB). This can only IMPROVE: every bank3 is just another keep-best candidate, and the
+    # complex-bank PREFERENCE below still wins whenever the complex section is adequate, so
+    # the synthetic non-min-phase variants (V3/V4/V1) stay byte-identical. With C_ft on,
+    # the shelf-seed start also recovers the +90deg LF high-pass character (Target B).
+    w0lo, w0hi = TWO_PI * f[0] / 10.0, TWO_PI * f[-1] * 10.0
 
-        def unpack3(p):
-            return [p[0], p[1], np.exp(p[2]), p[3], np.exp(p[4]), p[5], np.exp(p[6])]
+    def unpack3(p):
+        return [p[0], p[1], np.exp(p[2]), p[3], np.exp(p[4]), p[5], np.exp(p[6])]
 
-        def resid3(p):
-            r = np.log(psrr_model(f, *zf, unpack3(p))) - np.log(H)
-            return np.concatenate([r.real, r.imag])
-        p0 = np.array([G_shelf[0], G_shelf[1],
-                       np.log(np.clip(G_shelf[2], w0lo, w0hi)),
-                       0.0, np.log(TWO_PI * f[0] * 10), 0.0,
-                       np.log(TWO_PI * f[len(f) // 2])])
-        lo3 = np.array([-np.inf, -np.inf, np.log(w0lo), -np.inf, np.log(w0lo),
-                        -np.inf, np.log(w0lo)])
-        hi3 = np.array([np.inf, np.inf, np.log(w0hi), np.inf, np.log(w0hi),
-                        np.inf, np.log(w0hi)])
+    def resid3(p):
+        r = np.log(psrr_model(f, *zf, unpack3(p))) - np.log(H)
+        return np.concatenate([r.real, r.imag])
+    lo3 = np.array([-np.inf, -np.inf, np.log(w0lo), -np.inf, np.log(w0lo),
+                    -np.inf, np.log(w0lo)])
+    hi3 = np.array([np.inf, np.inf, np.log(w0hi), np.inf, np.log(w0hi),
+                    np.inf, np.log(w0hi)])
+    _gm = TWO_PI * float(np.sqrt(f[0] * f[-1]))               # band geomean
+    _tri = np.geomspace(TWO_PI * f[0] * 3, TWO_PI * f[-1] / 3, 3)
+    bank3_seeds = [
+        (G_shelf[2], TWO_PI * f[0] * 10, _gm),               # shelf-corner seed (legacy)
+        tuple(_tri),                                         # decade-spread low->high
+        (TWO_PI * f[-1] / 3, _gm, TWO_PI * f[0] * 10),       # high->low
+        (_gm, TWO_PI * f[0] * 10, TWO_PI * f[-1] / 3),       # mid-anchored
+    ]
+    for w1, w2, w3 in bank3_seeds:
+        p0 = np.array([G_shelf[0], G_shelf[1], np.log(np.clip(w1, w0lo, w0hi)),
+                       0.0, np.log(np.clip(w2, w0lo, w0hi)),
+                       0.0, np.log(np.clip(w3, w0lo, w0hi))])
         try:
             s3 = least_squares(resid3, p0, bounds=(lo3, hi3), method="trf",
                                max_nfev=20000)
