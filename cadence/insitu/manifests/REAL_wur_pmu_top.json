@@ -167,6 +167,9 @@
       55,
       125
     ],
+    "temp_sweep": [
+      "dc"
+    ],
     "enable": {
       "inoise": true
     }

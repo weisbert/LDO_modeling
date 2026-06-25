@@ -829,6 +829,52 @@ def _has_coverage_sweep(m):
     return len(_run.load_axis(m)) > 1 or bool(_manifest.temps(m))
 
 
+def _temp_swept_analyses(m):
+    """Which ANALYSES re-run at every temperature. coverage.temp_sweep:
+      absent / 'all'  -> None      (every group at every temp -- backward-compatible default / PVT)
+      ['dc', ...]     -> that set  (off-nominal temps re-run ONLY these analyses; small-signal runs
+                                    once at the nominal temp -- it is temperature-INVARIANT in the
+                                    emitted model). The modeling-minimal choice is ['dc'] (the I-V
+                                    that feeds Idc(T)); a 3-temp run then drops from ~3x the jobs to
+                                    (all groups once) + (the dc groups per off-nominal temp).
+    Default is FULL so existing runs are unchanged; opt a manifest in with coverage.temp_sweep."""
+    cov = (m.get("coverage") or {})
+    ts = cov.get("temp_sweep")
+    if ts in (None, "", "all"):
+        return None
+    if isinstance(ts, str):
+        return {ts}
+    return set(ts)
+
+
+def _fan_nominal_smallsignal(merged, labels, label_temp, tnom):
+    """Off-nominal temps ran only the temp-dependent (dc/I-V) groups, so their cells carry no
+    small-signal arrays. Copy each load's NOMINAL-temp small-signal onto its off-nominal-temp
+    sibling labels so the assembled npz is COMPLETE for fit_multiport (the temp axis only varies
+    Idc/I-V; the report digest re-collapses this for export). iv_ stays per temp (never fanned).
+    A no-op when a load has a single temp (load-sweep once-cells, or no temp sweep)."""
+    pre = ("z_", "p_", "noise_", "noise_i_", "y_", "pi_")
+
+    def _grp(lbl):
+        t = label_temp.get(lbl)
+        suf = f"_T{t:g}" if (t is not None and t == t) else None      # t==t rejects NaN (no temp)
+        return lbl[:-len(suf)] if suf and lbl.endswith(suf) else lbl
+    import collections
+    bygrp = collections.OrderedDict()
+    for lbl in labels:
+        bygrp.setdefault(_grp(lbl), []).append(lbl)
+    for members in bygrp.values():
+        if len(members) <= 1:
+            continue
+        nom = min(members, key=lambda l: abs((label_temp.get(l) or 0.0) - (tnom or 0.0)))
+        for k in [k for k in list(merged) if k.endswith(f"_{nom}") and k.startswith(pre)]:
+            stem = k[:-len(f"_{nom}")]
+            for sib in members:
+                nk = f"{stem}_{sib}"
+                if nk not in merged:
+                    merged[nk] = merged[k]
+
+
 def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alps",
                            netlistdir=None, ahdllibdir=None, pdk_model_dir=None,
                            base_netlist=None, model_lib=None, model_cell=None, model_path=None,
@@ -930,6 +976,17 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
     all_grps = _run.groups(m)
     swept = [g for g in all_grps if _run.is_load_swept_group(g)]      # 1x AC + noise (per load)
     once = [g for g in all_grps if not _run.is_load_swept_group(g)]   # dc/tran/2x (at the OP)
+    # TEMP-SWEEP SCOPING: re-run only the temperature-dependent analyses (default: dc/I-V ->
+    # Idc(T)) at OFF-nominal temps; small-signal runs ONCE at the nominal temp (it is temp-
+    # invariant in the model). coverage.temp_sweep='all' restores the full per-temp matrix.
+    tsa = _temp_swept_analyses(m)
+    _utemps = sorted(t for t in temps_axis if t is not None)
+    tnom = _utemps[len(_utemps) // 2] if _utemps else None
+
+    def _grps_for(temp, base):
+        if tsa is None or temp is None or temp == tnom or len(_utemps) <= 1:
+            return base                                  # nominal temp / no sweep / 'all': everything
+        return [g for g in base if g["analysis"] in tsa]  # off-nominal: temp-dependent analyses only
 
     # 5) the per-cell runner: run ONE cell (a groups-subset at one op_loads+temp). Each cell has
     #    its OWN netlist + PSF dir under <corner>/{netlist,psf}/<cell_label> (never /simulation/).
@@ -972,12 +1029,17 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
     if "run" in want:
         for temp in temps_axis:
             if load_swept:
-                _cell(once, None, temp, _lbl("Lnom", temp))            # dc/tran/2x at the OP, once
+                _cell(_grps_for(temp, once), None, temp, _lbl("Lnom", temp))     # OP cell (dc per temp)
                 for (load_label, op) in load_axis:
-                    _cell(swept, op, temp, _lbl(load_label, temp))     # AC/noise per load point
+                    _cell(_grps_for(temp, swept), op, temp, _lbl(load_label, temp))  # AC/noise per load
             else:
-                _cell(all_grps, None, temp, _lbl(None, temp))          # everything once per temp
+                _cell(_grps_for(temp, all_grps), None, temp, _lbl(None, temp))   # all @ nom, dc off-nom
         _ran("run")
+        if tsa is not None and len(_utemps) > 1:
+            per_temp = (len(once) + len(swept) * len(load_axis)) if load_swept else len(all_grps)
+            _progress(progress, "run",
+                      f"temp-sweep scoping: small-signal once @ {tnom:g}C, {sorted(tsa)} re-run per "
+                      f"temp ({len(cmds)} job(s) vs {per_temp * len(temps_axis)} full per-temp matrix)")
     res["dsub_cmds"] = cmds
     res["dsub_cmd"] = cmds[0] if cmds else None
     res["loads"] = labels
@@ -988,10 +1050,13 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
     #    return the assembled dsub commands (no npz).
     npz_path = None
     if merged:
-        ref = {"loads": np.array(labels), **merged}
         # meta_iload_<o>: the rail's iload per label (NaN where that cell did not set the rail).
         # We re-derive each cell's op_loads from its label by replaying the loop bookkeeping.
         label_ops, label_temp = _sweep_label_meta(load_axis, temps_axis, load_swept, _lbl)
+        # off-nominal temps ran only the temp-dependent groups -> fan the nominal-temp small-signal
+        # onto their cells so the npz is complete for fit_multiport (no-op without temp scoping).
+        _fan_nominal_smallsignal(merged, labels, label_temp, tnom)
+        ref = {"loads": np.array(labels), **merged}
         for o in m["v_out"]:
             ref[f"meta_iload_{o}"] = np.array(
                 [label_ops.get(lbl, {}).get(o, float("nan")) for lbl in labels], dtype=float)

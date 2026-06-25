@@ -492,5 +492,69 @@ def test_sweep_needs_base_or_factory(tmp_path):
     assert "base_netlist" in str(ei.value) or "netlister_factory" in str(ei.value)
 
 
+# =====================================================================================
+# (N) TEMP-SWEEP SCOPING: coverage.temp_sweep=['dc'] re-runs ONLY the dc/I-V groups at off-
+#     nominal temps (small-signal once at the nominal temp). Default (absent) = full per-temp
+#     matrix (backward-compatible). This is what cuts the real load x temp run 225 -> 81 jobs.
+# =====================================================================================
+def test_temp_sweep_scoping_offnominal_runs_dc_only(tmp_path):
+    m = _wur_cov_manifest(loads=True, temps=True, kinds=True)         # load x temp
+    m["coverage"]["temps"] = [-40, 55, 125]
+    m["coverage"]["temp_sweep"] = ["dc"]
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp_path)
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, corner)
+    grps = RUN.groups(m)
+    swept = [g for g in grps if RUN.is_load_swept_group(g)]
+    once = [g for g in grps if not RUN.is_load_swept_group(g)]
+    once_dc = [g for g in once if g["analysis"] == "dc"]
+    assert once_dc, "fixture needs dc (I-V) groups in the once set"
+    # seed exactly what each cell RUNS: nominal temp -> once(all) + load cells(swept);
+    # off-nominal temps -> the once-cell's dc groups only.
+    for temp in (-40, 55, 125):
+        t = f"T{temp:g}"
+        _seed_cell_psf(dirs, f"Lnom_{t}", once if temp == 55 else once_dc)
+        if temp == 55:
+            for (ll, _op) in RUN.load_axis(m):
+                _seed_cell_psf(dirs, f"{ll}_{t}", swept)
+
+    factory = RecordingFactory()
+    PC.run_pmu_coverage_sweep(
+        manifest=m, work_root=str(tmp_path), corner=corner, engine="alps",
+        base_netlist=str(base), netlistdir=str(base), pdk_model_dir=str(tmp_path / "pdk"),
+        netlister_factory=factory, runner=FakeRunner(), sleep=lambda *_: None,
+        steps=["netlist", "run"])
+
+    ran = {}
+    for ob, tag in factory.groups:
+        ran.setdefault(pathlib.Path(ob).name, set()).add(tag)
+    assert ran["Lnom_T55"] == {g["tag"] for g in once}, "nominal temp runs ALL once-groups"
+    assert ran["Lnom_T-40"] == {g["tag"] for g in once_dc}, f"off-nom dc only: {ran['Lnom_T-40']}"
+    assert ran["Lnom_T125"] == {g["tag"] for g in once_dc}
+    # load cells (swept AC/noise) exist only at the nominal temp -- not re-run off-nominal
+    assert "L0_T55" in ran and "L0_T-40" not in ran and "L0_T125" not in ran
+
+
+def test_fan_nominal_smallsignal_completes_offnominal():
+    """The npz fan: a non-load-swept temp sweep (the cells ARE the corners) copies the nominal
+    temp's small-signal onto its off-nominal siblings so fit_multiport reads a complete npz; @iv
+    is left per-temp. A single-temp load group (load sweep) is a no-op."""
+    merged = {"z_pll_Lnom_T55": np.array([[1.0, 2.0, 0.0]]),
+              "iv_i500n_Lnom_T-40": np.array([[0.0, 1e-6]]),
+              "iv_i500n_Lnom_T55": np.array([[0.0, 2e-6]]),
+              "iv_i500n_Lnom_T125": np.array([[0.0, 3e-6]])}
+    labels = ["Lnom_T-40", "Lnom_T55", "Lnom_T125"]
+    ltemp = {"Lnom_T-40": -40.0, "Lnom_T55": 55.0, "Lnom_T125": 125.0}
+    PC._fan_nominal_smallsignal(merged, labels, ltemp, 55.0)
+    assert "z_pll_Lnom_T-40" in merged and "z_pll_Lnom_T125" in merged
+    assert merged["z_pll_Lnom_T-40"] is merged["z_pll_Lnom_T55"], "off-nom small-signal = nominal copy"
+    assert merged["iv_i500n_Lnom_T-40"][0, 1] == 1e-6, "@iv must stay per temp (never fanned)"
+    # a load-sweep once-cell (single temp per load group, temp=NaN) -> no-op
+    m2 = {"z_pll_L0": np.array([[1.0, 2.0, 0.0]])}
+    PC._fan_nominal_smallsignal(m2, ["L0"], {"L0": float("nan")}, None)
+    assert list(m2) == ["z_pll_L0"]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

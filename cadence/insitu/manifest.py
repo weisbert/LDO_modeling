@@ -357,6 +357,13 @@ def _validate_coverage(m):
     for t in tps:
         if isinstance(t, bool) or not isinstance(t, (int, float)):
             raise ManifestError(f"coverage.temps must be numbers, got {t!r}")
+    ts = cov.get("temp_sweep")
+    if ts is not None and ts != "all" and not (
+            isinstance(ts, list) and all(isinstance(x, str) for x in ts)):
+        raise ManifestError(
+            "coverage.temp_sweep must be 'all' (every measurement at every temp -- PVT-style) "
+            "or a list of analysis names (e.g. ['dc']); default re-runs only the temperature-"
+            "dependent analyses (the I-V that feeds Idc(T)), small-signal once at the nominal temp")
 
 
 def analysis_override(m, role, key, kind):
