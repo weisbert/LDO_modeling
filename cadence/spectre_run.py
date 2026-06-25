@@ -35,6 +35,14 @@ def _env():
     return e
 
 
+def available():
+    """True iff the local Spectre binary is runnable under our env. The parse-gate (and any
+    spectre-dependent test) skips when this is False -- i.e. on CI or the company box, which
+    have no local Cadence/Spectre install -- so those decks are validated only where Spectre
+    actually exists (the dev box). Cheap: a PATH lookup under _env(), no process launch."""
+    return shutil.which("spectre", path=_env()["PATH"]) is not None
+
+
 def run(scs_text, tag, aux=(), timeout=300):
     """Write `scs_text` to <WORK>/<tag>/input.scs, run `spectre -64`, and parse
     every PSF analysis output. Returns {analysis_name: parsed_dict}. Raises with
