@@ -1024,44 +1024,75 @@ if _HAVE_QT:
             cov = QGroupBox("Coverage — what to characterize")
             cov.setStyleSheet("QGroupBox{font-weight:bold;}")
             covf = QFormLayout(cov)
-            self.f_cov_tier = QComboBox()
-            self.f_cov_tier.addItems(["T0", "T1", "T2", "T3", "T4"])
-            self.f_cov_tier.setCurrentText("T4")             # default = FULL tier ladder
-            self.f_cov_tier.setToolTip(
-                "The coverage tier — a NESTED ADDITIVE ladder (each tier adds its sims on top of "
-                "every lower one):\n"
-                "  T0  LTI AC + .noise at the OP (Zout/PSRR/Y/pi/noise)\n"
-                "  T1  + transient slew/recovery steps\n"
-                "  T2  + DC I-V (current sinks) + dropout/load-reg (rails)\n"
-                "  T3  + the per-rail load schedule (AC/noise repeated at each iload)\n"
-                "  T4  + temperature corners\n"
-                "DEFAULT = T4 (full). NB: a tier alone adds ZERO points until you DECLARE the "
-                "matching per-rail sweep (iload/trans/iv/temps) — a tier with no declared params "
-                "reproduces the identical T0 matrix.")
-            covf.addRow("tier", self.f_cov_tier)
+            # Coverage SELECTION = a flat per-measurement checkbox grid (the source of truth) +
+            # preset buttons that fill it to a tier ladder. Replaces the single tier combo: voltage
+            # noise (the always-on T0 item) is now VISIBLE and ANY subset is expressible (e.g. "T0 +
+            # temperature only", impossible with the old additive combo). Serialized back to the
+            # UNCHANGED manifest schema (coverage.tier + minimal coverage.enable deltas) by
+            # _coverage_to_dict, so every downstream consumer is untouched.
+            from insitu import manifest as _Mcov
+            _preset = QWidget(); _prl = QHBoxLayout(_preset)
+            _prl.setContentsMargins(0, 0, 0, 0); _prl.addWidget(QLabel("preset:"))
+            for _t in _Mcov.TIERS:
+                _b = QPushButton(_t); _b.setFixedWidth(38)
+                _b.setToolTip(f"tick every measurement up to {_t} (nested additive ladder); "
+                              f"then fine-tune the boxes individually")
+                _b.clicked.connect(lambda _chk=False, t=_t: self._cov_preset(t))
+                _prl.addWidget(_b)
+            _prl.addStretch(1)
+            covf.addRow("tier preset", _preset)
+            _cov_labels = [
+                ("ac",            "AC transfers — Zout / PSRR / admittance (core)"),
+                ("noise",         "Output noise — VOLTAGE rails"),
+                ("slew",          "Load-step transient — slew / recovery"),
+                ("iv",            "I-V compliance — current sinks"),
+                ("dropout",       "Dropout / load-regulation — rails"),
+                ("load_schedule", "Load schedule — AC/noise at each iload"),
+                ("temp",          "Temperature corners"),
+                ("inoise",        "Output noise — CURRENT sinks (opt-in)"),
+            ]
+            _cov_tips = {
+                "ac": "Core LTI AC at the OP: Zout, PSRR per supply, sink admittance + current-PSRR.",
+                "noise": "Voltage-output .noise → each rail's output-noise spectrum. Part of the T0 "
+                         "core; shown explicitly now (untick only to skip it).",
+                "slew": "The 'slew' coverage MEASUREMENT (T1): transient load steps → dynamic "
+                        "recovery. Emits a point only where a per-rail 'trans' cell is filled. "
+                        "SEPARATE from the slew_en model param below.",
+                "iv": "DC I-V compliance sweep on each current sink (T2). Needs a per-sink 'iv_sweep' cell.",
+                "dropout": "DC dropout / load-regulation sweep on each rail (T2). Needs a per-rail cell.",
+                "load_schedule": "Repeat AC/noise at multiple load points (T3). Needs per-rail iload sweeps.",
+                "temp": "Repeat the suite at the temperature corners listed below (T4).",
+                "inoise": "OPT-IN current-output .noise (probe-form) on each i_out → the Report tab's "
+                          "current-noise panel. No tier turns it on; one extra analysis per sink.",
+            }
+            self.f_cov_items = {}
+            _items_w = QWidget(); _igl = QGridLayout(_items_w)
+            _igl.setContentsMargins(0, 0, 0, 0)
+            for _i, (_k, _lab) in enumerate(_cov_labels):
+                _cb = QCheckBox(_lab); _cb.setToolTip(_cov_tips[_k])
+                self.f_cov_items[_k] = _cb
+                _igl.addWidget(_cb, _i // 2, _i % 2)
+            self.f_cov_inoise = self.f_cov_items["inoise"]   # back-compat alias for old references
+            covf.addRow("measurements", _items_w)
+            self._cov_preset("T4")                           # default = full ladder (every box but inoise)
             self.f_cov_temps = QLineEdit()
             self.f_cov_temps.setPlaceholderText("blank → single (session) temp; e.g. -40,55,125")
             self.f_cov_temps.setToolTip(
                 "Temperature corners in °C, comma-separated → coverage.temps. Blank → [] (a single "
-                "session temp, no temp sweep). e.g. -40,55,125 (middle = nominal/model-bake temp).")
+                "session temp, no temp sweep). e.g. -40,55,125 (middle = nominal/model-bake temp). "
+                "Swept only when the 'Temperature corners' box above is ticked.")
             covf.addRow("temperature corners [°C]", self.f_cov_temps)
             self.f_cov_slew = QCheckBox("emit slew_en core (default off = model runs LTI)")
             self.f_cov_slew.setToolTip(
-                "Sets the emitted VA param coverage.slew_en (0/1). Even when T1 is extracted (the "
-                "model CARRIES the slew core), the model runs LTI until slew_en=1. Default OFF.")
-            covf.addRow("slew_en", self.f_cov_slew)
+                "Sets the emitted VA param coverage.slew_en (0/1) — a MODEL knob, NOT a measurement. "
+                "Even when the 'Load-step transient' box is ticked (the model CARRIES the slew core), "
+                "the model runs LTI until slew_en=1. Default OFF.")
+            covf.addRow("slew_en (model)", self.f_cov_slew)
             self.f_cov_lin = QCheckBox("2× amplitude linearity self-check (guardrail 4)")
             self.f_cov_lin.setToolTip(
                 "coverage.lin_gate: rerun one AC point at 2× drive amplitude; ratio-invariance "
                 "certifies the OP is linear (the one-hot superposition assumption holds). Default OFF.")
-            covf.addRow("lin_gate", self.f_cov_lin)
-            self.f_cov_inoise = QCheckBox("measure current-output noise (coverage.enable.inoise)")
-            self.f_cov_inoise.setToolTip(
-                "OPT-IN current-output NOISE: adds a probe-form .noise on each i_out so the Report "
-                "tab's current-noise panel (In vs f) has GT to fit + emit. NO tier auto-enables it "
-                "(the extra .noise costs one analysis per current port). Needed for the bias refs' "
-                "output-current noise → VCO phase-noise / PLL jitter. Default OFF.")
-            covf.addRow("current noise", self.f_cov_inoise)
+            covf.addRow("lin_gate (QA)", self.f_cov_lin)
             cov_help = QLabel(
                 "<span style='color:#678'>Per-rail load sweeps live in the Voltage-outputs "
                 "<b>“iload sweep”</b> + <b>“trans”</b> columns; per-sink I-V lives in the "
@@ -1612,19 +1643,28 @@ if _HAVE_QT:
                 self._set_row_checked(self.t_supplies, r, "PSRR→I",
                                       check_all or key in cset)
 
+        def _cov_preset(self, tier):
+            """A preset button: tick every coverage MEASUREMENT up to `tier` (the nested additive
+            ladder), untick the rest. inoise is in no tier, so a preset never ticks it (opt-in)."""
+            from insitu import manifest as M
+            on = M.tier_cumulative(tier)
+            for it, cb in self.f_cov_items.items():
+                cb.setChecked(it in on)
+
         def _dict_to_coverage(self, m):
             """Populate the Coverage widgets + the per-rail/per-sink coverage table cells from
             m['coverage']. ABSENT coverage -> tier=T4 defaults + empty cells (a no-coverage
             manifest opens clean). The role tables must already be filled (the cells key by row)."""
+            from insitu import manifest as M
             cov = m.get("coverage") or {}
-            tier = cov.get("tier", "T4")
-            self.f_cov_tier.setCurrentText(tier if tier in
-                                           ("T0", "T1", "T2", "T3", "T4") else "T4")
+            # the 8 per-measurement checkboxes mirror coverage_enabled() EXACTLY (absent coverage ->
+            # tier T4 default -> every item on but inoise); slew_en/lin_gate are separate model/QA knobs.
+            for it, cb in self.f_cov_items.items():
+                cb.setChecked(M.coverage_enabled(m, it))
             tps = cov.get("temps") or []
             self.f_cov_temps.setText(", ".join(self._fmt_num(t) for t in tps))
             self.f_cov_slew.setChecked(bool(int(cov.get("slew_en", 0) or 0)))
             self.f_cov_lin.setChecked(bool(cov.get("lin_gate", False)))
-            self.f_cov_inoise.setChecked(bool((cov.get("enable") or {}).get("inoise", False)))
             # per-rail / per-sink cells -- keyed by the row's key text.
             loads = cov.get("loads") or {}
             trans = cov.get("transient") or {}
@@ -2474,17 +2514,21 @@ if _HAVE_QT:
             import copy
             cov = copy.deepcopy(prev) if isinstance(prev, dict) else {}
 
-            tier = self.f_cov_tier.currentText().strip() or "T4"
+            from insitu import manifest as M
+            # the flat per-measurement checkboxes are the source of truth; serialize them back to the
+            # UNCHANGED schema (tier + minimal enable deltas) so every downstream consumer is untouched
+            # and a checkbox set matching a tier ladder stays byte-identical to the old tier-only form.
+            checked = {it for it, cb in self.f_cov_items.items() if cb.isChecked()}
+            tier, enable_delta = M.coverage_items_to_tier_enable(checked)
             cov["tier"] = tier
             # temps: explicit floats AND Cadence start:step:stop ranges (inclusive of stop),
             # comma-mixed -- via the one shared grammar (manifest.expand_temp_set).
-            from insitu import manifest as M
             temps = M.expand_temp_set(self.f_cov_temps.text())
             if temps:
                 cov["temps"] = temps
             else:
                 cov.pop("temps", None)
-            if self.f_cov_slew.isChecked():
+            if self.f_cov_slew.isChecked():        # slew_en: a MODEL param, independent of the 'slew' item
                 cov["slew_en"] = 1
             else:
                 cov.pop("slew_en", None)
@@ -2492,13 +2536,12 @@ if _HAVE_QT:
                 cov["lin_gate"] = True
             else:
                 cov.pop("lin_gate", None)
-            # current-output noise lives under the nested coverage.enable; preserve any OTHER
-            # enable overrides the form does not surface, drop the whole dict when it empties.
+            # enable: the form OWNS all 8 COVERAGE_ITEMS -> rebuild their deltas; preserve any
+            # UNMODELED enable key carried in `prev`. Drop the dict when it empties.
             en = dict(cov.get("enable") or {})
-            if self.f_cov_inoise.isChecked():
-                en["inoise"] = True
-            else:
-                en.pop("inoise", None)            # off -> drop the override (no tier auto-enables it)
+            for it in M.COVERAGE_ITEMS:
+                en.pop(it, None)
+            en.update(enable_delta)
             if en:
                 cov["enable"] = en
             else:
@@ -6607,8 +6650,12 @@ def _selftest_manifest_editor(win, tmp):
         "iv": {"i3p6u_vco": {"sweep": {"type": "lin", "start": 0.0, "stop": 1.1, "n": 12}}},
     }
     dlgc = _ManifestEditorDialog(win, json.dumps(base), None)
-    # the global coverage widgets populate
-    assert dlgc.f_cov_tier.currentText() == "T2", "coverage tier did not populate the combo"
+    # the global coverage widgets populate: the 8 per-measurement checkboxes mirror tier T2 (ac/
+    # noise/slew/iv/dropout on; load_schedule/temp off) PLUS the explicit enable.inoise override.
+    _ck = {k: cb.isChecked() for k, cb in dlgc.f_cov_items.items()}
+    assert all(_ck[k] for k in ("ac", "noise", "slew", "iv", "dropout", "inoise")) \
+        and not _ck["load_schedule"] and not _ck["temp"], \
+        f"coverage checkboxes did not reflect tier T2 + enable.inoise: {_ck}"
     assert dlgc.f_cov_slew.isChecked(), "slew_en did not populate the checkbox"
     assert dlgc.f_cov_lin.isChecked(), "lin_gate did not populate the checkbox"
     assert dlgc.f_cov_inoise.isChecked(), "coverage.enable.inoise did not populate the checkbox"
@@ -6658,14 +6705,17 @@ def _selftest_manifest_editor(win, tmp):
     nocov = json.dumps({"name": "nc", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
                         "v_out": {"o": {"net": "VO"}}, "i_out": {"c": {"net": "IC", "dc": 0.9}}})
     dlgn = _ManifestEditorDialog(win, nocov, None)
-    assert dlgn.f_cov_tier.currentText() == "T4", "no-coverage manifest must default the tier to T4"
+    # no-coverage manifest opens as the full T4 default: every measurement box ticked but inoise.
+    _ckn = {k: cb.isChecked() for k, cb in dlgn.f_cov_items.items()}
+    assert all(_ckn[k] for k in dlgn.f_cov_items if k != "inoise") and not _ckn["inoise"], \
+        f"no-coverage manifest must open as the full T4 default (every box but inoise): {_ckn}"
     assert dlgn.f_cov_temps.text() == "" and not dlgn.f_cov_slew.isChecked() \
-        and not dlgn.f_cov_lin.isChecked() and not dlgn.f_cov_inoise.isChecked(), \
-        "no-coverage manifest must open with empty coverage knobs"
+        and not dlgn.f_cov_lin.isChecked(), \
+        "no-coverage manifest must open with empty slew_en/lin_gate/temps knobs"
     n_out = dlgn._form_to_dict()
     assert "coverage" not in n_out, "a no-coverage manifest must NOT emit a coverage key (byte-clean)"
-    # ... but flipping ONE knob (tier T4->T1) does emit a minimal, valid coverage section.
-    dlgn.f_cov_tier.setCurrentText("T1")
+    # ... but a non-default selection (preset T1 = ac/noise/slew only) emits a minimal coverage section.
+    dlgn._cov_preset("T1")
     n_out2 = dlgn._form_to_dict()
     assert n_out2.get("coverage", {}).get("tier") == "T1", "a non-default tier must emit coverage.tier"
     assert "loads" not in n_out2["coverage"] and "temps" not in n_out2["coverage"], \

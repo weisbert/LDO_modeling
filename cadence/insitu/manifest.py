@@ -147,6 +147,36 @@ def coverage_enabled(m, item):
     return False
 
 
+def tier_cumulative(tier):
+    """The SET of COVERAGE_ITEMS a tier turns on (its own items + every lower tier's). Used by the
+    GUI 'preset' buttons to fill the per-item checkboxes. inoise is in NO tier -> never included
+    (it stays opt-in). An unknown tier degrades to the full ladder (defensive, mirrors
+    coverage_enabled)."""
+    idx = TIERS.index(tier) if tier in TIERS else len(TIERS) - 1
+    out = set()
+    for t in TIERS[: idx + 1]:
+        out |= set(_TIER_ITEMS[t])
+    return out
+
+
+def coverage_items_to_tier_enable(checked):
+    """Inverse of coverage_enabled across all COVERAGE_ITEMS: given the SET of items the user wants
+    ON, return (tier, enable) such that coverage_enabled() reproduces EXACTLY that set. Picks the
+    tier whose cumulative ladder-set is CLOSEST to `checked` (fewest enable-overrides), then emits
+    enable[item] deltas -- True for a checked item the tier doesn't turn on, False for a tier-on
+    item left unchecked. A `checked` that equals a tier's ladder -> (that tier, {}), byte-identical
+    to the old tier-only UI so existing manifests round-trip unchanged. inoise (in no tier) -> a
+    True delta when checked, absent otherwise -> stays opt-in. This is what the redesigned coverage
+    UI (flat per-item checkboxes + tier preset) serializes through, keeping the manifest schema
+    (tier + enable) and every downstream consumer untouched."""
+    checked = {it for it in checked if it in COVERAGE_ITEMS}
+    # tie-break on the LOWEST tier (fewest items auto-on -> the most explicit, least-surprising form)
+    best = min(TIERS, key=lambda t: (len(tier_cumulative(t) ^ checked), TIERS.index(t)))
+    on_set = tier_cumulative(best)
+    enable = {it: (it in checked) for it in COVERAGE_ITEMS if (it in checked) != (it in on_set)}
+    return best, enable
+
+
 def _expand_sweep(sweep):
     """A {'type':'lin'|'log','start','stop','n'} sweep -> an ascending python list of floats.
     n<=1 -> [start]. log requires start>0,stop>0. Pure python (no numpy)."""
