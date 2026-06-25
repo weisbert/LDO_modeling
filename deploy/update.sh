@@ -51,7 +51,11 @@ echo "[2/2] re-running smoke test ..."
 # bundled-Qt isolation (same as bootstrap): beat the box's system/Cadence libQt5Core.so.5
 QTLIB="$(echo "$PREFIX"/.venv/lib/python3.*/site-packages/PyQt5/Qt5/lib)"
 export LD_LIBRARY_PATH="$QTLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-QT_QPA_PLATFORM=offscreen "$PREFIX/.venv/bin/python" \
+# LDO_NOISE_FAST: this is a deploy SANITY check, not a modeling-quality gate. It caps the
+# noise-bank least-squares budget (a single non-converging corner otherwise burns max_nfev=30000
+# ~= 20s, status=0 -- the entire slowdown) and skips the adaptive 6->10 escalation. Full
+# budget + adaptation stay in the pytest/CI selftest. Cuts the smoke from ~21s to ~2s.
+QT_QPA_PLATFORM=offscreen LDO_NOISE_FAST=1 "$PREFIX/.venv/bin/python" \
     "$PREFIX/app/gui/ldo_modeler.py" --selftest --require-qt
 
 cp "$HERE/MANIFEST.json" "$PREFIX/MANIFEST.deployed.json"

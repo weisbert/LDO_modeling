@@ -15,6 +15,7 @@ model/ldo_model.lib. Topology (all linear/passive -> HB/PSS-robust, no laplace_n
 Per-load corner {R_a, L_a, Rpass, g_lf, wz, Vn_white} fitted; model selects by `iload`.
 """
 import argparse
+import os
 from dataclasses import dataclass, field
 import numpy as np
 from scipy.optimize import least_squares
@@ -354,6 +355,17 @@ NOISE_MODE = "norton"   # noise-block structure: "norton" (legacy Norton current
 NFKV = []    # module global: shared series voltage-bank Lorentzian corner freqs (hybrid)
 NSPUR_F = []   # module global: intrinsic discrete-spur freqs (Hz, load-independent)
 NSPUR_PH = []  # module global: spur SIN injection phase (rad) at the nominal corner
+
+
+def _noise_nfev():
+    """Deploy SMOKE fast-path (deploy/update.sh sets LDO_NOISE_FAST): cap the noise-bank
+    least-squares budget. Converging fits use 40-60 nfev; a non-converging corner otherwise
+    burns the full 30000 (~20s, status=0) and IS the entire `bash apply` slowdown. The cap makes
+    the smoke fast WITHOUT changing it elsewhere -- unset (pytest / CI / the real box extraction)
+    keeps the full budget, byte-identical for every converging fit."""
+    return 2000 if os.environ.get("LDO_NOISE_FAST") else 30000
+
+
 KT4 = 4 * 1.380649e-23 * 300.0   # 4kT at 300K (resistor thermal-noise scale)
 NRk = 1e6    # fixed section resistor; gm transconductance sets each section amplitude
 
@@ -687,7 +699,7 @@ def fit_noise_bank(zfits, M=MNOISE):
             init += [float(np.log(In2[-3:].mean() + 1e-80))]
             init += list(np.log(np.interp(np.exp(fks0), f, In2) + 1e-80))
             lob += [-200.0] * (M + 1); hib += [60.0] * (M + 1)
-        s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=30000)
+        s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=_noise_nfev())
         fks = np.exp(s.x[:M]); rest = s.x[M:].reshape(nL, M + 1)
         # worst-corner Sv-domain log-RMS (Sv=sqrt(In2)*|Z| with the same Z -> the In2
         # log-ratio /2 IS the Sv dB error); drives the adaptive-M trigger below
@@ -728,7 +740,14 @@ def fit_noise_bank(zfits, M=MNOISE):
     # can remove (e.g. the In-dip at the Zout peak: the bank is monotone-down + white,
     # it cannot dip below its own HF floor; that is the known loop-noise-shape bound).
     best, wbest = fit_M(M)
-    while wbest > NOISE_ADAPT_TRIG and len(best["fk"]) < NOISE_M_MAX:
+    # The adaptive escalation (greedily inserting sections, M -> NOISE_M_MAX) is the dominant fit
+    # cost: each insert re-runs a full least_squares. The deploy SMOKE test (deploy/update.sh sets
+    # LDO_NOISE_FAST) only needs an end-to-end sanity fit, not the full 6->10 search on a
+    # reference that never converges below the trigger anyway -> skip the escalation there (~5x
+    # faster `bash apply`). UNSET (pytest / CI / the real box runs) -> full adaptive path,
+    # byte-identical. The 14 production refs fit <=3.7dB at M=6 and never adapt regardless.
+    _adapt = not os.environ.get("LDO_NOISE_FAST")
+    while _adapt and wbest > NOISE_ADAPT_TRIG and len(best["fk"]) < NOISE_M_MAX:
         fstar = worst_point_freq(best)
         fstar = float(np.clip(fstar, f0 / 5 * 1.01, f1 * 5 * 0.99))
         NB2, w2 = fit_M(len(best["fk"]) + 1, fks_init=list(best["fk"]) + [fstar])
@@ -822,7 +841,7 @@ def fit_noise_hybrid(zfits, M=4):
             init += list(np.log(np.interp(np.exp(fks0), f, Vt2) + 1e-80))
             init += [float(np.log(np.mean(Sv2[-3:] / (Z2[-3:] + 1e-80)) + 1e-80))]  # gw2
             lob += [-200.0] * (M + 2); hib += [60.0] * (M + 2)
-        s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=30000)
+        s = least_squares(resid, init, bounds=(lob, hib), method="trf", max_nfev=_noise_nfev())
         fks = np.exp(s.x[:M]); rest = s.x[M:].reshape(nL, M + 2)
         # worst-corner Sv-domain log-RMS (Sv^2 log-ratio in 10log10 IS the Sv dB error)
         worst = 0.0
@@ -857,7 +876,8 @@ def fit_noise_hybrid(zfits, M=4):
         return fbest
 
     best, wbest = fit_M(M)
-    while wbest > NOISE_ADAPT_TRIG and len(best["fkv"]) < 8:
+    _adapt = not os.environ.get("LDO_NOISE_FAST")    # smoke fast-path (see fit_noise_bank)
+    while _adapt and wbest > NOISE_ADAPT_TRIG and len(best["fkv"]) < 8:
         fstar = float(np.clip(worst_point_freq(best), f0 / 5 * 1.01, f1 * 5 * 0.99))
         NH2, w2 = fit_M(len(best["fkv"]) + 1, fks_init=list(best["fkv"]) + [fstar])
         if w2 < wbest - 1e-9:
