@@ -498,6 +498,15 @@ def emit_multiport_digest(ref, manifest, views=None):
                 g = np.asarray(ref[k], float)
                 fr, Yr = CD._logresample_complex(g[:, 0], g[:, 1] + 1j * g[:, 2])
                 _emit_c(pr, f"@y {c} {il}", fr, Yr)
+        for il in loads:
+            # current-output noise GT (A/rtHz) -- only when coverage.inoise measured it. Carrying it
+            # makes a pasted report reproduce + RETUNE the current-noise fit (in_white/in_kf); without
+            # it the noise_i panel could not be rebuilt from a paste (the reproducibility gap).
+            k = f"noise_i_{c}_{il}"
+            if k in ref:
+                g = np.asarray(ref[k], float)
+                fr, Sr = CD._logresample_real(g[:, 0], g[:, 1])
+                _emit_r(pr, f"@noise_i {c} {il}", fr, Sr)
         for s in m["current_psrr_supplies"]:
             for il in loads:
                 k = f"pi_{c}_{s}_{il}"
@@ -537,6 +546,8 @@ def parse_multiport_digest(text):
                 ref[f"noise_{toks[0]}_{toks[1]}"] = arr
             elif kind == "y" and len(toks) >= 2:
                 ref[f"y_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "noise_i" and len(toks) >= 2:
+                ref[f"noise_i_{toks[0]}_{toks[1]}"] = arr
             elif kind == "pi" and len(toks) >= 3:
                 ref[f"pi_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
             elif kind == "iv" and len(toks) >= 2:

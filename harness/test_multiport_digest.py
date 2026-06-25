@@ -61,6 +61,26 @@ def test_digest_rebuilds_all_fit_keys(tmp_path):
                        np.asarray(raw["meta_iload_pll"], float), equal_nan=True)
 
 
+def test_digest_round_trips_current_noise():
+    """@noise_i carries the current-output noise GT (A/rtHz) so a pasted report can rebuild +
+    RETUNE the in_white/in_kf fit -- closing the reproducibility gap when coverage.inoise ran (the
+    digest previously emitted @y/@pi/@iv for sinks but NOT their noise, so noise_i was unfixable
+    from a paste)."""
+    f = np.logspace(1, 8, 60)
+    In = np.sqrt(1e-12 ** 2 + 1e-22 / f)                       # white + flicker
+    ref = {"loads": np.array(["tt_25c"]),
+           "noise_i_i500n_lpf_tt_25c": np.c_[f, In]}
+    m = {"name": "t", "v_out": {}, "supplies": {},
+         "i_out": {"i500n_lpf": {"net": "N", "pin": "P"}}, "current_psrr_supplies": []}
+    txt = "\n".join(RMP.emit_multiport_digest(ref, m))
+    assert "@noise_i i500n_lpf tt_25c" in txt, "current-noise GT not emitted to the digest"
+    reb = RMP.parse_multiport_digest(txt)
+    k = "noise_i_i500n_lpf_tt_25c"
+    assert k in reb, "current-noise key did not round-trip through the digest"
+    assert reb[k].shape[1] == 2 and reb[k].shape[0] >= 10      # [f, In], log-resampled
+    assert abs(reb[k][-1, 1] / In[-1] - 1.0) < 0.3            # HF white floor preserved
+
+
 # ----------------------------------------------------------------- manifest round-trips
 def test_parse_manifest_round_trips(tmp_path):
     _npz, m, _res, txt = _build(tmp_path)
