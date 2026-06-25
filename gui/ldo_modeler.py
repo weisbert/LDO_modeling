@@ -1111,6 +1111,28 @@ if _HAVE_QT:
                 "session temp, no temp sweep). e.g. -40,55,125 (middle = nominal/model-bake temp). "
                 "Swept only when the 'Temperature corners' box above is ticked.")
             covf.addRow("temperature corners [°C]", self.f_cov_temps)
+            # OPTION-2: make the temperature SCOPE explicit -- WHICH measurements re-run at every
+            # temperature corner (the rest run once at the nominal temp, where they are temperature-
+            # invariant in the emitted model). Maps to coverage.temp_sweep: a SUBSET -> ['dc',...];
+            # all four ticked == full PVT == the backward-compatible default (omitted). This removes
+            # the "global temps with no declared scope" ambiguity -- the field now SAYS what it hits.
+            self.f_cov_temp_sweep = {}
+            _ts_w = QWidget(); _tsg = QGridLayout(_ts_w)
+            _tsg.setContentsMargins(0, 0, 0, 0)
+            for _i, (_k, _lab) in enumerate([("dc", "current Idc / I-V (sinks → PTAT)"),
+                                             ("ac", "Zout / PSRR (AC)"),
+                                             ("noise", "output noise"),
+                                             ("tran", "load-step transient")]):
+                _cb = QCheckBox(_lab); _cb.setChecked(True)         # default full; overridden on load
+                _cb.setToolTip(
+                    "Tick the measurements that re-run at EVERY temperature corner; the rest run once "
+                    "at the nominal (median) temp -- they are temperature-invariant in the emitted "
+                    "model. The modeling-minimal choice is just 'current Idc / I-V' (what feeds the "
+                    "PTAT Idc(T) coefficient). Tick all four for a full PVT-coverage pass. Only takes "
+                    "effect when 'temperature corners' above are set.")
+                self.f_cov_temp_sweep[_k] = _cb
+                _tsg.addWidget(_cb, _i // 2, _i % 2)
+            covf.addRow("temperature applies to", _ts_w)
             self.f_cov_slew = QCheckBox("emit slew_en core (default off = model runs LTI)")
             self.f_cov_slew.setToolTip(
                 "Sets the emitted VA param coverage.slew_en (0/1) — a MODEL knob, NOT a measurement. "
@@ -1692,6 +1714,12 @@ if _HAVE_QT:
                 cb.setChecked(M.coverage_enabled(m, it))
             tps = cov.get("temps") or []
             self.f_cov_temps.setText(", ".join(self._fmt_num(t) for t in tps))
+            # temperature scope (option-2): absent / 'all' = full (every box ticked); a list -> those.
+            ts = cov.get("temp_sweep")
+            _ticked = (set(self.f_cov_temp_sweep) if ts is None or ts == "all"
+                       else {ts} if isinstance(ts, str) else set(ts))
+            for _a, _cb in self.f_cov_temp_sweep.items():
+                _cb.setChecked(_a in _ticked)
             self.f_cov_slew.setChecked(bool(int(cov.get("slew_en", 0) or 0)))
             self.f_cov_lin.setChecked(bool(cov.get("lin_gate", False)))
             # per-rail / per-sink cells -- keyed by the row's key text.
@@ -2557,6 +2585,17 @@ if _HAVE_QT:
                 cov["temps"] = temps
             else:
                 cov.pop("temps", None)
+            # temperature SCOPE (option-2): which analyses re-run per temp. Only meaningful WITH temps;
+            # a SUBSET serializes to coverage.temp_sweep, all-four (== full PVT, the default) is omitted.
+            if temps:
+                _ts = [a for a in ("dc", "ac", "noise", "tran")
+                       if self.f_cov_temp_sweep[a].isChecked()]
+                if len(_ts) == 4:
+                    cov.pop("temp_sweep", None)
+                else:
+                    cov["temp_sweep"] = _ts
+            else:
+                cov.pop("temp_sweep", None)
             if self.f_cov_slew.isChecked():        # slew_en: a MODEL param, independent of the 'slew' item
                 cov["slew_en"] = 1
             else:
@@ -2605,7 +2644,8 @@ if _HAVE_QT:
             overlay("iv", self.t_iout, "iv_sweep", self._ivcov_from_text)
 
             # byte-clean drop: only the default tier + nothing else set + nothing inherited.
-            non_default = (tier != "T4" or "temps" in cov or "slew_en" in cov or "lin_gate" in cov
+            non_default = (tier != "T4" or "temps" in cov or "temp_sweep" in cov
+                           or "slew_en" in cov or "lin_gate" in cov
                            or cov.get("loads") or cov.get("transient") or cov.get("iv")
                            or cov.get("dropout") or cov.get("enable"))
             if not non_default:
@@ -6734,6 +6774,21 @@ def _selftest_manifest_editor(win, tmp):
     assert cd.get("enable", {}).get("inoise") is True, \
         f"coverage.enable.inoise did not round-trip: {cd.get('enable')}"
     assert cd["temps"] == [-40, 55, 125], f"temps did not round-trip: {cd.get('temps')}"
+    # [option-2] temperature SCOPE: base has temps but NO temp_sweep -> absent == full -> all four
+    # 'temperature applies to' boxes ticked, and the round-trip omits temp_sweep (byte-clean).
+    assert all(cb.isChecked() for cb in dlgc.f_cov_temp_sweep.values()), \
+        "absent temp_sweep must show as full (every 'applies to' box ticked)"
+    assert "temp_sweep" not in cd, f"full temp scope must stay byte-clean (omitted): {cd.get('temp_sweep')}"
+    for _a, _cb in dlgc.f_cov_temp_sweep.items():                # scope to I-V only
+        _cb.setChecked(_a == "dc")
+    assert dlgc._form_to_dict()["coverage"]["temp_sweep"] == ["dc"], \
+        "ticking only I-V must serialize coverage.temp_sweep=['dc']"
+    _bd = json.loads(json.dumps(base)); _bd["coverage"]["temp_sweep"] = ["dc"]
+    dlgts = _ManifestEditorDialog(win, json.dumps(_bd), None)    # a manifest that DECLARES ['dc']
+    _tscope = {a: cb.isChecked() for a, cb in dlgts.f_cov_temp_sweep.items()}
+    assert _tscope == {"dc": True, "ac": False, "noise": False, "tran": False}, \
+        f"temp_sweep=['dc'] did not populate only the I-V box: {_tscope}"
+    assert dlgts._form_to_dict()["coverage"]["temp_sweep"] == ["dc"], "temp_sweep=['dc'] must round-trip"
     lsw = cd["loads"]["vco"]["sweep"]
     assert lsw["type"] == "log" and abs(lsw["start"] - 200e-6) < 1e-12 \
         and abs(lsw["stop"] - 6e-3) < 1e-12 and lsw["n"] == 4, f"loads sweep lost: {lsw}"
