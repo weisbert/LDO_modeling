@@ -668,6 +668,58 @@ def test_step_run_resilient_one_group_fails_others_finish(tmp_path):
     assert victim in msg and "FAILED" in msg and "completed" in msg   # full summary, not bail-on-1
 
 
+class _FailingRunner:
+    """A runner whose jobs all reach Donau state FAILED: dsub -> a unique JOBID, djob -> FAILED,
+    dpeek -> only the scheduler's view (no real reason). Drives the failed-state path so we can
+    assert the ENGINE log (not just dpeek) is surfaced."""
+
+    def __init__(self):
+        self.calls = []
+        self._n = 0
+
+    def __call__(self, argv, timeout=None, check=False):
+        self.calls.append(list(argv))
+        head = argv[0]
+        if head == "dsub":
+            self._n += 1
+            return RunResult(0, f"Submit job successfully. JOBID {37400000 + self._n}\n", "", list(argv))
+        if head == "djob":
+            return RunResult(0, "State: FAILED\n", "", list(argv))
+        if head == "dpeek":
+            return RunResult(0, "Job state is FAILED.\n", "", list(argv))   # scheduler-only, useless
+        raise AssertionError(f"_FailingRunner: no scripted reply for {head!r}")
+
+
+def test_step_run_failed_job_surfaces_alps_log_tail(tmp_path):
+    """The recurring red-zone pain: a FAILED Donau job only gives 'job FAILED' via dpeek; the REAL
+    reason lives in the engine's own log in the run dir. step_run must read that log's tail and
+    fold it INTO the failure message (so it shows up in the Run tab without hand-hunting) and stash
+    its path on the group for the GUI right-click."""
+    m = _resolved_wur_manifest()
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp_path), gui, "tt_25c")
+
+    def _failing_netlister(group):
+        d = pathlib.Path(dirs["netlist"]) / "g" / group["tag"]
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "input.scs").write_text("// stub\n")
+        # the log ALPS leaves in its run cwd, carrying the actual abort reason:
+        (d / "psf.log").write_text(
+            "Reading netlist input.scs ...\n"
+            f"ERROR: syntax error near 'oprobe' in noise analysis ({group['tag']})\n"
+            "Simulation aborted.\n")
+        return str(d)
+
+    netinfo = PC.step_netlist(dirs, netlistdir=str(_wur_base_dir(tmp_path)),
+                              pdk_model_dir=str(tmp_path / "pdk"))
+    with pytest.raises(PC._runc.RunCornerError) as ei:
+        PC.step_run(netinfo, dirs["psf"], m, engine="alps", runner=_FailingRunner(),
+                    group_netlister=_failing_netlister, sleep=lambda *_: None)
+    msg = str(ei.value)
+    assert "ALPS log" in msg, "the engine-log section must be folded into the failure message"
+    assert "syntax error near 'oprobe'" in msg, "the REAL abort reason must reach the user inline"
+
+
 def test_step_run_cancel_between_groups(tmp_path):
     """A cancel() that turns True after the first group stops the sweep with CancelledError
     BETWEEN groups (a submitted group is never interrupted mid-poll)."""

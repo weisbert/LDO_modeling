@@ -4566,6 +4566,8 @@ if _HAVE_QT:
                  "slot": (lambda: self._x_tail(job)) if have_job else None},
                 {"label": "Jump to first error", "enabled": started,
                  "slot": (lambda dd=d: self._x_jump_error(dd))},
+                {"label": "Open ALPS log", "enabled": started,
+                 "slot": (lambda dd=d: self._x_open_alps_log(dd))},
                 {"sep": True},
                 {"label": "Open group folder", "enabled": bool(nd),
                  "slot": (lambda: self._x_open_path(nd)) if nd else None},
@@ -4675,23 +4677,39 @@ if _HAVE_QT:
             tail = donau.peek_tail(job_id, donau.SubprocessRunner())
             QMessageBox.information(self, f"dpeek {job_id}", tail or "(no output yet)")
 
+        def _x_alps_log_path(self, data):
+            """The freshest ALPS/Spectre log FILE for this group (netlist dir + PSF dir), or None.
+            Shares run_corner.find_alps_log so the GUI hunts exactly where the runner does."""
+            from cluster import run_corner
+            return run_corner.find_alps_log(data.get("log_dir") or data.get("netlist_dir"),
+                                            data.get("psf_dir"))
+
+        def _x_open_alps_log(self, data):
+            """xdg-open the actual ALPS log FILE (not just the folder) -- the recurring red-zone ask:
+            right-click a failed group, jump straight to its job log instead of hand-hunting."""
+            f = self._x_alps_log_path(data)
+            if f is None:
+                QMessageBox.information(self, "Open ALPS log",
+                    "No ALPS/Spectre log yet -- the job may still be queued, or it wrote none. "
+                    "(On failure the log tail is also printed in the Run-tab error.)")
+                return
+            self._x_open_path(str(f))
+
         def _x_jump_error(self, data):
-            """Surface the FIRST error line (with a little context) from the job tail (dpeek) or any
-            local *.log/*.out in the group folder. Falls back to a 'nothing yet' note."""
+            """Surface the FIRST error line (with a little context) from the job tail (dpeek) or the
+            group's ALPS log (*.log/*.warn/*.out in the netlist OR PSF dir). 'nothing yet' note else."""
             text = ""
             job = data.get("job_id")
             if job:
                 from cluster import donau
                 text = donau.peek_tail(job, donau.SubprocessRunner(), lines=400) or ""
             if not text:
-                nd = data.get("log_dir") or data.get("netlist_dir")
-                if nd and pathlib.Path(nd).is_dir():
-                    logs = sorted(pathlib.Path(nd).glob("*.log")) + sorted(pathlib.Path(nd).glob("*.out"))
-                    for lf in logs:
-                        try:
-                            text = lf.read_text(errors="replace"); break
-                        except OSError:
-                            pass
+                lf = self._x_alps_log_path(data)
+                if lf is not None:
+                    try:
+                        text = lf.read_text(errors="replace")
+                    except OSError:
+                        pass
             lines = text.splitlines()
             hit = next((k for k, ln in enumerate(lines)
                         if "error" in ln.lower() or "fatal" in ln.lower()), None)
@@ -6022,7 +6040,7 @@ def _selftest_status_menu(win, tmp, app):
                 "Re-run this group", "Copy JOBID", "Copy dsub command"):
         assert not a0[lab]["enabled"], f"'{lab}' must be disabled before the group starts"
     full = [a.get("label") for a in win._x_status_menu_actions(0)]
-    for lab in ("Open netlist (input.scs)", "Jump to first error", "Open PSF dir",
+    for lab in ("Open netlist (input.scs)", "Jump to first error", "Open ALPS log", "Open PSF dir",
                 "Open terminal here", "Copy folder path", "Check job status (djob)",
                 "Re-run this group"):
         assert lab in full, f"menu missing '{lab}'"

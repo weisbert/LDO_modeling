@@ -194,6 +194,28 @@ def test_noise_group_emits_noise_with_output_port(tmp_path):
     assert pll_net in sline.split()
 
 
+def test_current_noise_group_emits_oprobe_AFTER_noise_keyword(tmp_path):
+    """A current-OUTPUT noise group (coverage.enable.inoise) reads the probe vsource's branch
+    current noise -> `nz <noise> oprobe=<probe>`. CRITICAL: `oprobe=` is a noise PARAMETER and MUST
+    follow the `noise` analysis-type keyword; only an optional node-pair may sit before the type.
+    The real box REJECTED `nz oprobe=<src> noise ...` (param=value before the type -> parse error,
+    Donau job FAILED before running). This locks the correct token order."""
+    raw = re.sub(r"<net:([^>]+)>", r"\1", WUR.read_text())
+    d = json.loads(raw)
+    d.setdefault("coverage", {}).setdefault("enable", {})["inoise"] = True   # opt-in current noise
+    m = M.load(_write_tmp(d))
+    g = _group(m, "g_ni_i500n_lpf")
+    probe = g["oprobe_src"]                                   # the reused bias vsource (Vbias_500n_lpf)
+    txt = _netlist_text(tmp_path, m, "g_ni_i500n_lpf")
+    nz = next(l for l in txt.splitlines()
+              if l.strip().startswith(NA.NOISE_NAME + " ") and "oprobe=" in l)
+    # the analysis type `noise` MUST precede the oprobe= parameter (else ALPS/Spectre parse error)
+    assert nz.index(" noise") < nz.index("oprobe="), f"oprobe= before `noise` (parse error): {nz!r}"
+    assert f"{NA.NOISE_NAME} {m['analysis']['noise']} oprobe={probe}" in txt
+    # the probe BRANCH CURRENT (:p) is the saved output signal
+    assert f"{probe}:p" in txt
+
+
 # =====================================================================================
 # (1c) PER-OBJECT analysis override (keyed by the group OWNER; falls back to global)
 # =====================================================================================

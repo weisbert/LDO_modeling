@@ -149,6 +149,48 @@ def finalize_corner(out_abs, *, require_simdone, job_id, runner):
     return str(out_abs)
 
 
+# --------------------------------------------------------------------------- ALPS log discovery
+# When a Donau job FAILS the `dpeek` tail only gives "job <id> FAILED" (the SCHEDULER's view) --
+# the REAL reason (a netlist parse error, a missing model, a non-convergent op) lives in the
+# engine's own log, which ALPS writes in the run cwd (the netlist dir, `dsub -EP <netlistdir>`)
+# and sometimes the -o PSF dir. We surface its tail on failure (run_corner caller) and the GUI
+# right-clicks straight to the file -- so nobody has to hand-hunt for it. Best-effort + read-only.
+_LOG_GLOBS = ("*.log", "*.warn", "*.out", "logFile", "CDS.log")
+
+
+def find_alps_log(*dirs):
+    """The freshest ALPS/Spectre log file across `dirs` (the netlist dir + the PSF dir), or None.
+    Best-effort: globs *.log/*.warn/*.out/logFile/CDS.log in each existing dir and returns the
+    most-recently-modified match (the failing run's log, on a re-used dir). Never raises."""
+    cands = []
+    for d in dirs:
+        if not d:
+            continue
+        p = pathlib.Path(d)
+        if not p.is_dir():
+            continue
+        for pat in _LOG_GLOBS:
+            cands.extend(p.glob(pat))
+    if not cands:
+        return None
+    try:
+        return max(cands, key=lambda f: f.stat().st_mtime)
+    except OSError:
+        return cands[0]
+
+
+def alps_log_tail(*dirs, lines=40):
+    """(Path, tail-text) of the freshest ALPS log across `dirs`, or (None, "") if none found.
+    The tail is the last `lines` lines -- where the engine's error/abort message lands."""
+    f = find_alps_log(*dirs)
+    if f is None:
+        return None, ""
+    try:
+        return f, "\n".join(f.read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return f, ""
+
+
 def _verify_psf(out_dir, require_simdone, job_id, runner):
     """Confirm the engine actually produced output in out_dir. The HARD gate is a non-empty PSF
     dir (a 'done' job that wrote nothing -> usually a netlist/model error the ALPS log explains).

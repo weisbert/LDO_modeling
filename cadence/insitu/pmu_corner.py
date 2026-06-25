@@ -358,8 +358,9 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
             g["_job_id"] = sub["job_id"]
             g["_dsub_cmd"] = sub["dsub_cmd"]
             g["_out_abs"] = str(sub["out_abs"])
+            g["_netdir"] = str(netdir)                  # where ALPS runs -> where its log lands
             _progress(progress, "run", f"group {i+1}/{n} {tag}: submitting")
-            inflight[sub["job_id"]] = dict(i=i, g=g, out_abs=sub["out_abs"],
+            inflight[sub["job_id"]] = dict(i=i, g=g, out_abs=sub["out_abs"], netdir=str(netdir),
                                            require_simdone=sub["require_simdone"],
                                            last=None, waited=0.0)
         if not inflight:
@@ -383,9 +384,19 @@ def step_run(netinfo, psf_root, m, *, engine="alps", donau=None, runner=None,
                 _progress(progress, "run",
                           f"group {i+1}/{n} {tag}: Donau job {state.upper()}")
             if state == "failed":
+                # dpeek gives only the SCHEDULER's "job FAILED"; the real reason is in the ENGINE
+                # log (netlist dir / PSF dir). Surface its tail INLINE + stash the path so the GUI
+                # right-clicks straight to it -- no hand-hunting (the recurring red-zone pain).
                 tail = _donau.peek_tail(job_id, runner)
-                _fail_group(ctx["i"], ctx["g"], f"Donau job {job_id} FAILED"
-                            + (f"\n--- dpeek tail ---\n{tail}" if tail else ""))
+                logpath, logtail = _runc.alps_log_tail(ctx.get("netdir"), ctx["out_abs"])
+                if logpath:
+                    ctx["g"]["_alps_log"] = str(logpath)
+                reason = f"Donau job {job_id} FAILED"
+                if tail:
+                    reason += f"\n--- dpeek tail ---\n{tail}"
+                if logtail:
+                    reason += f"\n--- ALPS log ({logpath}) ---\n{logtail}"
+                _fail_group(ctx["i"], ctx["g"], reason)
                 del inflight[job_id]
                 continue
             if state == "done":

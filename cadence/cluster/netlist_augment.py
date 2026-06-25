@@ -589,10 +589,12 @@ def _analysis_line(m, group, hot_src=None):
         ground = m["ground"]
         # CURRENT-noise group (a bias port's output-current noise): the output is the probe
         # vsource's BRANCH CURRENT, so emit `oprobe=<probe>` (no node-pair) -- Spectre reports the
-        # current noise of that source. BOX-VALIDATE-PENDING: confirm `nz oprobe=<src> <noise>`
-        # writes the 'out' current-noise signal on the box/ALPS (importmp._read_noise_out reads it).
+        # current noise of that source. CRITICAL ORDER: `oprobe=` is a noise-analysis PARAMETER, so
+        # it MUST come AFTER the `noise` analysis-type keyword. Only an optional node-pair `(p n)`
+        # may sit between the analysis name and the type; a `param=value` there is a Spectre/ALPS
+        # PARSE ERROR (the box rejected `nz oprobe=<src> noise ...` -- job FAILED before running).
         if group.get("oprobe_src"):
-            return f"{NOISE_NAME} oprobe={group['oprobe_src']} {m['analysis']['noise']}"
+            return f"{NOISE_NAME} {m['analysis']['noise']} oprobe={group['oprobe_src']}"
         o = _noise_owner(m, group)
         noise = _manifest.analysis_line_for(m, "v_out", o, "noise") if o else m["analysis"]["noise"]
         return f"{NOISE_NAME} ({group['oprobe']} {ground}) {noise}"
