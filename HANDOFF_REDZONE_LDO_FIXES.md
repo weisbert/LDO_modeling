@@ -1,6 +1,61 @@
 # HANDOFF — Red-zone real-LDO (WuR_PMU) modeling fixes
 
-**Date:** 2026-06-24 · **Branch:** main (all pushed) · **Suite:** 374 green
+**Date:** 2026-06-25 · **Branch:** main (all pushed) · **Suite:** 395 green
+
+---
+## ⏩ SESSION-4 UPDATE (read this FIRST) — temp-sweep syntax + 2nd-order Idc(T) + fast smoke + box pre-flight
+
+Four commits this session, all pushed to main:
+
+- **`d8188cb` nominal temp = 55 °C** — the Idc(T) fit references `TNOM=55` (param literally
+  `idc55`); my SESSION-3 `tnom_c=25` was the odd one out. `REAL_wur_pmu_top.json` now has
+  `coverage.temps=[-40,55,125]` + `tnom_c=55` (55 = house nominal = middle point = bake temp lands
+  on the model reference). **WHY the default sweep is 3 points**: Idc(T) is a LINEAR fit
+  `idc55 + didt·(T−55)` (2 params) → 2 corners fit the line, the middle (55) anchors the bake temp
+  + validates linearity. A dense sweep is averaged away by the linear fit unless ≥5 points engage
+  the new quadratic (below).
+- **`d9735e8` definable temp-sweep syntax + guarded 2nd-order Idc(T) fit** (user: "需要可定义语法集，
+  把二阶拟合也做了"). (A) `manifest.expand_temp_set(spec)` — explicit floats AND Cadence
+  `start:step:stop` ranges (inclusive of an on-grid stop), comma-mixed (`-40:10:120, 125`); accepts
+  a string OR a list (idempotent). Shared by both GUI temps fields (`_form_gui` + editor
+  `_form_to_dict`) + `build_manifest`. **TOOL FACT: `coverage.temps` MUST stay an explicit number
+  list** — `manifest._validate_coverage` RAISES on a string, and `load()` validates → expansion
+  happens at the GUI/build boundary, NOT in `temps()`. Sorted+deduped → `tnom_c=middle` is now the
+  MEDIAN (fixes a latent insertion-order bug). (B) `fit_isrc._fit_temp` gains a `d2` [A/K²]
+  curvature term, engages ONLY when ≥5 UNIQUE temps AND the quadratic beats linear by ≥10% SSE AND
+  the linear residual is ≥0.01% RMS (`TEMP_QUAD_RESID_FLOOR`, the float-dust guard — without it a
+  near-linear in-situ fit produced a meaningless `d2=5e-24`). <5 pts / no curvature → `d2=0` and
+  `idc55/didt` come from the EXACT pre-existing linear code (byte-identical). `d2` carried through
+  `predict_idcT` + BOTH emitters (`emit_pmu_model` VA Kelvin `$temperature-328.15` AND `emit_isrc`
+  ngspice degC `temper-55` twin — must move in lockstep or crossval diverges) + the in-situ
+  `fit_multiport` crow (was dropping it). The `d2` rvar/asg/VA-term is emitted ONLY when `d2≠0` → a
+  linear model's `.va` is substring-identical to today (no `.va` byte-compare test exists). +18 tests.
+- **`ac204c3` fast deploy smoke** (user: `bash apply` got much slower). ROOT CAUSE (found by
+  instrumenting `nfev`): a SINGLE non-converging noise-bank `least_squares` burns the full
+  `max_nfev=30000` (status=0, ~20s) while every converging fit uses 40-60 nfev; the adaptive 6→10
+  escalation adds more on the box. FIX: env-gated `LDO_NOISE_FAST` (deploy/update.sh sets it on the
+  smoke only) → `_noise_nfev()` caps the budget 30000→2000 AND skips the escalation in BOTH banks
+  (Norton `fit_noise_bank` + hybrid `fit_noise_hybrid`). UNSET (pytest/CI/**the real box
+  extraction**) = full budget + adaptation, byte-identical for converging fits. Smoke 21.5s→10.3s
+  (still PASS); residual ~10s is matplotlib report-tab/screenshot rendering (historical floor, NOT
+  the fit). Locked `test_noise_metrics` unchanged. OFFERED (not done): a flag to skip the smoke
+  screenshots → ~3-4s.
+
+### ✅ BOX PRE-FLIGHT (the user is about to validate the real chip, NO manifest edits)
+Verified the manifest is COMPLETE for a one-shot run: **26 measurements × 3 temps** — Zout/PSRR/
+output-noise/coupling/slew (voltage) + I-V/|Y|/current-PSRR/**current-noise** (current). `coverage`
+is read directly by the run (`cli.py:164 _manifest.load`); "scan netlist" only fills source cells,
+never `coverage`; the `<net:…>` placeholders auto-resolve OFFLINE (B+ `net==pin`). **The ONE
+prerequisite**: the box must `bash apply` so its `REAL_wur_pmu_top.json` IS the updated version
+(verify: `grep -A4 '"enable"'`/`'"temps"'` show `inoise:true` + `[-40,55,125]`) — else blank panels
+again. Post-run sanity (ALPS-keyword unverified, see SESSION-3): PTAT Idc(T) must SLOPE + current-
+noise panels non-blank.
+
+### NEXT when the user pastes the new box report
+1. Confirm Idc(T) + current-noise panels populate (the ALPS-keyword sanity check above).
+2. Then the residual MODELING work (unchanged since SESSION-2): **pll PSRR non-min-phase** (the
+   blocker; `fit_model._bank_fit`/AAA on sparse silicon AC) + **Zout resonance mislocation** on both
+   rails. The 2nd-order Idc(T) now needs a ≥5-temp box run to actually exercise curvature on silicon.
 
 ---
 ## ⏩ SESSION-3 UPDATE (read this FIRST) — the two missing sims were never REQUESTED
