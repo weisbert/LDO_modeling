@@ -417,6 +417,35 @@ class ExtractCore:
         gui, corner = self._wa_gui(), self._corner()
         _base, dirs = PC.corner_dir(work_root, gui, corner)
         _log = (lambda _s, msg: log(msg)) if log else None
+        import fit_multiport as FMP
+        # COVERAGE SWEEP (temps and/or multi-load): the single-corner step_run path below runs ONE
+        # temperature, so a manifest that declares coverage.temps would silently drop the temp axis
+        # (Idc(T) stays empty -- exactly the reported symptom). Dispatch to run_pmu_coverage_sweep,
+        # which loops temps/loads, emits `options temp=` per cell, and assembles ONE _sweep.npz (with
+        # the meta_temp array) that fit_multiport reads to build Idc(T). Single-OP manifests (no
+        # temps, no load sweep) keep the original single-corner path untouched.
+        if PC._has_coverage_sweep(m):
+            sw = PC.run_pmu_coverage_sweep(
+                m, work_root=work_root, corner=corner, engine=engine,
+                netlistdir=netlistdir, base_netlist=netlistdir, ahdllibdir=ahdllibdir,
+                pdk_model_dir=pdk_model_dir, runner=runner, donau=donau or DonauCfg(),
+                group_status=group_status, dry_run=dry_run, progress=_log,
+                max_parallel=max_parallel, steps=["netlist", "run", "import"])
+            if dry_run:
+                return dict(dry_run=True, dsub_cmds=sw["dsub_cmds"], n_groups=len(sw["dsub_cmds"]))
+            npz = sw.get("npz")
+            if not fit or not npz:
+                return dict(dry_run=False, fit=fit, npz_path=npz, psf_map=None,
+                            dsub_cmds=sw["dsub_cmds"], n_groups=len(sw["dsub_cmds"]))
+            self.npz_path = str(npz)
+            self.result = FMP.fit_multiport(str(npz), m)
+            self._fit_manifest = m
+            self.report = FMP.report(self.result)
+            self.port_refs = FMP.export_single_port_refs(str(npz), m)
+            self.gate = (None, "", "Donau+ALPS coverage sweep (temps/loads)")
+            return dict(dry_run=False, npz_path=str(npz), gate=self.gate, report=self.report,
+                        ports=self.port_refs, psf_map=None,
+                        dsub_cmds=sw["dsub_cmds"], n_groups=len(sw["dsub_cmds"]))
         # offline per-group netlister over the designer's base input.scs. The resolved-net GUARD +
         # the supply-source auto-detect fire HERE, before any submit, so a bad manifest (placeholder
         # nets / no locatable supply source) fails loudly up front, not mid-sweep.
@@ -6172,6 +6201,18 @@ def _selftest_cluster_sweep(win, tmp, app):
     for g in grps:                                       # each group's offline one-hot netlist exists
         assert (dirs["netlist"] / g["tag"] / "input.scs").is_file(), g["tag"]
     assert {t for t, _s in seen} == {g["tag"] for g in grps}, "group_status missed a group"
+
+    # --- SWEPT CORE: a manifest declaring coverage.temps MUST route to run_pmu_coverage_sweep
+    # (the single-corner step_run path silently drops the temp axis -> Idc(T) stays empty, the
+    # reported bug). Dry-run: confirm it dispatches + assembles per-TEMP cells (3 groups x 2 temps).
+    man_sw = dict(man); man_sw["coverage"] = {"tier": "T4", "temps": [27, 55]}
+    mpath_sw = tmp / "clsweep_temps.json"; mpath_sw.write_text(json.dumps(man_sw))
+    xcs = ExtractCore(); xcs.load_manifest(str(mpath_sw))
+    assert PC._has_coverage_sweep(xcs.manifest), "a temps manifest must be detected as swept"
+    out_sw = xcs.run_cluster_sweep(netlistdir=str(base), pdk_model_dir=str(tmp), engine="alps",
+                                   work_root=str(tmp), dry_run=True, max_parallel=3)
+    assert out_sw["dry_run"] and out_sw["n_groups"] == ngroups * 2, \
+        f"swept dry-run must assemble {ngroups} groups x 2 temps; got {out_sw['n_groups']}"
 
     # --- GUI WIRING: Build & Run (dry-run) starts the worker, fills the status table, shows cmds.
     # Scope WORK_ROOT to tmp so the worker (which takes no work_root) writes under tmp, not ~/.

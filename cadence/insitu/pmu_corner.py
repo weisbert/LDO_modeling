@@ -833,7 +833,8 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
                            netlistdir=None, ahdllibdir=None, pdk_model_dir=None,
                            base_netlist=None, model_lib=None, model_cell=None, model_path=None,
                            supply_pin=None, ground=None, runner=None, on_status=None,
-                           dry_run=False, progress=None, netlister_factory=None, donau=None,
+                           group_status=None, dry_run=False, progress=None,
+                           netlister_factory=None, donau=None,
                            poll_interval=5.0, max_parallel=1, poll_timeout=10800.0, sleep=None,
                            steps=None):
     """Run the LOAD x TEMPERATURE coverage SWEEP for ONE process corner (the STAGE-1b driver).
@@ -944,9 +945,10 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
         psf_cell.mkdir(parents=True, exist_ok=True)
         gnl = netlister_factory(op_loads, temp, nl_dir)
         rr = step_run(netinfo, psf_cell, m, engine=engine, donau=donau, runner=runner,
-                      on_status=on_status, dry_run=dry_run, progress=progress,
-                      group_netlister=gnl, groups=groups_subset, poll_interval=poll_interval,
-                      max_parallel=max_parallel, poll_timeout=poll_timeout, sleep=sleep)
+                      on_status=on_status, group_status=group_status, dry_run=dry_run,
+                      progress=progress, group_netlister=gnl, groups=groups_subset,
+                      poll_interval=poll_interval, max_parallel=max_parallel,
+                      poll_timeout=poll_timeout, sleep=sleep)
         cmds.extend(rr["dsub_cmds"])
         if rr.get("psf_map"):
             # read the cell's PSF by TAG; key each array by the cell LABEL (the sweep's "load")
