@@ -50,10 +50,17 @@ def _zrms(Zm, Zg):
 
 # ----------------------------------------------------------------- gate discrimination
 def test_is_shelf_discriminates_shelf_from_resonance_and_flat():
-    assert FM._is_shelf(F, _shelf_z(F)) is True
-    assert FM._is_shelf(F, _lc_z(F)) is False             # peak then rolloff, Re>=0
+    assert FM._is_shelf(F, _shelf_z(F)) is True            # negative-real shelf
+    # SIGN-AGNOSTIC: a POSITIVE-real rising shelf must ALSO fire. importmp passivity-normalizes Zout
+    # to Re>=0 (the real silicon case), and an earlier Re<0 gate MISSED it -> reverted to the bad
+    # mislocated resonant fit (real pll 1.84dB MISLOCATED instead of 1.69 shelf). The shape is the
+    # discriminator, not the phase.
+    x = F / 3e6
+    Zpos = (0.1 + 200.0 * x / np.sqrt(1 + x ** 2)).astype(complex)    # +real, |Z| 0.1 -> ~200
+    assert FM._is_shelf(F, Zpos) is True, "positive-real shelf (real silicon) must fire"
+    assert FM._is_shelf(F, _lc_z(F)) is False             # peak then rolloff
     assert FM._is_shelf(F, np.full_like(F, 5.0) + 0j) is False   # flat R
-    # a HIGH-FREQUENCY resonance (peak near band top) is still rejected: Re Z>=0
+    # a HIGH-FREQUENCY resonance (peak near band top) is still rejected: it rolls off (plateau<<peak)
     fhi = np.logspace(1, np.log10(5e8), 150)
     assert FM._is_shelf(fhi, _lc_z(fhi, L=4e-9, C=2e-11)) is False
 

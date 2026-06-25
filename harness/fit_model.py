@@ -130,13 +130,14 @@ def fit_cft():
 
 
 def _is_shelf(f, Z):
-    """A loop-ACTIVE output-impedance SHELF, not a passive LC resonance: |Z| climbs
-    ~monotonically to an HF plateau with NO post-peak rolloff, and Re(Z)<0 across the
-    band (the regulator loop sources current -> negative real part). The strictly
-    positive-real zmodel cannot represent this, so it is forced to fake an LC peak; we
-    instead fit |Z| magnitude-only with the output-cap branch held open. The
-    negative-real majority is the physical discriminator that a genuine HF LC peak
-    (whose rolloff merely falls off the right edge of the sweep) does NOT share."""
+    """A loop-active output-impedance SHELF, not a passive LC resonance: |Z| climbs
+    ~monotonically from a small LF floor to a high HF PLATEAU and STAYS there (no post-peak
+    rolloff). The passive zmodel mislocates it (fakes an LC peak), so we fit |Z| magnitude-only
+    with the output-cap branch held open. SIGN-AGNOSTIC: the discriminator is the SHAPE (big rise
+    + peak near the band top + |Z| stays at the plateau), NOT the phase. (An earlier version gated
+    on Re(Z)<0 -- but importmp passivity-normalizes Zout to Re>=0, so the gate MISSED the real
+    positive-real silicon shelf and reverted to the mislocated resonant fit; the rolloff test below
+    is the real discriminator a genuine HF LC peak does NOT pass.)"""
     f = np.asarray(f, float); Z = np.asarray(Z)
     if f.size < 5:
         return False
@@ -146,11 +147,13 @@ def _is_shelf(f, Z):
         return False
     ipk = int(np.argmax(mag))
     peak = float(mag[ipk])
-    plateau = float(np.median(mag[f >= 0.5 * f[-1]]))
+    plateau = float(np.median(mag[f >= 0.5 * f[-1]]))   # |Z| over the top half of the band
     Q = peak / R0
-    frac_neg = float(np.mean(Z.real < 0))            # physical: loop-active => Re Z<0
-    return (frac_neg >= 0.5 and Q > 3.0
-            and ipk >= 0.6 * f.size and plateau > 0.5 * peak)
+    # rise from the LF floor to a high HF plateau that does NOT roll back off:
+    #   Q>3        -- |Z| climbs >3x from the floor (a real shelf/loop-active rise)
+    #   ipk>=0.6N  -- the maximum sits in the top 40% of the band (rising, not a mid-band peak)
+    #   plateau>0.6*peak -- |Z| is STILL near its max at the top (a resonance rolls off -> plateau<<peak)
+    return Q > 3.0 and ipk >= 0.6 * f.size and plateau > 0.6 * peak
 
 
 def fit_cout_esr():
