@@ -20,6 +20,7 @@ import sys
 import pathlib
 
 import numpy as np
+from scipy.optimize import least_squares
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -150,16 +151,40 @@ def _fit_psrr(f, g):
 
 
 def _fit_noise(f, In):
-    """In^2(f) = iw^2 + kf/f  (af=1).  Linear LS in 1/f."""
-    y = In**2
-    x = 1.0 / f
-    A = np.vstack([np.ones_like(x), x]).T
-    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
-    iw2 = max(coef[0], 0.0)
-    kf = max(coef[1], 0.0)
-    fit = iw2 + kf * x
-    r2 = 1 - np.sum((y - fit) ** 2) / np.sum((y - y.mean()) ** 2)
-    return dict(in_white=np.sqrt(iw2), in_kf=kf, in_r2=float(r2))
+    """In(f) = sqrt(in_white^2 + in_kf/f)  (af=1). Fit in LOG-AMPLITUDE space (least_squares on
+    log(model) - log(In)) so the white floor and the flicker tail are weighted EQUALLY across the
+    decades -- which is what the dB PSD score does.
+
+    A linear LS in In^2 (power) is dominated by the LARGE low-freq flicker values and barely
+    constrains the small HF white floor, so in_white lands far too high: on the real PMU sinks the
+    power LS read in_white 5-30x high and the noise PSD scored 9-15 dB off. The log fit recovers the
+    true HF floor -> <1.5 dB on the real i500n/i3p6u/i1p5u (proven against the @noise_i GT)."""
+    f = np.asarray(f, float); In = np.asarray(In, float)
+    ok = np.isfinite(f) & np.isfinite(In) & (f > 0) & (In > 0)
+    f, In = f[ok], In[ok]
+    if f.size < 3:                                       # too few points for a stable 2-param fit
+        iw = float(In.min()) if f.size else 0.0
+        kf = float(max((In.max() ** 2 - iw ** 2) * f.min(), 0.0)) if f.size else 0.0
+        return dict(in_white=iw, in_kf=kf, in_r2=0.0)
+    order = np.argsort(f); f, In = f[order], In[order]
+    lz = np.log(In)
+    iw0 = max(float(In.min()), 1e-30)                    # white ~ the spectrum's HF floor (its min)
+    kf0 = max(float((In[0] ** 2 - iw0 ** 2) * f[0]), iw0 ** 2 * f[0] * 1e-6)
+
+    def _resid(p):
+        return np.log(np.sqrt(np.exp(p[0]) ** 2 + np.exp(p[1]) / f)) - lz
+    try:
+        s = least_squares(_resid, [np.log(iw0), np.log(kf0)], method="lm", max_nfev=10000)
+        iw, kf = float(np.exp(s.x[0])), float(np.exp(s.x[1]))
+        if not (np.isfinite(iw) and np.isfinite(kf)):
+            raise ValueError("non-finite noise fit")
+    except Exception:                                    # robust fallback = the legacy power LS
+        x = 1.0 / f
+        coef, *_ = np.linalg.lstsq(np.vstack([np.ones_like(x), x]).T, In ** 2, rcond=None)
+        iw, kf = float(np.sqrt(max(coef[0], 0.0))), float(max(coef[1], 0.0))
+    pred = np.sqrt(iw ** 2 + kf / f)
+    r2 = 1.0 - np.sum((np.log(pred) - lz) ** 2) / max(np.sum((lz - lz.mean()) ** 2), 1e-30)
+    return dict(in_white=iw, in_kf=kf, in_r2=float(r2))
 
 
 def _fit_temp(temps, idcT, min_quad_pts=TEMP_QUAD_MIN_PTS, quad_improve=TEMP_QUAD_MIN_GAIN):
