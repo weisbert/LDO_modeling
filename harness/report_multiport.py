@@ -379,6 +379,8 @@ def port_views(result, npz_path, manifest):
 # array (all from the manifest) NAME each key, and the parser reconstructs it from `@`-tokens.
 _MPD_BEGIN = "[MPD1] MULTIPORT GT DIGEST"
 _MPD_END = "[MPD1-END]"
+_MPD_GZ_BEGIN = "[MPD1-GZ]"          # gzip+base64 of the [MPD1] block -- lossless, ~4-8x smaller
+_MPD_GZ_END = "[MPD1-GZ-END]"
 
 
 def _z_resample(f, Z, ppd=6):
@@ -470,7 +472,7 @@ def _fanout_temp(ref):
                     ref[nk] = ref[k]
 
 
-def emit_multiport_digest(ref, manifest, views=None, budget_kb=None):
+def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=False):
     """Serialize ref's GT arrays (log-resampled) -> the machine-readable [MPD1] digest lines
     that parse_multiport_digest rebuilds into an npz-equivalent ref. Manifest-driven; emits a
     block only for the keys actually present (a coverage-light run simply emits fewer).
@@ -618,7 +620,20 @@ def emit_multiport_digest(ref, manifest, views=None, budget_kb=None):
            "block(s): " + ", ".join(dropped) + ". The grades/scores above are authoritative; "
            "re-emit with a larger budget_kb to carry these for local reproduction.]")
     pr(_MPD_END)
-    return L
+    if not compress:
+        return L
+    # LOSSLESS gzip+base64 of the whole [MPD1] block -- a load x temp digest is too big to paste
+    # under a size-limited red-zone export, so compress it (~4-8x on this numeric text). parse_
+    # multiport_digest / digest_to_npz decode it automatically -> FULL local reproduction, every
+    # load/port intact (no lossy budget drop). The human grades/scores above stay plain text.
+    import base64
+    import gzip
+    blob = base64.b64encode(gzip.compress("\n".join(L).encode("utf-8"), 9)).decode("ascii")
+    out = [_MPD_GZ_BEGIN + "  (lossless gzip+base64 of the [MPD1] digest; "
+           "report_multiport.digest_to_npz / parse_multiport_digest decode it automatically)"]
+    out += [blob[i:i + 120] for i in range(0, len(blob), 120)]      # wrap to 120-col lines
+    out.append(_MPD_GZ_END)
+    return out
 
 
 def parse_multiport_digest(text):
@@ -626,6 +641,26 @@ def parse_multiport_digest(text):
     of emit_multiport_digest). Returns {key: np.ndarray} -- the exact keys fit_multiport reads
     (z_<o>_<il>, p_<o>_<s>_<il>, noise_<o>_<il>, y_<c>_<il>, pi_<c>_<s>_<il>, iv_<c>_<label>,
     loads, meta_*). Ignores everything outside the block."""
+    # a compressed digest -> decode the gzip+base64 blob back to the plain [MPD1] text + recurse
+    if _MPD_GZ_BEGIN in text:
+        import base64
+        import gzip
+        chunks, ingz = [], False
+        for raw in text.splitlines():
+            s = raw.strip()
+            if s.startswith(_MPD_GZ_BEGIN):
+                ingz = True
+                continue
+            if s.startswith(_MPD_GZ_END):
+                break
+            if ingz and s:
+                chunks.append(s)
+        try:
+            plain = gzip.decompress(base64.b64decode("".join(chunks))).decode("utf-8")
+            return parse_multiport_digest(plain)
+        except Exception:                                  # noqa: BLE001 -- fall back to plain parse
+            pass
+
     ref = {}
     inblock = False
     kind = toks = None
@@ -817,7 +852,7 @@ def _rail_diagnosis(result, npz_path, manifest, o):
 
 
 # --------------------------------------------------------------------- public: report
-def debug_report(result, npz_path, manifest, budget_kb=None):
+def debug_report(result, npz_path, manifest, budget_kb=None, compress=False):
     """A single copy-pasteable text debug report for the whole multi-port model.
 
     Header (port roster + fit-param digest) -> per voltage rail (scores table + per-rail
@@ -996,7 +1031,8 @@ def debug_report(result, npz_path, manifest, budget_kb=None):
         _dbudget = None
         if budget_kb:
             _dbudget = max(1.0, float(budget_kb) - sum(len(x) + 1 for x in L) / 1024.0)
-        for line in emit_multiport_digest(ref_full, manifest, views=_views, budget_kb=_dbudget):
+        for line in emit_multiport_digest(ref_full, manifest, views=_views,
+                                          budget_kb=_dbudget, compress=compress):
             pr(line)
     except Exception as e:                             # noqa: BLE001 -- digest is best-effort
         pr("")

@@ -126,6 +126,36 @@ def test_digest_budget_drops_lowest_priority_named(tmp_path):
     assert "digest trimmed" not in full
 
 
+# --------------------------------------------------- lossless compressed digest (red-zone export)
+def test_compressed_digest_round_trips_smaller(tmp_path):
+    """A load x temp report's digest is too big to paste under a size-limited red-zone export, so
+    debug_report(compress=True) gzip+base64-encodes it: smaller, LOSSLESS, and digest_to_npz decodes
+    it automatically -> FULL local reproduction (every load/port), with the human grades still plain
+    text. This is what lets the modeler reproduce + debug locally instead of re-running the box."""
+    npz, m = _sweep_npz(tmp_path, with_temp=True, name="cgz")
+    res = FMP.fit_multiport(str(npz), m)
+    plain = RMP.debug_report(res, str(npz), m)
+    comp = RMP.debug_report(res, str(npz), m, compress=True)
+    assert RMP._MPD_GZ_BEGIN in comp and RMP._MPD_GZ_END in comp
+    assert RMP._MPD_BEGIN not in comp                      # the raw block is replaced by the blob
+    assert "OVERALL MODELING GRADE" in comp               # human grades stay plain text (skimmable)
+    assert len(comp.encode()) < len(plain.encode())       # smaller (more so on real 6-load reports)
+    # the compressed paste reproduces the SAME npz keys + grades as the plain one
+    reb_p = RMP.parse_multiport_digest(plain)
+    reb_c = RMP.parse_multiport_digest(comp)               # auto-decodes the gz blob
+    assert set(reb_c) == set(reb_p) and reb_c, "compressed digest lost keys"
+    for k in reb_p:
+        if k == "loads":
+            assert list(reb_c[k]) == list(reb_p[k]), "loads label mismatch"
+            continue
+        assert np.allclose(np.asarray(reb_c[k], float), np.asarray(reb_p[k], float), equal_nan=True), k
+    ref_c = RMP.digest_to_npz(comp, str(tmp_path / "cgz_rt.npz"))
+    g0 = {v["pin"]: v["grade"]["badge"] for v in RMP.port_views(res, str(npz), m)}
+    res2 = FMP.fit_multiport(ref_c, RMP.parse_manifest(comp))
+    g2 = {v["pin"]: v["grade"]["badge"] for v in RMP.port_views(res2, ref_c, RMP.parse_manifest(comp))}
+    assert g0 == g2, f"compressed paste did not reproduce grades: {g0} vs {g2}"
+
+
 # ----------------------------------------------------------------- manifest round-trips
 def test_parse_manifest_round_trips(tmp_path):
     _npz, m, _res, txt = _build(tmp_path)

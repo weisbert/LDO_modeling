@@ -3962,6 +3962,15 @@ if _HAVE_QT:
                 "trimmed, highest-value-first (Idc(T) / current-noise before the bulky voltage "
                 "rails), and anything dropped is named in the report. Re-copy after changing it.")
             top.addWidget(self.rep_budget)
+            self.rep_compress = QCheckBox("compress")
+            self.rep_compress.setChecked(True)               # default ON: load x temp reports are big
+            self.rep_compress.setToolTip(
+                "LOSSLESS gzip+base64 of the GT digest (~4-8x smaller -- a 6-load x 3-temp report "
+                "went 236 -> 31 KB). The grades/scores stay plain text; the digest becomes a compact "
+                "blob that report_multiport.digest_to_npz decodes automatically for FULL local "
+                "reproduction (every load/port intact, no lossy budget drop). Leave ON for a "
+                "size-limited red-zone export; untick only if you want a human-readable digest.")
+            top.addWidget(self.rep_compress)
             self.rep_copy = QPushButton("Copy debug report")
             self.rep_copy.setToolTip("Copy the copy-pasteable multi-port debug report to the clipboard.")
             self.rep_copy.clicked.connect(self._report_copy)
@@ -4329,7 +4338,8 @@ if _HAVE_QT:
             import report_multiport as RMP
             bud = self.rep_budget.value() or None             # 0 -> no cap
             return RMP.debug_report(self.extract.result, self.extract.npz_path,
-                                    self.extract.manifest, budget_kb=bud)
+                                    self.extract.manifest, budget_kb=bud,
+                                    compress=self.rep_compress.isChecked())
 
         def _report_copy(self):
             txt = self._report_text()
