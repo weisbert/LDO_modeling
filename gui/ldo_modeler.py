@@ -317,7 +317,7 @@ class ExtractCore:
         return supply_pin, (self.manifest.get("ground") or "VSS")
 
     def build_model_cell(self, model_lib, model_cell, model_path, *, session=None,
-                         dry_run=False, work_root=None, progress=None):
+                         dry_run=False, work_root=None, progress=None, port_grounds=None):
         """Emit the ONE combined PMU Verilog-A (1 supply LEFT / N v-rails + M i-biases RIGHT /
         VSS BOTTOM) from the multi-port fit and -- with a live session -- import + compile it +
         build the symbol cell in Cadence at the user's lib/cell/path (Component D, step_emit +
@@ -336,7 +336,8 @@ class ExtractCore:
         _base, dirs = PC.corner_dir(work_root, self._wa_gui(), self._corner())
         va_path = pathlib.Path(dirs["model"]) / f"{model_cell}.va"
         p = PC.step_emit(self.result, cell_name=model_cell, va_path=va_path,   # always: write .va
-                         supply=supply_pin, ground=ground, progress=progress)
+                         supply=supply_pin, ground=ground, progress=progress,
+                         port_grounds=port_grounds)
 
         def _cell(sess, dry):
             return PC.step_cell(self.result, p, model_lib=model_lib, model_cell=model_cell,
@@ -567,11 +568,14 @@ class ExtractCore:
                     psf_map=psf_map, missing=missing, skipped=skipped, n_meas=len(reads),
                     psf_root=str(root), skipped_groups=skipped_groups)
 
-    def export_va(self, model_cell, *, out_path=None, work_root=None, progress=None):
+    def export_va(self, model_cell, *, out_path=None, work_root=None, progress=None,
+                  port_grounds=None):
         """Emit ONLY the combined Verilog-A from the multi-port fit (no Cadence import/compile/
         symbol) -> the .va path. Decouples 'just give me the .va file' from 'build the cell in
         Virtuoso'. Writes to `out_path` if given, else the workarea model dir. Requires a completed
-        run/import OF THE CURRENT MANIFEST (same desync guard as build_model_cell)."""
+        run/import OF THE CURRENT MANIFEST (same desync guard as build_model_cell).
+        `port_grounds` (optional) := {port_pin: ground_net} split-ground map; None -> the single
+        manifest ground (byte-identical)."""
         if self.result is None or self._fit_manifest is not self.manifest:
             raise RuntimeError("run an extraction / import a finished simulation first -- there is "
                                "no fit to emit (or the manifest changed since the last run)")
@@ -584,7 +588,8 @@ class ExtractCore:
             _base, dirs = PC.corner_dir(work_root, self._wa_gui(), self._corner())
             va_path = pathlib.Path(dirs["model"]) / f"{model_cell}.va"
         return PC.step_emit(self.result, cell_name=model_cell, va_path=va_path,
-                            supply=supply_pin, ground=ground, progress=progress)
+                            supply=supply_pin, ground=ground, progress=progress,
+                            port_grounds=port_grounds)
 
     def port_list(self):
         return list(self.port_refs)
@@ -3888,7 +3893,8 @@ if _HAVE_QT:
             except ResolveUnavailable:
                 dry = True                           # no live Virtuoso -> emit .va + plan only
             try:
-                out = self.extract.build_model_cell(lib, cell, mpath, session=ws, dry_run=dry)
+                out = self.extract.build_model_cell(lib, cell, mpath, session=ws, dry_run=dry,
+                                                    port_grounds=getattr(self, "_va_port_grounds", None))
             except Exception as e:                       # usage error (stale-fit guard) -> raised
                 QMessageBox.critical(self, "Create model cell", f"{type(e).__name__}: {e}")
                 return
@@ -4380,9 +4386,54 @@ if _HAVE_QT:
             self.statusBar().showMessage(f"Saved the debug report → {fn}")
             QMessageBox.information(self, "Debug report", f"Wrote the debug report:\n{fn}")
 
+        def _ask_port_grounds(self, default_ground):
+            """Modal SPLIT-GROUND editor: bind each model output port to a ground net (free text).
+            Distinct names entered become separate module ground pins; ports sharing a name share
+            a pin. Returns {port: ground} or None if cancelled. Every port defaults to
+            `default_ground`, so OK-through == the single-ground .va (byte-identical)."""
+            import emit_pmu_model as _E
+            try:
+                v_outs, i_outs = _E.model_output_ports(self.extract.result)
+            except Exception:                            # noqa: BLE001
+                return {}                                # no ports derivable -> single ground
+            ports = [(p, "voltage rail") for p in v_outs] + [(p, "current bias") for p in i_outs]
+            if not ports:
+                return {}
+            dlg = QtWidgets.QDialog(self)
+            dlg.setWindowTitle("Split ground — assign a ground net per port")
+            lay = QVBoxLayout(dlg)
+            lay.addWidget(QLabel(
+                "Type the ground net each port returns to:\n"
+                "  • same name on several ports → they share that ground pin\n"
+                "  • different names → separate module ground pins (split ground)\n"
+                "Leave them all as-is for one shared ground."))
+            tbl = QTableWidget(len(ports), 3, dlg)
+            tbl.setHorizontalHeaderLabels(["Port", "Kind", "Ground net"])
+            tbl.verticalHeader().setVisible(False)
+            edits = []
+            for r, (p, kind) in enumerate(ports):
+                for c, txt in ((0, p), (1, kind)):
+                    it = QTableWidgetItem(txt)
+                    it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
+                    tbl.setItem(r, c, it)
+                ed = QLineEdit(default_ground or "VSS")
+                tbl.setCellWidget(r, 2, ed)
+                edits.append((p, ed))
+            tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            lay.addWidget(tbl)
+            bb = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+            bb.accepted.connect(dlg.accept); bb.rejected.connect(dlg.reject)
+            lay.addWidget(bb)
+            dlg.resize(480, 90 + 30 * len(ports))
+            if dlg.exec_() != QtWidgets.QDialog.Accepted:
+                return None
+            return {p: (ed.text().strip() or (default_ground or "VSS")) for p, ed in edits}
+
         def _x_export_va(self):
             """Export JUST the combined Verilog-A from the multi-port fit -- no Cadence, no
-            skillbridge. The user picks where to save it (defaults to the workarea model dir)."""
+            skillbridge. The user picks where to save it (defaults to the workarea model dir),
+            then assigns a ground net per port (split-ground editor)."""
             if getattr(self.extract, "result", None) is None:
                 QMessageBox.information(self, "Export Verilog-A",
                     "Run an extraction (Setup/Run tabs) or import a finished simulation first — "
@@ -4399,8 +4450,13 @@ if _HAVE_QT:
             fn, _ = QFileDialog.getSaveFileName(self, "Export Verilog-A", default, "Verilog-A (*.va)")
             if not fn:
                 return
+            _supply, ground = self.extract._model_ports()
+            pg = self._ask_port_grounds(ground)          # split-ground assignment editor
+            if pg is None:                               # user cancelled the editor
+                return
+            self._va_port_grounds = pg                   # reuse for the Create-cell symbol pins
             try:
-                va = self.extract.export_va(cell, out_path=fn)
+                va = self.extract.export_va(cell, out_path=fn, port_grounds=pg)
             except Exception as e:                       # noqa: BLE001
                 QMessageBox.critical(self, "Export Verilog-A", f"{type(e).__name__}: {e}")
                 return
@@ -6059,6 +6115,21 @@ def _selftest_import_finished_gui(win, tmp, app, root, mpath):
     got = win.extract.export_va("PMU_model", out_path=str(va_out))
     assert pathlib.Path(got).is_file() and pathlib.Path(got).read_text().lstrip().startswith(
         ("//", "`include", "module", "/*")), f"export_va did not write a .va: {got}"
+    # SPLIT-GROUND passthrough: a per-port ground map flows export_va -> step_emit -> emit_pmu_va
+    # and re-names the emitted ground pin (the editor's output). This stand-in fit has a single
+    # port, so it proves the plumbing via a rename; the multi-ground topology is locked in
+    # harness/test_emit_pmu_model.py::test_split_ground_per_port.
+    import emit_pmu_model as _Esg
+    _vo, _io = _Esg.model_output_ports(win.extract.result)
+    _pg = {p: "VSS_SPLITTEST" for p in _vo + _io}
+    _vasg = tmp / "exported_split.va"
+    win.extract.export_va("PMU_split", out_path=str(_vasg), port_grounds=_pg)
+    _sgtxt = pathlib.Path(_vasg).read_text()
+    assert "inout VSS_SPLITTEST;" in _sgtxt, (
+        "split-ground map did not reach emit_pmu_va; inout="
+        + str([l.strip() for l in _sgtxt.splitlines() if l.strip().startswith("inout")]))
+    pathlib.Path(_vasg).unlink()
+    win._va_port_grounds = None                      # don't leak the test map into later steps
     for p in list(win.extract.port_refs.values()) + [win.extract.npz_path, str(va_out)]:   # clean
         try:
             pathlib.Path(p).unlink()

@@ -489,8 +489,10 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
       - module/endmodule balance (exactly one of each, module before endmodule);
       - begin/end (analog block) balance;
       - the port list declares exactly the 1-input / N+M-output / ground interface
-        (the supply, every voltage + current out, and the ground appear in the
-        module header port list and in the input/output/inout direction decls)."""
+        (the supply, every voltage + current out, and the ground(s) appear in the
+        module header port list and in the input/output/inout direction decls).
+    `ground` may be a single net name (str) or a list of split-ground nets."""
+    grounds = [ground] if isinstance(ground, str) else list(ground)
     problems = []
     nmod = va_text.count("\nmodule ") + (1 if va_text.startswith("module ") else 0)
     nend = va_text.count("endmodule")
@@ -513,7 +515,7 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
         problems.append("could not parse module port list")
         return (not problems), problems
     ports = [t.strip() for t in mh.group(1).split(",") if t.strip()]
-    expected = [supply] + list(v_outs) + list(i_outs) + [ground]
+    expected = [supply] + list(v_outs) + list(i_outs) + grounds
     if ports != expected:
         problems.append(f"port list {ports} != expected {expected}")
     # direction decls: supply input, outs output, ground inout
@@ -528,8 +530,9 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
     for o in list(v_outs) + list(i_outs):
         if o not in outs:
             problems.append(f"output {o} not declared 'output'")
-    if ground not in inouts:
-        problems.append(f"ground {ground} not declared 'inout'")
+    for g in grounds:
+        if g not in inouts:
+            problems.append(f"ground {g} not declared 'inout'")
     return (not problems), problems
 
 
@@ -567,16 +570,34 @@ def _coverage_banner(fit_result, provenance):
     return f"// COVERAGE={tier_s}  OP={op_s}  VALID_LOAD={vl_s}"
 
 
+def model_output_ports(fit_result):
+    """Ordered (voltage rails, current biases) port names of the model -- the ports a per-port
+    ground can be bound to. Mirrors emit_pmu_va's derivation so a UI can list them up front."""
+    voltage = fit_result["voltage"]
+    v_outs = [voltage[rk].get("pin", rk) for rk in voltage]
+    seen, i_outs = set(), []
+    for r in fit_result.get("current", []):
+        s = r["sink"]
+        if s not in seen:
+            i_outs.append(r.get("pin", r["sink"]))
+            seen.add(s)
+    return v_outs, i_outs
+
+
 def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
-                supply_dc=None, tnom_c=None, provenance=None):
+                supply_dc=None, tnom_c=None, provenance=None, port_grounds=None):
     """Emit ONE combined Verilog-A module `cell_name` for the whole PMU: input `supply`
     (LEFT), every voltage rail + current bias from fit_result (RIGHT), `ground` (BOTTOM).
 
     fit_result := harness.fit_multiport.fit_multiport(npz, manifest) output.
     `provenance` (optional) := {tier, op_iload, op_temp, valid_load:(lo,hi)} -> stamps the
     header COVERAGE/OP/VALID_LOAD banner (else sourced from fit_result['meta'], else a clear
-    default). Returns the written va_path (pathlib.Path). Raises ValueError if the emitted
-    text fails the static VA sanity check (so a malformed interface never reaches the box)."""
+    default). `port_grounds` (optional) := {port_pin: ground_net} SPLIT-GROUND map -- each
+    listed port returns to its own ground net instead of the single `ground`; the distinct
+    nets become extra module ground pins. Ports absent from the map (or port_grounds=None)
+    use `ground`, so the default path is byte-identical. Returns the written va_path
+    (pathlib.Path). Raises ValueError if the emitted text fails the static VA sanity check
+    (so a malformed interface never reaches the box)."""
     va_path = pathlib.Path(va_path)
     voltage = fit_result["voltage"]
     current = fit_result.get("current", [])
@@ -615,14 +636,28 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
         for r in crows:
             r.setdefault("tnom_c", float(meta["tnom_c"]))
 
+    # per-port ground assignment: port_grounds maps a PORT (pin) name -> its ground net; any
+    # port absent uses the single `ground`, so the default (no map) path stays byte-identical.
+    # The DISTINCT grounds actually referenced (first-seen order) become the module ground pins
+    # -> one entry collapses to the old [ground] interface; >1 = split ground (e.g. VSS_VCO).
+    pg = dict(port_grounds or {})
+    v_gnd = [pg.get(p) or ground for p in v_outs]
+    i_gnd = [pg.get(p) or ground for p in i_outs]
+    grounds = []
+    for g in v_gnd + i_gnd:
+        if g not in grounds:
+            grounds.append(g)
+    if not grounds:
+        grounds = [ground]
+
     # pass the PIN name (port) as the block's `o` -- it is used as BOTH the port reference
     # and the internal node namespace prefix; pin names are unique + valid VA identifiers.
-    vblocks = [_voltage_block(port, voltage[rk], supply, ground)
-               for rk, port in zip(v_keys, v_outs)]
-    cblocks = [_current_block(port, r, supply, ground) for port, r in zip(i_outs, crows)]
+    vblocks = [_voltage_block(port, voltage[rk], supply, g)
+               for rk, port, g in zip(v_keys, v_outs, v_gnd)]
+    cblocks = [_current_block(port, r, supply, g) for port, r, g in zip(i_outs, crows, i_gnd)]
 
     # assemble the single module ----------------------------------------------------
-    all_ports = [supply] + v_outs + i_outs + [ground]
+    all_ports = [supply] + v_outs + i_outs + grounds
     internal_nodes = []
     for vb in vblocks:
         internal_nodes += vb["nodes"]
@@ -686,7 +721,7 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
     va = f"""// ============================================================
 // Combined PMU behavioral model for Cadence Spectre (auto-gen: harness/emit_pmu_model.py)
 // ONE module: input {supply} (LEFT) / {len(v_outs)} voltage rails + {len(i_outs)} current
-// biases (RIGHT) / {ground} ground (BOTTOM). Per-rail topology reuses the validated
+// biases (RIGHT) / {' / '.join(grounds)} ground(s) (BOTTOM). Per-rail topology reuses the validated
 // fit_model.emit_va transfer functions (Zout branches A/B/C + real PSRR bank + one
 // complex 2nd-order section + decoupled Norton @vout noise); current biases use the
 {op_note}
@@ -701,7 +736,7 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
 module {cell_name}({', '.join(all_ports)});
   input {supply};
   output {', '.join(v_outs + i_outs)};
-  inout {ground};
+  inout {', '.join(grounds)};
   {elec_decl}
 
   parameter real vdc_{supply} = {supply_dc:g};   // {supply} DC operating point [V]
@@ -720,7 +755,7 @@ module {cell_name}({', '.join(all_ports)});
   end
 endmodule
 """
-    ok, problems = va_sanity(va, supply, v_outs, i_outs, ground)
+    ok, problems = va_sanity(va, supply, v_outs, i_outs, grounds)
     if not ok:
         raise ValueError(f"emit_pmu_va sanity check FAILED for {cell_name}: {problems}")
     va_path.parent.mkdir(parents=True, exist_ok=True)

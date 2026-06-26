@@ -491,15 +491,17 @@ def step_fit(npz_path, m, *, progress=None):
 
 
 def step_emit(fit_result, *, cell_name, va_path, supply, ground, provenance=None,
-              progress=None):
+              progress=None, port_grounds=None):
     """8) emit the ONE combined PMU Verilog-A module (Component D). Ports are the GUI symbol
     PIN names (propagated by fit_multiport as each port's 'pin'). Returns the .va path.
 
     `provenance` (optional) := {tier, op_iload, op_temp, valid_load} for the .va COVERAGE
     banner; when None, emit_pmu_va sources it from fit_result['meta'] (set by fit_multiport),
-    so this step needs no new caller args. The existing signature stays kwarg-compatible."""
+    so this step needs no new caller args. The existing signature stays kwarg-compatible.
+    `port_grounds` (optional) := {port_pin: ground_net} split-ground map (None -> single
+    shared `ground`, byte-identical)."""
     p = _emit.emit_pmu_va(fit_result, cell_name, va_path, supply=supply, ground=ground,
-                          provenance=provenance)
+                          provenance=provenance, port_grounds=port_grounds)
     _progress(progress, "emit", f"wrote {pathlib.Path(p).name} "
               f"(1 module, {len(fit_result['voltage'])} V-rails + "
               f"{len({r['sink'] for r in fit_result['current']})} I-biases)")

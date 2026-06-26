@@ -359,6 +359,50 @@ def test_pmu_largesignal_vs_legacy_current_dispatch(tmp_path):
     assert ok, problems
 
 
+def test_split_ground_per_port(tmp_path):
+    """port_grounds binds each port to its own ground net: the DISTINCT nets become extra
+    module ground pins, each rail/bias references ONLY its assigned ground, and va_sanity
+    accepts the multi-ground interface."""
+    res = _real_pmu_fit_result()
+    pg = {"VDD0P8_PLL": "VSS_PLL", "VDD0P8_DIG": "VSS_PLL", "IBP_POLY_500N_VCO_Fit": "VSS_PLL",
+          "VDD0P8_VCO": "VSS_VCO", "IBP_POLY_1P8U_VCO": "VSS_VCO",
+          "IBP_PTAT_TUNE_1P5U_VCO": "VSS_VCO"}
+    txt = D.emit_pmu_va(res, "PMU_split", tmp_path / "s.va", supply="AVDD1P0",
+                        ground="VSS_PLL", port_grounds=pg).read_text()
+    # both ground pins present, in first-seen order, after all the outputs
+    assert _port_list(txt) == (["AVDD1P0", "VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO",
+                                "IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",
+                                "IBP_PTAT_TUNE_1P5U_VCO", "VSS_PLL", "VSS_VCO"])
+    assert "inout VSS_PLL, VSS_VCO;" in txt
+    # each rail returns to its assigned ground only
+    assert "I(VDD0P8_VCO, VSS_VCO)" in txt and "I(VDD0P8_VCO, VSS_PLL)" not in txt
+    assert "I(VDD0P8_PLL, VSS_PLL)" in txt and "I(VDD0P8_PLL, VSS_VCO)" not in txt
+    assert "I(IBP_PTAT_TUNE_1P5U_VCO, VSS_VCO)" in txt
+    assert "I(IBP_POLY_500N_VCO_Fit, VSS_PLL)" in txt
+    ok, problems = D.va_sanity(txt, "AVDD1P0",
+                               ["VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO"],
+                               ["IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",
+                                "IBP_PTAT_TUNE_1P5U_VCO"],
+                               ["VSS_PLL", "VSS_VCO"])
+    assert ok, problems
+
+
+def test_split_ground_default_is_byte_identical(tmp_path):
+    """No map (or every port mapped to the SAME net) collapses to the single-ground interface
+    byte-for-byte -- the split feature never perturbs the established default emission."""
+    res = _real_pmu_fit_result()
+    base = D.emit_pmu_va(res, "PMU_m", tmp_path / "a.va", supply="AVDD1P0", ground="VSS").read_text()
+    none = D.emit_pmu_va(res, "PMU_m", tmp_path / "b.va", supply="AVDD1P0", ground="VSS",
+                         port_grounds=None).read_text()
+    v_outs, i_outs = D.model_output_ports(res)
+    same = D.emit_pmu_va(res, "PMU_m", tmp_path / "c.va", supply="AVDD1P0", ground="VSS",
+                         port_grounds={p: "VSS" for p in v_outs + i_outs}).read_text()
+    assert base == none == same
+    assert (v_outs, i_outs) == (["VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO"],
+                                ["IBP_POLY_1P8U_VCO", "IBP_POLY_500N_VCO_Fit",
+                                 "IBP_PTAT_TUNE_1P5U_VCO"])
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
