@@ -189,8 +189,8 @@ def _voltage_block(o, vfit, supply, ground):
     # without re-fitting. (literal/single-OP path; the scheduled path keeps vreg load-scheduled.)
     vreg_par = (f"parameter real {pre}_vreg = {vreg:.6e};"
                 f"   // {o} regulated output target [V] (per-rail knob)")
-    Cn_par = "\n  ".join([vreg_par] + [
-        f"parameter real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
+    Cn_par = "\n  ".join([vreg_par] + [          # Cn = internal noise-corner caps (localparam)
+        f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
 
@@ -316,8 +316,8 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR):
     sched_par = (f"parameter real iload_{pre} = {iload_nom:.6e};"
                  f"   // {o} load OP [A]; ln(iload_{pre}) drives the param schedule "
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
-    Cn_par = sched_par + "".join(
-        f"\n  parameter real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
+    Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
+        f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
 
@@ -751,9 +751,12 @@ module {cell_name}({', '.join(all_ports)});
   inout {', '.join(grounds)};
   {elec_decl}
 
-  parameter real vdc_{supply} = {supply_dc:g};   // {supply} DC operating point [V]
-                                    // (PSRR / current-PSRR DC reference)
-  parameter real NRk = {NRk:.6e};   // fixed noise-section resistor (gm sets amplitude)
+  // INTERNAL model constants (localparam -> NOT instance/CDF parameters). vdc_{supply} is the
+  // PSRR/compliance DC-operating-point REFERENCE the small-signal terms linearize around (= the
+  // characterized supply DC; the live response still tracks the actual {supply} pin). NRk is the
+  // fixed noise-section resistor (the fitted gn sets amplitude). Re-emit if the supply OP moves.
+  localparam real vdc_{supply} = {supply_dc:g};   // {supply} DC operating-point reference [V]
+  localparam real NRk = {NRk:.6e};   // fixed noise-section resistor (gm sets amplitude)
   {cn_params}
 
   {rvar_decl}

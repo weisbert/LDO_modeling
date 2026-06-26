@@ -423,6 +423,11 @@ def test_per_port_operating_point_params(tmp_path):
     # still used by the model body (regulated-output reference + Idc(T) temp law)
     assert "V(VDD0P8_PLL_vrg, VSS) <+ VDD0P8_PLL_vreg;" in txt
     assert "IBP_PTAT_1P5U_idc55 + IBP_PTAT_1P5U_didt" in txt
+    # internal constants are localparam (NOT instance/CDF parameters): vdc reference, the noise
+    # resistor NRk, and the noise-corner caps -> they no longer clutter the Cadence Q/CDF list.
+    assert "localparam real vdc_AVDD1P0 =" in txt and "parameter real vdc_AVDD1P0" not in txt
+    assert "localparam real NRk =" in txt and "parameter real NRk" not in txt
+    assert "localparam real VDD0P8_PLL_Cn1 =" in txt   # noise-corner caps are constants too
 
 
 if __name__ == "__main__":
