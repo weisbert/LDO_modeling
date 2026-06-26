@@ -1,5 +1,33 @@
 # Handoff — PMU 行为模型缺了 DC/大信号层（修 fit + emit）
 
+> ## ✅ 已建+已验证 2026-06-26（ultracode，3 commits 推送 main）—— 先读这段
+> **20mV 已修+独立 GT 验证;启动 dip 重新定性、待用户两条信息。**
+> - **`41566d2` Cft**：`fit_multiport:105` 算了 `FM.fit_cft()` 但 `_fm_globals()` 上下文退出时**还原丢掉**了。
+>   接回 `result['cft']`，emit 发 per-rail `<rail>_Cft` + `I(<supply>,<rail>)<+Cft*ddt(...)`（literal+scheduled）。
+>   `cft≤0`→逐字节相同。
+> - **`eb32fd2` vreg 负载调度（修 20mV）**：瞬态数组是 `tr_<o>_<label>_<load>`（label=`<from:g>_<to:g>`），
+>   每条阶跃前/后尾巴=Vout@from/to。`importmp.split_ports` 现在把 `tr_` 带进 per-output view；
+>   `fit_multiport._build_vreg_schedule` 设 `vreg(iload)=Vout_settled+R_a*iload`（R_a 是唯一 DC 通路）并按
+>   ln(iload) 调度→`result['vreg_sched']`。`emit._voltage_block` 有它时把 vreg 从 baked param 改成调度 real var
+>   （`iload_<rail>` param + 钳位 ln 多项式，复用 `_sched_expr`）。同时修负载依赖 + 0.8 死目标偏移。无 `tr_`→None→逐字节相同。
+> - **`642dda1` Spectre-gated 独立 GT 验证锁**（`cadence/test_pmu_loadreg_gt_spectre.py`）：独立 GT（稳到 0.78，
+>   非线性 Rout）→ 消费 transient 的模型贴 GT 负载调整率 **<0.8mV**，不消费的 baseline **19.9–26.0mV 偏**（=用户症状）。
+> - 无回归：harness/+cadence/insitu **316 passed**；GUI selftest PASS；本地 Spectre -64 编译两种 .va。
+>
+> **启动 dip（800→704）重新定性**：用户澄清=**仿真 t=0 那一下、全 DC 源、无 step**（既不是负载阶跃 #2，也不是
+> 主动电源斜坡）。**本地实证**（`scratchpad/startup_probe.py`）：LTI 模型从 DC 工作点跑、纯 DC 源 → **dip=0.0mV**
+> （GT+模型都一上来就稳态，UIC 也一样）。⇒ 704 dip 是**大信号上电/节点建立**，小信号模型自身造不出。
+> **机制**：源是 DC 但节点不是（用户两个 LDO 各挂 20pF decap）；t=0 供电/bias 节点经真实源+decap 建立，输出经
+> PSRR+Cft+**`vregeff=vreg+lrsh(vdd)`(line-reg)** 跟着走 → dip。**所以 t=0 dip 和 line-reg 是同一回事**，绕不开。
+> 另：20mV 修完会改变 startup 叠图（模型以前高 20mV→dip 看着浅 20mV），`bash apply` 后大概率已靠拢。
+> **待用户两条**：(1) t=0 AVDD1P0 是理想 DC 源还是真实源带 rise/经 decap？有无 enable t=0 拉高？
+> (2) 新模型现在 startup 叠图里 t=0 是平的、还是有 dip 但深度/形状不对？
+> **下一步决策树**：先 `bash apply` 重看叠图（20mV 修完可能已对齐）；若仍差→唯一 LTI 杠杆=把老模型
+> `vregeff=vreg+lrsh(vdd)`+Cft 搬进 PMU=line-reg，需要 `dc_linereg` 电源扫；**或**若瞬态里录了 V(vin)，
+> 直接从 startup 段提"输出 vs 电源"跟踪、免新扫。等 (1)(2) 明确再定。
+> 下文是建之前的原始诊断，保留参考。
+
+
 > 下一场 ultracode 的任务：把老单口 `fit_model.emit_va` 有、新 PMU `emit_pmu_va` 被砍掉的
 > **DC 操作点层**（负载调度 vreg + 馈通 Cft，外加 line-reg hook 默认惰性）移植进
 > PMU 的 fit+emit。**纯代码修复**。
