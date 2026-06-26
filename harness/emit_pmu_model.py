@@ -185,18 +185,42 @@ def _voltage_block(o, vfit, supply, ground):
              f"{pre}_pca1", f"{pre}_pca2", f"{pre}_Rpc", f"{pre}_Lpc", f"{pre}_Cpc",
              f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))]
 
-    # {pre}_vreg is the rail's regulated-output target -> a per-rail MODULE PARAMETER (an
-    # editable CDF field, default = fitted value) so the user can retune each rail's voltage
-    # without re-fitting. (literal/single-OP path; the scheduled path keeps vreg load-scheduled.)
-    vreg_par = (f"parameter real {pre}_vreg = {vreg:.6e};"
-                f"   // {o} regulated output target [V] (per-rail knob)")
-    Cn_par = "\n  ".join([vreg_par] + _cft_param(pre, cft) + [   # Cn = noise-corner caps (localparam)
+    # vreg = the rail's regulated-output target. DEFAULT (no transient DC load-reg): a per-rail
+    # MODULE PARAMETER (editable CDF field, default = fitted) so the user can retune the voltage
+    # without re-fitting. When the fit derived a vreg(iload) DC load-reg schedule from the rail's
+    # TRANSIENT steps (vfit['vreg_sched']), vreg becomes a load-scheduled real var instead -- a
+    # clamped ln(iload) poly through the MEASURED settled-DC points -- so the model reproduces
+    # the real load regulation (and the real DC level, not the 0.8 target). The single-OP default
+    # (no transient) is byte-identical. (Mutually exclusive with the full multi-load AC schedule
+    # above, which already load-schedules vreg from per-corner AC fits.)
+    vreg_sched = vfit.get("vreg_sched")
+    vreg_rvars, vreg_asg = [], []
+    if vreg_sched:
+        vcur = [float(x) for x in vreg_sched["currents"]]
+        vval = [float(x) for x in vreg_sched["vregs"]]
+        vnom = float(vreg_sched["i_nom"])
+        vlo, vhi = min(vcur), max(vcur)
+        uvar = f"{pre}_u"
+        vreg_hdr = (f"parameter real iload_{pre} = {vnom:.6e};"
+                    f"   // {o} load OP [A]; ln(iload_{pre}) drives the vreg DC load-reg schedule "
+                    f"(VALID_LOAD [{vlo:g}..{vhi:g}])")
+        vreg_rvars = [uvar, f"{pre}_vreg"]
+        vreg_asg = [
+            f"// {o} vreg DC load-reg: clamp load to [{vlo:g},{vhi:g}] A then vreg=poly(ln(iload))",
+            f"{uvar} = ln(min(max(iload_{pre}, {vlo:.6e}), {vhi:.6e}));",
+            f"{pre}_vreg = {_sched_expr(vcur, vval, uvar, False)};",
+        ]
+    else:
+        vreg_hdr = (f"parameter real {pre}_vreg = {vreg:.6e};"
+                    f"   // {o} regulated output target [V] (per-rail knob)")
+    rvars = rvars + vreg_rvars
+    Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
 
-    # --- initial_step assignments (baked fitted params) ---
-    asg = "\n      ".join([
+    # --- initial_step assignments (vreg load-reg schedule first, then baked fitted params) ---
+    asg = "\n      ".join(vreg_asg + [
         f"{pre}_Ra = {float(p['R_a']):.6e};",
         f"{pre}_La = {float(p['L_a']):.6e};",
         f"{pre}_Rpl = {float(p['R_pl']):.6e};",

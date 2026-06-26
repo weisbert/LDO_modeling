@@ -474,6 +474,49 @@ def test_cft_absent_is_byte_identical(tmp_path):
     assert "_Cft" not in sbase
 
 
+def test_vreg_schedule_emitted_from_transient(tmp_path):
+    """A rail carrying a transient-derived DC load-reg schedule (vreg_sched) emits vreg as a
+    load-scheduled real var -- `parameter real iload_<rail>` + a clamped ln(iload) poly --
+    NOT a baked parameter. At each schedule current the poly reproduces the fitted vreg point
+    (corner-exact to 6 sig figs). va_sanity passes."""
+    cur = [1e-4, 2e-3, 4e-3]                          # 3 pts -> deg-2 poly INTERPOLATES (corner-exact)
+    vrg = [0.8000, 0.8020, 0.8040]                    # rising vreg(iload) load-reg curve
+    vf = _vfit(vreg=0.8); vf["pin"] = "VDD0P8_PLL"
+    vf["vreg_sched"] = dict(currents=cur, vregs=vrg, i_nom=1e-4)
+    res = dict(voltage={"pll": vf}, current=[],
+               meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    txt = D.emit_pmu_va(res, "PMU_vsch", tmp_path / "v.va", supply="AVDD1P0", ground="VSS").read_text()
+    # vreg is now an iload-driven schedule, no longer a baked parameter
+    assert "parameter real iload_VDD0P8_PLL = 1.000000e-04;" in txt
+    assert "VDD0P8_PLL_u = ln(min(max(iload_VDD0P8_PLL," in txt
+    assert "VDD0P8_PLL_vreg = min(max(" in txt
+    assert "parameter real VDD0P8_PLL_vreg" not in txt   # not a baked param anymore
+    # corner-exact: the emitted poly (same _sched_expr the body uses) reproduces each point
+    expr = D._sched_expr(cur, vrg, "u", False)
+    for i, v in zip(cur, vrg):
+        got = _eval_va_expr(expr, np.log(i))
+        assert abs(got - v) <= 1e-5, f"vreg sched off at {i}: {got} vs {v}"
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VDD0P8_PLL"], [], ["VSS"])
+    assert ok, problems
+
+
+def test_vreg_schedule_absent_is_byte_identical(tmp_path):
+    """vreg_sched absent or None -> emission byte-for-byte equal to the baked-vreg .va (vreg
+    stays a per-rail parameter, no iload_<rail> / no ln() schedule). Locks the default-inert
+    guarantee for the DC load-reg feature."""
+    vf = _vfit(vreg=0.8); vf["pin"] = "VDD0P8_PLL"
+    res_a = dict(voltage={"pll": vf}, current=[],
+                 meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    base = D.emit_pmu_va(res_a, "PMU_n", tmp_path / "a.va", supply="AVDD1P0", ground="VSS").read_text()
+    vf0 = _vfit(vreg=0.8); vf0["pin"] = "VDD0P8_PLL"; vf0["vreg_sched"] = None
+    res_b = dict(voltage={"pll": vf0}, current=[],
+                 meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    none = D.emit_pmu_va(res_b, "PMU_n", tmp_path / "b.va", supply="AVDD1P0", ground="VSS").read_text()
+    assert base == none
+    assert "parameter real VDD0P8_PLL_vreg = 8.000000e-01;" in base
+    assert "iload_VDD0P8_PLL" not in base
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))

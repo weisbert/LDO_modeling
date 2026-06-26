@@ -83,7 +83,8 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     """Fit one voltage output from its single-port view (split_ports output).
     view = {"npz": {z_<il>,p_<il>,noise_<il>,loads,meta_*}, "supplies": {s:{il:arr}}, ...}.
     Returns dict(P={il:params}, nfk, cout, esr, err=[per-corner per-metric], supplies=[...],
-    schedule_loads=[labels carrying a real, finite iv], cft=<gated feedthrough cap, 0.0 off>).
+    schedule_loads=[labels carrying a real, finite iv], cft=<gated feedthrough cap, 0.0 off>,
+    vreg_sched=<{currents,vregs,i_nom} DC load-reg from transient, or None>).
 
     `iload_map` {label: amps} carries the rail's REAL per-label current (from the npz
     meta_iload_<o>); when given it is the AUTHORITATIVE abscissa for the emit-side
@@ -191,8 +192,92 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     # per the contract). Single-OP -> one label or empty (baked literal downstream).
     schedule_loads = [il for il in loads
                       if np.isfinite(P[il]["iv"]) and P[il]["iv"] != 0.0]
+    # DC load-regulation schedule derived from the rail's TRANSIENT load steps (the AC sweep
+    # never carries DC load-reg). None when no parseable transient is present -> emit stays
+    # byte-identical. See _build_vreg_schedule.
+    vreg_sched = _build_vreg_schedule(sp, loads, P, nom)
     return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
-                supplies=list(supplies), schedule_loads=schedule_loads, cft=cft)
+                supplies=list(supplies), schedule_loads=schedule_loads, cft=cft,
+                vreg_sched=vreg_sched)
+
+
+def _settled_step(w):
+    """(pre-step, post-step) settled output means from a load-step [t,V] waveform, or None
+    when the step can't be located cleanly. The step edge = the largest |dV| sample; the
+    pre window is a slab just BEFORE the edge (skips the t~0 startup), the post window the
+    settled tail. Robust to step direction (up or down)."""
+    w = np.asarray(w, dtype=float)
+    if w.ndim != 2 or w.shape[0] < 8 or w.shape[1] < 2:
+        return None
+    t, V = w[:, 0], w[:, 1]
+    if not (np.all(np.isfinite(t)) and np.all(np.isfinite(V))):
+        return None
+    idx = int(np.argmax(np.abs(np.diff(V))))                  # the load-step edge
+    te, t0, tend = t[idx], t[0], t[-1]
+    if not (tend > te > t0):
+        return None
+    pre = (t >= te - 0.40 * (te - t0)) & (t < te - 0.02 * (te - t0))
+    post = t >= tend - 0.20 * (tend - te)
+    if pre.sum() < 3 or post.sum() < 3:
+        return None
+    return float(V[pre].mean()), float(V[post].mean())
+
+
+def _loadreg_from_transient(sp, loads):
+    """Recover {iload: settled Vout} DC load-regulation points from a rail's transient load
+    steps (view keys tr_<label>_<load>, label='<from:g>_<to:g>'). Each step yields TWO points:
+    pre-step tail = Vout@from, post-step tail = Vout@to. Duplicate iloads are averaged. Empty
+    when no parseable transient is present (custom non-from_to label -> that step is skipped)."""
+    by_i = {}
+    loads_sorted = sorted([str(x) for x in loads], key=len, reverse=True)
+    for k in list(sp.keys()):
+        if not (isinstance(k, str) and k.startswith("tr_")):
+            continue
+        rest = k[3:]                                          # <label>_<load>
+        lbl = None
+        for il in loads_sorted:                               # strip the known load suffix
+            if rest.endswith(f"_{il}"):
+                lbl = rest[:-(len(il) + 1)]
+                break
+        if lbl is None:
+            continue
+        try:
+            i_from_s, i_to_s = lbl.rsplit("_", 1)             # '<from>_<to>' (g-format, no '_')
+            i_from, i_to = float(i_from_s), float(i_to_s)
+        except Exception:                                     # noqa: BLE001 -- custom label
+            continue
+        s = _settled_step(sp[k])
+        if s is None:
+            continue
+        for iv, vo in ((i_from, s[0]), (i_to, s[1])):
+            if np.isfinite(iv) and iv > 0 and np.isfinite(vo):
+                by_i.setdefault(iv, []).append(vo)
+    return {iv: float(np.mean(vs)) for iv, vs in by_i.items()}
+
+
+def _build_vreg_schedule(sp, loads, P, nom):
+    """Derive a vreg(iload) DC load-regulation schedule from the rail's transient steps.
+
+    The model's DC output is Vout = vreg - R_a*iload (branch-A R_a is the ONLY DC path; B is
+    open, C is a cap). To reproduce the MEASURED settled Vout(iload) we set
+        vreg(iload) = Vout_settled(iload) + R_a*iload
+    and schedule vreg vs ln(iload). This corrects BOTH error sources in one shot: the
+    load-DEPENDENT droop (multiple loads) AND the fixed-target steady-state offset -- the AC
+    fit bakes vreg from the 0.8 TARGET (fit_multiport vout_dc default), not the real output.
+
+    Returns dict(currents, vregs, i_nom) or None (no transient / <2 distinct loads). i_nom =
+    the AC operating load so the default instance sits at the characterized OP."""
+    pts = _loadreg_from_transient(sp, loads)
+    if len(pts) < 2:
+        return None
+    R_a = float(P[nom]["R_a"])
+    currents = sorted(pts.keys())
+    if len(currents) < 2:
+        return None
+    vregs = [pts[i] + R_a * i for i in currents]
+    iv_nom = float(P[nom]["iv"])
+    i_nom = iv_nom if (np.isfinite(iv_nom) and iv_nom > 0) else currents[len(currents) // 2]
+    return dict(currents=currents, vregs=vregs, i_nom=float(i_nom))
 
 
 def _amps_ok(il):
