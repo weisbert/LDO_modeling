@@ -44,6 +44,14 @@ in the original 8-archetype set; the scalar PASS gate (`ptat_err`, `rout_err`) n
   sharp Q that makes the bow (Q₁₂₁≈45) conflicts with the bringup Q≤30 stability gate, so a
   bringup-PASSING GT with 3× peak ratios on *both* load sides is infeasible on this topology — a
   finding about the probe-feasibility envelope, not a gate failure.
+- **A1 spec resolution (DECISION, 2026-06-26):** ACCEPTED as-is. The literal A1 acceptance
+  ("peak|Z|@121µ ≥3× *both* the 20µ and 250µ sides") is **not pursued** — the only config that meets
+  it (lm=1u long-mirror, 3.33×/3.15×) forces mid-corner Q≈45, which fails the bringup Q≤30 stability
+  gate; sharp-Q-bow vs Q≤30-stability are jointly infeasible on this 5T-OTA/PMOS-pass topology (agent-
+  proven). qbow's falsifiable finding is met through a **structural-representation** channel instead
+  (composite 18.96 + offgrid FAIL + PSRR-complex structloco flip), which is a stronger result than a
+  single |Z| peak-ratio. No code/GT change; the A1 acceptance is read as "non-monotonic-Q bow the
+  2-branch RLC cannot represent," demonstrated by the above.
 
 ## Current path (stress `fit_isrc.py`) — `crossval_isrc` (PASS gate **stays 8/8** on baselines)
 
@@ -62,6 +70,40 @@ in the original 8-archetype set; the scalar PASS gate (`ptat_err`, `rout_err`) n
   the chord → `idc_err`/`ptat_err` fire), so a *clean* blind-spot B1 (existing gate passes, B1
   fires) needs an S-shaped / off-center-U current — delicate in this strongly-CTAT-Vth PDK. The B1
   **gate** is validated independently (synthetic lock test + clean on all 8 baselines + 15% miss).
+
+### FIX-1 (B1 clean blind-spot) — attempted, documented FALLBACK (2026-06-26)
+
+**Target:** a sink whose Idc(T) is collinear at the 3 fit temps (−40/55/125) so the existing
+scalar gate FULLY passes (idc_err<2% AND ptat_err<0.03), yet bows >5% at the interior held-out
+temps (25/85) so only `gate_heldout_idc` fires — i.e. B1 becomes a *clean* blind-spot, not
+"caught by both." This needs Idc(T) to cross its own −40↔125 chord three times (a sign-FLIPPING /
+cubic residual: r(25)>0, r(85)<0), which requires a genuine inflection plus a subtractive (CTAT)
+term — pure-convex sums cannot do it.
+
+**Feasibility — confirmed in principle.** A pure-numpy ideal check: an ideal tanh-S (T0≈48 °C,
+wide w≈68, amplitude ≈½ the baseline) and an ideal cubic-residual (α≈4e-7) BOTH satisfy
+idc_err≈0 / ptat≈0 / b1>5%. So the target shape is mathematically attainable.
+
+**Four MOS mechanism families were searched (hundreds of ngspice evals, an offline collinearity/
+bow/I-V-nonlinearity proxy calibrated against the real crossval; promising configs re-checked
+through the FULL fit→emit→re-sim pipeline). None yields an I-V-clean clean-win in this PDK:**
+
+| mechanism | result | why it fails |
+|---|---|---|
+| ideal tanh / cubic (numpy) | WIN | proves the target is feasible *in principle* |
+| all-NMOS, 1/2/3 parallel sub→strong devices | b1 ≤ 2.4% at collinear | monotonic same-sign **convex** residual — a sum of convex curves can't form the sign-flipping cubic; nulling r at 55 also collapses it at 25/85 |
+| output-side subtractive PMOS corrector | **iv_rms = 14.4%** (full-pipeline verified) | strong enough to force collinearity ⇒ the Vout-dependent corrector distorts the I-V (iv_rms ≫ 5%); gentle enough to keep I-V clean ⇒ can't reach collinear (idc_err 12%). A hard 3-way tension: collinear ⟂ bow ⟂ clean-I-V |
+| bias-shaped curvature mirror (subtract at a Vout-independent node, clean mirror out) | no win (idc_err 10%, iv_nl ≥ 5.5%) | fragile (pull>push collapses the diode node); the simple mirror's plateau is inherently curved (iv proxy floors at ~5.5%) and it still can't reach collinear |
+
+**Conclusion (FALLBACK, per `HANDOFF_ADVERSARIAL_PROBE_FIXES.md`):** a robust, bringup-stable,
+I-V-clean current that is collinear at the 3 fit temps yet bowed >5% in the interior is **not
+achievable** in this strongly-CTAT-Vth BSIM3 PDK after honest, thorough iteration. The current
+monotonic-convex `isrc_inflect_ctat_ptat` is **KEPT**: it still EXPOSES (15% interior miss),
+just via *both* the existing endpoint gate AND the new B1 gate rather than the B1 gate alone. This
+costs nothing on the deliverable — **the B1 gate is independently validated** (synthetic lock test
+fires on a U-shape / quiet on linear; clean ≤0.4% on all 8 baselines; 15% on the probe). The
+meta-finding stands at "3/4 clean + B1 caught-by-both"; making B1 the 4th clean case is blocked by
+the PDK, not by the gate. (Search harness retained under the session scratchpad, not committed.)
 
 ## The 5 new gates (the deliverable infrastructure)
 

@@ -1,5 +1,15 @@
 # Handoff — adversarial overfit-probe FIXES + extensions (next ultracode session)
 
+> **RESOLUTION (2026-06-26, ultracode).** FIX-2 → **(a) ACCEPT + document** (user-chosen); the qbow
+> A1 spec is read as a structural-representation finding (see `ADVERSARIAL_OVERFIT_PROBE_RESULTS.md`).
+> FIX-1 → **attempted thoroughly, documented FALLBACK** — four MOS mechanism families searched
+> (all-NMOS sub→strong ×3, output-side subtractive PMOS, bias-shaped curvature mirror); the target is
+> feasible in principle (ideal tanh/cubic) but NOT achievable I-V-clean + bringup-stable + collinear
+> in this CTAT-Vth PDK (output corrector hits iv_rms 14.4% full-pipeline; all-NMOS hits b1≤2.4% at
+> collinear). The current monotonic-convex B1 DUT is KEPT (still exposes; B1 gate independently
+> validated). Full write-up + mechanism table in the RESULTS doc. EXT-1/EXT-2 NOT done (left open).
+> No repo regression: only the RESULTS + this handoff doc were edited; harness/ground_truth untouched.
+
 **State (DONE, committed `e32ce06`, pushed):** 8 adversarial GT DUTs built+run+exposed; meta-finding
 confirmed (4/8 — A4 classab / B2 double_cascode / B3 bias_flip / B4 tempload — fail where the existing
 harness is blind, only the 5 new gates catch them); bonus baseline finding (v8_wilson B4 139 mV).
