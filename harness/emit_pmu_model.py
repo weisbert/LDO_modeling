@@ -159,9 +159,10 @@ def _voltage_block(o, vfit, supply, ground):
     nfk = list(vfit["nfk"])
     Cout = float(vfit["cout"])
     ESR = float(vfit["esr"])
+    cft = float(vfit.get("cft", 0.0))      # gated vin->vout feedthrough cap (0.0 -> not emitted)
     sched = _schedule_loads(vfit, P)
     if sched:
-        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR)
+        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft)
     il = _nom_corner(P)
     p = P[il]
     vreg = float(p["vreg"])
@@ -189,7 +190,7 @@ def _voltage_block(o, vfit, supply, ground):
     # without re-fitting. (literal/single-OP path; the scheduled path keeps vreg load-scheduled.)
     vreg_par = (f"parameter real {pre}_vreg = {vreg:.6e};"
                 f"   // {o} regulated output target [V] (per-rail knob)")
-    Cn_par = "\n  ".join([vreg_par] + [          # Cn = internal noise-corner caps (localparam)
+    Cn_par = "\n  ".join([vreg_par] + _cft_param(pre, cft) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
@@ -217,15 +218,38 @@ def _voltage_block(o, vfit, supply, ground):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
-def _voltage_body(o, supply, ground, nfk, Cout, ESR):
+def _cft_param(pre, cft):
+    """Per-rail gated vin->vout feedthrough cap param line(s). Empty list when cft<=0 so the
+    header stays byte-identical to the pre-feedthrough emit (mirrors fit_model.emit_va's
+    `if CFT > 0` gate). Editable knob (parameter, not localparam) like the old single-port .va."""
+    if cft and cft > 0:
+        return [f"parameter real {pre}_Cft = {float(cft):.6e};"
+                f"   // {pre} gated vin->vout feedthrough cap [F]"]
+    return []
+
+
+def _cft_body(o, supply, cft):
+    """Per-rail Cft feedthrough contribution (supply->{o}), emitted ONLY when cft>0. Mirrors
+    the single-port emit_va `I(vin, vout) <+ Cft*ddt(V(vin, vout))` with vin=supply, vout={o}.
+    Empty string when cft<=0 -> byte-identical body."""
+    if cft and cft > 0:
+        return (f"\n\n    // ---- gated vin->vout feedthrough cap (pass-device/package) ----"
+                f"\n    I({supply}, {o}) <+ {o}_Cft*ddt(V({supply}, {o}));")
+    return ""
+
+
+def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
     scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
     between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
-    contributions stays byte-equal. References the per-rail `<o>_*` real vars."""
+    contributions stays byte-equal. References the per-rail `<o>_*` real vars.
+
+    `cft`>0 appends a gated supply->{o} feedthrough contribution (load-independent literal);
+    cft<=0 (the default / single-OP) -> byte-identical to the pre-feedthrough body."""
     pre = o
     nsec = "\n    ".join(
         f"I({pre}_nk{k+1}, {ground}) <+ V({pre}_nk{k+1}, {ground})/NRk"
@@ -269,11 +293,11 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR):
     I({supply}, {pre}_ncs1) <+ V({supply}, {pre}_ncs1)/{pre}_Rpc;
     I({pre}_ncs1, {pre}_ncs2) <+ idt(V({pre}_ncs1, {pre}_ncs2))/{pre}_Lpc;
     I({pre}_ncs2, {pre}_vrf) <+ {pre}_Cpc*ddt(V({pre}_ncs2, {pre}_vrf));
-    I({o}, {ground}) <+ -({pre}_pcb0*V({pre}_ncs2, {pre}_vrf) + {pre}_gqb1*V({supply}, {pre}_ncs1));
+    I({o}, {ground}) <+ -({pre}_pcb0*V({pre}_ncs2, {pre}_vrf) + {pre}_gqb1*V({supply}, {pre}_ncs1));{_cft_body(o, supply, cft)}
 """
 
 
-def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR):
+def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft=0.0):
     """MULTI-LOAD path: each load-dependent small-signal param is a CLAMPED quadratic in
     u=ln(iload_<o>) (a per-rail module parameter, nominal = the middle schedule load's iv).
     At a schedule corner the scheduled expr == that corner's fitted value (corner-exact);
@@ -317,6 +341,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR):
                  f"   // {o} load OP [A]; ln(iload_{pre}) drives the param schedule "
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
     Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
+        f"\n  {ln}" for ln in _cft_param(pre, cft)) + "".join(
         f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
@@ -347,7 +372,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
                 scheduled=True, valid_load=(ilo, ihi))
 

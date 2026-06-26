@@ -430,6 +430,50 @@ def test_per_port_operating_point_params(tmp_path):
     assert "localparam real VDD0P8_PLL_Cn1 =" in txt   # noise-corner caps are constants too
 
 
+def test_cft_feedthrough_emitted_when_present(tmp_path):
+    """A rail carrying a gated vin->vout feedthrough cap (cft>0, the value fit_cft produced
+    and the PMU path used to DROP) emits an editable `<rail>_Cft` parameter + a supply->rail
+    ddt feedthrough contribution -- mirroring the old single-port emit_va. va_sanity passes."""
+    vf = _vfit(vreg=0.8)
+    vf["pin"] = "VDD0P8_PLL"
+    vf["cft"] = 1.74e-13                  # ~174 fF, the Target-B feedthrough magnitude
+    res = dict(voltage={"pll": vf}, current=[],
+               meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    txt = D.emit_pmu_va(res, "PMU_cft", tmp_path / "c.va", supply="AVDD1P0", ground="VSS").read_text()
+    assert "parameter real VDD0P8_PLL_Cft = 1.740000e-13;" in txt
+    assert "I(AVDD1P0, VDD0P8_PLL) <+ VDD0P8_PLL_Cft*ddt(V(AVDD1P0, VDD0P8_PLL));" in txt
+    ok, problems = D.va_sanity(txt, "AVDD1P0", ["VDD0P8_PLL"], [], ["VSS"])
+    assert ok, problems
+
+
+def test_cft_absent_is_byte_identical(tmp_path):
+    """cft absent OR cft<=0 -> emission byte-for-byte equal to the pre-feedthrough .va (no
+    `_Cft` param, no feedthrough contribution). Locks the default-inert guarantee on BOTH the
+    literal (single-OP) and the scheduled (multi-load) voltage paths."""
+    # literal path
+    vf = _vfit(vreg=0.8); vf["pin"] = "VDD0P8_PLL"
+    res_a = dict(voltage={"pll": vf}, current=[],
+                 meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    base = D.emit_pmu_va(res_a, "PMU_b", tmp_path / "a.va", supply="AVDD1P0", ground="VSS").read_text()
+    vf0 = _vfit(vreg=0.8); vf0["pin"] = "VDD0P8_PLL"; vf0["cft"] = 0.0
+    res_b = dict(voltage={"pll": vf0}, current=[],
+                 meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    zero = D.emit_pmu_va(res_b, "PMU_b", tmp_path / "b.va", supply="AVDD1P0", ground="VSS").read_text()
+    assert base == zero
+    assert "_Cft" not in base
+    # scheduled path (multi-load): cft absent vs cft=0.0 also byte-identical
+    sf, slabels = _multiload_vfit([50e-6, 580e-6, 2000e-6]); sf["pin"] = "VDD0P8_PLL"
+    sres = dict(voltage={"pll": sf}, current=[],
+                meta=dict(name="x", loads=slabels, supplies=["AVDD1P0"]))
+    sbase = D.emit_pmu_va(sres, "PMU_s", tmp_path / "sa.va", supply="AVDD1P0", ground="VSS").read_text()
+    sf0, _ = _multiload_vfit([50e-6, 580e-6, 2000e-6]); sf0["pin"] = "VDD0P8_PLL"; sf0["cft"] = 0.0
+    sres0 = dict(voltage={"pll": sf0}, current=[],
+                 meta=dict(name="x", loads=slabels, supplies=["AVDD1P0"]))
+    szero = D.emit_pmu_va(sres0, "PMU_s", tmp_path / "sb.va", supply="AVDD1P0", ground="VSS").read_text()
+    assert sbase == szero
+    assert "_Cft" not in sbase
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))

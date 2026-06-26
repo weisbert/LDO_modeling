@@ -83,7 +83,7 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     """Fit one voltage output from its single-port view (split_ports output).
     view = {"npz": {z_<il>,p_<il>,noise_<il>,loads,meta_*}, "supplies": {s:{il:arr}}, ...}.
     Returns dict(P={il:params}, nfk, cout, esr, err=[per-corner per-metric], supplies=[...],
-    schedule_loads=[labels carrying a real, finite iv]).
+    schedule_loads=[labels carrying a real, finite iv], cft=<gated feedthrough cap, 0.0 off>).
 
     `iload_map` {label: amps} carries the rail's REAL per-label current (from the npz
     meta_iload_<o>); when given it is the AUTHORITATIVE abscissa for the emit-side
@@ -103,6 +103,12 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
         FM.NOMINAL = nom
         FM.CFT = 0.0
         FM.fit_cft()                       # gate (stays silent on the stand-in)
+        # CAPTURE the gated vin->vout feedthrough cap BEFORE _fm_globals() restores the
+        # module global on block exit. fit_cft() writes FM.CFT as a side effect (0.0 when its
+        # 5 gates fail); the single-port emit_va consumed it, but the PMU emit path used to
+        # DROP it. Thread it out so emit_pmu_va can re-emit the I(vin,vout) feedthrough.
+        # CFT==0 (gate off / single-OP stand-in) -> emit stays byte-identical.
+        cft = float(FM.CFT)
         FM.C, FM.RC = FM.fit_cout_esr()    # this output's physical Cout/ESR
         cout, esr = FM.C, FM.RC
         zfits, P, err = {}, {}, []
@@ -186,7 +192,7 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     schedule_loads = [il for il in loads
                       if np.isfinite(P[il]["iv"]) and P[il]["iv"] != 0.0]
     return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
-                supplies=list(supplies), schedule_loads=schedule_loads)
+                supplies=list(supplies), schedule_loads=schedule_loads, cft=cft)
 
 
 def _amps_ok(il):
