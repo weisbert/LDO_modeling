@@ -180,14 +180,19 @@ def _voltage_block(o, vfit, supply, ground):
     rvars = [f"{pre}_Ra", f"{pre}_La", f"{pre}_Rpl", f"{pre}_Rb", f"{pre}_Lb",
              f"{pre}_G0", f"{pre}_G1", f"{pre}_w1", f"{pre}_G2", f"{pre}_w2",
              f"{pre}_G3", f"{pre}_w3", f"{pre}_pcb0", f"{pre}_pcb1", f"{pre}_pcw0",
-             f"{pre}_pcq", f"{pre}_gnw", f"{pre}_vreg", f"{pre}_Cps",
+             f"{pre}_pcq", f"{pre}_gnw", f"{pre}_Cps",
              f"{pre}_pca1", f"{pre}_pca2", f"{pre}_Rpc", f"{pre}_Lpc", f"{pre}_Cpc",
              f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))]
 
-    Cn_par = "\n  ".join(
+    # {pre}_vreg is the rail's regulated-output target -> a per-rail MODULE PARAMETER (an
+    # editable CDF field, default = fitted value) so the user can retune each rail's voltage
+    # without re-fitting. (literal/single-OP path; the scheduled path keeps vreg load-scheduled.)
+    vreg_par = (f"parameter real {pre}_vreg = {vreg:.6e};"
+                f"   // {o} regulated output target [V] (per-rail knob)")
+    Cn_par = "\n  ".join([vreg_par] + [
         f"parameter real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
-        for k in range(len(nfk)))
+        for k in range(len(nfk))])
 
     # --- initial_step assignments (baked fitted params) ---
     asg = "\n      ".join([
@@ -203,7 +208,6 @@ def _voltage_block(o, vfit, supply, ground):
         f"{pre}_pcb0 = {pcb0:.6e};  {pre}_pcb1 = {pcb1:.6e};",
         f"{pre}_pcw0 = {pcw0:.6e};  {pre}_pcq = {pcq:.6e};",
         f"{pre}_gnw = {float(p['gnw']):.6e};",
-        f"{pre}_vreg = {vreg:.6e};",
     ] + [f"{pre}_gn{k+1} = {float(p[f'gn{k+1}']):.6e};" for k in range(len(nfk))]
       + [
         f"{pre}_Cps = 1e-12;",
@@ -424,10 +428,14 @@ def _current_block_largesignal(o, crow, supply, ground):
             f"    I({o}, {pre}_nz) <+ {pre}_Cz*ddt(V({o}, {pre}_nz));"
             f"        // 2nd-order admittance zero (cascode/Wilson): lossy series C-R\n"
             f"    I({pre}_nz, {ground}) <+ V({pre}_nz, {ground})/{pre}_Rz;\n")
-    rvars = [f"{pre}_idc55", f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
+    rvars = [f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
              f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"] \
         + d2_var + zero_var
-    asg = (f"{pre}_idc55 = {idc55:.6e};  {pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
+    # {pre}_idc55 is the bias's DC output current at Tnom -> a per-bias MODULE PARAMETER (an
+    # editable CDF field, default = fitted value) so the user can retune each bias current.
+    idc_par = (f"parameter real {pre}_idc55 = {idc55:.6e};"
+               f"   // {o} DC bias current @ {float(crow.get('tnom_c', 55.0)):g}C [A] (per-bias knob)")
+    asg = (f"{pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
            f"{pre}_vc = {vc:.6g};  {pre}_gdd = {gdd_eff:.6e};  {pre}_vk = {vk:.6g};  "
            f"{pre}_kp = {kp:.6g};  {pre}_vhi = {vhi:.6g};  {pre}_Cp = {cp:.6e};  "
            f"{pre}_inw2 = {inw2:.6e};  {pre}_kf = {kf:.6e};" + d2_asg + zero_asg)
@@ -449,7 +457,7 @@ def _current_block_largesignal(o, crow, supply, ground):
 {zero_body}    I({o}, {ground}) <+ white_noise({pre}_inw2, "{pre}_wht");
     I({o}, {ground}) <+ flicker_noise({pre}_kf, 1.0, "{pre}_flk");
 """
-    return dict(rvars=rvars, asg=asg, body=body, nodes=zero_node)
+    return dict(rvars=rvars, asg=asg, body=body, nodes=zero_node, params=idc_par)
 
 
 def _current_block_legacy(o, crow, supply, ground):
@@ -671,7 +679,11 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
     for cb in cblocks:
         rvars += cb["rvars"]
 
-    cn_params = "\n  ".join(vb["params"] for vb in vblocks if vb["params"])
+    # module-level parameters (editable CDF fields): per-rail vreg + noise corners (voltage
+    # blocks) and per-bias idc (current blocks). vdc_<supply>/NRk are added in the header.
+    _param_lines = [vb["params"] for vb in vblocks if vb.get("params")]
+    _param_lines += [cb["params"] for cb in cblocks if cb.get("params")]
+    cn_params = "\n  ".join(_param_lines)
     asgs = "\n      ".join([vb["asg"] for vb in vblocks] + [cb["asg"] for cb in cblocks])
     bodies = "\n".join([vb["body"] for vb in vblocks] + [cb["body"] for cb in cblocks])
 

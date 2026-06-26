@@ -403,6 +403,28 @@ def test_split_ground_default_is_byte_identical(tmp_path):
                                  "IBP_PTAT_TUNE_1P5U_VCO"])
 
 
+def test_per_port_operating_point_params(tmp_path):
+    """Each voltage rail's regulated output (vreg) and each large-signal bias's DC current
+    (idc55) are MODULE PARAMETERS (editable CDF fields, default = fitted), declared exactly
+    ONCE (no double-assign in initial_step) and still referenced by the body."""
+    vf = _vfit(vreg=0.8)
+    vf["pin"] = "VDD0P8_PLL"
+    ls = dict(sink="i1p5u", pin="IBP_PTAT_1P5U", pol="sink", idc55=1.502e-6, didt=1e-9,
+              g0=3e-10, vc=0.667, gdd=2e-9, vknee=0.05, knee_p=1.0, Cp=16e-15,
+              in_white=0.0, in_kf=0.0, tnom_c=25.0)
+    res = dict(voltage={"pll": vf}, current=[ls],
+               meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
+    txt = D.emit_pmu_va(res, "PMU_x", tmp_path / "x.va", supply="AVDD1P0", ground="VSS").read_text()
+    # declared as parameters, exactly once each (the promotion, not a 2nd initial_step assign)
+    assert "parameter real VDD0P8_PLL_vreg = 8.000000e-01;" in txt
+    assert "parameter real IBP_PTAT_1P5U_idc55 = 1.502000e-06;" in txt
+    assert txt.count("VDD0P8_PLL_vreg =") == 1, "vreg must not be re-assigned in initial_step"
+    assert txt.count("IBP_PTAT_1P5U_idc55 =") == 1, "idc55 must not be re-assigned in initial_step"
+    # still used by the model body (regulated-output reference + Idc(T) temp law)
+    assert "V(VDD0P8_PLL_vrg, VSS) <+ VDD0P8_PLL_vreg;" in txt
+    assert "IBP_PTAT_1P5U_idc55 + IBP_PTAT_1P5U_didt" in txt
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
