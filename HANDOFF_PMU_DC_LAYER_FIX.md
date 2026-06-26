@@ -1,8 +1,25 @@
 # Handoff — PMU 行为模型缺了 DC/大信号层（修 fit + emit）
 
 > 下一场 ultracode 的任务：把老单口 `fit_model.emit_va` 有、新 PMU `emit_pmu_va` 被砍掉的
-> **DC 操作点层**（线性调整 line-reg + 馈通 Cft + DC-vreg + 负载调度 vreg）移植进
-> PMU 的 fit+emit。**纯代码修复**；多负载/温度/电源扫的重抽是用户那边（见 §数据侧）。
+> **DC 操作点层**（负载调度 vreg + 馈通 Cft，外加 line-reg hook 默认惰性）移植进
+> PMU 的 fit+emit。**纯代码修复**。
+
+> ## ⚠️ 修正（用户提问后 2026-06-26）—— 优先读这段，它覆盖下文的 dropout/line-reg 部分
+> **核心改成：让 fit 消费用户已经给的 transient 负载阶跃数据。** 核实结论：
+> - 用户在 manifest 里**已声明 transient 负载阶跃**：pll `100µ→{2m,3m,4m}`、vco `100µ→{4m,5m,6m}`
+>   （1ns 沿，10µs）。**transient 就是 dropout 的活、而且更全**：阶跃**顶端稳态值 = 各负载输出 =
+>   负载调整率（直接修 20mV）**；阶跃**动态过冲/恢复 = 大信号瞬态（修启动 drop）**。
+> - **但 fit 完全没消费它**：建模 npz 里**没有任何 trans_ 数组**（只有 z_/y_/noise_/iv_/p_/pi_）；
+>   `fit_model.py` 里 fit transient 的代码 **= 0 处**；trans_* 只被 `score.py` 当**验证参照**用过，
+>   从没当过建模输入。→ 用户的 transient 一直被**扔掉**。
+> - **因此：① 不要再加 DC dropout 扫**（transient 信息更多，冗余）；**② line-reg/电源扫拿掉**
+>   （用户说暂时没必要；emit 留默认惰性 hook，不要数据）。
+> - **真正要做的**：fit 读 npz 里的 `trans_<rail>_<step>`，提取 (a) 每个 step 的**稳态输出 → vreg(iload)
+>   负载调整率 → 负载调度**（修 20mV，**连多负载 AC 重抽都不一定需要**，稳态点 transient 里就有）；
+>   (b) 动态段 → 启动/负载瞬态（trans-ID，infra 见 `validate_trans_id`/`trans_import`，可作 Phase-2）。
+> - **数据侧只剩一件**：确认 transient 真的被**跑 + import 进了 fit 的 npz**（`importmp` 已支持
+>   `kind==trans`→[t,V]；注意 digest 会丢 transient，要从**完整 run npz** fit，不是 digest）。
+> 下文 §L2/§B(2,4)/§数据侧 里关于"加 dropout/dc_linereg 扫"的部分**作废**，以本段为准。
 
 ## 症状（用户在真实 PMU TB 里对比看到的）
 1. **启动大 drop**：真实 LDO 启动时输出掉到 ~704mV（从 800），新 PMU 模型掉得不够。
