@@ -4244,6 +4244,9 @@ if _HAVE_QT:
                 a.axvline(vw.get("vc", 0.0), color="k", ls=":", lw=.8)
                 a.set_title("I-V compliance knee"); a.set_xlabel("Vo [V]"); a.set_ylabel("I [µA]")
                 a.grid(True, which="both", alpha=.3); a.legend(fontsize=8)
+                # absolute µA on the ticks (no '+1.50' offset trap) + 0-based so a flat
+                # current source reads as its true level, not the µV rout ripple around an offset.
+                a.ticklabel_format(useOffset=False, axis="y"); a.set_ylim(bottom=0)
             else:
                 self._report_blank(a, "no I-V panel")
 
@@ -5640,6 +5643,8 @@ if _HAVE_QT:
             ax[0, 0].axvline(v["vc"], color="k", ls=":", lw=.8)
             ax[0, 0].set_title("I-V compliance knee")   # pin/pol shown in the metric box + status line
             ax[0, 0].set_xlabel("Vo [V]"); ax[0, 0].set_ylabel("I [µA]")
+            # no '+1.50' offset trap; 0-based so a flat current source reads as its true µA level
+            ax[0, 0].ticklabel_format(useOffset=False, axis="y"); ax[0, 0].set_ylim(bottom=0)
             ax[0, 1].loglog(v["ac_f"], np.abs(v["ac_y"]), label="GT", lw=2)
             ax[0, 1].loglog(v["ac_f"], np.abs(d["y_model"]), "--", label="model")
             ax[0, 1].set_title("|Y| admittance [S]"); ax[0, 1].set_xlabel("Hz")
