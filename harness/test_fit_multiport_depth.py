@@ -284,6 +284,32 @@ def test_vreg_schedule_from_opaque_custom_labels(tmp_path):
     assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]
 
 
+def test_vreg_schedule_bridges_label_form_divergence(tmp_path):
+    """REGRESSION (the box's `3 transient wfm in npz, 0 mapped`): the npz was imported with the
+    AUTO `<from:g>_<to:g>` label form (`tr_pll_0.0001_0.002`) but the FIT manifest carries CUSTOM
+    labels (2m/3m/4m) -- the recurring GUI-built vs hand-edited REAL divergence. split_ports must
+    BRIDGE by from/to so the schedule still builds WITHOUT a re-import."""
+    curve = {1e-4: 0.800, 2e-3: 0.802, 3e-3: 0.803, 4e-3: 0.804}
+    z, p, n = _ac()
+    rec = {"loads": np.array(["nom"]), "z_pll_nom": z, "p_pll_AVDD1P0_nom": p,
+           "noise_pll_nom": n, "meta_iload_pll": np.array([1e-4])}
+    for i_to in (2e-3, 3e-3, 4e-3):                          # AUTO-form npz keys (no custom label)
+        rec[f"tr_pll_{1e-4:g}_{i_to:g}"] = _vstep(curve[1e-4], curve[i_to])
+    npz = tmp_path / "bridge.npz"
+    np.savez(npz, **rec)
+    m = {"name": "bridge", "supplies": {"AVDD1P0": {"dc": 1.05, "net": "VDD1P0"}},
+         "current_psrr_supplies": ["AVDD1P0"],
+         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8}}, "i_out": {},
+         "coverage": {"transient": {"pll": {"steps": [       # CUSTOM labels -- divergent from npz
+             {"from": 1e-4, "to": 2e-3, "label": "2m"},
+             {"from": 1e-4, "to": 3e-3, "label": "3m"},
+             {"from": 1e-4, "to": 4e-3, "label": "4m"}]}}}}
+    res = FMP.fit_multiport(str(npz), m)
+    vs = res["voltage"]["pll"]["vreg_sched"]
+    assert vs is not None, "auto-form npz + custom-label manifest must bridge by from/to"
+    assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]
+
+
 def test_no_transient_vreg_sched_none(tmp_path):
     """No transient arrays -> vreg_sched is None (the single-OP default; emit stays byte-
     identical via the baked-vreg parameter path)."""

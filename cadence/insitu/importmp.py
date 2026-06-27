@@ -363,20 +363,41 @@ def split_ports(ref, manifest):
             if isinstance(k, str) and k.startswith(f"tr_{o}_"):
                 sp["tr_" + k[len(f"tr_{o}_"):]] = ref[k]
         # Map each transient view-key -> its (i_from, i_to) load currents from the manifest's
-        # coverage.transient step DECLARATION (the source of truth). The fit must NOT parse the
-        # currents out of the key: the manifest tag is tr_<o>_<label> with a user label that may
-        # be opaque ("2m"/"3m") and has NO _<load> suffix, so string-parsing silently dropped
-        # every real step. {} when no transient decl -> no load-reg schedule (byte-identical).
+        # coverage.transient step DECLARATION (the source of truth -- never string-parse currents
+        # out of the opaque key). The npz key uses the label the IMPORT manifest assigned
+        # (st.label, else the auto `<from:g>_<to:g>`); the FIT manifest may carry a DIFFERENT label
+        # form (the recurring GUI-built vs hand-edited REAL divergence), so try BOTH the explicit
+        # label AND the auto from/to key -> a label-vs-auto mismatch still maps WITHOUT a re-import.
+        # {} when no transient decl -> no load-reg schedule (byte-identical).
+        steps = ((((m.get("coverage") or {}).get("transient") or {}).get(o) or {}).get("steps") or [])
         tr_steps = {}
-        for st in ((((m.get("coverage") or {}).get("transient") or {}).get(o) or {})
-                   .get("steps") or []):
+        for st in steps:
             try:
-                lbl = st.get("label") or f"{st['from']:g}_{st['to']:g}"
-                vk = f"tr_{lbl}"
-                if vk in sp:
-                    tr_steps[vk] = (float(st["from"]), float(st["to"]))
+                frm, to = float(st["from"]), float(st["to"])
             except (KeyError, TypeError, ValueError):
                 continue
+            for cand in ((f"tr_{st['label']}" if st.get("label") else None),
+                         f"tr_{frm:g}_{to:g}"):
+                if cand and cand in sp:
+                    tr_steps[cand] = (frm, to)
+                    break
+        # self-diagnose a mapping MISS (waveforms present but none matched) so the fit_log says
+        # EXACTLY why vreg stayed baked: the npz transient keys vs the manifest step keys tried.
+        _sp_tr = sorted(k for k in sp if isinstance(k, str) and k.startswith("tr_"))
+        if _sp_tr and not tr_steps:
+            _want = []
+            for st in steps:
+                _lab = st.get("label")
+                if not _lab:
+                    try:
+                        _lab = f"{float(st['from']):g}_{float(st['to']):g}"
+                    except (KeyError, TypeError, ValueError):
+                        _lab = "?"
+                _want.append(f"tr_{_lab}")
+            print(f"  load-reg MAP MISS '{o}': npz transient keys {_sp_tr} matched NONE of the "
+                  f"manifest step keys {_want or '(manifest has NO coverage.transient steps)'} "
+                  f"-> vreg stays baked. The npz was imported with a DIFFERENT manifest/label form "
+                  f"than the fit uses; align labels or re-import with the SAME manifest.")
         res[o] = {"npz": sp, "supplies": supmap, "loads": loads,
                   "primary_supply": prim, "tr_steps": tr_steps}
     return res
