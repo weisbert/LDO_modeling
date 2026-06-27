@@ -602,6 +602,36 @@ def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=Fa
                 if ("noise", o, il) in vm:
                     lines += _br(f"@noisemodel {o} {il}", fr, _on(fr, *vm[("noise", o, il)]).real)
                 blocks.append((7, lines))
+    # @loadreg: the settled DC load-reg points {iload: Vout} recovered from the TRANSIENT steps, so
+    # a pasted digest can REPRODUCE the vreg(iload) load-reg fit locally (the small-signal blocks
+    # above carry NO DC load-reg -- the transient is its only carrier; this closes the one class
+    # that used to force a box round-trip). Tiny + priority-1. digest_to_npz rebuilds 2-level tr_
+    # waveforms from these, and the inlined manifest carries coverage.transient so they re-map.
+    try:
+        import fit_multiport as _FM
+        for o in m["v_out"]:
+            steps = ((((m.get("coverage") or {}).get("transient") or {}).get(o) or {})
+                     .get("steps") or [])
+            sp, tr_steps = {}, {}
+            for k in ref:
+                if isinstance(k, str) and k.startswith(f"tr_{o}_"):
+                    sp["tr_" + k[len(f"tr_{o}_"):]] = ref[k]
+            for st in steps:
+                try:
+                    frm, to = float(st["from"]), float(st["to"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                for cand in ((f"tr_{st['label']}" if st.get("label") else None), f"tr_{frm:g}_{to:g}"):
+                    if cand and cand in sp:
+                        tr_steps[cand] = (frm, to)
+                        break
+            pts = _FM._loadreg_from_transient(sp, tr_steps)
+            if len(pts) >= 2:
+                lines = [f"@loadreg {o}   # iload[A], Vout_settled[V]  (DC load-reg from transient)"]
+                lines += [f"  {i:.6e}, {v:.6e}" for i, v in sorted(pts.items())]
+                blocks.append((1, lines))
+    except Exception:                                    # noqa: BLE001 -- @loadreg is best-effort
+        pass
     # ---- assemble under the optional byte budget (red-zone export cap). Always keep the @meta
     #      header; add GT blocks highest-priority-first until the budget; NAME anything dropped
     #      (never a silent truncation -- the human grades above stay authoritative). ----
@@ -684,6 +714,19 @@ def parse_multiport_digest(text):
                 ref[f"pi_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
             elif kind == "iv" and len(toks) >= 2:
                 ref[f"iv_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "loadreg" and len(toks) >= 1 and arr.shape[0] >= 2 and arr.shape[1] >= 2:
+                # arr = [[iload, Vout_settled], ...] DC load-reg curve. Synthesize the original
+                # transient steps nom->each (nom = smallest iload) as 2-level [t,V] waveforms so
+                # split_ports + _loadreg_from_transient recover the SAME settled points -> the
+                # vreg(iload) fit rebuilds EXACTLY. Keyed auto-form tr_<o>_<from:g>_<to:g> so the
+                # inlined manifest's coverage.transient steps re-map via split_ports' from/to bridge.
+                o = toks[0]
+                order = np.argsort(arr[:, 0])
+                cur, vout = arr[order, 0], arr[order, 1]
+                inom, vnom = float(cur[0]), float(vout[0])
+                t = np.linspace(0.0, 1e-5, 60)
+                for ii, vv in zip(cur[1:], vout[1:]):
+                    ref[f"tr_{o}_{inom:g}_{float(ii):g}"] = np.c_[t, np.where(t < 5e-6, vnom, float(vv))]
             # carried VOLTAGE MODEL curves -> m_* keys (fit_multiport never reads these; the
             # verification path uses them so the voltage GT-vs-model overlay is the BOX's actual
             # model, not a refit of the lossy digest). zmodel->m_z, psrrmodel->m_p, noisemodel->m_noise.

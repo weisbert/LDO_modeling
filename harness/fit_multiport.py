@@ -648,7 +648,7 @@ def _log_npz_inventory(ref, m):
     cats = [("z_", "Zout AC"), ("noise_i_", "current noise"), ("noise_", "output noise"),
             ("p_", "PSRR"), ("pi_", "current-PSRR"), ("y_", "admittance"),
             ("tr_", "transient step"), ("iv_", "I-V sweep"), ("dc_", "dropout/DC"),
-            ("meta_", "meta")]
+            ("m_", "carried model"), ("meta_", "meta")]
     try:
         _loads = [str(x) for x in ref["loads"]] if "loads" in files else "?"
     except Exception:                                  # noqa: BLE001
@@ -715,7 +715,8 @@ def _log_consumption(ref, m, views, volt, curr):
         used |= {k for k in files
                  if any(k.startswith(f"{p}_{c}_") or k == f"{p}_{c}"
                         for p in ("iv", "y", "pi", "noise_i"))}
-    data = sorted(k for k in files if k != "loads" and not k.startswith("meta_"))
+    data = sorted(k for k in files
+                  if k != "loads" and not k.startswith(("meta_", "m_")))  # m_* = carried model, not GT
     unused = [k for k in data if k not in used]
     print(f"[fit] --- CONSUMPTION: {len(data)} data arrays -> {len(data) - len(unused)} USED, "
           f"{len(unused)} UNUSED ---")

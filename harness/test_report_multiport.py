@@ -209,6 +209,45 @@ def test_debug_report_survives_degenerate_fit(tmp_path):
     assert "TO REPRODUCE" in txt
 
 
+def test_loadreg_digest_round_trip(tmp_path):
+    """The [MPD1] digest carries @loadreg so a PASTED report reproduces the vreg(iload) load-reg
+    fit locally -- the transient is the only DC-load-reg carrier; the digest used to drop it, which
+    forced a box round-trip for every load-reg/20mV question."""
+    f = np.geomspace(1, 1e8, 30)
+    z = np.c_[f, 0.1 / (1 + (f / 1e5) ** 2), -0.02 * f / 1e5 / (1 + (f / 1e5) ** 2)]
+    p = np.c_[f, np.full(30, -60.0), np.zeros(30)]
+    n = np.c_[f, np.full(30, 1e-9)]
+
+    def vstep(a, b):
+        t = np.linspace(0, 1e-5, 200)
+        return np.c_[t, np.where(t < 5e-6, a, b)]
+
+    rec = {"loads": np.array(["tt"]), "z_pll_tt": z, "p_pll_avdd_tt": p, "noise_pll_tt": n,
+           "meta_iload_pll": np.array([1e-4]),
+           "tr_pll_2m": vstep(0.780, 0.776), "tr_pll_3m": vstep(0.780, 0.774),
+           "tr_pll_4m": vstep(0.780, 0.772)}
+    npz = tmp_path / "wur.npz"
+    np.savez(npz, **rec)
+    m = {"name": "wur", "supplies": {"avdd": {"dc": 1.0, "net": "V"}},
+         "current_psrr_supplies": ["avdd"],
+         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8, "pin": "VDD0P8_PLL"}},
+         "i_out": {},
+         "coverage": {"tier": "T4", "transient": {"pll": {"steps": [
+             {"from": 1e-4, "to": 2e-3, "label": "2m"}, {"from": 1e-4, "to": 3e-3, "label": "3m"},
+             {"from": 1e-4, "to": 4e-3, "label": "4m"}]}}}}
+    res = FMP.fit_multiport(str(npz), m)
+    orig = res["voltage"]["pll"]["vreg_sched"]
+    assert orig is not None
+    rep = RMP.debug_report(res, str(npz), m)
+    assert "@loadreg" in rep, "digest must carry the @loadreg block"
+    # reproduce from the PASTED report alone (npz + manifest both rebuilt from the text)
+    npz2 = RMP.digest_to_npz(rep, str(tmp_path / "repro.npz"))
+    m2 = RMP.parse_manifest(rep)
+    rep2 = FMP.fit_multiport(npz2, m2)["voltage"]["pll"]["vreg_sched"]
+    assert rep2 is not None, "the digest must reproduce the load-reg schedule locally"
+    assert np.allclose(orig["vregs"], rep2["vregs"], atol=1e-4), (orig["vregs"], rep2["vregs"])
+
+
 if __name__ == "__main__":
     import subprocess
     raise SystemExit(subprocess.call([sys.executable, "-m", "pytest", __file__, "-q"]))
