@@ -852,7 +852,7 @@ def _rail_diagnosis(result, npz_path, manifest, o):
 
 
 # --------------------------------------------------------------------- public: report
-def debug_report(result, npz_path, manifest, budget_kb=None, compress=False):
+def debug_report(result, npz_path, manifest, budget_kb=None, compress=False, include_fit_log=True):
     """A single copy-pasteable text debug report for the whole multi-port model.
 
     Header (port roster + fit-param digest) -> per voltage rail (scores table + per-rail
@@ -900,7 +900,7 @@ def debug_report(result, npz_path, manifest, budget_kb=None, compress=False):
     # Cft gate, noise mode, residuals, fallbacks). Travels with the copy-pasted report so the
     # complete fitting process is debuggable offline. Absent (hand-built result / no capture)
     # -> section omitted -> byte-identical to the pre-log report.
-    _flog = result.get("fit_log") if isinstance(result, dict) else None
+    _flog = result.get("fit_log") if (include_fit_log and isinstance(result, dict)) else None
     if _flog and str(_flog).strip():
         pr("=" * 78)
         pr("FIT PROCESS LOG  (captured during fit_multiport -- the fitter's decisions + residuals)")

@@ -3977,6 +3977,14 @@ if _HAVE_QT:
                 "reproduction (every load/port intact, no lossy budget drop). Leave ON for a "
                 "size-limited red-zone export; untick only if you want a human-readable digest.")
             top.addWidget(self.rep_compress)
+            self.rep_fitlog = QCheckBox("fit log")
+            self.rep_fitlog.setChecked(True)                 # default ON: the captured fit process
+            self.rep_fitlog.setToolTip(
+                "Include the captured FIT PROCESS LOG in the report (provenance + code version, npz "
+                "INVENTORY, USED-vs-UNUSED consumption map, per-fit quality verdicts, ANOMALIES). "
+                "Leave ON to paste the full fitting process for debugging; untick for a lean "
+                "grades-only report.")
+            top.addWidget(self.rep_fitlog)
             self.rep_copy = QPushButton("Copy debug report")
             self.rep_copy.setToolTip("Copy the copy-pasteable multi-port debug report to the clipboard.")
             self.rep_copy.clicked.connect(self._report_copy)
@@ -4353,7 +4361,8 @@ if _HAVE_QT:
             bud = self.rep_budget.value() or None             # 0 -> no cap
             return RMP.debug_report(self.extract.result, self.extract.npz_path,
                                     self.extract.manifest, budget_kb=bud,
-                                    compress=self.rep_compress.isChecked())
+                                    compress=self.rep_compress.isChecked(),
+                                    include_fit_log=self.rep_fitlog.isChecked())
 
         def _report_copy(self):
             txt = self._report_text()

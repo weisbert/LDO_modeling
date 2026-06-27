@@ -542,6 +542,16 @@ def _log_voltage_summary(o, vf):
               f"noise={vf.get('nmode', '?')}/{len(vf.get('nfk', []))}fk; "
               f"Cout={float(vf.get('cout', float('nan'))):.3g}F "
               f"ESR={float(vf.get('esr', float('nan'))):.3g}ohm")
+        # fit QUALITY (the 'specific process'): worst-over-corner residual + verdict per transfer.
+        errs = vf.get("err") or []
+        if errs:
+            zr = max(float(e["zrms"]) for e in errs)
+            nr = max(float(e["nrms"]) for e in errs)
+            prs = [rms for e in errs for rms, _ in (e.get("psrr") or {}).values()]
+            pr = max(prs) if prs else float("nan")
+            print(f"[fit]    quality {o}: Zout {zr:.2f}dB[{_verdict(zr, 1.0, 3.0)}] "
+                  f"PSRR {pr:.2f}dB[{_verdict(pr, 1.0, 3.0)}] "
+                  f"noise {nr:.2f}dB[{_verdict(nr, 1.5, 3.0)}]")
     except Exception as e:                             # noqa: BLE001 -- a log line must never break the fit
         print(f"[fit]  V-rail {o}: <summary unavailable: {e}>")
 
@@ -565,11 +575,59 @@ def _log_current_summary(r):
             bits.append(f"in_wht={inw:.2e}A2/Hz")
         r2 = r.get("iv_r2")
         if r2 is not None:
-            bits.append(f"IVr2={float(r2):.4f}")
+            v = "OK" if float(r2) > 0.9 else ("~" if float(r2) > 0.5 else "BAD!!")
+            bits.append(f"IVr2={float(r2):.4f}[{v}]")
         print(f"[fit]  I-sink {r.get('sink', '?')} (pin {r.get('pin', r.get('sink', '?'))}, "
               f"{r.get('pol', 'sink')}): " + ", ".join(bits))
     except Exception as e:                             # noqa: BLE001
         print(f"[fit]  I-sink {r.get('sink', '?')}: <summary unavailable: {e}>")
+
+
+def _verdict(x, good, marg):
+    """OK / ~ / BAD!! verdict for a residual against (good, marginal) bars. NaN -> NaN!!."""
+    try:
+        x = float(x)
+        if not np.isfinite(x):
+            return "NaN!!"
+        return "OK" if x <= good else ("~" if x <= marg else "BAD!!")
+    except Exception:                                  # noqa: BLE001
+        return "?"
+
+
+def _log_provenance(npz_path, m):
+    """SECTION 0 -- provenance: the running CODE version (so the log itself proves a `bash apply`
+    landed), the npz path/size/mtime, and the manifest coverage fingerprint. Answers 'did my fix
+    deploy?' and 'which inputs?' without a round-trip. Defensive."""
+    import os
+    import datetime
+
+    def _mtime(p):
+        try:
+            return datetime.datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M")
+        except Exception:                              # noqa: BLE001
+            return "?"
+    sha = "?"
+    try:
+        import subprocess
+        sha = (subprocess.run(["git", "-C", os.path.dirname(os.path.abspath(__file__)),
+                               "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=3).stdout.strip() or "?")
+    except Exception:                                  # noqa: BLE001
+        pass
+    # the module mtime moves on every bash-apply even when the box is NOT a git checkout -> the
+    # reliable 'did the new code land' signal.
+    print(f"[fit] code    : git {sha} | fit_multiport.py mtime {_mtime(__file__)}")
+    try:
+        sz = f"{os.path.getsize(npz_path) / 1024:.0f} KB"
+    except Exception:                                  # noqa: BLE001
+        sz = "? KB"
+    print(f"[fit] npz     : {npz_path}  ({sz}, mtime {_mtime(npz_path)})")
+    cov = m.get("coverage") or {}
+    tr = cov.get("transient") or {}
+    nsteps = sum(len((tr.get(o) or {}).get("steps") or []) for o in tr)
+    print(f"[fit] manifest: name={m.get('name')} tier={cov.get('tier')} "
+          f"enable={cov.get('enable')} temps={cov.get('temps')} "
+          f"transient_steps={nsteps} temp_sweep={cov.get('temp_sweep')}")
 
 
 def _ref_keys(ref):
@@ -667,6 +725,44 @@ def _log_consumption(ref, m, views, volt, curr):
         print("[fit]   (every simulation array was consumed)")
 
 
+def _badnum(x):
+    try:
+        return not np.isfinite(float(x))
+    except Exception:                                  # noqa: BLE001
+        return True
+
+
+def _log_anomalies(volt, curr):
+    """SECTION 4 -- auto-flag the red numbers a reviewer would otherwise have to spot by eye: a
+    bad-fit R^2, a NaN metric, a marginal/BAD residual. Empty -> 'none flagged'. Defensive."""
+    flags = []
+    for o, vf in (volt or {}).items():
+        for e in vf.get("err", []):
+            zr = e.get("zrms")
+            if _badnum(zr):
+                flags.append(f"V-rail {o}: Zout RMS is NaN/inf (degenerate Zout fit)")
+            elif float(zr) > 3.0:
+                flags.append(f"V-rail {o}: Zout RMS {float(zr):.1f}dB > 3 (marginal/BAD)")
+            if _badnum(e.get("nrms")):
+                flags.append(f"V-rail {o}: noise RMS NaN/inf")
+        if _badnum(vf.get("cout")) or _badnum(vf.get("esr")):
+            flags.append(f"V-rail {o}: Cout/ESR NaN")
+    for r in (curr or []):
+        c = r.get("sink")
+        r2 = r.get("iv_r2")
+        if r2 is not None and not _badnum(r2) and float(r2) < 0.5:
+            flags.append(f"I-sink {c}: I-V fit R2={float(r2):.2f} < 0.5 -> BAD I-V fit "
+                         f"(check the sink dc/pol, or the knee side)")
+        if _badnum(r.get("g0")):
+            flags.append(f"I-sink {c}: g0 NaN")
+    if flags:
+        print(f"[fit] --- !! ANOMALIES: {len(flags)} flagged (fix these first) ---")
+        for f in flags:
+            print(f"[fit]   !! {f}")
+    else:
+        print("[fit] --- anomalies: none flagged ---")
+
+
 class _Tee:
     """Write to several streams at once: live passthrough (terminal/CLI unchanged) + a capture
     buffer. A dead/closed stream is skipped, never raised -- the fit must not die on logging."""
@@ -723,6 +819,7 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
     print(f"[fit] === {pathlib.Path(npz_path).stem}: {len(m.get('v_out', {}))} V-rail(s), "
           f"{len(cports)} current sink(s); tier={(m.get('coverage') or {}).get('tier')}, "
           f"supplies={supplies} ===")
+    _log_provenance(npz_path, m)                        # SECTION 0: code version + inputs identity
     _log_npz_inventory(ref, m)                         # SECTION 1: what simulation results exist
     volt = {}
     sched_meta = {}                                # per-rail {labels, currents} for emit
@@ -756,6 +853,7 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         r["pin"] = m["i_out"].get(r["sink"], {}).get("pin", r["sink"])
         _log_current_summary(r)
     _log_consumption(ref, m, views, volt, curr)        # SECTION 2: used vs present-but-unused
+    _log_anomalies(volt, curr)                          # SECTION 4: auto-flag red numbers
     # provenance for the emit banner (emit_pmu_va reads these off meta by default, so
     # step_emit needs no new args). All optional / defensive -- a coverage-free or
     # hand-built manifest leaves them None and the banner falls back to 'unspecified'.
