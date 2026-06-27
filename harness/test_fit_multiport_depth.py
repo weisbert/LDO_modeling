@@ -310,6 +310,34 @@ def test_vreg_schedule_bridges_label_form_divergence(tmp_path):
     assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]
 
 
+def test_vreg_schedule_maps_realbox_load_suffixed_keys(tmp_path):
+    """REGRESSION (the box's `3 transient wfm in npz, 0 mapped` that SURVIVED the from/to bridge):
+    the REAL importmp pipeline stores tr_<o>_<label>_<load> (e.g. `tr_pll_2m_tt_25c`). After the
+    rail collapse split_ports holds `tr_2m_tt_25c` -- WITH the load-corner suffix -- but the
+    manifest step tag is the BARE `tr_2m`. The prior fixtures used `tr_pll_2m` (no _<load>), so
+    they passed while the box kept emitting baked 0.8V (the inert 20mV). split_ports must match the
+    load-suffixed key against the bare manifest step."""
+    curve = {1e-4: 0.800, 2e-3: 0.802, 3e-3: 0.803, 4e-3: 0.804}
+    z, p, n = _ac()
+    rec = {"loads": np.array(["tt_25c"]),                    # a NAMED corner, not 'nom'
+           "z_pll_tt_25c": z, "p_pll_AVDD1P0_tt_25c": p, "noise_pll_tt_25c": n,
+           "meta_iload_pll": np.array([1e-4])}
+    steps = []
+    for i_to, lbl in zip((2e-3, 3e-3, 4e-3), ("2m", "3m", "4m")):
+        rec[f"tr_pll_{lbl}_tt_25c"] = _vstep(curve[1e-4], curve[i_to])  # tr_<o>_<label>_<load>
+        steps.append({"from": 1e-4, "to": i_to, "label": lbl})
+    npz = tmp_path / "realbox.npz"
+    np.savez(npz, **rec)
+    m = {"name": "realbox", "supplies": {"AVDD1P0": {"dc": 1.05, "net": "VDD1P0"}},
+         "current_psrr_supplies": ["AVDD1P0"],
+         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8}}, "i_out": {},
+         "coverage": {"transient": {"pll": {"steps": steps}}}}
+    res = FMP.fit_multiport(str(npz), m)
+    vs = res["voltage"]["pll"]["vreg_sched"]
+    assert vs is not None, "load-suffixed real-box keys must map to the bare manifest step"
+    assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]
+
+
 def test_no_transient_vreg_sched_none(tmp_path):
     """No transient arrays -> vreg_sched is None (the single-OP default; emit stays byte-
     identical via the baked-vreg parameter path)."""

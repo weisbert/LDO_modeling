@@ -376,15 +376,27 @@ def split_ports(ref, manifest):
                 frm, to = float(st["from"]), float(st["to"])
             except (KeyError, TypeError, ValueError):
                 continue
-            for cand in ((f"tr_{st['label']}" if st.get("label") else None),
+            # the REAL box stores tr_<o>_<label>_<load>, so after the rail collapse above sp holds
+            # tr_<label>_<load> (e.g. tr_2m_tt_25c) -- NOT the bare tr_<label> the manifest tag is.
+            # Try BOTH label forms (explicit label, auto from/to) AND BOTH the bare key (digest /
+            # single-corner reproduce) and every load-corner-suffixed key (real box). First hit wins.
+            done = False
+            for base in ((f"tr_{st['label']}" if st.get("label") else None),
                          f"tr_{frm:g}_{to:g}"):
-                if cand and cand in sp:
-                    tr_steps[cand] = (frm, to)
+                if not base:
+                    continue
+                for cand in (base, *(f"{base}_{il}" for il in loads)):
+                    if cand in sp:
+                        tr_steps[cand] = (frm, to)
+                        done = True
+                        break
+                if done:
                     break
         # self-diagnose a mapping MISS (waveforms present but none matched) so the fit_log says
         # EXACTLY why vreg stayed baked: the npz transient keys vs the manifest step keys tried.
         _sp_tr = sorted(k for k in sp if isinstance(k, str) and k.startswith("tr_"))
         if _sp_tr and not tr_steps:
+            _sfx = f"[_{loads[0]}]" if loads else ""
             _want = []
             for st in steps:
                 _lab = st.get("label")
@@ -393,7 +405,7 @@ def split_ports(ref, manifest):
                         _lab = f"{float(st['from']):g}_{float(st['to']):g}"
                     except (KeyError, TypeError, ValueError):
                         _lab = "?"
-                _want.append(f"tr_{_lab}")
+                _want.append(f"tr_{_lab}{_sfx}")
             print(f"  load-reg MAP MISS '{o}': npz transient keys {_sp_tr} matched NONE of the "
                   f"manifest step keys {_want or '(manifest has NO coverage.transient steps)'} "
                   f"-> vreg stays baked. The npz was imported with a DIFFERENT manifest/label form "
