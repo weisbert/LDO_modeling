@@ -229,21 +229,29 @@ def _vstep(vf, vt, t0=5e-6, tstop=1e-5, n=400):
     return np.c_[t, np.where(t < t0, vf, vt)]
 
 
-def _transient_npz(tmp_path, curve, name="tr"):
-    """Single-OP voltage npz (z/p/noise at 'nom') PLUS transient load steps 100u->{2m,3m,4m}.
+def _transient_npz(tmp_path, curve, name="tr", labels=("2m", "3m", "4m")):
+    """Single-OP voltage npz (z/p/noise at 'nom') PLUS transient load steps 100u->{2m,3m,4m},
+    keyed EXACTLY as the real manifest->importmp pipeline produces them: tr_<o>_<label> with the
+    manifest's CUSTOM label and NO _<load> suffix (importmp writes the manifest tag verbatim --
+    the box's REAL_wur_pmu_top.json uses labels "2m"/"3m"/"4m"). The (i_from,i_to) currents are
+    declared ONLY in the manifest's coverage.transient -- NOT recoverable from the opaque key --
+    so this fixture FAILS if the fit string-parses currents out of the key (the shipped bug).
     `curve` = {iload: settled Vout}; the steps are 100u->each. R_a from _ac() is 0.05."""
     z, p, n = _ac()
     rec = {"loads": np.array(["nom"]),
            "z_pll_nom": z, "p_pll_AVDD1P0_nom": p, "noise_pll_nom": n,
            "meta_iload_pll": np.array([1e-4])}
     i_from = 1e-4
-    for i_to in (2e-3, 3e-3, 4e-3):
-        rec[f"tr_pll_{i_from:g}_{i_to:g}_nom"] = _vstep(curve[i_from], curve[i_to])
+    steps = []
+    for i_to, lbl in zip((2e-3, 3e-3, 4e-3), labels):
+        rec[f"tr_pll_{lbl}"] = _vstep(curve[i_from], curve[i_to])   # custom label, no _load
+        steps.append({"from": i_from, "to": i_to, "label": lbl})
     npz = tmp_path / f"{name}.npz"
     np.savez(npz, **rec)
     m = {"name": name, "supplies": {"AVDD1P0": {"dc": 1.05, "net": "VDD1P0"}},
          "current_psrr_supplies": ["AVDD1P0"],
-         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8}}, "i_out": {}}
+         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8}}, "i_out": {},
+         "coverage": {"transient": {"pll": {"steps": steps}}}}
     return npz, m
 
 
@@ -261,6 +269,19 @@ def test_vreg_schedule_from_transient(tmp_path):
     exp = [curve[i] + R_a * i for i in vs["currents"]]      # vreg = Vout_settled + R_a*iload
     assert np.allclose(vs["vregs"], exp, atol=1e-9), (vs["vregs"], exp)
     assert vs["i_nom"] == 1e-4                              # the AC OP load
+
+
+def test_vreg_schedule_from_opaque_custom_labels(tmp_path):
+    """REGRESSION (the a8880df shipped-but-inert bug): the load currents come from the manifest
+    step decl, NOT from string-parsing the key. With fully OPAQUE labels (no numeric content,
+    no _<load> suffix -- e.g. 'stepA') the OLD parser returned {} -> vreg_sched=None -> the
+    emit was byte-identical to pre-fix (the user's '没区别'). The schedule MUST still be built."""
+    curve = {1e-4: 0.800, 2e-3: 0.802, 3e-3: 0.803, 4e-3: 0.804}
+    npz, m = _transient_npz(tmp_path, curve, labels=("stepA", "stepB", "stepC"))
+    res = FMP.fit_multiport(str(npz), m)
+    vs = res["voltage"]["pll"]["vreg_sched"]
+    assert vs is not None, "opaque-label transient -> schedule must still build (from manifest)"
+    assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]
 
 
 def test_no_transient_vreg_sched_none(tmp_path):

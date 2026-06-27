@@ -193,9 +193,10 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     schedule_loads = [il for il in loads
                       if np.isfinite(P[il]["iv"]) and P[il]["iv"] != 0.0]
     # DC load-regulation schedule derived from the rail's TRANSIENT load steps (the AC sweep
-    # never carries DC load-reg). None when no parseable transient is present -> emit stays
-    # byte-identical. See _build_vreg_schedule.
-    vreg_sched = _build_vreg_schedule(sp, loads, P, nom)
+    # never carries DC load-reg). view['tr_steps'] = {tr_<label>: (i_from, i_to)} from the
+    # manifest step decl (split_ports), so the load currents come from the SOURCE OF TRUTH --
+    # not string-parsed from the opaque key. None when no transient -> emit byte-identical.
+    vreg_sched = _build_vreg_schedule(sp, view.get("tr_steps"), P, nom)
     return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
                 supplies=list(supplies), schedule_loads=schedule_loads, cft=cft,
                 vreg_sched=vreg_sched)
@@ -223,28 +224,22 @@ def _settled_step(w):
     return float(V[pre].mean()), float(V[post].mean())
 
 
-def _loadreg_from_transient(sp, loads):
+def _loadreg_from_transient(sp, tr_steps):
     """Recover {iload: settled Vout} DC load-regulation points from a rail's transient load
-    steps (view keys tr_<label>_<load>, label='<from:g>_<to:g>'). Each step yields TWO points:
-    pre-step tail = Vout@from, post-step tail = Vout@to. Duplicate iloads are averaged. Empty
-    when no parseable transient is present (custom non-from_to label -> that step is skipped)."""
+    steps. `tr_steps` maps each transient view-key -> its (i_from, i_to) load currents, taken
+    from the manifest's coverage.transient step DECLARATION (the source of truth). The currents
+    are NOT parsed out of the key string: the key/label is opaque (the real manifest uses custom
+    labels like "2m"/"3m" -> key tr_2m, which carries NO numeric currents and NO load suffix),
+    so string-parsing silently dropped every real step. Each step yields TWO settled-DC points:
+    pre-step tail = Vout@from, post-step tail = Vout@to. Duplicate iloads averaged. Empty when
+    no transient is present/declared."""
     by_i = {}
-    loads_sorted = sorted([str(x) for x in loads], key=len, reverse=True)
-    for k in list(sp.keys()):
-        if not (isinstance(k, str) and k.startswith("tr_")):
-            continue
-        rest = k[3:]                                          # <label>_<load>
-        lbl = None
-        for il in loads_sorted:                               # strip the known load suffix
-            if rest.endswith(f"_{il}"):
-                lbl = rest[:-(len(il) + 1)]
-                break
-        if lbl is None:
+    for k, fromto in (tr_steps or {}).items():
+        if k not in sp:
             continue
         try:
-            i_from_s, i_to_s = lbl.rsplit("_", 1)             # '<from>_<to>' (g-format, no '_')
-            i_from, i_to = float(i_from_s), float(i_to_s)
-        except Exception:                                     # noqa: BLE001 -- custom label
+            i_from, i_to = float(fromto[0]), float(fromto[1])
+        except (TypeError, ValueError, IndexError):           # malformed step decl
             continue
         s = _settled_step(sp[k])
         if s is None:
@@ -255,7 +250,7 @@ def _loadreg_from_transient(sp, loads):
     return {iv: float(np.mean(vs)) for iv, vs in by_i.items()}
 
 
-def _build_vreg_schedule(sp, loads, P, nom):
+def _build_vreg_schedule(sp, tr_steps, P, nom):
     """Derive a vreg(iload) DC load-regulation schedule from the rail's transient steps.
 
     The model's DC output is Vout = vreg - R_a*iload (branch-A R_a is the ONLY DC path; B is
@@ -267,7 +262,7 @@ def _build_vreg_schedule(sp, loads, P, nom):
 
     Returns dict(currents, vregs, i_nom) or None (no transient / <2 distinct loads). i_nom =
     the AC operating load so the default instance sits at the characterized OP."""
-    pts = _loadreg_from_transient(sp, loads)
+    pts = _loadreg_from_transient(sp, tr_steps)
     if len(pts) < 2:
         return None
     R_a = float(P[nom]["R_a"])

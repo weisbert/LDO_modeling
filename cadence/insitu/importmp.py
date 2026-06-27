@@ -25,7 +25,7 @@ results/ref/pmu_standin.npz by the P4 gate):
     z_<o>_<load>, couple_<a>_<b>_<load>, noise_<o>_<load>,
     p_<o>_<s>_<load>, y_<c>_<load>, pi_<c>_<s>_<load>     (+ loads, meta_*)
   coverage-gated (STAGE 1b, present only when the manifest declares the params):
-    iv_<c>_<load> = [Vsweep, I], dc_<o>_<load> = [Iload, Vout], tr_<o>_<label>_<load> = [t, V]
+    iv_<c>_<load> = [Vsweep, I], dc_<o>_<load> = [Iload, Vout], tr_<o>_<label> = [t, V]
   GUARDRAIL-3: check_zout_dc_consistency(ref, manifest) cross-checks Zout(s->0) vs the DC
   load-reg slope (a cheap post-assemble sanity warning, never a hard gate).
 
@@ -354,15 +354,31 @@ def split_ports(ref, manifest):
                     supmap.setdefault(s, {})[il] = ref[pk]
             if prim and f"p_{o}_{prim}_{il}" in ref:
                 sp[f"p_{il}"] = ref[f"p_{o}_{prim}_{il}"]   # legacy single-PSRR slot
-        # carry this rail's transient load-step waveforms (tr_<o>_<label>_<load>, [t,V])
-        # into the single-port view as tr_<label>_<load> (drop the <o>_ the way z_<o>_<il>
-        # collapses to z_<il>). The AC sweep never carries DC load-regulation; these steps
-        # do (pre-step tail = Vout@from, post-step tail = Vout@to), and the voltage fit reads
-        # them to build a vreg(iload) load-reg schedule. Absent on a small-signal-only run.
+        # carry this rail's transient load-step waveforms (tr_<o>_<label>, [t,V]) into the
+        # single-port view as tr_<label> (drop the <o>_ the way z_<o>_<il> collapses to z_<il>).
+        # The AC sweep never carries DC load-regulation; these steps do (pre-step tail =
+        # Vout@from, post-step tail = Vout@to), and the voltage fit reads them to build a
+        # vreg(iload) load-reg schedule. Absent on a small-signal-only run.
         for k in ref:
             if isinstance(k, str) and k.startswith(f"tr_{o}_"):
                 sp["tr_" + k[len(f"tr_{o}_"):]] = ref[k]
-        res[o] = {"npz": sp, "supplies": supmap, "loads": loads, "primary_supply": prim}
+        # Map each transient view-key -> its (i_from, i_to) load currents from the manifest's
+        # coverage.transient step DECLARATION (the source of truth). The fit must NOT parse the
+        # currents out of the key: the manifest tag is tr_<o>_<label> with a user label that may
+        # be opaque ("2m"/"3m") and has NO _<load> suffix, so string-parsing silently dropped
+        # every real step. {} when no transient decl -> no load-reg schedule (byte-identical).
+        tr_steps = {}
+        for st in ((((m.get("coverage") or {}).get("transient") or {}).get(o) or {})
+                   .get("steps") or []):
+            try:
+                lbl = st.get("label") or f"{st['from']:g}_{st['to']:g}"
+                vk = f"tr_{lbl}"
+                if vk in sp:
+                    tr_steps[vk] = (float(st["from"]), float(st["to"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        res[o] = {"npz": sp, "supplies": supmap, "loads": loads,
+                  "primary_supply": prim, "tr_steps": tr_steps}
     return res
 
 

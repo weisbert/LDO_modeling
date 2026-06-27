@@ -123,12 +123,18 @@ def built(tmp_path_factory):
            "p_pll_AVDD1P0_nom": np.c_[fp, H.real, H.imag],
            "noise_pll_nom": np.c_[fn, np.abs(Sv)],
            "meta_iload_pll": np.array([IOP])}
-    for i_to in (2e-3, 3e-3, 4e-3):
-        rec[f"tr_pll_{IOP:g}_{i_to:g}_nom"] = _one_way_step(gt_block, IOP, i_to, f"lrg_tr_{i_to:g}")
+    steps = []
+    for i_to, lbl in zip((2e-3, 3e-3, 4e-3), ("2m", "3m", "4m")):
+        rec[f"tr_pll_{lbl}"] = _one_way_step(gt_block, IOP, i_to, f"lrg_tr_{i_to:g}")
+        steps.append({"from": IOP, "to": i_to, "label": lbl})
     # vout_dc stays at the 0.8 default (the buggy assumption) -- the transient must override it.
+    # The (from,to) currents are declared in coverage.transient (the SOURCE OF TRUTH); the npz
+    # key tr_pll_<label> uses the box's REAL custom labels "2m"/"3m"/"4m" (NOT a numeric
+    # <from>_<to> key) -- so this GT validation now exercises the exact shipped-and-inert path.
     m = {"name": "lrg", "supplies": {"AVDD1P0": {"dc": 0.98, "net": "vin"}},
          "current_psrr_supplies": ["AVDD1P0"],
-         "v_out": {"pll": {"net": "vout", "iload": IOP, "vout_dc": 0.8}}, "i_out": {}}
+         "v_out": {"pll": {"net": "vout", "iload": IOP, "vout_dc": 0.8}}, "i_out": {},
+         "coverage": {"transient": {"pll": {"steps": steps}}}}
 
     def _fit_emit(npz_rec, cell):
         npz = tmp / f"{cell}.npz"
