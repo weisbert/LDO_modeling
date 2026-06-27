@@ -197,10 +197,12 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     # never carries DC load-reg). view['tr_steps'] = {tr_<label>: (i_from, i_to)} from the
     # manifest step decl (split_ports), so the load currents come from the SOURCE OF TRUTH --
     # not string-parsed from the opaque key. None when no transient -> emit byte-identical.
-    vreg_sched = _build_vreg_schedule(sp, view.get("tr_steps"), P, nom)
+    tr_steps = view.get("tr_steps") or {}
+    n_tr_npz = sum(1 for k in sp if isinstance(k, str) and k.startswith("tr_"))  # waveforms present
+    vreg_sched = _build_vreg_schedule(sp, tr_steps, P, nom)
     return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
                 supplies=list(supplies), schedule_loads=schedule_loads, cft=cft,
-                vreg_sched=vreg_sched)
+                vreg_sched=vreg_sched, n_tr_npz=n_tr_npz, n_tr_mapped=len(tr_steps))
 
 
 def _settled_step(w):
@@ -528,6 +530,12 @@ def _log_voltage_summary(o, vf):
             labs = list(P.keys())
             vreg = (f"baked {float(P[labs[len(labs) // 2]]['vreg']):.4f}V (single-OP)"
                     if labs else "baked (single-OP)")
+            # spell out WHY the load-reg schedule did not engage -- the exact data/manifest gap:
+            #   0 wfm in npz  -> transient steps were never simulated/imported into THIS npz
+            #   N wfm, 0 mapped -> npz HAS the waveforms but the fit's manifest has no
+            #                      coverage.transient steps to map them to
+            vreg += (f" [load-reg OFF: {vf.get('n_tr_npz', 0)} transient wfm in npz, "
+                     f"{vf.get('n_tr_mapped', 0)} mapped to manifest steps -> need >=2 load pts]")
         cft = float(vf.get("cft", 0.0) or 0.0)
         print(f"[fit]  V-rail {o} (pin {vf.get('pin', o)}): vreg={vreg}; "
               f"Cft={('%.1ffF' % (cft * 1e15)) if cft > 0 else 'off'}; "
