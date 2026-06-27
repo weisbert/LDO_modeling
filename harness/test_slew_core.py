@@ -130,15 +130,38 @@ def test_fit_slew_a_none_without_transient():
     assert FMP._fit_slew_a({"z_pll": np.zeros((5, 3))}, {}) is None
 
 
+def test_fit_slew_a_rejects_switching_contaminated_dip():
+    """The HARDENED gate: a dip buried in switching ripple whose amplitude is comparable to the
+    dip depth is NOT a clean slew measurement -- the bottom is noise-located, so a naive fit reads
+    SRa wrong. _fit_slew_a must REJECT it (return None) so the model falls back to the manual knob
+    instead of silently emitting a noise-located SRa. (Tail kept clean so the OLD 4x-ripple gate
+    passes -- this exercises the NEW anti-aliasing envelope/roughness gate specifically.)"""
+    base = _step_wave(50e-9, 25e-9, depth=0.080, settled=0.78, n=400)
+    t = base[:, 0]
+    rip = np.zeros_like(t)
+    m = (t >= 50e-9) & (t <= 158e-9)                    # switching active over the dip; tail clean
+    rip[m] = 0.08 * np.sin(2 * np.pi * 3.0e8 * t[m])    # ripple ~ dip depth -> bottom unreliable
+    ali = base.copy(); ali[:, 1] = base[:, 1] + rip
+    assert FMP._fit_slew_a({"tr_pll_2m": ali}, {"tr_pll_2m": (1e-4, 2.1e-3)}) is None
+
+
+def test_fit_slew_a_rejects_nonphysical_rate():
+    """SRa outside the physical [1e3,1e8] A/s band is a sampling artifact, not slew -> rejected.
+    A tiny dI over a normal t_bottom drives SRa below the floor; the step is dropped -> None."""
+    # dI = 1e-9 A over ~25ns -> SRa ~ 40 A/s, far below the 1e3 floor
+    sp = {"tr_pll_2m": _step_wave(50e-9, 25e-9, depth=0.080, settled=0.78)}
+    assert FMP._fit_slew_a(sp, {"tr_pll_2m": (1e-4, 1.0e-4 + 1e-9)}) is None
+
+
 # --------------------------------------------------------------- manifest manual knob
 _tfd = __import__("test_fit_multiport_depth")
 
 
 def test_manifest_slew_a_knob_threads_to_emit(tmp_path):
-    """The MANUAL knob: m['v_out'][rail]['slew_a'] flows fit_multiport -> vfit['slew_a'] -> the
-    emitted .va carries the editable VDD0P8_PLL_SRa param + the slew()-limited branch-A. This is
-    what lets the user tune SRa in their TB. The transient AUTO-fit is held (unreliable on GHz),
-    so the manifest is the source of truth."""
+    """The MANUAL override knob: m['v_out'][rail]['slew_a'] flows fit_multiport -> vfit['slew_a']
+    -> the emitted .va carries the editable VDD0P8_PLL_SRa param + the slew()-limited branch-A.
+    This is the escape hatch that lets the user pin/tune SRa in their TB (here the npz has no
+    transient, so there is no auto-fit to override -- the knob is the only source)."""
     npz, m = _tfd._sweep_npz(tmp_path, name="slewman")
     m["v_out"]["pll"]["pin"] = "VDD0P8_PLL"
     m["v_out"]["pll"]["slew_a"] = 12000.0
@@ -148,6 +171,50 @@ def test_manifest_slew_a_knob_threads_to_emit(tmp_path):
                        supply="AVDD1P0", ground="VSS").read_text()
     assert "parameter real VDD0P8_PLL_SRa = 1.200000e+04" in va
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in va
+
+
+def _undershoot_tr_manifest(tmp_path, name):
+    """A single-OP voltage npz + manifest whose coverage.transient waveform is a CLEAN undershoot
+    (dI=2.0mA, t_bottom=25ns -> SRa=8.0e4), so the branch-A slew AUTO-fit engages -- the clean
+    characterization the manual knob stands in for. Returns (npz_path, manifest)."""
+    z, p, n = _tfd._ac()
+    rec = {"loads": np.array(["nom"]),
+           "z_pll_nom": z, "p_pll_AVDD1P0_nom": p, "noise_pll_nom": n,
+           "meta_iload_pll": np.array([1e-4]),
+           "tr_pll_2m": _step_wave(50e-9, 25e-9, depth=0.080, settled=0.78)}
+    npz = tmp_path / f"{name}.npz"
+    np.savez(npz, **rec)
+    m = {"name": name, "supplies": {"AVDD1P0": {"dc": 1.05, "net": "VDD1P0"}},
+         "current_psrr_supplies": ["AVDD1P0"],
+         "v_out": {"pll": {"net": "VPLL", "pin": "VDD0P8_PLL", "iload": 1e-4, "vout_dc": 0.8}},
+         "i_out": {},
+         "coverage": {"transient": {"pll": {"steps": [{"from": 1e-4, "to": 2.1e-3, "label": "2m"}]}}}}
+    return npz, m
+
+
+def test_autofit_slew_engages_on_clean_undershoot(tmp_path):
+    """END-TO-END auto-fit (the integration this change adds): a rail whose coverage.transient
+    shows a clean undershoot yields slew_a FROM THE FIT, with NO manifest knob -- SRa is now a fit
+    product like Zout/PSRR/noise, flowing coverage.transient -> _fit_slew_a -> vfit -> emit."""
+    npz, m = _undershoot_tr_manifest(tmp_path, "slewauto")
+    res = FMP.fit_multiport(str(npz), m)
+    assert res["voltage"]["pll"]["slew_a"] == pytest.approx(2.0e-3 / 25e-9, rel=0.25)
+    va = D.emit_pmu_va(res, "PMU_auto", tmp_path / "auto.va",
+                       supply="AVDD1P0", ground="VSS").read_text()
+    assert "parameter real VDD0P8_PLL_SRa = " in va
+    assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in va
+
+
+def test_manifest_slew_a_overrides_autofit(tmp_path):
+    """The manifest knob OVERRIDES the auto-fit: the same clean-undershoot transient would auto-fit
+    SRa~8e4, but a manifest slew_a=5.5e4 wins -- the escape hatch for DUTs whose transient should
+    not be trusted (the real WuR GHz system TB)."""
+    npz, m = _undershoot_tr_manifest(tmp_path, "slewover")
+    auto = FMP.fit_multiport(str(npz), m)["voltage"]["pll"]["slew_a"]
+    assert auto == pytest.approx(8.0e4, rel=0.25)          # the auto-fit it would have used
+    m["v_out"]["pll"]["slew_a"] = 5.5e4                    # ... overridden by the knob
+    res = FMP.fit_multiport(str(npz), m)
+    assert res["voltage"]["pll"]["slew_a"] == 5.5e4
 
 
 def test_manifest_no_slew_a_is_byte_identical(tmp_path):

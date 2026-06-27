@@ -201,13 +201,14 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     n_tr_npz = sum(1 for k in sp if isinstance(k, str) and k.startswith("tr_"))  # waveforms present
     vreg_sched = _build_vreg_schedule(sp, tr_steps, P, nom)
     # branch-A regulation slew-rate limit SRa (the LARGE-SIGNAL load-transient undershoot the AC
-    # Zout cannot carry). AUTO-FIT FROM TRANSIENTS IS HELD: `_fit_slew_a` is reliable only on a
-    # CLEAN characterization load step (known dI + decap + fine early sampling); on the real GHz
-    # switching transients the dip is hidden / the spurs alias below Nyquist, so it mis-reads
-    # (see memory real-tb-model-vs-real-comparison). SRa therefore comes from the manifest as a
-    # MANUAL knob -- m['v_out'][rail]['slew_a'], applied at the fit_multiport call site. None here
-    # -> the rail emits byte-identical unless the manifest sets slew_a.
-    slew_a = None
+    # Zout cannot carry) -- AUTO-FIT from the SAME coverage.transient steps the vreg schedule uses,
+    # so SRa is a fit product like Zout/PSRR/noise, not a hand-filled constant. `_fit_slew_a` is
+    # hardened to REJECT switching-rippled / under-sampled steps (returns None) rather than emit a
+    # noise-located SRa; on a clean characterization step it recovers dI/t_bottom. None (no clean
+    # undershoot, or no transient) -> the rail emits byte-identical. The manifest slew_a, when set,
+    # OVERRIDES this at the fit_multiport call site -- the escape hatch for DUTs whose transient is
+    # GHz-contaminated (the real WuR system TB) where the auto-fit must not be trusted.
+    slew_a = _fit_slew_a(sp, tr_steps)
     # when transients ARE mapped but the schedule still didn't build, capture WHY (per-waveform
     # settled-extraction dump) so the fit log explains it without another box round-trip.
     loadreg_diag = (_loadreg_diag(sp, tr_steps)
@@ -336,6 +337,24 @@ def _build_vreg_schedule(sp, tr_steps, P, nom):
     return dict(currents=currents, vregs=vregs, i_nom=float(i_nom))
 
 
+def _movavg(y, w):
+    """Edge-padded box smoother (replicates the end values so there is no zero-pull artifact at the
+    boundaries), length-preserving. Used to extract the dip ENVELOPE from a switching-rippled
+    transient so the bottom can be timed robustly."""
+    y = np.asarray(y, float)
+    w = max(1, int(w))
+    if w <= 1 or y.size < w:
+        return y
+    pad = w // 2
+    yp = np.pad(y, pad, mode="edge")
+    return np.convolve(yp, np.ones(w) / w, mode="valid")[: y.size]
+
+
+# physical branch-A slew-rate band [A/s]: a real LDO pass device ramps its current at ~1e3..1e8 A/s.
+# A "fit" outside this band is a sampling / aliasing artifact, not a slew measurement -> reject.
+_SRA_LO, _SRA_HI = 1.0e3, 1.0e8
+
+
 def _fit_slew_a(sp, tr_steps):
     """Branch-A regulation SLEW-RATE limit SRa [A/s] from the rail's transient load steps -- the
     LARGE-SIGNAL dynamic the AC Zout/PSRR fundamentally cannot carry (proven: same load + same cap
@@ -345,10 +364,24 @@ def _fit_slew_a(sp, tr_steps):
     post-step level -- until the current catches the load. The dip BOTTOM sits ~dI/SRa after the
     edge, CAP-INDEPENDENTLY (the test cap sets the dip DEPTH, not its TIME), so
         SRa = dI / t_bottom ,  t_bottom = t(dip extremum) - t(step edge)
-    Gated like Cft/d2/vreg_sched: a step is used ONLY when it shows a CLEAN undershoot (the dip is
-    clearly past the settled-tail ripple) -- a slow / monotonically-settling step has no dip -> it
-    contributes no SRa -> when NO step shows one the rail emits byte-identical. Returns the median
-    SRa over the qualifying steps, or None."""
+    Multi-step (the manifest declares 2m/3m/4m): each qualifying step gives one SRa estimate and
+    the MEDIAN is returned, so one bad step cannot swing it (and the median assumes SRa is ~load-
+    independent across the steps -- the branch-A single-rate model; wide scatter would show as a
+    skewed median, not a crash).
+
+    Gated like Cft/d2/vreg_sched: a step contributes ONLY when it shows a CLEAN undershoot, and the
+    whole rail emits byte-identical when none do. CLEAN here is hardened against the real-TB failure
+    mode (memory real-tb-model-vs-real): an under-sampled / switching-rippled transient has a dip
+    region that is OSCILLATORY, so the raw argmin lands on a noise trough and t_bottom (hence SRa)
+    reads ~10x wrong. A step is therefore rejected unless
+      (1) the dip is clearly past the settled-tail ripple (>=2mV and >4x tail std),
+      (2) the high-frequency content not captured by the smoothed envelope is a SMALL fraction of
+          the dip depth (switching ripple ~ dip depth -> the bottom is noise-located -> reject),
+      (3) the raw bottom and the smoothed-envelope bottom agree in time (bottom robust to smoothing),
+      (4) the resulting SRa lands in the physical band [1e3,1e8] A/s.
+    What this CANNOT catch is a SLOW alias that mimics real envelope structure -- that is a Nyquist
+    limit of the data, not fixable in the fit; for such DUTs the manifest slew_a override is the
+    escape hatch. Returns the median SRa over the qualifying steps, or None."""
     srs = []
     for k, fromto in (tr_steps or {}).items():
         if k not in sp:
@@ -376,7 +409,7 @@ def _fit_slew_a(sp, tr_steps):
         te = t[int(np.argmax(np.where(win, dV, -1.0)))]
         post = t >= tend - 0.20 * span                       # settled tail (dip recovered)
         seg = (t > te) & (t < tend - 0.20 * span)            # where the undershoot lives
-        if post.sum() < 3 or seg.sum() < 3:
+        if post.sum() < 3 or seg.sum() < 5:                  # >=5 dip samples to judge smoothness
             continue
         v_settled = float(V[post].mean())
         ripple = float(np.std(V[post]))
@@ -385,12 +418,21 @@ def _fit_slew_a(sp, tr_steps):
         j = int(np.argmin(Vseg)) if load_up else int(np.argmax(Vseg))
         v_ext, t_ext = float(Vseg[j]), float(tseg[j])
         depth = (v_settled - v_ext) if load_up else (v_ext - v_settled)
-        # gate: a REAL undershoot (dip clearly past ripple, >=2mV) resolved in time after the edge
+        # (1) a REAL undershoot (dip clearly past tail ripple, >=2mV) resolved in time after the edge
         if not (depth > max(2e-3, 4.0 * ripple) and t_ext > te):
             continue
+        # (2)+(3) anti-aliasing: extract the dip ENVELOPE and reject when the bottom is noise-located
+        Vsm = _movavg(Vseg, max(3, Vseg.size // 8))
+        if float(np.std(Vseg - Vsm)) > 0.30 * depth:         # high-freq ripple ~ dip depth -> reject
+            continue
+        js = int(np.argmin(Vsm)) if load_up else int(np.argmax(Vsm))
+        if abs(float(tseg[js]) - t_ext) > 0.25 * (tseg[-1] - tseg[0]):   # bottom not robust -> reject
+            continue
         t_bottom = t_ext - te
+        if t_bottom <= 0:
+            continue
         sr = dI / t_bottom
-        if np.isfinite(sr) and sr > 0:
+        if np.isfinite(sr) and _SRA_LO <= sr <= _SRA_HI:     # (4) physical slew band only
             srs.append(sr)
     return float(np.median(srs)) if srs else None
 
@@ -1002,11 +1044,13 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         # numeric-label parse then 0.0, byte-identical to the pre-stage-2b path.
         ilmap = _iload_map(ref, o, [str(x) for x in views[o]["loads"]])
         volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc, iload_map=ilmap)
-        # MANUAL branch-A slew knob: m['v_out'][rail]['slew_a'] [A/s] (the user-tuned SRa) -> emit
-        # the editable VDD0P8_<rail>_SRa CDF param + the slew-limited regulation. Absent/<=0 ->
-        # slew_a None -> byte-identical. (The transient auto-fit is held; see _fit_voltage_output.)
+        # branch-A slew SRa [A/s] is AUTO-FIT from coverage.transient inside _fit_voltage_output.
+        # The manifest m['v_out'][rail]['slew_a'], when present and >0, is an OVERRIDE (the user-
+        # tuned SRa / the escape hatch for GHz-contaminated DUTs) -- it wins over the auto-fit.
+        # Absent/<=0 -> keep the auto-fitted value (None when no clean undershoot -> byte-identical).
         _sa = (m["v_out"][o] or {}).get("slew_a")
-        volt[o]["slew_a"] = float(_sa) if (_sa and float(_sa) > 0) else None
+        if _sa and float(_sa) > 0:
+            volt[o]["slew_a"] = float(_sa)
         # carry the designer's GUI symbol pin name (set by build_manifest) so the model
         # cell's PORT is the pin, not our internal role key. Default: the role key itself
         # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).
