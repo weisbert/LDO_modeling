@@ -1348,6 +1348,11 @@ if _HAVE_QT:
             t._analysis_role = analysis_role
             t._analysis_idx = cols.index("analysis") if "analysis" in cols else None
             t._analysis = {}                 # key-text -> {ac?, noise?}
+            # per-rail branch-A slew override (v_out.<o>.slew_a [A/s]): surfaced in the 'trans'
+            # editor (slew is the transient's dynamic). Same overlay pattern as _analysis -- the
+            # store is the form's authority for the key; blank/absent clears, a value sets/overrides
+            # the coverage.transient auto-fit. Generic on every table (only v_out reads it back).
+            t._slew = {}                     # key-text -> slew_a string
             # coverage-sweep columns get a composite cell: an editable QLineEdit (type directly)
             # PLUS a '…' button that opens the Cadence-style editor. _dialog_cols marks them so the
             # row builder installs the widget and the readers/writers route through it.
@@ -1466,7 +1471,15 @@ if _HAVE_QT:
             if le is None:
                 return
             if kind == "trans" and hasattr(dlg, "_open_trans_editor"):
-                dlg._open_trans_editor(le)
+                # resolve the row that owns this composite cell -> its rail key, so the trans
+                # editor can read/write that rail's slew override (v_out.<key>.slew_a).
+                key = None
+                for r in range(t.rowCount()):
+                    if any(t.cellWidget(r, c) is w for c in range(t.columnCount())):
+                        ki = t.item(r, 0)
+                        key = ki.text().strip() if ki else None
+                        break
+                dlg._open_trans_editor(le, key, t)
             elif hasattr(dlg, "_open_cov_sweep_editor"):
                 dlg._open_cov_sweep_editor(le, kind)
 
@@ -1648,6 +1661,8 @@ if _HAVE_QT:
                 t.setRowCount(0)
                 if getattr(t, "_analysis", None) is not None:
                     t._analysis.clear()             # start clean; restored from the dict below
+                if getattr(t, "_slew", None) is not None:
+                    t._slew.clear()                 # ditto the slew-override store
                 tcols = getattr(t, "_cols", cols)
                 # physical columns the row builder must SKIP (emit a blank placeholder): the gear
                 # 'analysis' column, the checkbox columns (set separately), and the coverage cells.
@@ -1679,6 +1694,12 @@ if _HAVE_QT:
                     ov = ent.get("analysis")
                     if isinstance(ov, dict) and ov and getattr(t, "_analysis", None) is not None:
                         t._analysis[k] = dict(ov)
+                    # restore the branch-A slew override (v_out.<o>.slew_a) into the slew store, so
+                    # the 'trans' editor shows it and collect() round-trips it (only keys present
+                    # here are touched on save -> a rail with no slew_a is left untouched, lossless).
+                    sa = ent.get("slew_a")
+                    if sa not in (None, "") and getattr(t, "_slew", None) is not None:
+                        t._slew[k] = str(sa)
                     r = self._table_add_row(t, row)
                     if unresolved_pin is not None:
                         self._flag_unresolved_net(t, r, tcols.index("net"), unresolved_pin)
@@ -2189,13 +2210,17 @@ if _HAVE_QT:
                 txt = (txt + " @" + ",".join(tail)) if txt else ("@" + ",".join(tail))
             return txt
 
-        def _open_trans_editor(self, le):
+        def _open_trans_editor(self, le, key=None, table=None):
             """The transient load-STEP editor for a v_out 'trans' cell, in designer terms: a
             BASELINE (light) load + a list of TARGET (heavy) loads -- each target becomes one
             baseline→target slew step -- plus the edge time and sim duration. Maps to/from the
-            cell's from:to step format. Writes the rebuilt cell text back on OK."""
+            cell's from:to step format. Writes the rebuilt cell text back on OK. `key`/`table`
+            (when given) also surface this rail's branch-A slew override (v_out.<key>.slew_a):
+            blank = auto-fit SRa from the steps; a value overrides (the escape hatch for a TB
+            whose transient is too contaminated to auto-fit). Persisted in table._slew[key]."""
             if le is None:
                 return
+            cur_slew = str((getattr(table, "_slew", {}) or {}).get(key) or "") if key else ""
             f = self._trans_parse_cell(le.text())
             steps = f["steps"]
             froms = {s["from"] for s in steps if s.get("from")}
@@ -2222,12 +2247,21 @@ if _HAVE_QT:
             e_tstep = QLineEdit(f["tstep"]); e_tstep.setPlaceholderText("optional, e.g. 10n")
             form.addRow("Edge time", e_edge); form.addRow("Sim time (tstop)", e_tstop)
             form.addRow("tstep (optional)", e_tstep)
+            e_slew = QLineEdit(cur_slew); e_slew.setPlaceholderText("blank = auto-fit from the steps")
+            e_slew.setToolTip("branch-A slew-rate override SRa [A/s], e.g. 12000. BLANK = the model "
+                              "auto-fits SRa from these transient steps (the normal path). A VALUE "
+                              "overrides that auto-fit -- the escape hatch when the TB transient is "
+                              "too switching-contaminated to trust (the real GHz system TB). Emits "
+                              "the editable VDD0P8_<rail>_SRa param; tune it in ADE without re-regen.")
+            if key and table is not None:
+                form.addRow("Slew override (A/s)", e_slew)     # only for a resolved v_out rail
             brow = QHBoxLayout(); brow.addStretch(1)
             b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
             brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
             b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
             b_clear.clicked.connect(lambda: (e_base.clear(), e_tg.clear(), e_edge.clear(),
-                                             e_tstop.clear(), e_tstep.clear(), dlg.accept()))
+                                             e_tstop.clear(), e_tstep.clear(), e_slew.clear(),
+                                             dlg.accept()))
             if not dlg.exec_():
                 return
             base = e_base.text().strip()
@@ -2236,6 +2270,14 @@ if _HAVE_QT:
             newf = {"steps": steps2, "edge": e_edge.text().strip(),
                     "tstop": e_tstop.text().strip(), "tstep": e_tstep.text().strip()}
             le.setText(self._trans_render_cell(newf))
+            # persist the slew override into the per-rail store (collect() writes it to slew_a):
+            # a value sets/overrides, blank clears -> the store is the form's authority for the key.
+            if key and getattr(table, "_slew", None) is not None:
+                sv = e_slew.text().strip()
+                if sv:
+                    table._slew[key] = sv
+                else:
+                    table._slew.pop(key, None)
 
         @staticmethod
         def _loads_to_text(spec):
@@ -2526,6 +2568,20 @@ if _HAVE_QT:
                         ent["analysis"] = ov
                     else:
                         ent.pop("analysis", None)
+                    # branch-A slew override: the slew store is the form's authority for keys it
+                    # KNOWS (loaded with slew_a, or set in the trans editor). A known key with a
+                    # positive numeric value sets slew_a; blank/0/non-numeric clears it. A key the
+                    # store never saw is left untouched -> a rail's stash-preserved slew_a survives
+                    # even if the form never surfaced it (lossless, like the other unmodeled keys).
+                    if role == "v_out" and key in (getattr(t, "_slew", None) or {}):
+                        try:
+                            sf = float(t._slew[key])
+                        except (TypeError, ValueError):
+                            sf = None
+                        if sf is not None and sf > 0:
+                            ent["slew_a"] = sf
+                        else:
+                            ent.pop("slew_a", None)
                     out[key] = ent
                 return out
             m["supplies"] = collect(self.t_supplies, "supplies", ["key", "net", "dc", "tb_src"])
@@ -6636,6 +6692,35 @@ def _selftest_manifest_editor(win, tmp):
     dlg5.subtabs.setCurrentIndex(RAW)
     assert json.loads(dlg5.ed.toPlainText())["v_out"]["pll"].get("src") == "Iload_pll_2", \
         "v_out 'src instance' edit must round-trip to v_out.<o>.src"
+
+    # 5f) v_out branch-A SLEW OVERRIDE (slew_a): a loaded v_out.<o>.slew_a populates the per-rail
+    #     slew store (surfaced as the trans editor's 'Slew override' field), round-trips Form->Raw,
+    #     a store edit overrides / a clear removes it; a rail with no slew_a stays slew-free.
+    sl = json.dumps({
+        "name": "sl", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "v_out": {"pll": {"net": "VDD0P8_PLL", "slew_a": 12000.0},
+                  "vco": {"net": "VDD0P8_VCO"}}})
+    dlg7 = _ManifestEditorDialog(win, sl, None)
+    assert dlg7.t_vout._slew.get("pll") == "12000.0", "loaded slew_a must populate the slew store"
+    assert "vco" not in dlg7.t_vout._slew, "a rail without slew_a must not enter the store"
+    dlg7.subtabs.setCurrentIndex(RAW)                            # Form->Raw via collect()
+    sl_raw = json.loads(dlg7.ed.toPlainText())
+    assert sl_raw["v_out"]["pll"].get("slew_a") == 12000.0, "slew_a must round-trip Form->Raw"
+    assert "slew_a" not in sl_raw["v_out"]["vco"], "the no-slew rail must stay slew-free"
+    # a store edit (what the trans editor's OK does) overrides; a new rail can gain an override
+    dlg7.subtabs.setCurrentIndex(0)                             # Raw->Form re-parses + repopulates
+    dlg7.t_vout._slew["pll"] = "15000"
+    dlg7.t_vout._slew["vco"] = "9000"
+    dlg7.subtabs.setCurrentIndex(RAW)
+    sl_raw2 = json.loads(dlg7.ed.toPlainText())
+    assert sl_raw2["v_out"]["pll"].get("slew_a") == 15000.0, "slew override edit must round-trip"
+    assert sl_raw2["v_out"]["vco"].get("slew_a") == 9000.0, "a newly-added slew override must save"
+    # clearing the override removes slew_a (the store's blank = off)
+    dlg7.subtabs.setCurrentIndex(0)
+    dlg7.t_vout._slew["pll"] = ""
+    dlg7.subtabs.setCurrentIndex(RAW)
+    assert "slew_a" not in json.loads(dlg7.ed.toPlainText())["v_out"]["pll"], \
+        "clearing the slew override must remove slew_a"
 
     # 5e) [2.3] current-PSRR is a per-supply checkbox (no free-text field). Loading the explicit
     #     list checks just those; editing the checkboxes writes the explicit checked list back.
