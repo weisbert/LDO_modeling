@@ -640,6 +640,7 @@ def _log_provenance(npz_path, m):
         pass
     # the module mtime moves on every bash-apply even when the box is NOT a git checkout -> the
     # reliable 'did the new code land' signal.
+    print("[fit] ===== [0] PROVENANCE (did my fix deploy? which inputs?) =====")
     print(f"[fit] code    : git {sha} | fit_multiport.py mtime {_mtime(__file__)}")
     try:
         sz = f"{os.path.getsize(npz_path) / 1024:.0f} KB"
@@ -677,7 +678,8 @@ def _log_npz_inventory(ref, m):
         _loads = [str(x) for x in ref["loads"]] if "loads" in files else "?"
     except Exception:                                  # noqa: BLE001
         _loads = "?"
-    print(f"[fit] --- npz INVENTORY: {len(files)} arrays (loads={_loads}) ---")
+    print(f"[fit] ===== [1] SIMULATIONS PRESENT (which results exist): "
+          f"{len(files)} arrays (loads={_loads}) =====")
     seen = set()
     for pre, lab in cats:
         ks = sorted(k for k in files if k.startswith(pre) and k not in seen)
@@ -742,8 +744,8 @@ def _log_consumption(ref, m, views, volt, curr):
     data = sorted(k for k in files
                   if k != "loads" and not k.startswith(("meta_", "m_")))  # m_* = carried model, not GT
     unused = [k for k in data if k not in used]
-    print(f"[fit] --- CONSUMPTION: {len(data)} data arrays -> {len(data) - len(unused)} USED, "
-          f"{len(unused)} UNUSED ---")
+    print(f"[fit] ===== [2] WHICH RESULTS WERE USED IN THE FIT: {len(data)} data arrays -> "
+          f"{len(data) - len(unused)} USED, {len(unused)} UNUSED =====")
     for k in unused:
         print(f"[fit]   UNUSED {k}  -> {_unused_reason(k)}")
     if not unused:
@@ -786,7 +788,7 @@ def _log_anomalies(volt, curr):
         if _badnum(r.get("g0")):
             flags.append(f"I-sink {c}: g0 NaN")
     if flags:
-        print(f"[fit] --- !! ANOMALIES: {len(flags)} flagged (fix these first) ---")
+        print(f"[fit] ===== [!] ANOMALIES (fix these first): {len(flags)} flagged =====")
         for f in flags:
             print(f"[fit]   !! {f}")
     else:
