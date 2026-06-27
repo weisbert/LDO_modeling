@@ -25,7 +25,8 @@
       "net": "<net:VDD0P8_PLL>",
       "pin": "VDD0P8_PLL",
       "iload": 0.0005,
-      "src": "Iload_pll"
+      "src": "Iload_pll",
+      "slew_a": 12000.0
     },
     "vco": {
       "net": "<net:VDD0P8_VCO>",

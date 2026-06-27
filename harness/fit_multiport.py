@@ -200,13 +200,21 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     tr_steps = view.get("tr_steps") or {}
     n_tr_npz = sum(1 for k in sp if isinstance(k, str) and k.startswith("tr_"))  # waveforms present
     vreg_sched = _build_vreg_schedule(sp, tr_steps, P, nom)
+    # branch-A regulation slew-rate limit SRa (the LARGE-SIGNAL load-transient undershoot the AC
+    # Zout cannot carry). AUTO-FIT FROM TRANSIENTS IS HELD: `_fit_slew_a` is reliable only on a
+    # CLEAN characterization load step (known dI + decap + fine early sampling); on the real GHz
+    # switching transients the dip is hidden / the spurs alias below Nyquist, so it mis-reads
+    # (see memory real-tb-model-vs-real-comparison). SRa therefore comes from the manifest as a
+    # MANUAL knob -- m['v_out'][rail]['slew_a'], applied at the fit_multiport call site. None here
+    # -> the rail emits byte-identical unless the manifest sets slew_a.
+    slew_a = None
     # when transients ARE mapped but the schedule still didn't build, capture WHY (per-waveform
     # settled-extraction dump) so the fit log explains it without another box round-trip.
     loadreg_diag = (_loadreg_diag(sp, tr_steps)
                     if (vreg_sched is None and len(tr_steps) >= 2) else None)
     return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
                 supplies=list(supplies), schedule_loads=schedule_loads, cft=cft,
-                vreg_sched=vreg_sched, n_tr_npz=n_tr_npz, n_tr_mapped=len(tr_steps),
+                vreg_sched=vreg_sched, slew_a=slew_a, n_tr_npz=n_tr_npz, n_tr_mapped=len(tr_steps),
                 loadreg_diag=loadreg_diag)
 
 
@@ -326,6 +334,65 @@ def _build_vreg_schedule(sp, tr_steps, P, nom):
     iv_nom = float(P[nom]["iv"])
     i_nom = iv_nom if (np.isfinite(iv_nom) and iv_nom > 0) else currents[len(currents) // 2]
     return dict(currents=currents, vregs=vregs, i_nom=float(i_nom))
+
+
+def _fit_slew_a(sp, tr_steps):
+    """Branch-A regulation SLEW-RATE limit SRa [A/s] from the rail's transient load steps -- the
+    LARGE-SIGNAL dynamic the AC Zout/PSRR fundamentally cannot carry (proven: same load + same cap
+    + same small-signal Zout, but the real LDO undershoots ~3x deeper than a pure-LTI model; a
+    finite slew reproduces it, SR->inf collapses it). On a load step of dI, the pass-device
+    regulation current can only ramp at SRa, so the output UNDERSHOOTS -- dips BELOW its settled
+    post-step level -- until the current catches the load. The dip BOTTOM sits ~dI/SRa after the
+    edge, CAP-INDEPENDENTLY (the test cap sets the dip DEPTH, not its TIME), so
+        SRa = dI / t_bottom ,  t_bottom = t(dip extremum) - t(step edge)
+    Gated like Cft/d2/vreg_sched: a step is used ONLY when it shows a CLEAN undershoot (the dip is
+    clearly past the settled-tail ripple) -- a slow / monotonically-settling step has no dip -> it
+    contributes no SRa -> when NO step shows one the rail emits byte-identical. Returns the median
+    SRa over the qualifying steps, or None."""
+    srs = []
+    for k, fromto in (tr_steps or {}).items():
+        if k not in sp:
+            continue
+        w = np.asarray(sp[k], float)
+        if w.ndim != 2 or w.shape[0] < 12 or w.shape[1] < 2:
+            continue
+        t, V = w[:, 0], w[:, 1]
+        if not (np.all(np.isfinite(t)) and np.all(np.isfinite(V))):
+            continue
+        try:
+            i_from, i_to = float(fromto[0]), float(fromto[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        dI = abs(i_to - i_from)
+        t0, tend = t[0], t[-1]
+        span = tend - t0
+        if not (np.isfinite(dI) and dI > 0 and span > 0):
+            continue
+        # step edge = largest |dV|, skipping the t~0 turn-on and the far settled tail
+        dV = np.abs(np.diff(V))
+        win = (t[:-1] >= t0 + 0.15 * span) & (t[:-1] <= t0 + 0.85 * span)
+        if not win.any():
+            continue
+        te = t[int(np.argmax(np.where(win, dV, -1.0)))]
+        post = t >= tend - 0.20 * span                       # settled tail (dip recovered)
+        seg = (t > te) & (t < tend - 0.20 * span)            # where the undershoot lives
+        if post.sum() < 3 or seg.sum() < 3:
+            continue
+        v_settled = float(V[post].mean())
+        ripple = float(np.std(V[post]))
+        load_up = i_to > i_from                              # a load INCREASE dips the output DOWN
+        Vseg, tseg = V[seg], t[seg]
+        j = int(np.argmin(Vseg)) if load_up else int(np.argmax(Vseg))
+        v_ext, t_ext = float(Vseg[j]), float(tseg[j])
+        depth = (v_settled - v_ext) if load_up else (v_ext - v_settled)
+        # gate: a REAL undershoot (dip clearly past ripple, >=2mV) resolved in time after the edge
+        if not (depth > max(2e-3, 4.0 * ripple) and t_ext > te):
+            continue
+        t_bottom = t_ext - te
+        sr = dI / t_bottom
+        if np.isfinite(sr) and sr > 0:
+            srs.append(sr)
+    return float(np.median(srs)) if srs else None
 
 
 def _amps_ok(il):
@@ -610,8 +677,11 @@ def _log_voltage_summary(o, vf):
             vreg += (f" [load-reg OFF: {vf.get('n_tr_npz', 0)} transient wfm in npz, "
                      f"{vf.get('n_tr_mapped', 0)} mapped to manifest steps -> need >=2 load pts]")
         cft = float(vf.get("cft", 0.0) or 0.0)
+        sa = vf.get("slew_a")
+        slew = (f"branch-A slew {float(sa):.3g} A/s (large-signal undershoot)" if sa and sa > 0
+                else f"OFF (no transient undershoot; {vf.get('n_tr_mapped', 0)} steps mapped)")
         print(f"[fit]  V-rail {o} (pin {vf.get('pin', o)}): vreg={vreg}; "
-              f"Cft={('%.1ffF' % (cft * 1e15)) if cft > 0 else 'off'}; "
+              f"Cft={('%.1ffF' % (cft * 1e15)) if cft > 0 else 'off'}; slew={slew}; "
               f"noise={vf.get('nmode', '?')}/{len(vf.get('nfk', []))}fk; "
               f"Cout={float(vf.get('cout', float('nan'))):.3g}F "
               f"ESR={float(vf.get('esr', float('nan'))):.3g}ohm")
@@ -932,6 +1002,11 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         # numeric-label parse then 0.0, byte-identical to the pre-stage-2b path.
         ilmap = _iload_map(ref, o, [str(x) for x in views[o]["loads"]])
         volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc, iload_map=ilmap)
+        # MANUAL branch-A slew knob: m['v_out'][rail]['slew_a'] [A/s] (the user-tuned SRa) -> emit
+        # the editable VDD0P8_<rail>_SRa CDF param + the slew-limited regulation. Absent/<=0 ->
+        # slew_a None -> byte-identical. (The transient auto-fit is held; see _fit_voltage_output.)
+        _sa = (m["v_out"][o] or {}).get("slew_a")
+        volt[o]["slew_a"] = float(_sa) if (_sa and float(_sa) > 0) else None
         # carry the designer's GUI symbol pin name (set by build_manifest) so the model
         # cell's PORT is the pin, not our internal role key. Default: the role key itself
         # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).

@@ -160,9 +160,10 @@ def _voltage_block(o, vfit, supply, ground):
     Cout = float(vfit["cout"])
     ESR = float(vfit["esr"])
     cft = float(vfit.get("cft", 0.0))      # gated vin->vout feedthrough cap (0.0 -> not emitted)
+    slew_a = float(vfit.get("slew_a", 0.0) or 0.0)   # branch-A regulation slew limit (0 -> not emitted)
     sched = _schedule_loads(vfit, P)
     if sched:
-        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft)
+        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft, slew_a)
     il = _nom_corner(P)
     p = P[il]
     vreg = float(p["vreg"])
@@ -214,7 +215,7 @@ def _voltage_block(o, vfit, supply, ground):
         vreg_hdr = (f"parameter real {pre}_vreg = {vreg:.6e};"
                     f"   // {o} regulated output target [V] (per-rail knob)")
     rvars = rvars + vreg_rvars
-    Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + [   # Cn = noise-corner caps (localparam)
+    Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
@@ -242,7 +243,7 @@ def _voltage_block(o, vfit, supply, ground):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
@@ -256,6 +257,38 @@ def _cft_param(pre, cft):
     return []
 
 
+def _slew_param(pre, sr):
+    """Per-rail branch-A regulation SLEW-RATE limit param line(s). Empty list when sr is absent /
+    <=0 / non-finite so the header stays byte-identical to the pre-slew emit (same opt-in gate as
+    Cft / d2 / admittance zero). When present, the LDO pass-device large-signal current cannot
+    change faster than SRa [A/s], which is what produces the deep load-transient UNDERSHOOT a
+    pure-LTI Zout misses. Editable CDF knob (parameter, not localparam) -- the user tunes it in
+    their TB. Two cautions are carried in the emitted comment: (1) a too-LOW SRa drives a
+    non-physical deep undershoot (rail can swing past the supply rails); (2) the hard slew() pumps
+    breakpoints, so a LONG transient (>> 1us) WITHOUT a sim maxstep can explode the time-step --
+    the GHz use case already mandates a fine maxstep so it is unaffected."""
+    if sr and sr > 0 and sr < 1e30:                       # finite + positive (reject inf / garbage)
+        return [f"parameter real {pre}_SRa = {float(sr):.6e};"
+                f"   // {pre} branch-A slew-rate limit [A/s] (large-signal undershoot). Physical"
+                f" ~1e3..1e8; too low -> non-physical deep dip. For tran >> 1us set sim maxstep"
+                f" <= ~1ns (hard slew() can blow up the time-step otherwise)."]
+    return []
+
+
+def _branchA_reg(pre, slew_sr):
+    """Branch-A regulation contribution (node nA -> vrg through R_a). DEFAULT = the passive
+    resistor `V(nA,vrg) <+ Ra*I(nA,vrg)` (byte-identical to the pre-slew emit). When a slew rate
+    is fitted, the SAME R_a path is rate-limited via the built-in `slew()` operator:
+    `I(nA,vrg) <+ slew(V(nA,vrg)/Ra, SRa)`. At DC and small signal slew()==identity, so it is
+    EXACTLY the R_a resistor -> Zout/PSRR/noise (all DC+AC analyses) are unchanged; only large
+    fast transients get rate-limited. SR->inf would also reduce to the resistor, but the absent
+    case is gated at emit time so the default .va text is unchanged."""
+    if slew_sr and slew_sr > 0 and slew_sr < 1e30:        # gate matches _slew_param (SRa declared)
+        return (f"I({pre}_nA, {pre}_vrg) <+ slew(V({pre}_nA, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
+                f"   // R_a regulation, large-signal slew-limited")
+    return f"V({pre}_nA, {pre}_vrg) <+ {pre}_Ra*I({pre}_nA, {pre}_vrg);"
+
+
 def _cft_body(o, supply, cft):
     """Per-rail Cft feedthrough contribution (supply->{o}), emitted ONLY when cft>0. Mirrors
     the single-port emit_va `I(vin, vout) <+ Cft*ddt(V(vin, vout))` with vin=supply, vout={o}.
@@ -266,14 +299,16 @@ def _cft_body(o, supply, cft):
     return ""
 
 
-def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0):
+def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
     scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
     between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
     contributions stays byte-equal. References the per-rail `<o>_*` real vars.
 
     `cft`>0 appends a gated supply->{o} feedthrough contribution (load-independent literal);
-    cft<=0 (the default / single-OP) -> byte-identical to the pre-feedthrough body."""
+    cft<=0 (the default / single-OP) -> byte-identical to the pre-feedthrough body.
+    `slew_sr`>0 rate-limits branch-A's R_a regulation current (large-signal undershoot);
+    None/<=0 (the default) -> the passive R_a resistor, byte-identical to the pre-slew body."""
     pre = o
     nsec = "\n    ".join(
         f"I({pre}_nk{k+1}, {ground}) <+ V({pre}_nk{k+1}, {ground})/NRk"
@@ -295,7 +330,7 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0):
 
     // Zout branch A: (L_a || R_pl) + R_a
     I({o}, {pre}_nA) <+ idt(V({o}, {pre}_nA))/{pre}_La + V({o}, {pre}_nA)/{pre}_Rpl;
-    V({pre}_nA, {pre}_vrg) <+ {pre}_Ra*I({pre}_nA, {pre}_vrg);
+    {_branchA_reg(pre, slew_sr)}
 
     // intrinsic output noise: decoupled Norton current @{o} (white floor + {len(nfk)} Lorentzians)
     I({pre}_nw, {ground}) <+ V({pre}_nw, {ground})/NRk;
@@ -321,7 +356,7 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0):
 """
 
 
-def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft=0.0):
+def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft=0.0, slew_a=0.0):
     """MULTI-LOAD path: each load-dependent small-signal param is a CLAMPED quadratic in
     u=ln(iload_<o>) (a per-rail module parameter, nominal = the middle schedule load's iv).
     At a schedule corner the scheduled expr == that corner's fitted value (corner-exact);
@@ -365,7 +400,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
                  f"   // {o} load OP [A]; ln(iload_{pre}) drives the param schedule "
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
     Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
-        f"\n  {ln}" for ln in _cft_param(pre, cft)) + "".join(
+        f"\n  {ln}" for ln in _cft_param(pre, cft) + _slew_param(pre, slew_a)) + "".join(
         f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
@@ -396,7 +431,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
                 scheduled=True, valid_load=(ilo, ihi))
 
