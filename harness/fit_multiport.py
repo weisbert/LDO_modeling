@@ -262,8 +262,16 @@ def _loadreg_diag(sp, tr_steps):
         except Exception:                                   # noqa: BLE001
             frm = to = float("nan")
         if s is None:
-            out.append(f"{k} ({frm:g}->{to:g}A): NO settled pair -- biggest dV@{ef:.0%} of span, "
-                       f"V[0]={V[0]:.4f} V[mid]={V[len(V) // 2]:.4f} V[end]={V[-1]:.4f}")
+            # dump the SHAPE: V at 9 evenly-spaced time fractions + the min and where it sits, so a
+            # load STEP (settles at a new level) vs a load PULSE (dips then RETURNS to the start)
+            # vs a dropout collapse is distinguishable from the paste alone.
+            ix = np.linspace(0, len(V) - 1, 9).round().astype(int)
+            ser = " ".join(f"{V[i]:.3f}" for i in ix)
+            imn = int(np.argmin(V)); imx = int(np.argmax(V))
+            extreme = imn if abs(V[imn] - V[0]) >= abs(V[imx] - V[0]) else imx
+            ef2 = ((t[extreme] - t[0]) / span) if span > 0 else float("nan")
+            out.append(f"{k} ({frm:g}->{to:g}A): NO settled pair -- V@[0..100%]= {ser} ; "
+                       f"extreme {V[extreme]:.4f}V @{ef2:.0%} (start {V[0]:.4f}, end {V[-1]:.4f})")
         else:
             out.append(f"{k} ({frm:g}->{to:g}A): pre={s[0]:.5f}V post={s[1]:.5f}V")
     return out
