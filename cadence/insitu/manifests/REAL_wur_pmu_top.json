@@ -32,7 +32,8 @@
       "net": "<net:VDD0P8_VCO>",
       "pin": "VDD0P8_VCO",
       "iload": 0.002,
-      "src": "Iload_vco"
+      "src": "Iload_vco",
+      "slew_a": 12000.0
     }
   },
   "i_out": {
