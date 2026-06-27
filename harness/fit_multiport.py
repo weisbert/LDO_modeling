@@ -703,10 +703,16 @@ def _log_npz_inventory(ref, m):
 
 
 def _unused_reason(k):
-    """Why a present npz array went UNUSED -- the actionable hint."""
+    """Why a present npz array went UNUSED -- the actionable hint. Distinguishes a BUG (should be
+    consumed but a mapping failed) from a BY-DESIGN gap (no model path for it yet)."""
     if k.startswith("tr_"):
         return ("transient present but NOT mapped to a manifest step (label mismatch / no "
                 "coverage.transient) -> vreg stays BAKED (the load-reg/20mV gap)")
+    if k.startswith("couple_"):
+        return ("BY DESIGN: output<->output coupling (transfer-Z V_other/I_this, auto-emitted per "
+                "rail pair) -- the PMU has NO cross-rail coupling model today, so it is measured but "
+                "not fit. OK if the rails are isolated; if |couple| is large vs each rail's own Zout "
+                "it is a real modeling gap. Not a bug.")
     if k.startswith("dc_"):
         return "dropout/DC sweep present but DC-dropout/slew emission is stage-2b (not emitted yet)"
     if k.startswith("iv_"):
