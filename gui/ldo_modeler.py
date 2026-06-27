@@ -3677,9 +3677,25 @@ if _HAVE_QT:
             # finished-sim import summary -- whatever the last action produced.
             self.x_report_box = QGroupBox("Report / log (fit report · dsub preview · import summary)")
             _rbl = QVBoxLayout(self.x_report_box)
+            # the 'fit log' toggle lives HERE, next to the log it governs (NOT buried in the Report
+            # tab) -- it shows/hides the captured FIT PROCESS LOG in THIS box live, and also governs
+            # whether the Report tab's 'Copy debug report' includes it. Untick for a lean view.
+            _rhdr = QtWidgets.QHBoxLayout(); _rhdr.setContentsMargins(0, 0, 0, 0)
+            self.rep_fitlog = QCheckBox("fit log")
+            self.rep_fitlog.setChecked(True)                 # default ON: the captured fit process
+            self.rep_fitlog.setToolTip(
+                "Show the captured FIT PROCESS LOG in this box (provenance + code version, npz "
+                "INVENTORY, USED-vs-UNUSED consumption map, per-fit quality verdicts, ANOMALIES) "
+                "and include it in the Report tab's 'Copy debug report'. Toggles live -- untick "
+                "for a lean grades-only view; tick to paste the full fitting process for debugging.")
+            self.rep_fitlog.toggled.connect(lambda _=False: self._x_render_report())
+            _rhdr.addWidget(self.rep_fitlog); _rhdr.addStretch(1)
+            _rbl.addLayout(_rhdr)
             self.x_report = QTextEdit(); self.x_report.setReadOnly(True)
             self.x_report.setStyleSheet("font-family:monospace; font-size:11px;")
             _rbl.addWidget(self.x_report)
+            self._x_report_base = ""                          # last report WITHOUT the fit-log section
+            self._x_fitlog_text = None                        # captured fit log for the current report
 
             # a DRAGGABLE vertical splitter between the per-group status table and the report/log, so
             # the user can trade height between them (drag the handle). Neither pane fully collapses.
@@ -3977,14 +3993,8 @@ if _HAVE_QT:
                 "reproduction (every load/port intact, no lossy budget drop). Leave ON for a "
                 "size-limited red-zone export; untick only if you want a human-readable digest.")
             top.addWidget(self.rep_compress)
-            self.rep_fitlog = QCheckBox("fit log")
-            self.rep_fitlog.setChecked(True)                 # default ON: the captured fit process
-            self.rep_fitlog.setToolTip(
-                "Include the captured FIT PROCESS LOG in the report (provenance + code version, npz "
-                "INVENTORY, USED-vs-UNUSED consumption map, per-fit quality verdicts, ANOMALIES). "
-                "Leave ON to paste the full fitting process for debugging; untick for a lean "
-                "grades-only report.")
-            top.addWidget(self.rep_fitlog)
+            # the 'fit log' toggle lives on the Extract -> Run page next to the log box it governs
+            # (self.rep_fitlog, built with x_report_box); 'Copy debug report' reads it from there.
             self.rep_copy = QPushButton("Copy debug report")
             self.rep_copy.setToolTip("Copy the copy-pasteable multi-port debug report to the clipboard.")
             self.rep_copy.clicked.connect(self._report_copy)
@@ -5001,7 +5011,7 @@ if _HAVE_QT:
                      "nothing submitted", ""]
                 for cmd in cmds:
                     L.append(shlex.join(str(x) for x in cmd)); L.append("")
-                self.x_report.setPlainText("\n".join(L))
+                self._x_set_report("\n".join(L))             # preview: no fit log
                 self.x_gate.setText(f"preview — {len(cmds)} per-group command(s)")
                 self.x_progmsg.setText("preview")
                 self.statusBar().showMessage(f"Previewed {len(cmds)} per-group dsub command(s) — "
@@ -5011,7 +5021,7 @@ if _HAVE_QT:
             nmeas = len(out.get("psf_map") or {})
             self.x_gate.setText(f"<b><span style='color:#157f3b'>Donau+ALPS sweep DONE</span></b> "
                                 f"— {nmeas} measurement(s), npz {npz}")
-            self.x_report.setPlainText(out["report"])
+            self._x_set_report(out["report"], self._x_cur_fitlog())
             self.xm_make.setEnabled(True)                # a fit of the current manifest exists
             self._x_show_results(f"Donau+ALPS sweep done — {nmeas} measurement(s), npz {npz}")
             self.x_progmsg.setText("done")
@@ -5055,6 +5065,30 @@ if _HAVE_QT:
             self._xw.finished.connect(self._xw.deleteLater)
             self._xw.start()
 
+        def _x_cur_fitlog(self):
+            """The captured FIT PROCESS LOG of the current fit (result['fit_log']), or None."""
+            r = getattr(self.extract, "result", None)
+            f = r.get("fit_log") if isinstance(r, dict) else None
+            return f if (isinstance(f, str) and f.strip()) else None
+
+        def _x_render_report(self):
+            """Render the Run-tab log box = base report (+ the FIT PROCESS LOG when 'fit log' is
+            ticked). Called on every report write AND on the checkbox toggle, so the log shows/hides
+            LIVE without re-importing. The Report tab's 'Copy debug report' reads the same flag."""
+            txt = self._x_report_base or ""
+            if self._x_fitlog_text and getattr(self, "rep_fitlog", None) and self.rep_fitlog.isChecked():
+                txt = (txt + "\n\n" + "=" * 72
+                       + "\nFIT PROCESS LOG  (captured during fit -- copy-paste for debugging)\n"
+                       + "=" * 72 + "\n" + self._x_fitlog_text.rstrip())
+            self.x_report.setPlainText(txt)
+
+        def _x_set_report(self, text, fitlog=None):
+            """Set the Run-tab log box. `fitlog` (when present) is appended/hidden per the 'fit log'
+            toggle; pass None for previews/dumps so a later toggle is a no-op on them."""
+            self._x_report_base = text or ""
+            self._x_fitlog_text = fitlog if (isinstance(fitlog, str) and fitlog.strip()) else None
+            self._x_render_report()
+
         def _x_import_done(self, out):
             """A finished-sim import completed -> show the fit report + enable 'Create model cell'.
             A coverage extra (slew/I-V/dropout) that wasn't saved in the PSF is noted, NOT fatal."""
@@ -5066,22 +5100,15 @@ if _HAVE_QT:
             self.x_gate.setText(f"<b><span style='color:#157f3b'>Imported finished sim</span></b> "
                                 f"— {out['n_meas']} measurement(s), npz {npz}{skiptxt}")
             report = out["report"]
-            # append the captured FIT PROCESS LOG (vreg source / Cft gate / noise mode / residuals)
-            # so the whole fitting process is VISIBLE here and selectable-to-copy. It is ALSO folded
-            # into the Report tab's 'Copy debug report'. Best-effort: absent on a non-fit import.
-            _res = getattr(self.extract, "result", None)
-            _flog = _res.get("fit_log") if isinstance(_res, dict) else None
-            if _flog and _flog.strip():
-                report = (report + "\n\n" + "=" * 72
-                          + "\nFIT PROCESS LOG  (captured during fit -- copy-paste for debugging)\n"
-                          + "=" * 72 + "\n" + _flog.rstrip())
             if skipped:
                 report += ("\n\n# " + "-" * 70 + f"\n# {len(skipped)} COVERAGE measurement(s) "
                            "SKIPPED — their signal wasn't saved in the finished PSF. The CORE model "
                            "imported fine; these only add slew / I-V / dropout detail. Re-run those "
                            "groups (with the node saved) and re-import to include them:\n"
                            + "\n".join(f"#   - {s}" for s in skipped))
-            self.x_report.setPlainText(report)
+            # the captured FIT PROCESS LOG (vreg source / Cft gate / noise mode / residuals) rides
+            # along here, toggled LIVE by the 'fit log' checkbox above the box.
+            self._x_set_report(report, self._x_cur_fitlog())
             # populate + SHOW the per-group list so the user can right-click a row (Open netlist /
             # PSF dir / folder) -- import-finished previously left the table empty (#5 follow-up).
             try:
@@ -5156,7 +5183,7 @@ if _HAVE_QT:
                       "#   and click Build & Run to execute the full Donau+ALPS sweep (each group",
                       "#   gets its own one-hot netlist; watch the per-group status table)."]
                 self._x_show_run()                       # committed a preview -> show its dump (#4)
-                self.x_report.setPlainText("\n".join(L))
+                self._x_set_report("\n".join(L))         # preview: no fit log
                 self.x_gate.setText(f"{where} preview — {len(grps)} command(s) above")
                 self.statusBar().showMessage(f"Previewed {len(grps)} {where} command(s) "
                                              f"(engine={eng}). Nothing executed.")
@@ -5195,7 +5222,7 @@ if _HAVE_QT:
             colour = {"PASS": "#157f3b", "FAIL": "#b00020", "SKIP": "#777"}[tag]
             self.x_gate.setText(f"<b>gate vs gold: <span style='color:{colour}'>{tag}</span></b> "
                                 f"({detail}) — npz {pathlib.Path(out['npz_path']).name}")
-            self.x_report.setPlainText(out["report"])
+            self._x_set_report(out["report"], self._x_cur_fitlog())
             self.xm_make.setEnabled(True)        # a fit of the current manifest exists -> cell build OK
             self._x_show_results(f"Extraction done — gate vs gold: {tag} ({detail})")
             self.x_progmsg.setText("done")

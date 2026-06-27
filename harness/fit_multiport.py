@@ -438,12 +438,20 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
     # Cp + the 2nd-order cascode/Wilson zero (y_wz/y_wp) from the AC admittance, via the SAME
     # fit_isrc._fit_admittance the report path uses (report<->emit consistency), anchored to the
     # I-V conductance g0. y_wz/y_wp stay None on a flat g0+sCp admittance -> emit is byte-identical.
-    Cp, y_wz, y_wp = 0.0, None, None
+    Cp, y_wz, y_wp, yrms = 0.0, None, None, float("nan")
     if cp.get("y"):
         il_y = op_label if op_label in cp["y"] else next(iter(cp["y"]))
         g = cp["y"][il_y]; f = g[:, 0]; Y = g[:, 1] + 1j * g[:, 2]
         af = ISR._fit_admittance(f, Y, float(iv["g0"]))
         Cp, y_wz, y_wp = float(af["cp"]), af["y_wz"], af["y_wp"]
+        # grade the ADOPTED admittance model vs GT (dB-mag RMS, == report's diff_metrics yrms) so
+        # the summary table + fit-log carry a REAL |Y| residual. The large-signal row used to omit
+        # yrms entirely -> the table fell back to NaN (the box's `Yrms = nan` on every sink).
+        try:
+            yp = dict(g0=float(iv["g0"]), cp=Cp, y_wz=y_wz, y_wp=y_wp)
+            yrms = float(ISR._y_rms_db(ISR.predict_y(yp, f), Y))
+        except Exception:                              # noqa: BLE001 -- never break the fit on grading
+            yrms = float("nan")
 
     # current-output noise (in_white/in_kf): fit the in-situ noise_i_<c>_<load> (A/rtHz, the probe
     # current noise) via the VALIDATED fit_isrc._fit_noise (white + 1/f). Absent (coverage.inoise
@@ -456,11 +464,25 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
         narr = nik[nlbl]
         nz = ISR._fit_noise(narr[:, 0], narr[:, 1])
         in_white, in_kf = float(nz["in_white"]), float(nz["in_kf"])
+    # I-V fit quality as a %-of-plateau current RMS (== report's diff_metrics ivrms) -- the
+    # MEANINGFUL absolute metric. R^2 (iv_r2) is DEGENERATE for a near-flat current-source I-V:
+    # a good sink holds I~const across V, so SS_tot (the data variance) ~ 0 and R^2 goes hugely
+    # negative even when the current error is sub-%. The box's `IVr2 = -1.8..-7.6 [BAD!!]` on all
+    # three sinks is exactly this artifact -- so the fit-log/anomaly now grade on ivrms, not R^2.
+    try:
+        Iplat = float(np.median(np.sort(Is)[-8:]))
+        ivp = dict(idc=float(iv["idc"]), g0=float(iv["g0"]), vc=float(sink_dc),
+                   vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
+                   pol=pol, knee_side=iv["knee_side"], vhi=float(iv["vhi"]))
+        Im = ISR.predict_iv(ivp, Vs)
+        ivrms = float(np.sqrt(np.mean(((Im - Is) / (Iplat + 1e-30)) ** 2)) * 100.0)
+    except Exception:                                  # noqa: BLE001
+        ivrms = float("nan")
     return dict(sink=c, il=op_label, pol=pol, vc=float(sink_dc),
                 idc55=idc55, didt=didt, d2=d2, g0=float(iv["g0"]),
                 gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
                 knee_side=iv["knee_side"], vhi=float(iv["vhi"]),
-                Cp=float(Cp), y_wz=y_wz, y_wp=y_wp,
+                Cp=float(Cp), y_wz=y_wz, y_wp=y_wp, yrms=yrms, ivrms=ivrms,
                 in_white=in_white, in_kf=in_kf, tnom_c=float(tnom_c),
                 iv_r2=float(iv["iv_r2"]))
 
@@ -573,10 +595,12 @@ def _log_current_summary(r):
         inw = float(r.get("in_white", 0.0) or 0.0)
         if inw:
             bits.append(f"in_wht={inw:.2e}A2/Hz")
-        r2 = r.get("iv_r2")
-        if r2 is not None:
-            v = "OK" if float(r2) > 0.9 else ("~" if float(r2) > 0.5 else "BAD!!")
-            bits.append(f"IVr2={float(r2):.4f}[{v}]")
+        ivr = r.get("ivrms")
+        if ivr is not None and np.isfinite(ivr):       # %-of-plateau RMS = the MEANINGFUL I-V grade
+            bits.append(f"IVrms={float(ivr):.2f}%[{_verdict(ivr, 2.0, 5.0)}]")
+        yr = r.get("yrms")
+        if yr is not None and np.isfinite(yr):
+            bits.append(f"Yrms={float(yr):.2f}dB[{_verdict(yr, 3.0, 8.0)}]")
         print(f"[fit]  I-sink {r.get('sink', '?')} (pin {r.get('pin', r.get('sink', '?'))}, "
               f"{r.get('pol', 'sink')}): " + ", ".join(bits))
     except Exception as e:                             # noqa: BLE001
@@ -750,10 +774,15 @@ def _log_anomalies(volt, curr):
             flags.append(f"V-rail {o}: Cout/ESR NaN")
     for r in (curr or []):
         c = r.get("sink")
-        r2 = r.get("iv_r2")
-        if r2 is not None and not _badnum(r2) and float(r2) < 0.5:
-            flags.append(f"I-sink {c}: I-V fit R2={float(r2):.2f} < 0.5 -> BAD I-V fit "
+        # grade I-V on the %-of-plateau RMS (the meaningful absolute error), NOT R^2: a near-flat
+        # current-source I-V drives SS_tot->0 so R^2 is hugely negative even at sub-% error -- the
+        # box's IVr2=-1.8..-7.6 was a metric artifact, not a bad fit. Flag only a real >5% miss.
+        ivr = r.get("ivrms")
+        if ivr is not None and not _badnum(ivr) and float(ivr) > 5.0:
+            flags.append(f"I-sink {c}: I-V fit RMS={float(ivr):.1f}% > 5% -> BAD I-V fit "
                          f"(check the sink dc/pol, or the knee side)")
+        if _badnum(r.get("yrms")):
+            flags.append(f"I-sink {c}: |Y| RMS NaN/inf (admittance not graded)")
         if _badnum(r.get("g0")):
             flags.append(f"I-sink {c}: g0 NaN")
     if flags:

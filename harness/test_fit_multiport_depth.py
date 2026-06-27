@@ -162,6 +162,41 @@ def test_current_largesignal_row(tmp_path):
     assert r["in_white"] == 0.0 and r["in_kf"] == 0.0  # sink noise not in the matrix
 
 
+def test_flat_sink_graded_on_ivrms_not_r2(tmp_path):
+    """REGRESSION (the box's `Yrms=nan` + `IVr2=-1.8..-7.6 [BAD!!]` on all 3 sinks): a near-ideal
+    current sink holds I~const across V, so the I-V data variance (SS_tot) -> 0 and R^2 goes hugely
+    NEGATIVE even at sub-% current error -- a metric artifact, not a bad fit. AND the large-signal
+    row used to omit yrms entirely -> the table showed NaN. The fit now (a) carries a real yrms
+    (dB-mag admittance residual), (b) carries ivrms (%-of-plateau current RMS), and (c) grades the
+    fit-log verdict + anomaly on ivrms, NOT R^2."""
+    f = _ac()[0][:, 0]                                  # reuse the AC freq grid
+    Vo = np.linspace(0.0, 0.8, 10)
+    idc, g0 = 1.5e-6, 4e-10                             # tiny conductance => essentially flat I-V
+    rng = np.random.default_rng(7)
+    I = idc + rng.normal(0, 3e-12, Vo.size)            # FLAT + 2ppm noise -> SS_tot ~ 0 -> R^2<0
+    # (predict_iv anchors Idc at V=vc, not the data mean, so a flat noisy I-V gives SS_res >= SS_tot)
+    rec = {"loads": np.array(["tt_25c"]),
+           "z_pll_tt_25c": _ac()[0], "p_pll_AVDD1P0_tt_25c": _ac()[1], "noise_pll_tt_25c": _ac()[2],
+           "iv_i1p5u_tt_25c": np.c_[Vo, I],
+           "y_i1p5u_tt_25c": np.c_[f, np.full_like(f, g0), 2 * np.pi * f * 1.7e-14],
+           "pi_i1p5u_AVDD1P0_tt_25c": np.c_[f, np.full_like(f, -1e-7), np.zeros_like(f)]}
+    npz = tmp_path / "flat.npz"
+    np.savez(npz, **rec)
+    m = {"name": "flat", "supplies": {"AVDD1P0": {"dc": 1.05, "net": "VDD1P0"}},
+         "current_psrr_supplies": ["AVDD1P0"],
+         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8}},
+         "i_out": {"i1p5u": {"net": "IB", "dc": 0.4, "pol": "sink"}}}
+    res = FMP.fit_multiport(str(npz), m)
+    r = next(rr for rr in res["current"] if rr["sink"] == "i1p5u")
+    assert np.isfinite(r["yrms"]), "large-signal row must carry a real yrms (was NaN on the box)"
+    assert np.isfinite(r["ivrms"]) and r["ivrms"] < 2.0, ("flat sink fits well in %-terms", r["ivrms"])
+    assert r["iv_r2"] < 0.5, "the flat-I-V R^2 IS degenerate (proves R^2 is the wrong gate)"
+    # the fit log grades on ivrms% and does NOT raise a false BAD-I-V anomaly for this sink
+    log = res["fit_log"]
+    assert "IVrms=" in log and "Yrms=" in log, "per-sink line shows ivrms% + yrms dB"
+    assert "i1p5u: I-V fit RMS" not in log, "must NOT flag a metric-artifact R^2 as a bad fit"
+
+
 def test_current_psrr_sign_preserved(tmp_path):
     """gdd = dI/dVsup = -pi (pi carries the importmp sign). pi=-2e-7 -> gdd=+2e-7."""
     npz, m = _sweep_npz(tmp_path)
