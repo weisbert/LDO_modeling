@@ -200,31 +200,73 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     tr_steps = view.get("tr_steps") or {}
     n_tr_npz = sum(1 for k in sp if isinstance(k, str) and k.startswith("tr_"))  # waveforms present
     vreg_sched = _build_vreg_schedule(sp, tr_steps, P, nom)
+    # when transients ARE mapped but the schedule still didn't build, capture WHY (per-waveform
+    # settled-extraction dump) so the fit log explains it without another box round-trip.
+    loadreg_diag = (_loadreg_diag(sp, tr_steps)
+                    if (vreg_sched is None and len(tr_steps) >= 2) else None)
     return dict(P=P, nfk=nfk, nmode=nmode, nfkv=nfkv, cout=cout, esr=esr, err=err,
                 supplies=list(supplies), schedule_loads=schedule_loads, cft=cft,
-                vreg_sched=vreg_sched, n_tr_npz=n_tr_npz, n_tr_mapped=len(tr_steps))
+                vreg_sched=vreg_sched, n_tr_npz=n_tr_npz, n_tr_mapped=len(tr_steps),
+                loadreg_diag=loadreg_diag)
 
 
 def _settled_step(w):
     """(pre-step, post-step) settled output means from a load-step [t,V] waveform, or None
-    when the step can't be located cleanly. The step edge = the largest |dV| sample; the
-    pre window is a slab just BEFORE the edge (skips the t~0 startup), the post window the
-    settled tail. Robust to step direction (up or down)."""
+    when the step can't be located cleanly. The step edge = the largest |dV| sample searched
+    ONLY in [15%,98%] of the time span, so a t~0 TURN-ON transient (the startup drop the user
+    sees -- its dV can DWARF the load step and hijack a whole-waveform argmax, collapsing the pre
+    window to nothing) does not steal the edge. The pre window is a settled slab just BEFORE the
+    edge AND clear of the turn-on; the post window the settled tail. Robust to step direction."""
     w = np.asarray(w, dtype=float)
     if w.ndim != 2 or w.shape[0] < 8 or w.shape[1] < 2:
         return None
     t, V = w[:, 0], w[:, 1]
     if not (np.all(np.isfinite(t)) and np.all(np.isfinite(V))):
         return None
-    idx = int(np.argmax(np.abs(np.diff(V))))                  # the load-step edge
-    te, t0, tend = t[idx], t[0], t[-1]
+    t0, tend = t[0], t[-1]
+    span = tend - t0
+    if span <= 0:
+        return None
+    dV = np.abs(np.diff(V))                                   # edge between sample i and i+1
+    win = (t[:-1] >= t0 + 0.15 * span) & (t[:-1] <= t0 + 0.98 * span)  # skip turn-on + far tail
+    idx = int(np.argmax(np.where(win, dV, -1.0))) if win.any() else int(np.argmax(dV))
+    te = t[idx]
     if not (tend > te > t0):
         return None
-    pre = (t >= te - 0.40 * (te - t0)) & (t < te - 0.02 * (te - t0))
+    pre = (t >= max(te - 0.40 * (te - t0), t0 + 0.15 * span)) & (t < te - 0.02 * (te - t0))
     post = t >= tend - 0.20 * (tend - te)
     if pre.sum() < 3 or post.sum() < 3:
         return None
     return float(V[pre].mean()), float(V[post].mean())
+
+
+def _loadreg_diag(sp, tr_steps):
+    """Per-transient shape dump for the FAILURE case (transients mapped but the vreg schedule
+    still did not build): for each waveform, the located settled pre/post pair, or -- when it
+    couldn't -- the edge position + V at start/mid/end, so a startup-dominated or step-at-t0
+    waveform is visible WITHOUT a box round-trip. Returns a list of one-line strings."""
+    out = []
+    for k, fromto in sorted((tr_steps or {}).items()):
+        if k not in sp:
+            out.append(f"{k}: key absent in view"); continue
+        w = np.asarray(sp[k], float)
+        if w.ndim != 2 or w.shape[0] < 8 or w.shape[1] < 2:
+            out.append(f"{k}: not a [t,V] array (shape {w.shape})"); continue
+        t, V = w[:, 0], w[:, 1]
+        span = t[-1] - t[0]
+        ei = int(np.argmax(np.abs(np.diff(V)))) if V.size > 1 else 0
+        ef = ((t[ei] - t[0]) / span) if span > 0 else float("nan")
+        s = _settled_step(sp[k])
+        try:
+            frm, to = float(fromto[0]), float(fromto[1])
+        except Exception:                                   # noqa: BLE001
+            frm = to = float("nan")
+        if s is None:
+            out.append(f"{k} ({frm:g}->{to:g}A): NO settled pair -- biggest dV@{ef:.0%} of span, "
+                       f"V[0]={V[0]:.4f} V[mid]={V[len(V) // 2]:.4f} V[end]={V[-1]:.4f}")
+        else:
+            out.append(f"{k} ({frm:g}->{to:g}A): pre={s[0]:.5f}V post={s[1]:.5f}V")
+    return out
 
 
 def _loadreg_from_transient(sp, tr_steps):
@@ -483,6 +525,7 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
                 gdd=gdd, vknee=float(iv["vknee"]), knee_p=float(iv["knee_p"]),
                 knee_side=iv["knee_side"], vhi=float(iv["vhi"]),
                 Cp=float(Cp), y_wz=y_wz, y_wp=y_wp, yrms=yrms, ivrms=ivrms,
+                iv_vmin=float(Vs[0]), iv_vmax=float(Vs[-1]),   # swept I-V range (for OP-in-range check)
                 in_white=in_white, in_kf=in_kf, tnom_c=float(tnom_c),
                 iv_r2=float(iv["iv_r2"]))
 
@@ -564,6 +607,9 @@ def _log_voltage_summary(o, vf):
               f"noise={vf.get('nmode', '?')}/{len(vf.get('nfk', []))}fk; "
               f"Cout={float(vf.get('cout', float('nan'))):.3g}F "
               f"ESR={float(vf.get('esr', float('nan'))):.3g}ohm")
+        # mapped-but-no-schedule: dump each waveform's settled extraction so the gap is visible
+        for d in (vf.get("loadreg_diag") or []):
+            print(f"[fit]      load-reg wfm  {d}")
         # fit QUALITY (the 'specific process'): worst-over-corner residual + verdict per transfer.
         errs = vf.get("err") or []
         if errs:
@@ -787,8 +833,18 @@ def _log_anomalies(volt, curr):
         # box's IVr2=-1.8..-7.6 was a metric artifact, not a bad fit. Flag only a real >5% miss.
         ivr = r.get("ivrms")
         if ivr is not None and not _badnum(ivr) and float(ivr) > 5.0:
-            flags.append(f"I-sink {c}: I-V fit RMS={float(ivr):.1f}% > 5% -> BAD I-V fit "
-                         f"(check the sink dc/pol, or the knee side)")
+            vc, vlo, vhi = r.get("vc"), r.get("iv_vmin"), r.get("iv_vmax")
+            # the #1 cause of a big I-V miss: the sink's OPERATING point (i_out.dc = vc) is OUTSIDE
+            # the swept I-V range -> the Idc anchor + knee are EXTRAPOLATED. Name it precisely.
+            if (vc is not None and vlo is not None and vhi is not None
+                    and not (_badnum(vc) or _badnum(vlo) or _badnum(vhi))
+                    and not (float(vlo) <= float(vc) <= float(vhi))):
+                flags.append(f"I-sink {c}: I-V fit RMS={float(ivr):.1f}% > 5% -> OP vc={float(vc):g}V "
+                             f"is OUTSIDE the swept I-V [{float(vlo):g}..{float(vhi):g}]V -> the fit "
+                             f"EXTRAPOLATES. Re-sweep I-V to cover vc, or fix i_out.dc.")
+            else:
+                flags.append(f"I-sink {c}: I-V fit RMS={float(ivr):.1f}% > 5% -> BAD I-V fit "
+                             f"(check the sink dc/pol, or the knee side)")
         if _badnum(r.get("yrms")):
             flags.append(f"I-sink {c}: |Y| RMS NaN/inf (admittance not graded)")
         if _badnum(r.get("g0")):

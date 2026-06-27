@@ -373,6 +373,38 @@ def test_vreg_schedule_maps_realbox_load_suffixed_keys(tmp_path):
     assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]
 
 
+def test_vreg_schedule_survives_t0_startup_spike(tmp_path):
+    """REGRESSION (the box's `3 mapped to manifest steps -> need >=2 load pts`): the real transient
+    waveforms open with a t=0 TURN-ON drop whose |dV| can DWARF the load-step |dV|. A whole-waveform
+    argmax then locks the 'edge' onto the startup, collapses the pre-window, and _settled_step
+    returns None for every step -> 0 settled pts -> vreg stayed BAKED (the 20mV NEVER moved even
+    after the steps mapped). _settled_step must search the edge clear of the turn-on so the schedule
+    still builds."""
+    z, p, n = _ac()
+    rec = {"loads": np.array(["tt_25c"]),
+           "z_pll_tt_25c": z, "p_pll_AVDD1P0_tt_25c": p, "noise_pll_tt_25c": n,
+           "meta_iload_pll": np.array([1e-4])}
+    settled = {1e-4: 0.800, 2e-3: 0.802, 3e-3: 0.803, 4e-3: 0.804}   # the rising load-reg
+    t = np.linspace(0, 1e-5, 203)
+    steps = []
+    for i_to, lbl in zip((2e-3, 3e-3, 4e-3), ("2m", "3m", "4m")):
+        V = np.full_like(t, settled[1e-4])
+        V[t < 2e-6] = settled[1e-4] - 0.10 * np.exp(-t[t < 2e-6] / 4e-7)  # DEEP t=0 startup dip
+        V[t >= 5e-6] = settled[i_to]                                       # the real load step
+        rec[f"tr_pll_{lbl}_tt_25c"] = np.c_[t, V]
+        steps.append({"from": 1e-4, "to": i_to, "label": lbl})
+    npz = tmp_path / "startup.npz"
+    np.savez(npz, **rec)
+    m = {"name": "startup", "supplies": {"AVDD1P0": {"dc": 1.05, "net": "VDD1P0"}},
+         "current_psrr_supplies": ["AVDD1P0"],
+         "v_out": {"pll": {"net": "VPLL", "iload": 1e-4, "vout_dc": 0.8}}, "i_out": {},
+         "coverage": {"transient": {"pll": {"steps": steps}}}}
+    res = FMP.fit_multiport(str(npz), m)
+    vs = res["voltage"]["pll"]["vreg_sched"]
+    assert vs is not None, "startup-spiked transients must still yield a vreg schedule"
+    assert vs["currents"] == [1e-4, 2e-3, 3e-3, 4e-3]               # the load step (not the startup)
+
+
 def test_no_transient_vreg_sched_none(tmp_path):
     """No transient arrays -> vreg_sched is None (the single-OP default; emit stays byte-
     identical via the baked-vreg parameter path)."""
