@@ -67,12 +67,12 @@ def _rdp_keep(xs, ys, eps):
         if i1 <= i0 + 1:
             continue
         x0, y0, x1, y1 = xs[i0], ys[i0], xs[i1], ys[i1]
-        dx, dy = x1 - x0, y1 - y0
-        denom = (dx * dx + dy * dy) ** 0.5 or 1e-30
+        dx = (x1 - x0) or 1e-30
         dmax, imax = -1.0, -1
         for i in range(i0 + 1, i1):
-            d = abs(dy * (xs[i] - x0) - dx * (ys[i] - y0)) / denom   # perp. distance to chord
-            if d > dmax:
+            chord = y0 + (y1 - y0) * (xs[i] - x0) / dx      # the linear interpolant at xs[i]
+            d = abs(ys[i] - chord)                          # VERTICAL gap = the reconstruction error
+            if d > dmax:                                    # (perp. distance under-resolves steep flanks)
                 dmax, imax = d, i
         if dmax > eps and imax > 0:
             keep[imax] = True
@@ -87,28 +87,58 @@ def _norm(a):
     return [(x - lo) / rng for x in a], lo, hi
 
 
-def decimate(rows, max_points):
-    """Union the RDP-kept indices of EVERY signal column onto a shared time grid (so each signal's
-    features survive), plus each signal's global min/max, capped to max_points by tuning epsilon."""
+def _prethin(t, sigs, tol):
+    """O(n) pre-thin so RDP (O(n^2) worst-case) never chokes on a huge adaptive-timestep export
+    (1e5..1e7 pts). Keep a sample whenever ANY signal has moved more than ~tol*range since the
+    LAST kept sample -- this preserves shoulders, edges AND slow ramps (cumulative move triggers
+    a keep) while dropping flat-region noise below tol and long flat runs. Unlike min/max binning
+    it never erases the shoulder (the last flat point before a drop), which is what makes RDP's
+    chord cut straight into the dip. Endpoints always kept; RDP then bounds error + trims count."""
+    n = len(t)
+    rng = [(max(s) - min(s)) or 1.0 for s in sigs]
+    thr = [0.3 * tol * r for r in rng]
+    keep = [0]
+    last = 0
+    for i in range(1, n - 1):
+        if any(abs(sigs[j][i] - sigs[j][last]) > thr[j] for j in range(len(sigs))):
+            if i - 1 > keep[-1]:
+                keep.append(i - 1)                         # the SHOULDER: last sample before the move
+            keep.append(i)                                 # (else RDP's chord cuts from the prior flat
+            last = i                                       #  point straight into the dip -> big error)
+    keep.append(n - 1)
+    return keep
+
+
+def decimate(rows, max_points, tol=1e-3):
+    """Two-stage, scales to millions of points: (1) O(n) min/max pre-bin to a few thousand
+    candidates that retain every extreme; (2) RDP (+ forced global extrema) on the candidates,
+    unioned across signals onto a shared time grid, with an epsilon FLOOR at `tol` (a fraction of
+    each signal's range) so sub-tol NOISE is ignored -- otherwise the budget gets spent capturing
+    flat-region noise wiggles instead of the real dip (default tol=1e-3 = 0.1% of range). Epsilon
+    is raised above the floor only when the genuine features need more than max_points."""
     t = [r[0] for r in rows]
     sigs = [[r[c] for r in rows] for c in range(1, len(rows[0]))]
-    tn, _, _ = _norm(t)
-    sn = [_norm(s)[0] for s in sigs]
 
-    forced = {0, len(t) - 1}
-    for s in sigs:                                         # never lose a global extreme (dip bottom)
+    cand = _prethin(t, sigs, tol)                              # stage 1: huge -> O(n), keep features
+    ct = [t[i] for i in cand]
+    csigs = [[s[i] for i in cand] for s in sigs]
+    tn, _, _ = _norm(ct)
+    sn = [_norm(s)[0] for s in csigs]
+
+    forced = {0, len(cand) - 1}
+    for s in csigs:                                        # never lose a global extreme (dip bottom)
         forced.add(s.index(min(s)))
         forced.add(s.index(max(s)))
 
-    def kept_for(eps):
+    def kept_for(eps):                                     # positions WITHIN the candidate set
         keep = set(forced)
         for y in sn:
             keep |= _rdp_keep(tn, y, eps)
         return keep
 
-    lo, hi = 1e-9, 1.0                                     # binary-search eps -> <= max_points
-    keep = kept_for(lo)
-    if len(keep) > max_points:
+    lo, hi = max(tol, 1e-9), 1.0                           # eps FLOOR = tol -> noise below tol ignored
+    keep = kept_for(lo)                                    # tolerance-limited (fewest, all meaningful)
+    if len(keep) > max_points:                             # real features exceed budget -> raise eps
         for _ in range(40):
             mid = (lo * hi) ** 0.5
             k = kept_for(mid)
@@ -117,7 +147,7 @@ def decimate(rows, max_points):
             else:
                 hi = mid
                 keep = k
-    idx = sorted(keep)
+    idx = sorted(cand[p] for p in keep)                   # map candidate positions -> original idx
     return idx, t, sigs
 
 
@@ -129,15 +159,19 @@ def main():
     ap = argparse.ArgumentParser(description="Shape-preserving decimation of a Cadence transient.")
     ap.add_argument("input")
     ap.add_argument("--max-points", type=int, default=400)
+    ap.add_argument("--tol", type=float, default=1e-3,
+                    help="ignore deviations below this FRACTION of each signal's range (default "
+                         "1e-3 = 0.1%%); raise to drop more noise, lower to keep finer wiggles")
     ap.add_argument("--cols", default="", help="comma list of column indices, e.g. 0,1,4")
     ap.add_argument("--label", default="", help="optional label for the summary header")
     a = ap.parse_args()
 
     rows = _parse(a.input, a.cols)
-    idx, t, sigs = decimate(rows, a.max_points)
+    idx, t, sigs = decimate(rows, a.max_points, a.tol)
 
     lbl = a.label or a.input
-    print(f"# decimate_trans: {lbl}  {len(rows)} -> {len(idx)} rows  "
+    ratio = len(rows) / max(1, len(idx))
+    print(f"# decimate_trans: {lbl}  {len(rows)} -> {len(idx)} rows  ({ratio:.0f}x smaller)  "
           f"(t {_fmt(t[0])}..{_fmt(t[-1])}s)")
     for j, s in enumerate(sigs):
         imn = s.index(min(s))
