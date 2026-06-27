@@ -5057,6 +5057,15 @@ if _HAVE_QT:
             self.x_gate.setText(f"<b><span style='color:#157f3b'>Imported finished sim</span></b> "
                                 f"— {out['n_meas']} measurement(s), npz {npz}{skiptxt}")
             report = out["report"]
+            # append the captured FIT PROCESS LOG (vreg source / Cft gate / noise mode / residuals)
+            # so the whole fitting process is VISIBLE here and selectable-to-copy. It is ALSO folded
+            # into the Report tab's 'Copy debug report'. Best-effort: absent on a non-fit import.
+            _res = getattr(self.extract, "result", None)
+            _flog = _res.get("fit_log") if isinstance(_res, dict) else None
+            if _flog and _flog.strip():
+                report = (report + "\n\n" + "=" * 72
+                          + "\nFIT PROCESS LOG  (captured during fit -- copy-paste for debugging)\n"
+                          + "=" * 72 + "\n" + _flog.rstrip())
             if skipped:
                 report += ("\n\n# " + "-" * 70 + f"\n# {len(skipped)} COVERAGE measurement(s) "
                            "SKIPPED — their signal wasn't saved in the finished PSF. The CORE model "

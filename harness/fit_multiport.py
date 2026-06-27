@@ -24,6 +24,7 @@ requirement: a current-sink model that is off must be visible, not averaged away
     # or:  python harness/fit_multiport.py --variant pmu_standin --manifest pmu_top
 """
 import contextlib
+import io
 import pathlib
 import sys
 
@@ -508,9 +509,107 @@ def _fit_current_ports(cports, supplies, ref=None, manifest=None, tnom_c=55.0):
 
 
 # --------------------------------------------------------------------------- driver
+def _log_voltage_summary(o, vf):
+    """One-line per-rail fit summary captured into result['fit_log'] -- the HIGH-VALUE decisions
+    a reviewer needs at a glance: vreg SOURCE (a silently-inert `baked` here when a load-reg
+    schedule was expected is the exact bug class we hit), Cft gate, noise mode, Cout/ESR.
+    Defensive: a missing field degrades to a fallback, never breaks the fit."""
+    try:
+        vs = vf.get("vreg_sched")
+        sl = vf.get("schedule_loads", []) or []
+        if vs:
+            cur, vr = list(vs.get("currents", [])), list(vs.get("vregs", []))
+            vreg = (f"load-reg schedule {len(cur)}pts [{min(cur):g}..{max(cur):g}]A"
+                    + (f" -> vreg [{min(vr):.4f}..{max(vr):.4f}]V" if vr else ""))
+        elif len(sl) > 1:
+            vreg = f"multi-load AC schedule ({len(sl)} loads)"
+        else:
+            P = vf.get("P") or {}
+            labs = list(P.keys())
+            vreg = (f"baked {float(P[labs[len(labs) // 2]]['vreg']):.4f}V (single-OP)"
+                    if labs else "baked (single-OP)")
+        cft = float(vf.get("cft", 0.0) or 0.0)
+        print(f"[fit]  V-rail {o} (pin {vf.get('pin', o)}): vreg={vreg}; "
+              f"Cft={('%.1ffF' % (cft * 1e15)) if cft > 0 else 'off'}; "
+              f"noise={vf.get('nmode', '?')}/{len(vf.get('nfk', []))}fk; "
+              f"Cout={float(vf.get('cout', float('nan'))):.3g}F "
+              f"ESR={float(vf.get('esr', float('nan'))):.3g}ohm")
+    except Exception as e:                             # noqa: BLE001 -- a log line must never break the fit
+        print(f"[fit]  V-rail {o}: <summary unavailable: {e}>")
+
+
+def _log_current_summary(r):
+    """One-line per-sink fit summary: idc(@tnom), temp slope, I-V knee, admittance zero, white
+    noise, I-V fit R^2. Defensive -- missing fields degrade gracefully (a small-signal-only sink
+    carries fewer keys)."""
+    try:
+        bits = [f"idc={float(r.get('idc55', float('nan'))) * 1e6:.3g}uA@{r.get('tnom_c', '?')}C"]
+        didt = float(r.get("didt", 0.0) or 0.0)
+        if didt:
+            bits.append(f"didt={didt * 1e9:.3g}nA/K")
+        vk = r.get("vknee")
+        if vk is not None and r.get("knee_side"):
+            bits.append(f"knee@{float(vk):.3g}V({r.get('knee_side')})")
+        if r.get("y_wz") and r.get("y_wp"):
+            bits.append(f"Yzero(wz={float(r['y_wz']):.3g},wp={float(r['y_wp']):.3g})")
+        inw = float(r.get("in_white", 0.0) or 0.0)
+        if inw:
+            bits.append(f"in_wht={inw:.2e}A2/Hz")
+        r2 = r.get("iv_r2")
+        if r2 is not None:
+            bits.append(f"IVr2={float(r2):.4f}")
+        print(f"[fit]  I-sink {r.get('sink', '?')} (pin {r.get('pin', r.get('sink', '?'))}, "
+              f"{r.get('pol', 'sink')}): " + ", ".join(bits))
+    except Exception as e:                             # noqa: BLE001
+        print(f"[fit]  I-sink {r.get('sink', '?')}: <summary unavailable: {e}>")
+
+
+class _Tee:
+    """Write to several streams at once: live passthrough (terminal/CLI unchanged) + a capture
+    buffer. A dead/closed stream is skipped, never raised -- the fit must not die on logging."""
+    def __init__(self, *streams):
+        self._streams = [s for s in streams if s is not None]
+
+    def write(self, s):
+        for st in self._streams:
+            try:
+                st.write(s)
+            except Exception:                          # noqa: BLE001
+                pass
+        return len(s)
+
+    def flush(self):
+        for st in self._streams:
+            try:
+                st.flush()
+            except Exception:                          # noqa: BLE001
+                pass
+
+
 def fit_multiport(npz_path, manifest, vout_dc=None):
+    """Fit every modeled port of a multi-port npz (PUBLIC entry).
+
+    Captures the WHOLE fit's diagnostic output into result['fit_log'] -- a copy-pasteable
+    record of the fitting process (per-rail vreg source / Cft gate / noise mode / Cout-ESR,
+    per-sink knee, plus every fitter's residual/adapt/fallback print) for offline debugging --
+    while still streaming it live to stdout so the CLI/terminal behaviour is unchanged. The
+    per-rail summary line in particular makes a silently-inert decision (e.g. `vreg=baked 0.8V`
+    when a load-reg schedule was expected) obvious at a glance. See _fit_multiport_impl."""
+    buf = io.StringIO()
+    old = sys.stdout
+    sys.stdout = _Tee(old, buf)
+    try:
+        result = _fit_multiport_impl(npz_path, manifest, vout_dc)
+    finally:
+        sys.stdout = old
+    if isinstance(result, dict):
+        result["fit_log"] = buf.getvalue()
+    return result
+
+
+def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
     """Fit every modeled port of a multi-port npz. Returns a structured result dict:
-    {voltage: {o: <fit>}, current: [rows], meta}. Pure-Python; no simulator."""
+    {voltage: {o: <fit>}, current: [rows], meta, fit_log}. Pure-Python; no simulator."""
     from insitu import importmp as IM
     ref = IM.load_multiport(npz_path)
     m = manifest
@@ -518,6 +617,9 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
     views = IM.split_ports(ref, m)
     cports = IM.current_ports(ref, m)
     supplies = list(m["supplies"])
+    print(f"[fit] === {pathlib.Path(npz_path).stem}: {len(m.get('v_out', {}))} V-rail(s), "
+          f"{len(cports)} current sink(s); tier={(m.get('coverage') or {}).get('tier')}, "
+          f"supplies={supplies} ===")
     volt = {}
     sched_meta = {}                                # per-rail {labels, currents} for emit
     for o in m["v_out"]:
@@ -534,6 +636,7 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
         sl = volt[o].get("schedule_loads", [])
         sched_meta[o] = dict(labels=list(sl),
                              currents=[float(volt[o]["P"][il]["iv"]) for il in sl])
+        _log_voltage_summary(o, volt[o])
     # nominal temp the Idc(T) fit references: middle of the manifest temps, else 55.
     _tnom = 55.0
     try:
@@ -547,6 +650,7 @@ def fit_multiport(npz_path, manifest, vout_dc=None):
                               ref=ref, manifest=m, tnom_c=_tnom)
     for r in curr:
         r["pin"] = m["i_out"].get(r["sink"], {}).get("pin", r["sink"])
+        _log_current_summary(r)
     # provenance for the emit banner (emit_pmu_va reads these off meta by default, so
     # step_emit needs no new args). All optional / defensive -- a coverage-free or
     # hand-built manifest leaves them None and the banner falls back to 'unspecified'.

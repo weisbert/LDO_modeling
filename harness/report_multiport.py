@@ -896,6 +896,19 @@ def debug_report(result, npz_path, manifest, budget_kb=None, compress=False):
        f"{GRADE_BARS['v_zrms'][1]:.0f} marginal, noise<{GRADE_BARS['v_nrms'][0]:.1f}; current "
        f"I-V<{GRADE_BARS['c_ivrms'][0]:.0f}% , |Y|/PSRR<{GRADE_BARS['c_yrms'][0]:.0f}dB; sign flip=REVIEW)")
     pr("")
+    # FIT PROCESS LOG -- the fitter's own diagnostics captured by fit_multiport (vreg source,
+    # Cft gate, noise mode, residuals, fallbacks). Travels with the copy-pasted report so the
+    # complete fitting process is debuggable offline. Absent (hand-built result / no capture)
+    # -> section omitted -> byte-identical to the pre-log report.
+    _flog = result.get("fit_log") if isinstance(result, dict) else None
+    if _flog and str(_flog).strip():
+        pr("=" * 78)
+        pr("FIT PROCESS LOG  (captured during fit_multiport -- the fitter's decisions + residuals)")
+        pr("=" * 78)
+        for _ln in str(_flog).rstrip("\n").splitlines():
+            pr(_ln)
+        pr("=" * 78)
+        pr("")
     pr("fit-param digest:")
     for v in vviews:
         pr(f"  rail '{v['name']}' (pin {v['pin']}): Cout={v['cout']*1e12:.1f}pF "
