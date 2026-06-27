@@ -572,6 +572,101 @@ def _log_current_summary(r):
         print(f"[fit]  I-sink {r.get('sink', '?')}: <summary unavailable: {e}>")
 
 
+def _ref_keys(ref):
+    """The npz key list whether ref is a plain dict (load_multiport) or an .files-bearing
+    NpzFile/_NpzLike. Defensive -> [] on anything odd."""
+    try:
+        return [k for k in (getattr(ref, "files", None) or list(ref)) if isinstance(k, str)]
+    except Exception:                                  # noqa: BLE001
+        return []
+
+
+def _log_npz_inventory(ref, m):
+    """SECTION 1 -- list EVERY array in the npz grouped by measurement kind (+ labels + sweep
+    range), so the log shows exactly WHAT simulation results are present. Defensive."""
+    files = _ref_keys(ref)
+    if not files:
+        return
+    cats = [("z_", "Zout AC"), ("noise_i_", "current noise"), ("noise_", "output noise"),
+            ("p_", "PSRR"), ("pi_", "current-PSRR"), ("y_", "admittance"),
+            ("tr_", "transient step"), ("iv_", "I-V sweep"), ("dc_", "dropout/DC"),
+            ("meta_", "meta")]
+    try:
+        _loads = [str(x) for x in ref["loads"]] if "loads" in files else "?"
+    except Exception:                                  # noqa: BLE001
+        _loads = "?"
+    print(f"[fit] --- npz INVENTORY: {len(files)} arrays (loads={_loads}) ---")
+    seen = set()
+    for pre, lab in cats:
+        ks = sorted(k for k in files if k.startswith(pre) and k not in seen)
+        if pre == "noise_":
+            ks = [k for k in ks if not k.startswith("noise_i_")]
+        seen.update(ks)
+        if not ks:
+            continue
+        rng = ""
+        try:
+            a = np.asarray(ref[ks[0]])
+            if a.ndim == 2 and a.shape[0] > 1:
+                rng = f"  [axis0 {a[0, 0]:.3g}..{a[-1, 0]:.3g}, {a.shape[0]}pts]"
+        except Exception:                              # noqa: BLE001
+            pass
+        shown = ", ".join(ks) if len(ks) <= 10 else ", ".join(ks[:10]) + f", +{len(ks) - 10} more"
+        print(f"[fit]   {lab:16s}: {len(ks):2d}  {shown}{rng}")
+    other = sorted(k for k in files if k not in seen and k != "loads")
+    if other:
+        print(f"[fit]   {'other':16s}: {len(other)}  {', '.join(other)}")
+
+
+def _unused_reason(k):
+    """Why a present npz array went UNUSED -- the actionable hint."""
+    if k.startswith("tr_"):
+        return ("transient present but NOT mapped to a manifest step (label mismatch / no "
+                "coverage.transient) -> vreg stays BAKED (the load-reg/20mV gap)")
+    if k.startswith("dc_"):
+        return "dropout/DC sweep present but DC-dropout/slew emission is stage-2b (not emitted yet)"
+    if k.startswith("iv_"):
+        return "I-V present but the sink took NO large-signal row (no matching i_out dc/pol?) -- check"
+    if k.startswith(("z_", "p_", "noise_")):
+        return "AC array for a load that carries no z_ (orphan corner) -> not a voltage-fit corner"
+    return "present but not consumed by any fit path"
+
+
+def _log_consumption(ref, m, views, volt, curr):
+    """SECTION 2 -- which simulation arrays the fit CONSUMED vs which were present but UNUSED
+    (with a reason). The round-trip killer: a present-but-unused transient/dropout names itself."""
+    files = set(_ref_keys(ref))
+    if not files:
+        return
+    used = set()
+    for o in m.get("v_out", {}):
+        view = views.get(o, {}) or {}
+        sp = view.get("npz", {}) or {}
+        loads_fit = [il for il in view.get("loads", []) if f"z_{il}" in sp]
+        for il in loads_fit:
+            used |= {f"z_{o}_{il}", f"noise_{o}_{il}"} & files
+            for s in (m.get("supplies", {}) or {}):
+                if f"p_{o}_{s}_{il}" in files:
+                    used.add(f"p_{o}_{s}_{il}")
+        for vk in (view.get("tr_steps") or {}):        # tr_<label> view-key -> tr_<o>_<label> npz key
+            ok = f"tr_{o}_{vk[3:]}"
+            if ok in files:
+                used.add(ok)
+    for r in (curr or []):
+        c = r.get("sink")
+        used |= {k for k in files
+                 if any(k.startswith(f"{p}_{c}_") or k == f"{p}_{c}"
+                        for p in ("iv", "y", "pi", "noise_i"))}
+    data = sorted(k for k in files if k != "loads" and not k.startswith("meta_"))
+    unused = [k for k in data if k not in used]
+    print(f"[fit] --- CONSUMPTION: {len(data)} data arrays -> {len(data) - len(unused)} USED, "
+          f"{len(unused)} UNUSED ---")
+    for k in unused:
+        print(f"[fit]   UNUSED {k}  -> {_unused_reason(k)}")
+    if not unused:
+        print("[fit]   (every simulation array was consumed)")
+
+
 class _Tee:
     """Write to several streams at once: live passthrough (terminal/CLI unchanged) + a capture
     buffer. A dead/closed stream is skipped, never raised -- the fit must not die on logging."""
@@ -628,6 +723,7 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
     print(f"[fit] === {pathlib.Path(npz_path).stem}: {len(m.get('v_out', {}))} V-rail(s), "
           f"{len(cports)} current sink(s); tier={(m.get('coverage') or {}).get('tier')}, "
           f"supplies={supplies} ===")
+    _log_npz_inventory(ref, m)                         # SECTION 1: what simulation results exist
     volt = {}
     sched_meta = {}                                # per-rail {labels, currents} for emit
     for o in m["v_out"]:
@@ -659,6 +755,7 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
     for r in curr:
         r["pin"] = m["i_out"].get(r["sink"], {}).get("pin", r["sink"])
         _log_current_summary(r)
+    _log_consumption(ref, m, views, volt, curr)        # SECTION 2: used vs present-but-unused
     # provenance for the emit banner (emit_pmu_va reads these off meta by default, so
     # step_emit needs no new args). All optional / defensive -- a coverage-free or
     # hand-built manifest leaves them None and the banner falls back to 'unspecified'.

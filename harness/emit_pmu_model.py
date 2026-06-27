@@ -593,6 +593,37 @@ def va_sanity(va_text, supply, v_outs, i_outs, ground):
     return (not problems), problems
 
 
+def va_format_report(va_text, supply, v_outs, i_outs, grounds):
+    """VALIDATE the emitted .va FORMAT for a copy-paste log (answers 'verify the target file'):
+    structural va_sanity + module/port/param roster + per-rail emit SHAPE (vreg load-reg SCHEDULE
+    vs baked literal, Cft on/off) + per-sink terms. Static text scan -- never raises."""
+    import re
+    grounds = [grounds] if isinstance(grounds, str) else list(grounds)
+    L = []
+    try:
+        ok, probs = va_sanity(va_text, supply, v_outs, i_outs, grounds)
+        L.append(f"[emit] --- TARGET .va VALIDATION: {'OK (structurally valid)' if ok else 'PROBLEMS'} ---")
+        for p in probs:
+            L.append(f"[emit]   ! {p}")
+        mod = re.search(r"\bmodule\s+(\w+)\s*\(", va_text)
+        params = re.findall(r"parameter\s+real\s+(\w+)\s*=", va_text)
+        L.append(f"[emit]   module : {mod.group(1) if mod else '?'}  (supply {supply}, "
+                 f"{len(v_outs)} rail(s), {len(i_outs)} sink(s), grounds {grounds})")
+        L.append(f"[emit]   params : {len(params)} -> {', '.join(params) if params else '(none)'}")
+        for o in v_outs:
+            sched = (f"iload_{o}" in va_text) and (f"{o}_vreg = min(max(" in va_text)
+            baked = f"parameter real {o}_vreg =" in va_text
+            cft = f"{o}_Cft" in va_text
+            vreg = "load-reg SCHEDULE" if sched else ("BAKED literal" if baked else "?")
+            L.append(f"[emit]   rail {o}: vreg={vreg}; Cft={'on' if cft else 'off'}")
+        for c in i_outs:
+            L.append(f"[emit]   sink {c}: I-V/g0/PSRR/noise"
+                     + ("; admittance-zero=on" if f"{c}_Cz" in va_text else ""))
+    except Exception as e:                             # noqa: BLE001 -- a validator must never break emit
+        L.append(f"[emit]   <validation unavailable: {e}>")
+    return "\n".join(L)
+
+
 # --------------------------------------------------------------------- emit
 def _coverage_banner(fit_result, provenance):
     """Build the .va COVERAGE/OP/VALID_LOAD provenance comment line (HANDOFF §4). EVERY
@@ -825,6 +856,7 @@ endmodule
     va_path.parent.mkdir(parents=True, exist_ok=True)
     va_path.write_text(va)
     print(f"wrote {va_path}  (1 module, {len(v_outs)} V-rails + {len(i_outs)} I-biases)")
+    print(va_format_report(va, supply, v_outs, i_outs, grounds))   # self-validate the target .va
     return va_path
 
 
