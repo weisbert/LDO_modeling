@@ -277,6 +277,15 @@ def _slew_param(pre, sr):
     return []
 
 
+# anti-windup defaults (large-signal robustness; see _recov_param). The deadzone clamp is ZERO
+# (value + slope) within +-VCL of vrg, so with VCL >> the real worst-case dip these never engage in
+# any realistic transient -> DC/AC/in-envelope replay are untouched; they only bound the non-physical
+# tank ring on huge out-of-envelope steps. Override per-rail via the recovery dict (Imax/Vcl/Gcl).
+_RECOV_IMAX = 1.50e-02   # physical reg pass-current limit [A] (anti-windup on the slew target)
+_RECOV_VCL  = 3.00e-01   # clamp deadzone half-width [V] (>> the ~88mV real worst-case dip)
+_RECOV_GCL  = 2.00e+01   # clamp strength [A/V^2] beyond the deadzone
+
+
 def _recov_ok(recov):
     """True iff a recovery (overdamped 2nd-order Zout) param dict is present + fully valid:
     all four of Lreg, Rreg, Cs, Rs finite + strictly positive. Mirrors the slew_a/cft opt-in
@@ -307,11 +316,25 @@ def _recov_param(pre, recov):
 
     These elements are LOSSLESS / DC-BLOCKED at DC (Lreg shorts, Cs opens) so Zdc is unchanged
     -> the regulated DC setpoint (vreg) is NOT moved; only the recovery SHAPE between the dip
-    and steady state is reshaped. Same opt-in discipline as slew_a / Cft / d2."""
+    and steady state is reshaped. Same opt-in discipline as slew_a / Cft / d2.
+
+    Also emits the ANTI-WINDUP knobs (Imax/Vcl/Gcl) that bound the loop's large-signal response:
+    without them the slew-limited reg branch lags so long on an out-of-envelope harsh step that
+    vout crashes and the lossless La/Lreg tank rings past the rails. Both clamps are zero inside
+    the validated envelope (Vcl >> the real dip), so the in-envelope replay / DC / AC are
+    untouched. Defaults from _RECOV_*; override per-rail via recovery['Imax'|'Vcl'|'Gcl']."""
     if not _recov_ok(recov):
         return []
     Lreg = float(recov["Lreg"]); Rreg = float(recov["Rreg"])
     Cs = float(recov["Cs"]); Rs = float(recov["Rs"])
+
+    def _ov(key, default):
+        try:
+            v = float(recov.get(key))
+        except (TypeError, ValueError):
+            return default
+        return v if (v > 0 and v < 1e30) else default
+    Imax = _ov("Imax", _RECOV_IMAX); Vcl = _ov("Vcl", _RECOV_VCL); Gcl = _ov("Gcl", _RECOV_GCL)
     return [
         f"parameter real {pre}_Lreg = {Lreg:.6e};"
         f"   // {pre} slow-recovery inductor [H] (overdamped 2nd-order Zout; lossless at DC)",
@@ -321,6 +344,12 @@ def _recov_param(pre, recov):
         f"   // {pre} recovery snubber cap [F] (AC-only damping, DC-blocked -> no droop)",
         f"parameter real {pre}_Rs = {Rs:.6e};"
         f"   // {pre} recovery snubber resistance [ohm]",
+        f"parameter real {pre}_Imax = {Imax:.6e};"
+        f"   // {pre} anti-windup reg pass-current limit [A]",
+        f"parameter real {pre}_Vcl = {Vcl:.6e};"
+        f"   // {pre} anti-windup clamp deadzone half-width [V] (>> the real dip)",
+        f"parameter real {pre}_Gcl = {Gcl:.6e};"
+        f"   // {pre} anti-windup clamp strength [A/V^2] beyond the deadzone",
     ]
 
 
@@ -337,7 +366,12 @@ def _branchA_reg(pre, slew_sr, recov=None):
     (Lreg||Rreg, lossless at DC) is inserted between branch A's node nA and the regulation node,
     and an AC-only Rs-Cs snubber (DC-blocked -> no droop) is added from vout to vrg. The
     regulation (slew or resistor) then feeds from the inserted node nB instead of nA. With recov
-    OFF (the default) the inserted node + snubber are absent and the text is byte-identical."""
+    OFF (the default) the inserted node + snubber are absent and the text is byte-identical.
+
+    With recov ON the two ANTI-WINDUP bounds are also emitted (zero inside the validated envelope):
+    the slew target current is clamped to +-Imax (a crashed vout can no longer demand absurd
+    current), and a deadzone shunt clamp (zero value+slope within +-Vcl of vrg) bounds the
+    non-physical La/Lreg tank ring on huge out-of-envelope steps."""
     use_recov = _recov_ok(recov)
     regnode = f"{pre}_nB" if use_recov else f"{pre}_nA"
     pre_lines = ""
@@ -346,8 +380,13 @@ def _branchA_reg(pre, slew_sr, recov=None):
                      f"    I({pre}_nA, {pre}_nB) <+ idt(V({pre}_nA, {pre}_nB))/{pre}_Lreg"
                      f" + V({pre}_nA, {pre}_nB)/{pre}_Rreg;\n    ")
     if slew_sr and slew_sr > 0 and slew_sr < 1e30:        # gate matches _slew_param (SRa declared)
-        reg = (f"I({regnode}, {pre}_vrg) <+ slew(V({regnode}, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
-               f"   // R_a regulation, large-signal slew-limited")
+        if use_recov:    # anti-windup: clamp the reg target current to +-Imax before slew()
+            reg = (f"I({regnode}, {pre}_vrg) <+ slew(max(-{pre}_Imax, "
+                   f"min({pre}_Imax, V({regnode}, {pre}_vrg)/{pre}_Ra)), {pre}_SRa);"
+                   f"   // R_a regulation, slew-limited, target anti-windup clamped")
+        else:
+            reg = (f"I({regnode}, {pre}_vrg) <+ slew(V({regnode}, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
+                   f"   // R_a regulation, large-signal slew-limited")
     else:
         reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"
     post_lines = ""
@@ -355,7 +394,14 @@ def _branchA_reg(pre, slew_sr, recov=None):
         post_lines = (f"\n    // recovery snubber: series Rs-Cs (vout->vrg), DC-blocked, kills"
                       f" the post-dip overshoot\n"
                       f"    I({pre}, {pre}_nD) <+ {pre}_Cs*ddt(V({pre}, {pre}_nD));\n"
-                      f"    V({pre}_nD, {pre}_vrg) <+ {pre}_Rs*I({pre}_nD, {pre}_vrg);")
+                      f"    V({pre}_nD, {pre}_vrg) <+ {pre}_Rs*I({pre}_nD, {pre}_vrg);\n"
+                      f"    // deadzone anti-windup clamp: zero value+slope within +-Vcl of vrg"
+                      f" (invisible to dip/AC), bounds the tank ring beyond it\n"
+                      f"    I({pre}, {pre}_vrg) <+ (V({pre}, {pre}_vrg) >  {pre}_Vcl) ? "
+                      f" {pre}_Gcl*(V({pre}, {pre}_vrg) - {pre}_Vcl)*(V({pre}, {pre}_vrg) - {pre}_Vcl)\n"
+                      f"                  : (V({pre}, {pre}_vrg) < -{pre}_Vcl) ? "
+                      f"-{pre}_Gcl*(V({pre}, {pre}_vrg) + {pre}_Vcl)*(V({pre}, {pre}_vrg) + {pre}_Vcl)\n"
+                      f"                  : 0.0;")
     return pre_lines + reg + post_lines
 
 

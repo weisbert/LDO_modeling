@@ -42,8 +42,8 @@ def test_recovery_off_is_byte_identical(tmp_path):
     res = _tem._real_pmu_fit_result()
     txt = D.emit_pmu_va(res, "PMU_m", tmp_path / "off.va",
                         supply="AVDD1P0", ground="VSS").read_text()
-    for tok in ("_Lreg", "_Rreg", "_Cs", "_Rs", "_nB", "_nD",
-                "recovery branch", "recovery snubber"):
+    for tok in ("_Lreg", "_Rreg", "_Cs", "_Rs", "_nB", "_nD", "_Imax", "_Vcl", "_Gcl",
+                "recovery branch", "recovery snubber", "anti-windup"):
         assert tok not in txt, f"unexpected recovery token {tok!r} in default emit"
 
 
@@ -61,6 +61,10 @@ def test_recovery_on_emits_exactly_the_recovery_cards(tmp_path):
     assert "parameter real VDD0P8_PLL_Rreg = 7.500000e+02" in t_on
     assert "parameter real VDD0P8_PLL_Cs = 2.500000e-11" in t_on
     assert "parameter real VDD0P8_PLL_Rs = 2.000000e+03" in t_on
+    # anti-windup knobs (default values -- not in the manifest dict here)
+    assert "parameter real VDD0P8_PLL_Imax = 1.500000e-02" in t_on
+    assert "parameter real VDD0P8_PLL_Vcl = 3.000000e-01" in t_on
+    assert "parameter real VDD0P8_PLL_Gcl = 2.000000e+01" in t_on
     # the slow recovery inductor branch nA->nB
     assert ("I(VDD0P8_PLL_nA, VDD0P8_PLL_nB) <+ idt(V(VDD0P8_PLL_nA, VDD0P8_PLL_nB))/VDD0P8_PLL_Lreg"
             in t_on)
@@ -69,6 +73,8 @@ def test_recovery_on_emits_exactly_the_recovery_cards(tmp_path):
     # the DC-blocked snubber
     assert "I(VDD0P8_PLL, VDD0P8_PLL_nD) <+ VDD0P8_PLL_Cs*ddt(V(VDD0P8_PLL, VDD0P8_PLL_nD))" in t_on
     assert "V(VDD0P8_PLL_nD, VDD0P8_PLL_vrg) <+ VDD0P8_PLL_Rs*I(VDD0P8_PLL_nD, VDD0P8_PLL_vrg)" in t_on
+    # the deadzone anti-windup shunt clamp (vout->vrg, beyond +-Vcl)
+    assert "I(VDD0P8_PLL, VDD0P8_PLL_vrg) <+ (V(VDD0P8_PLL, VDD0P8_PLL_vrg) >  VDD0P8_PLL_Vcl) ?" in t_on
     # nB/nD declared
     assert "VDD0P8_PLL_nB" in t_on and "VDD0P8_PLL_nD" in t_on
     # OTHER rails untouched: still the plain nA->vrg resistor, no recovery tokens
@@ -86,8 +92,10 @@ def test_recovery_composes_with_slew(tmp_path):
     res["voltage"]["pll"]["slew_a"] = 8.5e3
     t = D.emit_pmu_va(res, "PMU_m", tmp_path / "rs.va",
                       supply="AVDD1P0", ground="VSS").read_text()
-    assert ("I(VDD0P8_PLL_nB, VDD0P8_PLL_vrg) <+ "
-            "slew(V(VDD0P8_PLL_nB, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)") in t
+    # the slew target is anti-windup clamped to +-Imax (recovery composes with slew on the real PLL)
+    assert ("I(VDD0P8_PLL_nB, VDD0P8_PLL_vrg) <+ slew(max(-VDD0P8_PLL_Imax, "
+            "min(VDD0P8_PLL_Imax, V(VDD0P8_PLL_nB, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra)), "
+            "VDD0P8_PLL_SRa)") in t
     # NOT the nA-fed slew (recovery moved the regulation node)
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)" not in t
     assert "parameter real VDD0P8_PLL_Lreg = " in t
@@ -121,6 +129,30 @@ def test_fit_recovery_accepts_full_valid_dict():
     assert out is not None
     assert set(out) == {"Lreg", "Rreg", "Cs", "Rs"}
     assert out["Lreg"] == pytest.approx(1.6e-5)
+
+
+def test_fit_recovery_passes_optional_antiwindup_overrides():
+    """Imax/Vcl/Gcl are OPTIONAL: carried through when valid, silently dropped when bad; the 4
+    core keys are unaffected. Absent overrides -> emit uses its built-in defaults."""
+    rc = dict(_RECOV, Imax=2.0e-2, Vcl=0.25, Gcl=50.0)
+    out = FMP._fit_recovery({"recovery": rc})
+    assert out["Imax"] == pytest.approx(2.0e-2)
+    assert out["Vcl"] == pytest.approx(0.25)
+    assert out["Gcl"] == pytest.approx(50.0)
+    # a bad override is dropped, not fatal; core keys survive
+    out2 = FMP._fit_recovery({"recovery": dict(_RECOV, Imax=-1.0, Vcl="x")})
+    assert out2 is not None and "Imax" not in out2 and "Vcl" not in out2
+    assert set(out2) == set(_RECOV)
+    # the override reaches the emitted .va
+    import test_emit_pmu_model as _t
+    res = _t._real_pmu_fit_result()
+    res["voltage"]["pll"]["recovery"] = rc
+    import tempfile, pathlib as _pl
+    with tempfile.TemporaryDirectory() as d:
+        va = D.emit_pmu_va(res, "PMU_ov", _pl.Path(d) / "ov.va",
+                           supply="AVDD1P0", ground="VSS").read_text()
+    assert "parameter real VDD0P8_PLL_Imax = 2.000000e-02" in va
+    assert "parameter real VDD0P8_PLL_Vcl = 2.500000e-01" in va
 
 
 @pytest.mark.parametrize("bad", [
@@ -235,3 +267,26 @@ def test_recovery_transient_is_stable_and_bounded(tmp_path):
     v = np.asarray(d["tr"]["VDD0P8_PLL"]).real
     assert np.all(np.isfinite(v)), "recovery transient diverged (non-finite)"
     assert v.min() > -1e-3 and v.max() < 1.0 + 1e-3, f"out of bounds [{v.min():.3f},{v.max():.3f}]"
+
+
+def test_recovery_antiwindup_bounds_harsh_step(tmp_path):
+    """ANTI-WINDUP: an OUT-OF-ENVELOPE harsh step (0.1->2mA) that makes the un-clamped loop ring
+    past the rails (vout -> +-thousands mV) must now stay PHYSICAL -- the Imax + deadzone clamps
+    bound the tank ring. The validated in-envelope replay is untouched (clamps zero below +-Vcl;
+    locked separately by the bit-identical AC / 2.47mV replay)."""
+    sr = _spectre()
+    if sr is None:
+        pytest.skip("local Spectre not available")
+    va = str(_emit_recov_rail(tmp_path, recov=True).resolve())
+    scs = (f'simulator lang=spectre\nahdl_include "{va}"\n'
+           "Xd (AVDD1P0 VDD0P8_PLL 0) PLLR\n"
+           "Vs (AVDD1P0 0) vsource dc=1.0\n"
+           "Cd (VDD0P8_PLL 0) capacitor c=20e-12\n"
+           "Il (VDD0P8_PLL 0) isource type=pwl wave=[0 0.1e-3 19.9e-9 0.1e-3 "
+           "20e-9 2e-3 3e-6 2e-3]\n"
+           "tr tran stop=3e-6 step=1e-10 maxstep=1e-10\n")
+    d = sr.run(scs, "recov_antiwindup")
+    v = np.asarray(d["tr"]["VDD0P8_PLL"]).real
+    assert np.all(np.isfinite(v)), "harsh step diverged (non-finite)"
+    # firmly inside the rails -- no multi-volt ring (the un-clamped loop hit -4.1V / +2.8V here)
+    assert v.min() > -0.05 and v.max() < 1.05, f"harsh step out of bounds [{v.min():.3f},{v.max():.3f}]"

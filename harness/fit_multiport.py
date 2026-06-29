@@ -356,6 +356,7 @@ _SRA_LO, _SRA_HI = 1.0e3, 1.0e8
 
 
 _RECOV_KEYS = ("Lreg", "Rreg", "Cs", "Rs")
+_RECOV_OPT_KEYS = ("Imax", "Vcl", "Gcl")     # optional anti-windup overrides (emit has defaults)
 
 
 def _fit_recovery(vmf):
@@ -375,7 +376,11 @@ def _fit_recovery(vmf):
     GHz-switching-contaminated (the real WuR system TB; memory real-tb-model-vs-real), so a blind
     auto-fit would lock onto switching ripple -- exactly the failure mode _fit_slew_a is hardened
     against. Until a clean recovery-characterization step is isolated, this stays a hand-tuned
-    designer knob (same escape-hatch discipline as the slew_a manifest override)."""
+    designer knob (same escape-hatch discipline as the slew_a manifest override).
+
+    Optional anti-windup overrides (Imax/Vcl/Gcl) pass through when present + valid; absent ->
+    the emit uses its built-in defaults (the clamps bound the loop's large-signal response without
+    touching the in-envelope replay/DC/AC -- see emit_pmu_model._recov_param)."""
     recov = vmf.get("recovery") if isinstance(vmf, dict) else None
     if not isinstance(recov, dict):
         return None
@@ -388,6 +393,14 @@ def _fit_recovery(vmf):
         if not (v > 0 and v < 1e30):
             return None
         out[k] = v
+    for k in _RECOV_OPT_KEYS:        # optional; only carried when finite + strictly positive
+        if k in recov:
+            try:
+                v = float(recov.get(k))
+            except (TypeError, ValueError):
+                continue
+            if v > 0 and v < 1e30:
+                out[k] = v
     return out
 
 
