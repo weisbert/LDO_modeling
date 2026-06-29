@@ -2244,8 +2244,6 @@ if _HAVE_QT:
             if le is None:
                 return
             cur_slew = str((getattr(table, "_slew", {}) or {}).get(key) or "") if key else ""
-            cur_la = str((getattr(table, "_la", {}) or {}).get(key) or "") if key else ""
-            cur_recov = dict((getattr(table, "_recov", {}) or {}).get(key) or {}) if key else {}
             f = self._trans_parse_cell(le.text())
             steps = f["steps"]
             froms = {s["from"] for s in steps if s.get("from")}
@@ -2278,45 +2276,20 @@ if _HAVE_QT:
                               "overrides that auto-fit -- the escape hatch when the TB transient is "
                               "too switching-contaminated to trust (the real GHz system TB). Emits "
                               "the editable VDD0P8_<rail>_SRa param; tune it in ADE without re-regen.")
-            # LARGE-SIGNAL recovery overrides (only meaningful when slew is on -- same model switch).
-            # La override [H]: the AC-Zout fit under-estimates the branch-A inductance ~5x; the load-
-            # transient recovery needs ~120uH. Blank = use the fitted La (the LTI value).
-            e_la = QLineEdit(cur_la); e_la.setPlaceholderText("blank = use the fitted La (LTI)")
-            e_la.setToolTip("branch-A inductance OVERRIDE La [H], e.g. 120u. BLANK = the AC-Zout "
-                            "fitted value (which under-estimates the recovery time-constant ~5x). "
-                            "A VALUE corrects the low-freq Zout so the load-transient recovery is "
-                            "slow + monotonic (matches silicon). Pairs with the recovery network.")
-            # recovery network {Lreg,Rreg,Cs,Rs}: the overdamped 2nd-order Zout + DC-blocked snubber
-            # that makes the post-dip climb monotonic (no overshoot). ALL FOUR must be set to engage;
-            # any blank -> the whole recovery net is off (pure LTI + slew). Anti-windup is automatic.
-            e_lreg = QLineEdit(self._float_to_si(cur_recov.get("Lreg")) if cur_recov.get("Lreg") else "")
-            e_rreg = QLineEdit(self._float_to_si(cur_recov.get("Rreg")) if cur_recov.get("Rreg") else "")
-            e_cs = QLineEdit(self._float_to_si(cur_recov.get("Cs")) if cur_recov.get("Cs") else "")
-            e_rs = QLineEdit(self._float_to_si(cur_recov.get("Rs")) if cur_recov.get("Rs") else "")
-            for w, ph in ((e_lreg, "e.g. 16u"), (e_rreg, "e.g. 750"), (e_cs, "e.g. 25p"), (e_rs, "e.g. 2k")):
-                w.setPlaceholderText(ph)
-            e_lreg.setToolTip("recovery inductor Lreg [H] (lossless at DC -> DC setpoint unmoved; "
-                              "stretches the Cout recharge to a slow monotonic climb).")
-            e_rreg.setToolTip("recovery damp resistance Rreg [ohm] (sets the climb shape / overdamp).")
-            e_cs.setToolTip("snubber cap Cs [F] (AC-only, DC-blocked -> no droop; kills overshoot).")
-            e_rs.setToolTip("snubber resistance Rs [ohm].")
+            # NOTE: La override + the recovery network {Lreg,Rreg,Cs,Rs} are NO LONGER user-editable
+            # here -- they are FITTED from the (decap-loaded) load-step transient, not hand-typed.
+            # Any values already in the manifest are PRESERVED losslessly (the _la/_recov stores still
+            # load->collect round-trip); they just are not exposed as form fields. Slew override stays
+            # (the GHz-contaminated-TB escape hatch for SRa auto-fit).
             if key and table is not None:
                 form.addRow("Slew override (A/s)", e_slew)     # only for a resolved v_out rail
-                form.addRow("La override (H)", e_la)
-                v.addWidget(QLabel("<span style='color:#678'><b>Recovery network</b> (overdamped "
-                                   "post-dip climb; ALL FOUR needed to engage, else pure LTI+slew). "
-                                   "Anti-windup bounds are automatic.</span>"))
-                rf = QFormLayout(); v.addLayout(rf)
-                rf.addRow("Lreg (H)", e_lreg); rf.addRow("Rreg (ohm)", e_rreg)
-                rf.addRow("Cs (F)", e_cs); rf.addRow("Rs (ohm)", e_rs)
             brow = QHBoxLayout(); brow.addStretch(1)
             b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
             brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
             b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
             b_clear.clicked.connect(lambda: (e_base.clear(), e_tg.clear(), e_edge.clear(),
                                              e_tstop.clear(), e_tstep.clear(), e_slew.clear(),
-                                             e_la.clear(), e_lreg.clear(), e_rreg.clear(),
-                                             e_cs.clear(), e_rs.clear(), dlg.accept()))
+                                             dlg.accept()))
             if not dlg.exec_():
                 return
             base = e_base.text().strip()
@@ -2333,32 +2306,8 @@ if _HAVE_QT:
                     table._slew[key] = sv
                 else:
                     table._slew.pop(key, None)
-            # persist the La override ([H], blank clears) into the per-rail store.
-            if key and getattr(table, "_la", None) is not None:
-                lv = e_la.text().strip()
-                if lv:
-                    table._la[key] = lv
-                else:
-                    table._la.pop(key, None)
-            # persist the recovery network: parse all four; engage ONLY when all four are positive
-            # numbers, else clear (the whole net is opt-in -- partial -> off). SI suffixes parsed.
-            if key and getattr(table, "_recov", None) is not None:
-                vals, ok = {}, True
-                for fld, w in (("Lreg", e_lreg), ("Rreg", e_rreg), ("Cs", e_cs), ("Rs", e_rs)):
-                    txt = w.text().strip()
-                    if not txt:
-                        ok = False; continue
-                    try:
-                        num = self._si_to_float(txt)
-                    except (TypeError, ValueError):
-                        ok = False; continue
-                    if not (num > 0):
-                        ok = False; continue
-                    vals[fld] = num
-                if ok and len(vals) == 4:
-                    table._recov[key] = vals
-                else:
-                    table._recov.pop(key, None)
+            # La override + recovery network are FITTED (not user-editable) -> no persist-from-form
+            # here. The _la/_recov stores keep their loaded values (lossless manifest round-trip).
 
         @staticmethod
         def _loads_to_text(spec):
@@ -3829,11 +3778,13 @@ if _HAVE_QT:
             self.x_status.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             self.x_status.customContextMenuRequested.connect(self._x_status_menu)
             _hh = self.x_status.header()
-            _hh.setStretchLastSection(False)
-            _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+            # column 0 (Group/cell) HUGS its text -- a stretched col 0 left a big blank gap between
+            # the name and the Analysis column. Name/Analysis/State pack left; Progress eats the slack.
+            _hh.setStretchLastSection(True)
+            _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
             _hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
             _hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
-            _hh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
+            _hh.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)
             _sbl.addWidget(self.x_status)
 
             # report / log: the run's multi-port fit report, the dry-run dsub command preview, or the
@@ -4986,14 +4937,38 @@ if _HAVE_QT:
             for g in groups:
                 self._x_make_leaf(g["tag"], g["analysis"], None)
 
+        @staticmethod
+        def _x_cell_sort_key(cell):
+            """FUNCTIONAL order for the status tree (not alphabetical-by-label): group by LOAD
+            (OP/Lnom first, then L0,L1,.. by index), then TEMP ascending -- so e.g. -40/55/125°C·op
+            stay adjacent instead of being split by 55°C·L0 (the by-name order). Parses the raw
+            '<load>' / '<load>_T<temp>' cell key (no regex: this module doesn't import re)."""
+            raw = str(cell)
+            load, temp = raw, None
+            if "_T" in raw:
+                load, temp = raw.rsplit("_T", 1)
+            if load == "Lnom":
+                lr = (0, 0, "")                              # OP first
+            elif load[:1] == "L" and load[1:].isdigit():
+                lr = (1, int(load[1:]), "")                  # L0, L1, ... by index
+            else:
+                lr = (2, 0, load)                            # anything else, alpha, last
+            try:
+                tnum = float(temp) if temp is not None else float("-inf")
+            except ValueError:
+                tnum = float("inf")
+            return (lr, tnum)
+
         def _x_status_init_plan(self, plan):
             """Seed the status tree from a coverage_plan: one PARENT per cell (load x temp) with its
             measurement groups as child leaves + a done/total aggregate. The user sees the FULL job
-            list up front (0/N) and watches it fill; each leaf is a real job that runs ONCE."""
+            list up front (0/N) and watches it fill; each leaf is a real job that runs ONCE. Cells are
+            ordered FUNCTIONALLY (load-major, temp-ascending) and leaves by (analysis, tag) so related
+            conditions stay adjacent; leaf state is keyed by (cell, tag) so display order is cosmetic."""
             self.x_status.clear()
-            for pc in plan:
+            for pc in sorted(plan, key=lambda p: self._x_cell_sort_key(p["cell"])):
                 parent = self._x_cell_parent(pc["cell"], op_loads=pc.get("op_loads"))
-                for g in pc["groups"]:
+                for g in sorted(pc["groups"], key=lambda g: (g.get("analysis", ""), g.get("tag", ""))):
                     self._x_make_leaf(g["tag"], g["analysis"], pc["cell"])
                 self._x_update_cell(parent)
 
