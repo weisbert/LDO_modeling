@@ -117,6 +117,30 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
         for il in loads:
             gz = sp[f"z_{il}"]; fz = gz[:, 0]; Z = gz[:, 1] + 1j * gz[:, 2]
             R_a, L_a, R_pl, R_b, L_b = FM.fit_zout(fz, Z)
+            # HIGHER-ORDER (L||R) branch-A LADDER (reshape per the LDO expert panel). A single
+            # (L_a||R_pl) shelf cannot fit a multi-decade inductive rise whose Leff VARIES
+            # (the WuR pll/vco: Leff 24.8->1.0uH) -> it mislocates the rise corner (the 447kHz
+            # artifact). FM.fit_zout_ladder adds series (L_i||R_i) sections; ADOPT it ONLY when
+            # it is a strict, gated win over the single-shelf fit (>=0.3dB |Z| dB-RMS cut on the
+            # SAME grid), else extra stays [] and the (R_a..L_b) shelf is untouched -> byte-
+            # identical on every well-fit synthetic stand-in view. Same opt-in discipline as
+            # cft/d2/slew/admittance-zero. PSRR(=i_c*Zout)+noise(=In*|Zout|) auto-reconcile to the
+            # richer Zout because `extra` is threaded into every per-corner fit/score call below.
+            extra_il = []
+            try:
+                Ra2, La2, Rpl2, ex2, _ = FM.fit_zout_ladder(fz, Z)
+            except Exception:                          # noqa: BLE001 -- ladder is opportunistic
+                ex2 = []
+            if ex2:                                    # the ladder fitter adopted N>=2 sections
+                def _magrms(za, ex):
+                    zm = FM.zmodel(fz, *za, extra=ex)
+                    return float(np.sqrt(np.mean(
+                        (20 * np.log10(np.abs(zm) / np.abs(Z))) ** 2)))
+                rms_single = _magrms((R_a, L_a, R_pl, R_b, L_b), None)
+                rms_ladder = _magrms((Ra2, La2, Rpl2, 1e9, 1e-12), ex2)
+                if rms_ladder <= rms_single - 0.3:
+                    R_a, L_a, R_pl, R_b, L_b = Ra2, La2, Rpl2, 1e9, 1e-12
+                    extra_il = ex2
             zfits[il] = (R_a, L_a, R_pl, R_b, L_b)
             # iv = the rail's REAL current at this label. Priority: meta_iload_<o>[label]
             # (the in-situ truth, set by the sweep) -> a parseable numeric label (legacy
@@ -128,21 +152,25 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
             else:
                 iv = 0.0
             P[il] = dict(iv=iv, R_a=R_a, L_a=L_a, R_pl=R_pl, R_b=R_b, L_b=L_b,
-                         vreg=vout_dc + R_a * iv)
+                         vreg=vout_dc + R_a * iv, extra=extra_il)
             # PSRR per supply -- the primary supply's params live on P[il]; all supplies'
-            # fits are kept in per-supply dicts for the report.
+            # fits are kept in per-supply dicts for the report. `extra=extra_il` makes the
+            # PSRR de-embed/realize against the SAME (ladder) Zout the rail adopted.
             psrr_params = {}
             for s in supplies:
                 gp = view["supplies"][s][il]
                 fp = gp[:, 0]; H = gp[:, 1] + 1j * gp[:, 2]
-                G, Q = FM.fit_psrr(fp, H, R_a, L_a, R_pl, R_b, L_b)
+                G, Q = FM.fit_psrr(fp, H, R_a, L_a, R_pl, R_b, L_b, extra=extra_il)
                 psrr_params[s] = (G, Q)
             prim = view.get("primary_supply") or supplies[0]
             G, Q = psrr_params[prim]
             P[il].update(G0=G[0], G1=G[1], w1=G[2], G2=G[3], w2=G[4], G3=G[5], w3=G[6],
                          pcb0=Q[0], pcb1=Q[1], pcw0=Q[2], pcq=Q[3], _psrr=psrr_params)
-        # joint Norton-@vout noise bank over corners (reads FM.ref noise_<il>, FM.C/RC)
-        NB = FM.fit_noise_bank(zfits)
+        # joint Norton-@vout noise bank over corners (reads FM.ref noise_<il>, FM.C/RC).
+        # extra_fits carries each corner's adopted branch-A ladder so In=Sv/|Zout| de-embeds
+        # against the richer Zout (empty dict / all-[] -> byte-identical to the pre-ladder fit).
+        extra_fits = {il: P[il]["extra"] for il in loads}
+        NB = FM.fit_noise_bank(zfits, extra_fits=extra_fits)
         # GATED HYBRID (series voltage-noise) keep-best -- mirror fit_all's gated attempt so the
         # multi-port SCORE/REPORT matches the emitted single-port VA (which engages hybrid via
         # fit_all). A real LOOP-SHAPED rail has In=Sv/|Zout| falling steeper than the Norton bank
@@ -151,7 +179,7 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
         # every synthetic ref fits <=3.7dB Norton -> never fires there -> byte-identical).
         nmode, nfkv, NH = "norton", [], None
         if NB["worst"] > FM.NOISE_ADAPT_TRIG:
-            NH = FM.fit_noise_hybrid(zfits)
+            NH = FM.fit_noise_hybrid(zfits, extra_fits=extra_fits)
             if NH["worst"] < NB["worst"] - 0.5:
                 nmode, nfkv = "hybrid", list(NH["fkv"])
         nfk = list(NB["fk"]) if nmode == "norton" else []
@@ -169,21 +197,22 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
         for il in loads:
             e = dict(il=il)
             gz = sp[f"z_{il}"]; fz = gz[:, 0]; Zg = gz[:, 1] + 1j * gz[:, 2]
+            _ex = P[il]["extra"]                        # adopted branch-A ladder (or [])
             Zm = FM.zmodel(fz, P[il]["R_a"], P[il]["L_a"], P[il]["R_pl"],
-                           P[il]["R_b"], P[il]["L_b"])
+                           P[il]["R_b"], P[il]["L_b"], extra=_ex)
             e["zrms"] = _rms_db(Zm, Zg)
             e["psrr"] = {}
             for s in supplies:
                 gp = view["supplies"][s][il]; fp = gp[:, 0]; Hg = gp[:, 1] + 1j * gp[:, 2]
                 G, Q = P[il]["_psrr"][s]
                 Hm = FM.psrr_model(fp, P[il]["R_a"], P[il]["L_a"], P[il]["R_pl"],
-                                   P[il]["R_b"], P[il]["L_b"], G, Q)
+                                   P[il]["R_b"], P[il]["L_b"], G, Q, extra=_ex)
                 sel = fp >= 1e3
                 e["psrr"][s] = (_rms_db(Hm, Hg),
                                 float(np.degrees(np.sqrt(np.mean(
                                     np.angle(Hm[sel] / Hg[sel]) ** 2)))))
             gn = sp[f"noise_{il}"]; fn = gn[:, 0]; Sg = gn[:, 1]
-            Sm = FM.noise_model_sv(P[il], fn, FM.zmodel(fn, *zfits[il]),
+            Sm = FM.noise_model_sv(P[il], fn, FM.zmodel(fn, *zfits[il], extra=_ex),
                                    nfk=nfk, nfkv=nfkv, nmode=nmode)
             e["nrms"] = float(np.sqrt(np.mean(
                 (20 * np.log10((Sm + 1e-30) / (Sg + 1e-30))) ** 2)))

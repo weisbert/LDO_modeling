@@ -168,16 +168,18 @@ def _voltage_block(o, vfit, supply, ground):
     il = _nom_corner(P)
     p = P[il]
     vreg = float(p["vreg"])
+    extra = p.get("extra") or []           # higher-order branch-A ladder (empty -> byte-identical)
     G, Q = _primary_supply_psrr(vfit, p, supply)
     pcb0, pcb1, pcw0, pcq = (float(Q[0]), float(Q[1]), float(Q[2]), float(Q[3]))
 
     pre = o  # node/var namespace prefix
     # internal nodes for this rail (same roles as emit_va: vrg, nA, nC, nbb, np1-3,
-    # vrf, ncs1/2, nw + Lorentzian noise nodes nk1..)
+    # vrf, ncs1/2, nw + Lorentzian noise nodes nk1.. + the extra ladder nodes nA2..)
     nks = [f"{pre}_nk{k+1}" for k in range(len(nfk))]
-    nodes = [f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
-             f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
-             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks + _recov_nodes(pre, recov)
+    nodes = ([f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
+              f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
+              f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"]
+             + nks + _extra_nodes(pre, extra) + _recov_nodes(pre, recov))
 
     # per-rail real vars (all baked literals assigned in initial_step) + derived RLC
     rvars = [f"{pre}_Ra", f"{pre}_La", f"{pre}_Rpl", f"{pre}_Rb", f"{pre}_Lb",
@@ -185,7 +187,8 @@ def _voltage_block(o, vfit, supply, ground):
              f"{pre}_G3", f"{pre}_w3", f"{pre}_pcb0", f"{pre}_pcb1", f"{pre}_pcw0",
              f"{pre}_pcq", f"{pre}_gnw", f"{pre}_Cps",
              f"{pre}_pca1", f"{pre}_pca2", f"{pre}_Rpc", f"{pre}_Lpc", f"{pre}_Cpc",
-             f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))]
+             f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))] \
+        + _extra_rvars(pre, extra)
 
     # vreg = the rail's regulated-output target. DEFAULT (no transient DC load-reg): a per-rail
     # MODULE PARAMETER (editable CDF field, default = fitted) so the user can retune the voltage
@@ -237,6 +240,7 @@ def _voltage_block(o, vfit, supply, ground):
         f"{pre}_pcw0 = {pcw0:.6e};  {pre}_pcq = {pcq:.6e};",
         f"{pre}_gnw = {float(p['gnw']):.6e};",
     ] + [f"{pre}_gn{k+1} = {float(p[f'gn{k+1}']):.6e};" for k in range(len(nfk))]
+      + _extra_asg(pre, extra)
       + [
         f"{pre}_Cps = 1e-12;",
         f"{pre}_Cpc = 1e-12;",
@@ -245,7 +249,7 @@ def _voltage_block(o, vfit, supply, ground):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
@@ -366,10 +370,76 @@ def _recov_param(pre, recov):
     ]
 
 
-def _branchA_reg(pre, slew_sr, recov=None):
-    """Branch-A regulation contribution (node nA -> vrg through R_a). DEFAULT = the passive
-    resistor `V(nA,vrg) <+ Ra*I(nA,vrg)` (byte-identical to the pre-slew emit). When a slew rate
-    is fitted, the SAME R_a path is rate-limited via the built-in `slew()` operator:
+# --------------------------------------------------- higher-order branch-A (L||R) ladder
+# The measured WuR pll/vco Zout is a monotonic rising resistive SHELF (0.095ohm DC ->
+# ~197ohm plateau @~31.6MHz). A single (L_a||R_pl) section cannot fit a multi-decade rise
+# (effective L varies) -> it mislocates the rise corner (the 447kHz artifact). fit_zout_ladder
+# adopts >=1 EXTRA series (L_i||R_i) section; emit inserts them IN SERIES inside branch A,
+# between nA and the regulation node: o --[L_a||R_pl]--> nA --[L2||R2]--> nA2 --...--> [reg] -> vrg.
+# At DC every section's inductor shorts (section -> 0ohm) so Z_DC = R_a is UNCHANGED (vreg setpoint
+# preserved); at HF each inductor opens (section -> R_i) so the plateau = R_a + R_pl + sum(R_i).
+# Each helper returns nothing when `extra` is empty -> the rail emits byte-identical (same opt-in
+# discipline as cft/slew/recov/d2/admittance-zero). PSRR/noise bodies are UNCHANGED: i_c and the
+# Norton current are injected at node o, so they see the full Zout-at-o automatically -- the fit
+# just produced different G/Q/gnw coefficients against the richer ladder Zout.
+def _extra_nodes(pre, extra):
+    """Internal ladder nodes nA2..nA<N> (section 1 lives at the existing nA; extra[i] -> nA<i+2>).
+    Empty list when there are no extra sections -> byte-identical node declaration."""
+    extra = extra or []
+    return [f"{pre}_nA{i + 2}" for i in range(len(extra))]
+
+
+def _extra_rvars(pre, extra):
+    """Per-rail real vars La<k>/Rpl<k> (k=2..N) for the extra ladder sections. Empty when none."""
+    extra = extra or []
+    out = []
+    for i in range(len(extra)):
+        k = i + 2
+        out += [f"{pre}_La{k}", f"{pre}_Rpl{k}"]
+    return out
+
+
+def _extra_asg(pre, extra):
+    """@(initial_step) BAKED-literal assignments for the extra ladder sections (k=2..N). BAKED
+    like every fitted value so a re-emit always takes effect. Empty list when none."""
+    extra = extra or []
+    out = []
+    for i, LR in enumerate(extra):
+        k = i + 2
+        Li, Ri = float(LR[0]), float(LR[1])
+        out.append(f"{pre}_La{k} = {Li:.6e};  {pre}_Rpl{k} = {Ri:.6e};"
+                   f"   // {pre} branch-A ladder section {k} (higher-order rising shelf)")
+    return out
+
+
+def _extra_body(pre, extra):
+    """Branch-A ladder contribution lines + the LAST ladder node that feeds the regulation.
+    Each extra section is a series (L||R) rising-shelf inserted between the previous ladder node
+    and a new one: nA -> nA2 -> ... -> nA<N>. Returns ("", <pre>_nA) when there are no extra
+    sections -> the regulation feeds from nA exactly as before (byte-identical)."""
+    extra = extra or []
+    if not extra:
+        return "", f"{pre}_nA"
+    lines = []
+    prev = f"{pre}_nA"
+    for i in range(len(extra)):
+        k = i + 2
+        node = f"{pre}_nA{k}"
+        lines.append(
+            f"    // Zout branch A ladder section {k}: (La{k} || Rpl{k}), {prev}->{node}"
+            f" (higher-order rise; relocates the corner the single shelf mislocates)\n"
+            f"    I({prev}, {node}) <+ idt(V({prev}, {node}))/{pre}_La{k}"
+            f" + V({prev}, {node})/{pre}_Rpl{k};\n")
+        prev = node
+    return "".join(lines), prev
+
+
+def _branchA_reg(pre, slew_sr, recov=None, from_node=None):
+    """Branch-A regulation contribution (last ladder node -> vrg through R_a). DEFAULT = the passive
+    resistor `V(nA,vrg) <+ Ra*I(nA,vrg)` (byte-identical to the pre-slew emit). `from_node` is the
+    node the regulation feeds from (default <pre>_nA = the single-section case; the higher-order
+    ladder passes its LAST node nA<N> so the extra sections sit in series ahead of the regulation).
+    When a slew rate is fitted, the SAME R_a path is rate-limited via the built-in `slew()` operator:
     `I(nA,vrg) <+ slew(V(nA,vrg)/Ra, SRa)`. At DC and small signal slew()==identity, so it is
     EXACTLY the R_a resistor -> Zout/PSRR/noise (all DC+AC analyses) are unchanged; only large
     fast transients get rate-limited. SR->inf would also reduce to the resistor, but the absent
@@ -386,12 +456,14 @@ def _branchA_reg(pre, slew_sr, recov=None):
     current), and a deadzone shunt clamp (zero value+slope within +-Vcl of vrg) bounds the
     non-physical La/Lreg tank ring on huge out-of-envelope steps."""
     use_recov = _recov_ok(recov)
-    regnode = f"{pre}_nB" if use_recov else f"{pre}_nA"
+    if from_node is None:
+        from_node = f"{pre}_nA"          # single-section default (byte-identical)
+    regnode = f"{pre}_nB" if use_recov else from_node
     pre_lines = ""
     if use_recov:
         pre_lines = (f"// recovery branch A2: slow inductor (Lreg||Rreg), nA->nB (lossless at DC)\n"
-                     f"    I({pre}_nA, {pre}_nB) <+ idt(V({pre}_nA, {pre}_nB))/{pre}_Lreg"
-                     f" + V({pre}_nA, {pre}_nB)/{pre}_Rreg;\n    ")
+                     f"    I({from_node}, {pre}_nB) <+ idt(V({from_node}, {pre}_nB))/{pre}_Lreg"
+                     f" + V({from_node}, {pre}_nB)/{pre}_Rreg;\n    ")
     if slew_sr and slew_sr > 0 and slew_sr < 1e30:        # gate matches _slew_param (SRa declared)
         if use_recov:    # anti-windup clamp on the target + en_ls runtime LTI/large-signal switch
             reg = (f"I({regnode}, {pre}_vrg) <+ ({pre}_en_ls >= 0.5) ? "
@@ -433,7 +505,7 @@ def _cft_body(o, supply, cft):
     return ""
 
 
-def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None):
+def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None, extra=None):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
     scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
     between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
@@ -442,8 +514,13 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, reco
     `cft`>0 appends a gated supply->{o} feedthrough contribution (load-independent literal);
     cft<=0 (the default / single-OP) -> byte-identical to the pre-feedthrough body.
     `slew_sr`>0 rate-limits branch-A's R_a regulation current (large-signal undershoot);
-    None/<=0 (the default) -> the passive R_a resistor, byte-identical to the pre-slew body."""
+    None/<=0 (the default) -> the passive R_a resistor, byte-identical to the pre-slew body.
+    `extra` (the higher-order branch-A ladder, see _extra_body) inserts N series (L_i||R_i)
+    sections between nA and the regulation node; None/[] (the default) -> byte-identical."""
     pre = o
+    extra = extra or []
+    branchA_extra, last_node = _extra_body(pre, extra)    # ladder lines + the node feeding reg
+    ladder_note = f" [+ {len(extra)} ladder section(s)]" if extra else ""
     nsec = "\n    ".join(
         f"I({pre}_nk{k+1}, {ground}) <+ V({pre}_nk{k+1}, {ground})/NRk"
         f" + {pre}_Cn{k+1}*ddt(V({pre}_nk{k+1}, {ground}));\n"
@@ -462,9 +539,9 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, reco
     I({o}, {pre}_nbb) <+ idt(V({o}, {pre}_nbb))/{pre}_Lb;
     V({pre}_nbb, {pre}_vrg) <+ {pre}_Rb*I({pre}_nbb, {pre}_vrg);
 
-    // Zout branch A: (L_a || R_pl) + R_a
+    // Zout branch A: (L_a || R_pl) + R_a{ladder_note}
     I({o}, {pre}_nA) <+ idt(V({o}, {pre}_nA))/{pre}_La + V({o}, {pre}_nA)/{pre}_Rpl;
-    {_branchA_reg(pre, slew_sr, recov)}
+{branchA_extra}    {_branchA_reg(pre, slew_sr, recov, from_node=last_node)}
 
     // intrinsic output noise: decoupled Norton current @{o} (white floor + {len(nfk)} Lorentzians)
     I({pre}_nw, {ground}) <+ V({pre}_nw, {ground})/NRk;
@@ -500,6 +577,12 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
     machinery via _sched_expr (deg<=2 poly through the corners + the same envelope clamp)."""
     pre = o
     P = vfit["P"]
+    # higher-order branch-A ladder: BAKE the NOMINAL corner's extra as load-INDEPENDENT
+    # literals (a variable-length list cannot be scheduled across corners). The real pll/vco
+    # Zout is effectively single-corner (the digest carries small-signal at the nominal load),
+    # so a load-independent ladder is EXACT at nominal and a documented, acceptable
+    # approximation off-nominal. Empty (no ladder adopted) -> byte-identical scheduled block.
+    extra = P[_nom_corner(P)].get("extra") or []
     currents = [float(P[il]["iv"]) for il in sched]
     iload_nom = currents[len(currents) // 2]   # the middle schedule load's iv
     ilo, ihi = min(currents), max(currents)
@@ -514,19 +597,22 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         return [float(P[il][key]) for il in sched]
 
     nks = [f"{pre}_nk{k+1}" for k in range(len(nfk))]
-    nodes = [f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
-             f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
-             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks + _recov_nodes(pre, recov)
+    nodes = ([f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
+              f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
+              f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"]
+             + nks + _extra_nodes(pre, extra) + _recov_nodes(pre, recov))
 
     # u is a per-rail real var (clamped ln of the rail's iload param); all scheduled params
-    # follow exactly the literal block's rvar set.
+    # follow exactly the literal block's rvar set. The extra ladder vars are baked literals
+    # (load-independent, nominal corner) appended after the scheduled set.
     rvars = [uvar,
              f"{pre}_Ra", f"{pre}_La", f"{pre}_Rpl", f"{pre}_Rb", f"{pre}_Lb",
              f"{pre}_G0", f"{pre}_G1", f"{pre}_w1", f"{pre}_G2", f"{pre}_w2",
              f"{pre}_G3", f"{pre}_w3", f"{pre}_pcb0", f"{pre}_pcb1", f"{pre}_pcw0",
              f"{pre}_pcq", f"{pre}_gnw", f"{pre}_vreg", f"{pre}_Cps",
              f"{pre}_pca1", f"{pre}_pca2", f"{pre}_Rpc", f"{pre}_Lpc", f"{pre}_Cpc",
-             f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))]
+             f"{pre}_gqb1"] + [f"{pre}_gn{k+1}" for k in range(len(nfk))] \
+        + _extra_rvars(pre, extra)
 
     # the per-rail iload schedule parameter (nominal = middle schedule load) + noise-corner
     # capacitor params (same as the literal block).
@@ -558,7 +644,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         expr = _sched_expr(currents, _vals(key), uvar, logspace)
         sch_lines.append(f"{pre}_{keymap[key]} = {expr};")
 
-    asg = "\n      ".join(sch_lines + [
+    asg = "\n      ".join(sch_lines + _extra_asg(pre, extra) + [
         f"{pre}_Cps = 1e-12;",
         f"{pre}_Cpc = 1e-12;",
         f"{pre}_pca1 = 1.0/({pre}_pcq*{pre}_pcw0);  {pre}_pca2 = 1.0/({pre}_pcw0*{pre}_pcw0);",
@@ -566,7 +652,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
                 scheduled=True, valid_load=(ilo, ihi))
 

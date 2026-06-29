@@ -134,9 +134,10 @@ def _voltage_corner(P_il, nfk, sp, il, supplies, prim, err, nmode="norton", nfkv
     fit_multiport err row {zrms, psrr:{s:(rms_db,phase_deg)}, nrms} (scores reused verbatim --
     no re-scoring, so the table here == fit_multiport.report's table)."""
     zf = (P_il["R_a"], P_il["L_a"], P_il["R_pl"], P_il["R_b"], P_il["L_b"])
+    ex = P_il.get("extra")             # adopted branch-A ladder (None on a standalone/synthetic P_il)
     gz = sp[f"z_{il}"]
     fz, Zg = gz[:, 0], gz[:, 1] + 1j * gz[:, 2]
-    Zm = FM.zmodel(fz, *zf)
+    Zm = FM.zmodel(fz, *zf, extra=ex)
 
     # per-supply PSRR (primary supply drives the headline Hg/Hm panels)
     psrr = {}
@@ -144,14 +145,14 @@ def _voltage_corner(P_il, nfk, sp, il, supplies, prim, err, nmode="norton", nfkv
         gp = supplies[s][il]
         fp, Hg = gp[:, 0], gp[:, 1] + 1j * gp[:, 2]
         G, Q = P_il["_psrr"][s]
-        Hm = FM.psrr_model(fp, *zf, G, Q)
+        Hm = FM.psrr_model(fp, *zf, G, Q, extra=ex)
         psrr[s] = dict(fp=fp, Hg=Hg, Hm=Hm)
     # headline panel = primary supply (matches the single-PSRR slot the GUI/fit_model use)
     head = psrr[prim]
 
     gn = sp[f"noise_{il}"]
     fn, Sg = gn[:, 0], gn[:, 1]
-    Sm = FM.noise_model_sv(P_il, fn, FM.zmodel(fn, *zf), nfk=nfk, nfkv=nfkv, nmode=nmode)
+    Sm = FM.noise_model_sv(P_il, fn, FM.zmodel(fn, *zf, extra=ex), nfk=nfk, nfkv=nfkv, nmode=nmode)
 
     # scores: REUSE the fit_multiport err row (already model-vs-GT on these same arrays)
     scores = dict(zrms=float(err["zrms"]),

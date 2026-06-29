@@ -516,7 +516,7 @@ KT4 = 4 * 1.380649e-23 * 300.0   # 4kT at 300K (resistor thermal-noise scale)
 NRk = 1e6    # fixed section resistor; gm transconductance sets each section amplitude
 
 
-def psrr_model(f, R_a, L_a, R_pl, R_b, L_b, G, Q=None):
+def psrr_model(f, R_a, L_a, R_pl, R_b, L_b, G, Q=None, extra=None):
     """PSRR = i_c(s)*Zout. i_c = REAL bank + optional COMPLEX 2nd-order section:
         i_c = G0 + sum_i Gi/(1+s/wi)  +  (b0 + b1 s)/(1 + s/(Qf w0) + (s/w0)^2)
     G = [G0, G1,w1, G2,w2, G3,w3]; Q = (b0, b1, w0, Qf) or None.
@@ -526,9 +526,12 @@ def psrr_model(f, R_a, L_a, R_pl, R_b, L_b, G, Q=None):
       notch PSRR phase (V4/V3). Realized as a series R-L-C lowpass state x with two
       VCCS taps (b0 reads V_C=x, b1 reads V_R=a1*dx/dt) -> inductor-bearing but all
       linear/passive + controlled sources, NO laplace_nd, HB/PSS-robust. Pole is
-      ALWAYS stable (Re<0 by construction); Qf<=0.5 degrades gracefully to real."""
+      ALWAYS stable (Re<0 by construction); Qf<=0.5 degrades gracefully to real.
+    - extra: the higher-order (L_i||R_i) branch-A ladder (see zmodel); threaded so the
+      Zout factor here matches the richer ladder Zout (PSRR=i_c*Zout auto-reconciles).
+      None/[] -> byte-identical to the single-section shelf."""
     s = 1j * TWO_PI * f
-    Z = zmodel(f, R_a, L_a, R_pl, R_b, L_b)
+    Z = zmodel(f, R_a, L_a, R_pl, R_b, L_b, extra=extra)
     i_c = G[0] + sum(G[1 + 2 * i] / (1 + s / G[2 + 2 * i]) for i in range(NPS))
     if Q is not None and (Q[0] != 0.0 or Q[1] != 0.0):
         b0, b1, w0, Qf = Q
@@ -594,13 +597,15 @@ def _pair_section(p, r):
     return B0 / A0, B1 / A0, w0, Qf            # b0, b1, w0, Qf
 
 
-def _bank_fit(f, H, zf, n1=NPS):
+def _bank_fit(f, H, zf, n1=NPS, extra=None):
     """Fit i_c = H/Zout as the (n1 real + 1 complex) section bank: AAA-initialize the
     dominant complex pair + real poles, then polish with least_squares on the EXACT
     realizable form (residual = complex-log of psrr_model/H => mag-dB + phase-deg
-    jointly, matching the score). Returns (G[0..2n1], Q=(b0,b1,w0,Qf)) or None."""
+    jointly, matching the score). Returns (G[0..2n1], Q=(b0,b1,w0,Qf)) or None.
+    `extra` (the branch-A ladder, see zmodel) is threaded into the Zout used to de-embed
+    i_c and into the polish form; None/[] -> byte-identical."""
     try:
-        Zmod = zmodel(f, *zf)
+        Zmod = zmodel(f, *zf, extra=extra)
         ic = H / Zmod
         if CFT > 0.0:             # psrr_model adds sC_ft itself -> de-tail the bank
             ic = ic - 1j * TWO_PI * f * CFT          # target (else the tail is fit twice)
@@ -652,7 +657,7 @@ def _bank_fit(f, H, zf, n1=NPS):
 
         def resid(p):
             G, Q = unpack(p)
-            r = np.log(psrr_model(f, *zf, G, Q)) - np.log(H)
+            r = np.log(psrr_model(f, *zf, G, Q, extra=extra)) - np.log(H)
             return np.concatenate([r.real, r.imag])
         s = least_squares(resid, p0, bounds=(lo, hi), method="trf", max_nfev=20000)
         G, Q = unpack(s.x)
@@ -663,32 +668,35 @@ def _bank_fit(f, H, zf, n1=NPS):
         return None
 
 
-def _psrr_resid(f, H, zf, G, Q=None, sel_hz=1e3):
+def _psrr_resid(f, H, zf, G, Q=None, sel_hz=1e3, extra=None):
     """Combined PSRR mag(dB)+phase(rad) RMS residual over f>=sel_hz (the score band).
-    The single consistent metric used to KEEP-BEST among shelf / real-bank / complex."""
-    m = psrr_model(f, *zf, G, Q)
+    The single consistent metric used to KEEP-BEST among shelf / real-bank / complex.
+    `extra` (branch-A ladder, see zmodel) threaded to psrr_model; None/[] -> identical."""
+    m = psrr_model(f, *zf, G, Q, extra=extra)
     sel = f >= sel_hz
     r = np.log(m[sel] / H[sel])
     return float(np.sqrt(np.mean(r.real ** 2 + r.imag ** 2)))
 
 
-def _shelf(f, H, R_a, L_a, R_pl, R_b, L_b):
-    """Min-phase 1-section fit -> G=[g_hf, g_lf-g_hf, wz, 0,big, 0,big]."""
+def _shelf(f, H, R_a, L_a, R_pl, R_b, L_b, extra=None):
+    """Min-phase 1-section fit -> G=[g_hf, g_lf-g_hf, wz, 0,big, 0,big].
+    `extra` (branch-A ladder, see zmodel) threaded into every Zout/psrr_model eval so the
+    shelf PSRR factor matches the richer ladder Zout; None/[] -> byte-identical."""
     def resid(p):
         G = [1 / np.exp(p[0]), np.exp(p[1]) - 1 / np.exp(p[0]), np.exp(p[2]), 0, 1e9, 0, 1e9]
-        r = np.log(psrr_model(f, R_a, L_a, R_pl, R_b, L_b, G)) - np.log(H)
+        r = np.log(psrr_model(f, R_a, L_a, R_pl, R_b, L_b, G, extra=extra)) - np.log(H)
         return np.concatenate([r.real, r.imag])
-    Z8 = np.abs(zmodel(np.array([8e6]), R_a, L_a, R_pl, R_b, L_b)[0])
+    Z8 = np.abs(zmodel(np.array([8e6]), R_a, L_a, R_pl, R_b, L_b, extra=extra)[0])
     Rpass0 = Z8 / np.abs(H[np.argmin(np.abs(f - 8e6))])
-    g_lf0 = np.abs(H[0]) / np.abs(zmodel(np.array([f[0]]), R_a, L_a, R_pl, R_b, L_b)[0])
-    fpk = f[np.argmax(np.abs(zmodel(f, R_a, L_a, R_pl, R_b, L_b)))]
+    g_lf0 = np.abs(H[0]) / np.abs(zmodel(np.array([f[0]]), R_a, L_a, R_pl, R_b, L_b, extra=extra)[0])
+    fpk = f[np.argmax(np.abs(zmodel(f, R_a, L_a, R_pl, R_b, L_b, extra=extra)))]
     s1 = least_squares(resid, [np.log(Rpass0), np.log(g_lf0), np.log(TWO_PI * fpk)], method="lm")
     Rpass, g_lf, wz = np.exp(s1.x)
     G = [1 / Rpass, g_lf - 1 / Rpass, wz, 0.0, 1e9, 0.0, 1e9]
     return G, float(np.sqrt(np.mean(resid(s1.x) ** 2)))
 
 
-def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
+def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b, extra=None):
     """PSRR coupling-current bank -> (G, Q). G=[G0,G1,w1,G2,w2,G3,w3] are the real
     first-order sections; Q=(b0,b1,w0,Qf) is the optional complex 2nd-order section
     (b0=b1=0 => inert). Selector is KEEP-BEST on one combined mag+phase residual, so
@@ -699,20 +707,24 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
       * else build candidates {shelf, real-only SK bank, complex bank} and return the
         lowest-residual one. The complex bank (AAA-initialized, least_squares-polished
         on the EXACT realizable form) carries the non-minimum-phase / notch phase the
-        strictly-real sections cannot (V4 25->~1deg, V3 10->~1deg, V1 6->~2deg)."""
+        strictly-real sections cannot (V4 25->~1deg, V3 10->~1deg, V1 6->~2deg).
+    `extra` (the higher-order branch-A ladder, see zmodel) is threaded into EVERY Zout /
+    psrr_model evaluation so the de-embedded i_c = H/Zout (and the realizable polish) use
+    the SAME richer Zout the rail's Zout fit produced -- PSRR=i_c*Zout auto-reconciles to
+    the ladder by construction. None/[] (the standalone / synthetic path) -> byte-identical."""
     zf = (R_a, L_a, R_pl, R_b, L_b)
     Q0 = (0.0, 0.0, TWO_PI * float(np.sqrt(f[0] * f[-1])), 1.0)   # inert default section
-    G_shelf, e_shelf = _shelf(f, H, *zf)
+    G_shelf, e_shelf = _shelf(f, H, *zf, extra=extra)
     sel = f >= 1e3
     shelf_ph = np.degrees(np.sqrt(np.mean(
-        np.angle(psrr_model(f, *zf, G_shelf)[sel] / H[sel]) ** 2)))
+        np.angle(psrr_model(f, *zf, G_shelf, extra=extra)[sel] / H[sel]) ** 2)))
     if e_shelf < 0.05 and shelf_ph < SHELF_PH_TRIG:
         return G_shelf, Q0                            # min-phase -> shelf, complex inert
 
-    shelf_resid = _psrr_resid(f, H, zf, G_shelf, Q0)
+    shelf_resid = _psrr_resid(f, H, zf, G_shelf, Q0, extra=extra)
     cands = [("shelf", G_shelf, Q0, shelf_resid)]
     # real-only SK bank (the previous non-min-phase path; kept as a fallback candidate)
-    ic_t = H / zmodel(f, *zf)
+    ic_t = H / zmodel(f, *zf, extra=extra)
     if CFT > 0.0:                 # de-tail: psrr_model adds the sC_ft term itself
         ic_t = ic_t - 1j * TWO_PI * f * CFT
     sk = _sk_fit(1j * TWO_PI * f, ic_t, NPS)
@@ -724,12 +736,12 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
             G += [float(G_i), float(max(w_i, 1.0))]
         while len(G) < 1 + 2 * NPS:
             G += [0.0, 1e9]
-        cands.append(("sk", G, Q0, _psrr_resid(f, H, zf, G, Q0)))
+        cands.append(("sk", G, Q0, _psrr_resid(f, H, zf, G, Q0, extra=extra)))
     # complex bank: n1 real + 1 signed complex-conjugate section (the new path)
-    bank = _bank_fit(f, H, zf)
+    bank = _bank_fit(f, H, zf, extra=extra)
     if bank is not None:
         Gb, Qb = bank
-        cands.append(("complex", Gb, Qb, _psrr_resid(f, H, zf, Gb, Qb)))
+        cands.append(("complex", Gb, Qb, _psrr_resid(f, H, zf, Gb, Qb, extra=extra)))
     # MULTI-START full-real-bank polish (always a candidate). Polish all NPS real
     # sections on the EXACT realizable form, from several decade-spread pole seeds so the
     # fit is not trapped at the shelf's single corner. Originally gated to feedthrough
@@ -745,7 +757,7 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
         return [p[0], p[1], np.exp(p[2]), p[3], np.exp(p[4]), p[5], np.exp(p[6])]
 
     def resid3(p):
-        r = np.log(psrr_model(f, *zf, unpack3(p))) - np.log(H)
+        r = np.log(psrr_model(f, *zf, unpack3(p), extra=extra)) - np.log(H)
         return np.concatenate([r.real, r.imag])
     lo3 = np.array([-np.inf, -np.inf, np.log(w0lo), -np.inf, np.log(w0lo),
                     -np.inf, np.log(w0lo)])
@@ -768,7 +780,7 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
                                max_nfev=20000)
             G3 = unpack3(s3.x)
             if np.all(np.isfinite(G3)):
-                cands.append(("bank3", G3, Q0, _psrr_resid(f, H, zf, G3, Q0)))
+                cands.append(("bank3", G3, Q0, _psrr_resid(f, H, zf, G3, Q0, extra=extra)))
         except Exception:
             pass
     best = min(cands, key=lambda c: c[3])
@@ -783,7 +795,7 @@ def fit_psrr(f, H, R_a, L_a, R_pl, R_b, L_b):
     return best[1], best[2]
 
 
-def fit_noise_bank(zfits, M=MNOISE):
+def fit_noise_bank(zfits, M=MNOISE, extra_fits=None):
     """DECOUPLED Norton-@vout noise block. The intrinsic output-noise PSD is
     reproduced by a current source injected at vout: Sv_out = In(f)*|Zout|, so the
     target Norton current is In_target = Sv_meas/|Zout|. This DECOUPLES noise from
@@ -797,11 +809,15 @@ def fit_noise_bank(zfits, M=MNOISE):
     the corners stay fixed. Realized as a white-R floor + M fixed-R||C Lorentzian
     sections, each transconducted into vout (gm sets the per-corner amplitude):
         section current PSD = g^2 * 4kT*NRk / (1+(f/fk)^2),  fk = 1/(2pi NRk Ck)
-    Returns dict(fk=[..M..], gw={il:g}, gk={il:[..M..]}).  All passive+VCCS -> HB/PSS."""
+    Returns dict(fk=[..M..], gw={il:g}, gk={il:[..M..]}).  All passive+VCCS -> HB/PSS.
+    `extra_fits` {il: extra} carries the per-corner branch-A ladder (see zmodel) so the
+    |Zout| used to de-embed In = Sv/|Zout| matches the richer Zout; None / missing key ->
+    byte-identical (the standalone / synthetic path passes nothing)."""
+    extra_fits = extra_fits or {}
     targets = {}
     for il in LOADS:
         gn = ref[f"noise_{il}"]; f = gn[:, 0]; Sv = gn[:, 1]
-        Zmod = np.abs(zmodel(f, *zfits[il]))
+        Zmod = np.abs(zmodel(f, *zfits[il], extra=extra_fits.get(il)))
         In2 = (Sv / Zmod) ** 2                         # In^2 target
         # GRID EQUALIZATION: the log-residual weighs every SAMPLE equally, so a
         # linear-frequency noise export (typical pnoise binning; real 5.8G LDO) puts
@@ -918,17 +934,23 @@ def fit_noise_bank(zfits, M=MNOISE):
     return best
 
 
-def _za(f, R_a, L_a, R_pl):
-    """Branch-A series impedance ZA = R_a + jwL_a||R_pl (hybrid noise path only).
-    A series voltage source between the regulation rail and R_a reaches vout via
+def _za(f, R_a, L_a, R_pl, extra=None):
+    """Branch-A series impedance ZA = R_a + jwL_a||R_pl [+ extra sL_i||R_i] (hybrid noise
+    path only). A series voltage source between the regulation rail and R_a reaches vout via
     T = Zsh/(ZA+Zsh) = Zout/ZA (Zsh = the parallel rest: branches B, C, gated C_ft;
     the noise bench load is a current source = AC-open), so T is computed from the
-    SAME zmodel Zout the rest of the fit uses."""
+    SAME zmodel Zout the rest of the fit uses. `extra` (the branch-A ladder, see zmodel)
+    is included here too so the divider T stays consistent with the richer branch A;
+    None/[] -> byte-identical to the single-section ZA."""
     s = 1j * TWO_PI * f
-    return R_a + (s * L_a * R_pl) / (s * L_a + R_pl)
+    ZA = R_a + (s * L_a * R_pl) / (s * L_a + R_pl)
+    if extra:
+        for Li, Ri in extra:
+            ZA = ZA + (s * Li * Ri) / (s * Li + Ri)
+    return ZA
 
 
-def fit_noise_hybrid(zfits, M=4):
+def fit_noise_hybrid(zfits, M=4, extra_fits=None):
     """GATED alternative noise structure ("hybrid"): a VOLTAGE-noise bank in series
     with branch A (between the regulation source and R_a) + the existing Norton
     WHITE floor at vout:
@@ -945,7 +967,10 @@ def fit_noise_hybrid(zfits, M=4):
     MIN_LOG_GAP separation penalty on the shared log-corners, log-domain residual,
     1e-44 amplitude floor before the sqrt->gain conversion. Greedy section insertion
     up to 8 while worst > NOISE_ADAPT_TRIG (M=4 sufficed on the real part).
-    Returns dict(fkv=[..], snw={il}, snk={il:[..]}, gw={il}, worst=...)."""
+    Returns dict(fkv=[..], snw={il}, snk={il:[..]}, gw={il}, worst=...).
+    `extra_fits` {il: extra} carries the per-corner branch-A ladder (see zmodel) so both
+    Zout and the divider T=Zout/ZA use the richer branch A; None / missing -> byte-identical."""
+    extra_fits = extra_fits or {}
     targets = {}
     for il in LOADS:
         gn = ref[f"noise_{il}"]; f = gn[:, 0]; Sv = gn[:, 1]
@@ -958,8 +983,9 @@ def fit_noise_hybrid(zfits, M=4):
                              max(int(24 * np.log10(f[-1] / f[0])), 24))
             Sv = np.exp(np.interp(np.log(fu), np.log(f), np.log(Sv + 1e-80)))
             f = fu
-        Z = zmodel(f, *zfits[il])
-        T2 = np.abs(Z / _za(f, zfits[il][0], zfits[il][1], zfits[il][2])) ** 2
+        _ex = extra_fits.get(il)
+        Z = zmodel(f, *zfits[il], extra=_ex)
+        T2 = np.abs(Z / _za(f, zfits[il][0], zfits[il][1], zfits[il][2], extra=_ex)) ** 2
         targets[il] = (f, Sv ** 2, T2, np.abs(Z) ** 2)
     f0 = targets[LOADS[0]][0][0]; f1 = targets[LOADS[0]][0][-1]
     nL = len(LOADS)
@@ -1145,12 +1171,13 @@ def noise_model_sv(P_il, f, Z, nfk=None, nfkv=None, nmode=None):
     Z is the COMPLEX zmodel Zout already evaluated at f (so the C_ft shunt, branch B
     etc. are inherited); nfk/nfkv default to the module state of the last fit."""
     f = np.asarray(f, dtype=float)
+    extra = P_il.get("extra")          # branch-A ladder (see zmodel); None on standalone P_il
     if nmode is None:
         nmode = NOISE_MODE
     if nmode == "hybrid":
         if nfkv is None:
             nfkv = NFKV
-        ZA = _za(f, P_il["R_a"], P_il["L_a"], P_il["R_pl"])
+        ZA = _za(f, P_il["R_a"], P_il["L_a"], P_il["R_pl"], extra=extra)
         T2 = np.abs(Z / ZA) ** 2
         Vn2 = (P_il.get("snw", 0.0) ** 2) * KT4 * NRk * np.ones_like(f)
         for k in range(len(nfkv)):
@@ -1184,10 +1211,11 @@ def predict(P_il, f, nfk=None, nfkv=None, nmode=None):
         nfk = NFK
     f = np.asarray(f, dtype=float)
     zf = (P_il["R_a"], P_il["L_a"], P_il["R_pl"], P_il["R_b"], P_il["L_b"])
-    Z = zmodel(f, *zf)
+    extra = P_il.get("extra")          # branch-A ladder (see zmodel); None on standalone P_il
+    Z = zmodel(f, *zf, extra=extra)
     G = [P_il["G0"], P_il["G1"], P_il["w1"], P_il["G2"], P_il["w2"], P_il["G3"], P_il["w3"]]
     Q = (P_il["pcb0"], P_il["pcb1"], P_il["pcw0"], P_il["pcq"])
-    H = psrr_model(f, *zf, G, Q)
+    H = psrr_model(f, *zf, G, Q, extra=extra)
     Sv = noise_model_sv(P_il, f, Z, nfk=nfk, nfkv=nfkv, nmode=nmode)
     return dict(Zout=Z, PSRR=H, noise=Sv)
 
