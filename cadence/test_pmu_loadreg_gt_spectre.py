@@ -78,8 +78,16 @@ def _gt_block(va):
 
 
 def _one_way_step(gt_block, i_from, i_to, tag):
-    """A one-way load step i_from -> i_to that STAYS at i_to (manifest from/to semantics)."""
-    T0, edge, TST = 1e-6, 1e-9, 2e-5
+    """A one-way load step i_from -> i_to that STAYS at i_to (manifest from/to semantics).
+
+    The step lands at mid-capture (T0 = TST/2), NOT at the very start: the production
+    settled-DC extractor (fit_multiport._settled_step) skips the first 15% of the capture
+    span as a TURN-ON guard (real box transients open with a t~0 startup drop whose |dV|
+    dwarfs the load step -- shipped in 8e2588f). A real load-step capture therefore puts
+    the edge well inside the settled window; this synthetic GT must do the same so it
+    exercises the same path. (A step at 5% would fall inside the turn-on guard and the
+    extractor would correctly find no settled pre-window -> vreg stays baked.)"""
+    T0, edge, TST = 1e-5, 1e-9, 2e-5            # step at 50% of the capture (clear of the 15% guard)
     wave = f"0 {i_from:g} {T0:g} {i_from:g} {T0+edge:g} {i_to:g} {TST:g} {i_to:g}"
     scs = ("simulator lang=spectre\n" + gt_block +
            "Vsup (vin 0) vsource dc=0.98\n"
