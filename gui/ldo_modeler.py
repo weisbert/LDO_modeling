@@ -1357,6 +1357,13 @@ if _HAVE_QT:
             # store is the form's authority for the key; blank/absent clears, a value sets/overrides
             # the coverage.transient auto-fit. Generic on every table (only v_out reads it back).
             t._slew = {}                     # key-text -> slew_a string
+            # per-rail LARGE-SIGNAL recovery overrides, surfaced in the SAME 'trans' editor (they
+            # are only meaningful when the large-signal model is on -- i.e. alongside slew). Same
+            # overlay discipline as _slew: the store is the form's authority; blank/absent clears.
+            #   _la    : v_out.<o>.la_override [H] (dip-inductor / low-freq Zout correction)
+            #   _recov : v_out.<o>.recovery = {Lreg,Rreg,Cs,Rs} (overdamped 2nd-order recovery net)
+            t._la = {}                       # key-text -> la_override string
+            t._recov = {}                    # key-text -> recovery dict
             # coverage-sweep columns get a composite cell: an editable QLineEdit (type directly)
             # PLUS a '…' button that opens the Cadence-style editor. _dialog_cols marks them so the
             # row builder installs the widget and the readers/writers route through it.
@@ -1667,6 +1674,10 @@ if _HAVE_QT:
                     t._analysis.clear()             # start clean; restored from the dict below
                 if getattr(t, "_slew", None) is not None:
                     t._slew.clear()                 # ditto the slew-override store
+                if getattr(t, "_la", None) is not None:
+                    t._la.clear()                   # ditto the La-override store
+                if getattr(t, "_recov", None) is not None:
+                    t._recov.clear()                # ditto the recovery-dict store
                 tcols = getattr(t, "_cols", cols)
                 # physical columns the row builder must SKIP (emit a blank placeholder): the gear
                 # 'analysis' column, the checkbox columns (set separately), and the coverage cells.
@@ -1704,6 +1715,14 @@ if _HAVE_QT:
                     sa = ent.get("slew_a")
                     if sa not in (None, "") and getattr(t, "_slew", None) is not None:
                         t._slew[k] = str(sa)
+                    # restore the large-signal recovery overrides into their stores the same way
+                    # (the 'trans' editor surfaces both; collect() round-trips only loaded keys).
+                    la = ent.get("la_override")
+                    if la not in (None, "") and getattr(t, "_la", None) is not None:
+                        t._la[k] = str(la)
+                    rc = ent.get("recovery")
+                    if isinstance(rc, dict) and rc and getattr(t, "_recov", None) is not None:
+                        t._recov[k] = dict(rc)
                     r = self._table_add_row(t, row)
                     if unresolved_pin is not None:
                         self._flag_unresolved_net(t, r, tcols.index("net"), unresolved_pin)
@@ -2225,6 +2244,8 @@ if _HAVE_QT:
             if le is None:
                 return
             cur_slew = str((getattr(table, "_slew", {}) or {}).get(key) or "") if key else ""
+            cur_la = str((getattr(table, "_la", {}) or {}).get(key) or "") if key else ""
+            cur_recov = dict((getattr(table, "_recov", {}) or {}).get(key) or {}) if key else {}
             f = self._trans_parse_cell(le.text())
             steps = f["steps"]
             froms = {s["from"] for s in steps if s.get("from")}
@@ -2257,15 +2278,45 @@ if _HAVE_QT:
                               "overrides that auto-fit -- the escape hatch when the TB transient is "
                               "too switching-contaminated to trust (the real GHz system TB). Emits "
                               "the editable VDD0P8_<rail>_SRa param; tune it in ADE without re-regen.")
+            # LARGE-SIGNAL recovery overrides (only meaningful when slew is on -- same model switch).
+            # La override [H]: the AC-Zout fit under-estimates the branch-A inductance ~5x; the load-
+            # transient recovery needs ~120uH. Blank = use the fitted La (the LTI value).
+            e_la = QLineEdit(cur_la); e_la.setPlaceholderText("blank = use the fitted La (LTI)")
+            e_la.setToolTip("branch-A inductance OVERRIDE La [H], e.g. 120u. BLANK = the AC-Zout "
+                            "fitted value (which under-estimates the recovery time-constant ~5x). "
+                            "A VALUE corrects the low-freq Zout so the load-transient recovery is "
+                            "slow + monotonic (matches silicon). Pairs with the recovery network.")
+            # recovery network {Lreg,Rreg,Cs,Rs}: the overdamped 2nd-order Zout + DC-blocked snubber
+            # that makes the post-dip climb monotonic (no overshoot). ALL FOUR must be set to engage;
+            # any blank -> the whole recovery net is off (pure LTI + slew). Anti-windup is automatic.
+            e_lreg = QLineEdit(self._float_to_si(cur_recov.get("Lreg")) if cur_recov.get("Lreg") else "")
+            e_rreg = QLineEdit(self._float_to_si(cur_recov.get("Rreg")) if cur_recov.get("Rreg") else "")
+            e_cs = QLineEdit(self._float_to_si(cur_recov.get("Cs")) if cur_recov.get("Cs") else "")
+            e_rs = QLineEdit(self._float_to_si(cur_recov.get("Rs")) if cur_recov.get("Rs") else "")
+            for w, ph in ((e_lreg, "e.g. 16u"), (e_rreg, "e.g. 750"), (e_cs, "e.g. 25p"), (e_rs, "e.g. 2k")):
+                w.setPlaceholderText(ph)
+            e_lreg.setToolTip("recovery inductor Lreg [H] (lossless at DC -> DC setpoint unmoved; "
+                              "stretches the Cout recharge to a slow monotonic climb).")
+            e_rreg.setToolTip("recovery damp resistance Rreg [ohm] (sets the climb shape / overdamp).")
+            e_cs.setToolTip("snubber cap Cs [F] (AC-only, DC-blocked -> no droop; kills overshoot).")
+            e_rs.setToolTip("snubber resistance Rs [ohm].")
             if key and table is not None:
                 form.addRow("Slew override (A/s)", e_slew)     # only for a resolved v_out rail
+                form.addRow("La override (H)", e_la)
+                v.addWidget(QLabel("<span style='color:#678'><b>Recovery network</b> (overdamped "
+                                   "post-dip climb; ALL FOUR needed to engage, else pure LTI+slew). "
+                                   "Anti-windup bounds are automatic.</span>"))
+                rf = QFormLayout(); v.addLayout(rf)
+                rf.addRow("Lreg (H)", e_lreg); rf.addRow("Rreg (ohm)", e_rreg)
+                rf.addRow("Cs (F)", e_cs); rf.addRow("Rs (ohm)", e_rs)
             brow = QHBoxLayout(); brow.addStretch(1)
             b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
             brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
             b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
             b_clear.clicked.connect(lambda: (e_base.clear(), e_tg.clear(), e_edge.clear(),
                                              e_tstop.clear(), e_tstep.clear(), e_slew.clear(),
-                                             dlg.accept()))
+                                             e_la.clear(), e_lreg.clear(), e_rreg.clear(),
+                                             e_cs.clear(), e_rs.clear(), dlg.accept()))
             if not dlg.exec_():
                 return
             base = e_base.text().strip()
@@ -2282,6 +2333,32 @@ if _HAVE_QT:
                     table._slew[key] = sv
                 else:
                     table._slew.pop(key, None)
+            # persist the La override ([H], blank clears) into the per-rail store.
+            if key and getattr(table, "_la", None) is not None:
+                lv = e_la.text().strip()
+                if lv:
+                    table._la[key] = lv
+                else:
+                    table._la.pop(key, None)
+            # persist the recovery network: parse all four; engage ONLY when all four are positive
+            # numbers, else clear (the whole net is opt-in -- partial -> off). SI suffixes parsed.
+            if key and getattr(table, "_recov", None) is not None:
+                vals, ok = {}, True
+                for fld, w in (("Lreg", e_lreg), ("Rreg", e_rreg), ("Cs", e_cs), ("Rs", e_rs)):
+                    txt = w.text().strip()
+                    if not txt:
+                        ok = False; continue
+                    try:
+                        num = self._si_to_float(txt)
+                    except (TypeError, ValueError):
+                        ok = False; continue
+                    if not (num > 0):
+                        ok = False; continue
+                    vals[fld] = num
+                if ok and len(vals) == 4:
+                    table._recov[key] = vals
+                else:
+                    table._recov.pop(key, None)
 
         @staticmethod
         def _loads_to_text(spec):
@@ -2586,6 +2663,23 @@ if _HAVE_QT:
                             ent["slew_a"] = sf
                         else:
                             ent.pop("slew_a", None)
+                    # La override (same store discipline as slew_a: known key, >0 sets, else clears).
+                    if role == "v_out" and key in (getattr(t, "_la", None) or {}):
+                        try:
+                            lf = float(t._la[key])
+                        except (TypeError, ValueError):
+                            lf = None
+                        if lf is not None and lf > 0:
+                            ent["la_override"] = lf
+                        else:
+                            ent.pop("la_override", None)
+                    # recovery dict (the store only holds fully-valid 4-key dicts; presence = set).
+                    if role == "v_out" and key in (getattr(t, "_recov", None) or {}):
+                        rc = t._recov.get(key)
+                        if isinstance(rc, dict) and len(rc) == 4:
+                            ent["recovery"] = dict(rc)
+                        else:
+                            ent.pop("recovery", None)
                     out[key] = ent
                 return out
             m["supplies"] = collect(self.t_supplies, "supplies", ["key", "net", "dc", "tb_src"])
@@ -6886,6 +6980,41 @@ def _selftest_manifest_editor(win, tmp):
     dlg7.subtabs.setCurrentIndex(RAW)
     assert "slew_a" not in json.loads(dlg7.ed.toPlainText())["v_out"]["pll"], \
         "clearing the slew override must remove slew_a"
+
+    # 5f') v_out LARGE-SIGNAL recovery overrides (la_override scalar + recovery dict): loaded values
+    #      populate their stores, round-trip Form->Raw, a store edit overrides, a clear removes them;
+    #      a rail without them stays clean (same lossless discipline as slew_a).
+    lsm = json.dumps({
+        "name": "ls", "dut": {"lib": "L", "cell": "C", "tb_cell": "TB"},
+        "v_out": {"pll": {"net": "VDD0P8_PLL", "la_override": 0.00012,
+                          "recovery": {"Lreg": 1.6e-5, "Rreg": 750.0, "Cs": 2.5e-11, "Rs": 2000.0}},
+                  "vco": {"net": "VDD0P8_VCO"}}})
+    dlg8 = _ManifestEditorDialog(win, lsm, None)
+    assert dlg8.t_vout._la.get("pll") == "0.00012", "loaded la_override must populate the La store"
+    assert dlg8.t_vout._recov.get("pll", {}).get("Lreg") == 1.6e-5, "loaded recovery must populate the store"
+    assert "vco" not in dlg8.t_vout._la and "vco" not in dlg8.t_vout._recov, "a bare rail stays clean"
+    dlg8.subtabs.setCurrentIndex(RAW)                            # Form->Raw via collect()
+    ls_raw = json.loads(dlg8.ed.toPlainText())
+    assert ls_raw["v_out"]["pll"].get("la_override") == 0.00012, "la_override must round-trip Form->Raw"
+    assert ls_raw["v_out"]["pll"].get("recovery", {}).get("Rs") == 2000.0, "recovery must round-trip"
+    assert "la_override" not in ls_raw["v_out"]["vco"] and "recovery" not in ls_raw["v_out"]["vco"], \
+        "the bare rail must stay free of large-signal overrides"
+    # a store edit overrides; a partial recovery dict (set in collect only when complete) is honoured
+    dlg8.subtabs.setCurrentIndex(0)
+    dlg8.t_vout._la["pll"] = "0.0002"
+    dlg8.t_vout._recov["pll"] = {"Lreg": 2e-5, "Rreg": 800.0, "Cs": 3e-11, "Rs": 2500.0}
+    dlg8.subtabs.setCurrentIndex(RAW)
+    ls_raw2 = json.loads(dlg8.ed.toPlainText())
+    assert ls_raw2["v_out"]["pll"].get("la_override") == 0.0002, "la_override edit must round-trip"
+    assert ls_raw2["v_out"]["pll"]["recovery"]["Lreg"] == 2e-5, "recovery edit must round-trip"
+    # clearing both removes them
+    dlg8.subtabs.setCurrentIndex(0)
+    dlg8.t_vout._la["pll"] = ""
+    dlg8.t_vout._recov["pll"] = {}
+    dlg8.subtabs.setCurrentIndex(RAW)
+    pll_cleared = json.loads(dlg8.ed.toPlainText())["v_out"]["pll"]
+    assert "la_override" not in pll_cleared and "recovery" not in pll_cleared, \
+        "clearing the large-signal overrides must remove them"
 
     # 5e) [2.3] current-PSRR is a per-supply checkbox (no free-text field). Loading the explicit
     #     list checks just those; editing the checkboxes writes the explicit checked list back.
