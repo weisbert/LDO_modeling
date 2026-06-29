@@ -4167,6 +4167,29 @@ if _HAVE_QT:
             top.addWidget(self.rep_copy); top.addWidget(self.rep_save)
             v.addLayout(top)
 
+            # ---- per-family export selection: which GT WAVEFORMS travel in the digest --------
+            # all ticked (default) -> include=None -> the full digest (byte-compatible). Untick a
+            # family to omit it from the export (e.g. carry ONLY the transient). The transient
+            # waveform is the large-signal recovery GT the small-signal AC Zout cannot see.
+            wfrow = QHBoxLayout()
+            wfrow.addWidget(QLabel("export waveforms:"))
+            self._rep_wf = {}                       # label -> (checkbox, digest include-keys)
+            for lab, keys, tip in (
+                    ("Zout", ("zout",), "voltage-rail output impedance Zout(f)"),
+                    ("PSRR", ("psrr",), "voltage-rail PSRR(f)"),
+                    ("noise", ("noise",), "voltage-rail output noise(f)"),
+                    ("I-V", ("iv",), "current-sink I-V / Idc(T)"),
+                    ("curr Y/PSRR/noise", ("y", "pi", "noise_i"),
+                     "current-sink admittance, current-PSRR and current-noise"),
+                    ("transient", ("trans",),
+                     "load-step transient WAVEFORM [t,V] -- the large-signal recovery GT; the "
+                     "small-signal AC Zout cannot see it, so this is the only carrier")):
+                cb = QCheckBox(lab); cb.setChecked(True); cb.setToolTip(tip)
+                self._rep_wf[lab] = (cb, keys)
+                wfrow.addWidget(cb)
+            wfrow.addStretch(1)
+            v.addLayout(wfrow)
+
             # ---- splitter: LEFT grouped tree | RIGHT detail pane ----------------------------
             split = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
             self.rep_tree = QtWidgets.QTreeWidget()
@@ -4532,10 +4555,17 @@ if _HAVE_QT:
                 return ""
             import report_multiport as RMP
             bud = self.rep_budget.value() or None             # 0 -> no cap
+            # build the per-family export set from the checkboxes. ALL ticked -> None (full digest,
+            # byte-compatible); otherwise the union of the ticked families' include-keys.
+            wf = getattr(self, "_rep_wf", {}) or {}
+            inc = None
+            if wf and not all(cb.isChecked() for cb, _ in wf.values()):
+                inc = sorted({k for cb, keys in wf.values() if cb.isChecked() for k in keys})
             return RMP.debug_report(self.extract.result, self.extract.npz_path,
                                     self.extract.manifest, budget_kb=bud,
                                     compress=self.rep_compress.isChecked(),
-                                    include_fit_log=self.rep_fitlog.isChecked())
+                                    include_fit_log=self.rep_fitlog.isChecked(),
+                                    include=inc)
 
         def _report_copy(self):
             txt = self._report_text()

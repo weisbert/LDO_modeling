@@ -81,6 +81,27 @@ def test_digest_round_trips_current_noise():
     assert abs(reb[k][-1, 1] / In[-1] - 1.0) < 0.3            # HF white floor preserved
 
 
+def test_digest_round_trips_transient_waveform():
+    """@trans carries the load-step TRANSIENT WAVEFORM [t,V] (the large-signal recovery GT the AC
+    Zout cannot see). It must round-trip with the dip preserved, key the box form tr_<rail>_<suffix>,
+    and obey the per-family export `include` selection."""
+    t = np.linspace(0, 2e-7, 400)
+    V = 0.8 - 0.09 * np.exp(-((t - 25e-9) / 8e-9) ** 2)        # a 90mV dip at 25ns, recovers to 0.8
+    ref = {"loads": np.array(["tt_25c"]), "tr_pll_2m_tt_25c": np.c_[t, V]}
+    m = {"name": "t", "supplies": {}, "current_psrr_supplies": [], "i_out": {},
+         "v_out": {"pll": {"net": "VP", "pin": "VDD0P8_PLL"}}}
+    txt = "\n".join(RMP.emit_multiport_digest(ref, m))
+    assert "@trans pll 2m_tt_25c" in txt, "transient waveform not emitted to the digest"
+    reb = RMP.parse_multiport_digest(txt)
+    k = "tr_pll_2m_tt_25c"
+    assert k in reb, "transient key did not round-trip (box form tr_<rail>_<suffix>)"
+    assert reb[k].shape[1] == 2 and reb[k].shape[0] >= 12      # [t,V], above the load-reg fit gate
+    assert abs(reb[k][:, 1].min() - V.min()) < 2e-3           # the dip survived decimation
+    # per-family export selection: include without "trans" omits it; with it, keeps it
+    assert "@trans" not in "\n".join(RMP.emit_multiport_digest(ref, m, include=["zout", "psrr"]))
+    assert "@trans" in "\n".join(RMP.emit_multiport_digest(ref, m, include=["trans"]))
+
+
 # --------------------------------------------------- temperature collapse + export budget
 def test_temp_sweep_collapses_small_signal_and_fans_back(tmp_path):
     """A temperature sweep carries small-signal (z/psrr/noise/y/pi) at the NOMINAL temp of each

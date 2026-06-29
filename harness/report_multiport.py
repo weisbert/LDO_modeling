@@ -472,10 +472,40 @@ def _fanout_temp(ref):
                     ref[nk] = ref[k]
 
 
-def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=False):
+def _trans_subsample(t, V, npts=120):
+    """Decimation of a [t,V] transient for the digest that KEEPS the dip/extrema (the recovery
+    shape is the whole point) AND a uniform-by-index density floor (so the rebuilt waveform stays
+    above the downstream load-reg/recovery fit's min-point gate -- a pure RDP collapses a clean
+    step to ~4 pts). Sampling by INDEX preserves an adaptive-timestep's dense-near-the-edge
+    distribution. <=npts pts in -> passthrough."""
+    t = np.asarray(t, float)
+    V = np.asarray(V, float)
+    n = len(t)
+    if n <= npts:
+        return t, V
+    keep = set(np.linspace(0, n - 1, npts).astype(int).tolist())   # uniform density floor
+    keep |= {0, n - 1, int(np.argmin(V)), int(np.argmax(V))}       # endpoints + the dip/peak
+    idx = np.asarray(sorted(keep), int)
+    return t[idx], V[idx]
+
+
+# @<header-token> -> the include-key the GUI export checkboxes toggle (so a user can pick WHICH
+# waveform families travel in the digest). A family's GT block + its carried MODEL block share one
+# key (z & zmodel -> "zout", etc.). include=None -> emit everything (default, byte-compatible).
+_HDR2INC = {"iv": "iv", "noise_i": "noise_i", "y": "y", "pi": "pi",
+            "z": "zout", "zmodel": "zout", "psrr": "psrr", "psrrmodel": "psrr",
+            "noise": "noise", "noisemodel": "noise", "trans": "trans", "loadreg": "trans"}
+DIGEST_INCLUDE_KEYS = ("zout", "psrr", "noise", "y", "pi", "noise_i", "iv", "trans")
+
+
+def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=False, include=None):
     """Serialize ref's GT arrays (log-resampled) -> the machine-readable [MPD1] digest lines
     that parse_multiport_digest rebuilds into an npz-equivalent ref. Manifest-driven; emits a
     block only for the keys actually present (a coverage-light run simply emits fewer).
+
+    include (GUI export-checkbox set): an iterable of DIGEST_INCLUDE_KEYS to carry; None = all
+    (default). A family not in `include` is omitted from the digest entirely (NOT a budget drop --
+    the user chose not to export it), so e.g. include={"trans"} ships only the transient waveforms.
 
     budget_kb (red-zone export cap): when set, GT blocks are emitted highest-value-first
     (Idc(T) > current-noise > current Y/PSRR > voltage Zout/PSRR/noise) up to ~budget_kb of
@@ -491,6 +521,7 @@ def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=Fa
     overlay faithful without trusting the refit. Current ports DO refit faithfully -> not carried."""
     import current_digest as CD
     m = manifest
+    inc = None if include is None else {str(x) for x in include}
     loads = [str(x) for x in ref["loads"]]
     # TEMPERATURE-sweep collapse: the small-signal blocks (z/psrr/noise/y/pi/noise_i + models)
     # are temperature-invariant in the emitted model (only Idc/I-V carries a temp coefficient),
@@ -602,6 +633,20 @@ def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=Fa
                 if ("noise", o, il) in vm:
                     lines += _br(f"@noisemodel {o} {il}", fr, _on(fr, *vm[("noise", o, il)]).real)
                 blocks.append((7, lines))
+    # @trans: the load-step TRANSIENT WAVEFORM(s) [t, V] (shape-preserving decimation, dip kept).
+    # Priority 1: this is what the large-signal recovery / slew fit consumes, and it is the only
+    # AC-invisible (small-signal Zout can't see it) GT -- carrying it closes the last class that
+    # forced a box round-trip. Key = tr_<rail>_<suffix> verbatim (suffix = label[_load]) so
+    # split_ports re-maps it exactly. Off when "trans" not in the export selection.
+    for o in m["v_out"]:
+        for k in sorted(x for x in ref if str(x).startswith(f"tr_{o}_")):
+            g = np.asarray(ref[k], float)
+            if g.ndim != 2 or g.shape[0] < 2 or g.shape[1] < 2:
+                continue
+            ts, Vs = _trans_subsample(g[:, 0], g[:, 1])
+            lines = [f"@trans {o} {str(k)[len(f'tr_{o}_'):]}   # t[s], V[V]"]
+            lines += [f"  {a:.6e}, {b:.6e}" for a, b in zip(ts, Vs)]
+            blocks.append((1, lines))
     # @loadreg: the settled DC load-reg points {iload: Vout} recovered from the TRANSIENT steps, so
     # a pasted digest can REPRODUCE the vreg(iload) load-reg fit locally (the small-signal blocks
     # above carry NO DC load-reg -- the transient is its only carrier; this closes the one class
@@ -639,6 +684,9 @@ def emit_multiport_digest(ref, manifest, views=None, budget_kb=None, compress=Fa
     used = sum(len(x) + 1 for x in L)
     dropped = []
     for _pri, lines in sorted(blocks, key=lambda b: b[0]):
+        _hk = lines[0].lstrip("@").split()[0] if lines and lines[0].startswith("@") else ""
+        if inc is not None and _HDR2INC.get(_hk, _hk) not in inc:
+            continue                                     # deselected family (export choice, not a budget drop)
         sz = sum(len(x) + 1 for x in lines)
         if budget is not None and used + sz > budget and len(L) > 4:   # past the @meta header
             dropped.append(lines[0].split("#")[0].strip())
@@ -714,6 +762,11 @@ def parse_multiport_digest(text):
                 ref[f"pi_{toks[0]}_{toks[1]}_{toks[2]}"] = arr
             elif kind == "iv" and len(toks) >= 2:
                 ref[f"iv_{toks[0]}_{toks[1]}"] = arr
+            elif kind == "trans" and len(toks) >= 2 and arr.ndim == 2 and arr.shape[1] >= 2:
+                # full load-step waveform [t,V] -> tr_<rail>_<suffix> (suffix carries label[_load]
+                # verbatim, so split_ports re-maps it). The richer twin of @loadreg's 2-level synth:
+                # when present, split_ports' label-form-first match picks THIS over the synth below.
+                ref[f"tr_{toks[0]}_{toks[1]}"] = arr
             elif kind == "loadreg" and len(toks) >= 1 and arr.shape[0] >= 2 and arr.shape[1] >= 2:
                 # arr = [[iload, Vout_settled], ...] DC load-reg curve. Synthesize the original
                 # transient steps nom->each (nom = smallest iload) as 2-level [t,V] waveforms so
@@ -895,7 +948,8 @@ def _rail_diagnosis(result, npz_path, manifest, o):
 
 
 # --------------------------------------------------------------------- public: report
-def debug_report(result, npz_path, manifest, budget_kb=None, compress=False, include_fit_log=True):
+def debug_report(result, npz_path, manifest, budget_kb=None, compress=False, include_fit_log=True,
+                 include=None):
     """A single copy-pasteable text debug report for the whole multi-port model.
 
     Header (port roster + fit-param digest) -> per voltage rail (scores table + per-rail
@@ -1088,7 +1142,7 @@ def debug_report(result, npz_path, manifest, budget_kb=None, compress=False, inc
         if budget_kb:
             _dbudget = max(1.0, float(budget_kb) - sum(len(x) + 1 for x in L) / 1024.0)
         for line in emit_multiport_digest(ref_full, manifest, views=_views,
-                                          budget_kb=_dbudget, compress=compress):
+                                          budget_kb=_dbudget, compress=compress, include=include):
             pr(line)
     except Exception as e:                             # noqa: BLE001 -- digest is best-effort
         pr("")
