@@ -295,15 +295,25 @@ def load(vkey="base", nominal=None, vref=None):
     return ref
 
 
-def zmodel(f, R_a, L_a, R_pl=1e12, R_b=1e12, L_b=1e-12):
-    """Zout = (R_a + sL_a||R_pl) || (R_b + sL_b) || (ESR + 1/sC).
+def zmodel(f, R_a, L_a, R_pl=1e12, R_b=1e12, L_b=1e-12, extra=None):
+    """Zout = (R_a + sL_a||R_pl [+ extra sL_i||R_i]) || (R_b + sL_b) || (ESR + 1/sC).
     - R_pl: damping across L_a; R_pl->inf = classic resonant (R_a+sL_a)||C peak,
       finite = resistive PLATEAU (high-gain LDO open-loop Rout, e.g. V3).
     - branch B (R_b + sL_b): an OPTIONAL 2nd parallel R-L branch for a 2nd
       resonance / different HF roll-off (multi-pole Zout). R_b->inf disables it
-      (1-branch recovered), so it is added per-variant only when it helps."""
+      (1-branch recovered), so it is added per-variant only when it helps.
+    - extra: an OPTIONAL list of additional SERIES (L_i||R_i) ladder sections inside
+      branch A, [(L1,R1),(L2,R2),...]. Each is a rising-shelf section (short at DC,
+      ->R_i at HF, corner R_i/L_i) added IN SERIES with R_a + sL_a||R_pl. This makes
+      branch A a higher-order rising shelf that reproduces a measured multi-decade
+      inductive rise (varying Leff) a single section cannot -- the fix for the
+      mislocated-corner artifact. extra=None/[] -> byte-identical to the single-section
+      shelf. (The single (L_a,R_pl) is section 1; extra adds sections 2..N.)"""
     s = 1j * TWO_PI * f
     ZA = R_a + (s * L_a * R_pl) / (s * L_a + R_pl)
+    if extra:
+        for Li, Ri in extra:
+            ZA = ZA + (s * Li * Ri) / (s * Li + Ri)
     ZB = R_b + s * L_b
     ZC = RC + 1.0 / (s * C)
     Y = 1.0 / ZA + 1.0 / ZB + 1.0 / ZC
@@ -386,6 +396,83 @@ def fit_zout(f, Z):
     if e2 < 0.6 * e1:
         return tuple(np.exp(x2))                     # (R_a, L_a, R_pl, R_b, L_b)
     return (Ra, La, Rpl, 1e9, 1e-12)                 # 2nd branch off
+
+
+def fit_zout_ladder(f, Z, n_max=3, gain_db=0.3):
+    """Fit branch A as a HIGHER-ORDER (L||R) ladder: ZA = R_a + sum_{i=1..N}(sL_i||R_i),
+    magnitude-fit to the measured |Zout|. A single (L_a||R_pl) section (N=1, = today's shelf)
+    cannot reproduce a measured multi-decade inductive rise whose effective L VARIES with
+    frequency (the WuR pll/vco: Leff 24.8->5.8->1.0uH over 0.1-10MHz) -> the 1-section fit
+    mislocates the rise corner (the 447kHz artifact). Each extra section adds a rise corner.
+
+    Returns (R_a, L_a, R_pl, extra, rms_db) where section 1 = (L_a, R_pl) [drop-in for the
+    existing zmodel args] and `extra` = [(L2,R2),...] the additional sections (passed to
+    zmodel(...,extra=)). KEEP-BEST + GATED: N grows only while it cuts the |Z| dB-RMS by
+    >= gain_db; the smallest N that plateaus wins (parsimony, no overfit). N==1 -> extra=[]
+    -> byte-identical to the single-section shelf. The cap/branch-B are OMITTED here (the
+    ladder targets the <100MHz rise where the ~pF cap is negligible); the rail keeps its own
+    fitted Cout/ESR. Magnitude-only (the zrms grade + the shelf path are magnitude-only)."""
+    f = np.asarray(f, float); mag = np.abs(np.asarray(Z))
+    R0 = float(mag[0]); plateau = float(np.median(mag[f >= 0.5 * f[-1]]))
+    lo, hi = f[0], f[-1]
+    Lmin = 1.0 / (TWO_PI * hi * 3) * (R0 / 100.0 + 1e-9)   # loose physical bounds (not binding)
+
+    def zladder(p):                                  # p = [lnRa, lnL1,lnR1, lnL2,lnR2, ...]
+        s = 1j * TWO_PI * f
+        ZA = np.exp(p[0]) + 0j * s
+        for i in range(1, len(p), 2):
+            Li, Ri = np.exp(p[i]), np.exp(p[i + 1])
+            ZA = ZA + (s * Li * Ri) / (s * Li + Ri)
+        return ZA
+
+    def resid(p):
+        return np.log(np.abs(zladder(p))) - np.log(mag)
+
+    def fit_n(n):
+        # seed: split the total rise (plateau-R0) into n sections geometrically across the band
+        corners = np.logspace(np.log10(max(lo * 3, 1e2)), np.log10(hi / 3), n)
+        Rsec = max((plateau - R0) / n, R0)
+        p0 = [np.log(max(R0, 1e-3))]
+        for wc in corners:
+            Ri = Rsec
+            Li = Ri / (TWO_PI * wc)
+            p0 += [np.log(Li), np.log(Ri)]
+        lob = [np.log(R0 / 10)] + [np.log(1e-12), np.log(R0 / 50)] * n
+        hib = [np.log(max(R0 * 10, 1e-2))] + [np.log(1e-1), np.log(plateau * 5 + 1)] * n
+        best = None
+        for jit in (1.0, 0.3, 3.0):                  # a few multistarts on the corner spread
+            pp = list(p0)
+            for k in range(1, len(pp), 2):
+                pp[k] += np.log(jit)
+            try:
+                ss = least_squares(resid, pp, method="trf", bounds=(lob, hib), max_nfev=6000)
+            except Exception:                        # noqa: BLE001
+                continue
+            e = float(np.sqrt(np.mean(ss.fun ** 2))) * (20.0 / np.log(10))   # dB-RMS
+            if best is None or e < best[0]:
+                best = (e, ss.x)
+        return best
+
+    res = {}
+    for n in range(1, n_max + 1):
+        b = fit_n(n)
+        if b is not None:
+            res[n] = b
+    if not res:
+        return (R0, 1e-6, max(plateau, R0), [], float("inf"))
+    # keep-best: smallest N whose RMS is within gain_db of the best-so-far improvement chain
+    nbest = 1
+    for n in range(2, n_max + 1):
+        if n in res and (n - 1) in res and res[n][0] <= res[n - 1][0] - gain_db:
+            nbest = n
+    x = res[nbest][1]
+    Ra = float(np.exp(x[0]))
+    secs = [(float(np.exp(x[i])), float(np.exp(x[i + 1]))) for i in range(1, len(x), 2)]
+    # order sections by rising corner so section 1 = the lowest-frequency (largest-L) rise
+    secs.sort(key=lambda LR: LR[1] / LR[0])
+    L_a, R_pl = secs[0]
+    extra = secs[1:]
+    return (Ra, L_a, R_pl, extra, float(res[nbest][0]))
 
 
 NPS = 3   # PSRR coupling-current REAL sections (i_c real bank = G0 + sum_{i=1..NPS} Gi/(1+s/wi))
