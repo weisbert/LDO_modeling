@@ -32,6 +32,27 @@ NOT just broadband RMS which hid the 447kHz miss behind 1.9dB); G2 TIME-DOMAIN g
 regress. real_V = reference. Scope this run = PROOF on the PLL standalone .va; productionize into
 fit_model/fit_multiport/emit afterward. Build_spec lives in the wq06g7awt synthesis.
 
+## ✅ PRODUCTIONIZATION STEP 2 DONE (2026-06-30, `ab21b83`, main pushed) — ladder wired, zero-regression
+The higher-order (L||R) ladder Zout is now WIRED through the in-situ pipeline (fit_multiport + emit +
+report) with `extra=` threaded through fit_model's helpers. extra=None/absent EVERYWHERE -> byte-identical
+(standalone crossval 15/15 artifacts identical to HEAD; emit_va/fit_all UNTOUCHED). fit_multiport
+`_fit_voltage_output` calls `fit_zout_ladder` per rail with a GATED keep-best adoption (adopt iff N>=2 AND
+|Z| dB-RMS cut >=0.3dB on the same grid; else extra=[] -> synthetic views byte-identical), stores
+`P[il]["extra"]`, threads it into every per-corner PSRR/noise/score call (PSRR=i_c*Zout + noise=In*|Zout|
+auto-reconcile to the richer Zout). emit_pmu_model `_extra_{nodes,rvars,asg,body}` insert the sections IN
+SERIES in branch A (o->nA->nA2->...->[reg]->vrg; `_branchA_reg` gained `from_node`); DC shorts inductors
+(Z_DC=R_a preserved), HF -> R_a+R_pl+sum(R_i) plateau; PSRR/noise emit bodies UNCHANGED (currents inject
+at o). Scheduled path bakes the nominal-corner ladder load-independent (documented; real pll/vco Zout is
+single-corner). Lock: `harness/test_zout_ladder_wired.py`. VERIFIED (build->verify workflow, 4 adversarial
+lenses ALL pass): standalone byte-identical; emitted pll/vco .va local-Spectre AC pass G1 (|Z| err
+<=0.34dB @1/10/31.6MHz, plateau +/-1-1.5%, corner ratio 0.89/0.76; single-section contrast over-predicts
+1-10MHz +5.68dB -> ladder is a real fix; pll adopts extra=[(4.42uH,155)], vco [(1.23uH,50)]); PSRR
+IMPROVED (pll 0.115 vs 0.208dB, phase 0.57 vs 4.14deg), noise flat; passive (0 neg-Re), DC->0.8V, tran
+bounded; harness 208 + cadence 312 pytest green. ALSO `29179d7`: fixed a pre-existing red
+cadence/test_pmu_loadreg_gt_spectre.py (synthetic step was inside the _settled_step 15% turn-on guard;
+moved edge to 50% of capture, assertions unchanged). DEFERRED (needs user/box, unchanged): the G2 dip =
+large-signal current-assist term OR a same-temp 55C z_pll re-export. STEP 2 thread CLOSED.
+
 ## PRODUCTIONIZATION (higher-order Zout into the pipeline) — STEP 1 DONE, STEP 2 = next
 The build (workflow wq06g7awt) proved + emitted `cadence/wur_real_tb/ldo_pll_hiorder.va` (2-section
 (L||R) ladder). KEY refinement of the panel claim, rigorously established (3 fits + Spectre + adversarial
