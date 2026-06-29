@@ -58,13 +58,20 @@ B3 — MODEL STRUCTURE: fast linear path + slew COEXIST (not replace). Today sle
    AC bit-identical when slew off, byte-identical default. Validate: replay vs real_V reaches ~2-3mV with
    PHYSICAL params (no Cs=1nF). This is a design-panel job (try several topologies, score on the replay).
 
-B4 — REPRESENTATIVE coverage.transient + fit recovery from STANDARD FLOW. The char step must match the
-   deployment regime so the fit generalizes: set step magnitude + edge from the real load's worst-case
-   di/dt (USER INPUT NEEDED: the VCO/NDIV load's di/dt / swing magnitude — known from the load circuit,
-   no real_V needed). Then auto-fit La/Rpl(from AC Zout) + SRa/recovery(from the representative
-   coverage.transient recovery slope) — productionize scratchpad/autofit.py into fit_multiport (consume
-   coverage.transient + coverage.cdecap; de-embed the decap; emit). VALIDATE once (held-out) against
-   real_V on this LDO (we have it) to CALIBRATE the standard flow; thereafter standard-flow-only per LDO.
+B4 — REPRESENTATIVE char + fit recovery from STANDARD FLOW. The real load di/dt is DERIVED (no user
+   input needed) from real_pmu_iload_PLL_2000.txt: mean ~297uA, peaks ~1.96mA (NDIV), p2p ~2mA, raw
+   per-edge |di/dt| up to 6.6e7 A/s, envelope(10ns) ~6.7e5 A/s; 0-25ns trend ~flat (~265uA) -> the 25ns
+   dip is driven by the SWITCHING, not a slow ramp. KEY: the real load is TRANSIENT SWITCHING (mean 300uA,
+   snaps back each cycle), NOT a sustained step -- so a single clean coverage.transient step (0.5->2mA
+   HELD) is the WRONG excitation (the model crashes on the SUSTAINED 1.5mA demand, which the switching
+   load never imposes). => a fixed-step "representative" char doesn't exist; if B3 alone doesn't
+   generalize, the char must MIMIC THE LOAD PROFILE (mean+switching+peaks) or use the real load current
+   itself as the char stimulus (a current, derivable from the load circuit -- arguably more "standard"
+   than real_V). Then auto-fit La/Rpl(from AC Zout) + SRa/recovery(from that char) -- productionize
+   scratchpad/autofit.py into fit_multiport (consume the char + coverage.cdecap; de-embed; emit). VALIDATE
+   once (held-out) vs real_V on this LDO to CALIBRATE the std flow; thereafter std-flow-only per LDO.
+   PRIORITY NOTE: B3 (excitation-independent structure) is the real lever; do it first, then re-test
+   whether a clean char generalizes before investing in profile-mimicking char.
 
 B5 — VCO recovery: once B3/B4 work on PLL, VCO is the same fit on its coverage.transient (no special case).
 
