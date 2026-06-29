@@ -1,0 +1,48 @@
+`include "constants.vams"
+`include "disciplines.vams"
+// ============================================================================
+// od2nd : EXPLICIT OVERDAMPED 2nd-order Zout + slew front-end (PLL LDO rail)
+// ----------------------------------------------------------------------------
+// vreg ideal source + an output-impedance network that is deliberately OVERDAMPED
+// (real poles, no complex-pair ring) with a tens-of-ns dominant time constant, so
+// vout climbs slowly & MONOTONICALLY out of the slew-limited undershoot.
+//
+//   branch A  : dip inductor La (||Rpl)  ->  large-signal slew-limited undershoot
+//   branch A2 : SLOW recovery inductor Lreg (||Rreg)  ->  THE key element. It is
+//               lossless at DC (inductor shorts -> Zdc stays tiny -> DC = 0.8 V),
+//               but it raises the regulation-branch impedance at the recovery
+//               frequencies, so the Cout recharge current ramps SLOWLY -> the
+//               climb is stretched to ~100 ns (matches silicon) instead of
+//               snapping back in ~20 ns and over-shooting.
+//   branch D  : series Rs-Cs damping snubber. Cs blocks DC (no droop), Rs dissipates
+//               the post-dip ring energy -> kills the slew-induced overshoot. The
+//               damping therefore acts ONLY post-dip; the undershoot depth is kept.
+//
+// Net effect: small Zdc (DC reg), overdamped real-pole recovery (monotonic, ~100ns),
+// and the large-signal pass slew for the dip. Stable under the GHz switching replay.
+// ============================================================================
+module ldo_pll(vin, vout, gnd);
+  inout vin, vout, gnd;
+  electrical vin, vout, gnd, vrg, nA, nB, nD;
+  parameter real vreg = 8.000000e-01;   // setpoint (NEVER offset -> DC must be 800mV)
+  parameter real Ra   = 9.719499e-02;   // DC reg resistance (slew-limited) -> small Zdc
+  parameter real La   = 1.20e-04;        // dip inductor (di/dt-limited undershoot)
+  parameter real Rpl  = 1.602450e+02;    // parallel loss across La
+  parameter real SRa  = 8.5e3;           // branch-A regulation slew limit [A/s]
+  parameter real Lreg = 1.60e-05;        // SLOW recovery inductor -> stretches the climb
+  parameter real Rreg = 7.50e+02;        // parallel damp across Lreg (overdamp, set climb shape)
+  parameter real Cs   = 2.50e-11;        // snubber cap (AC-only damping, no DC droop)
+  parameter real Rs   = 2.00e+03;        // snubber damping resistance
+  analog begin
+    V(vrg, gnd) <+ vreg;
+    // branch A: dip inductor (La || Rpl), vout -> nA
+    I(vout, nA) <+ idt(V(vout, nA))/La + V(vout, nA)/Rpl;
+    // branch A2: slow recovery inductor (Lreg || Rreg), nA -> nB  (lossless at DC)
+    I(nA, nB)   <+ idt(V(nA, nB))/Lreg + V(nA, nB)/Rreg;
+    // DC reg resistance, regulation slew-limited, nB -> vrg
+    I(nB, vrg)  <+ slew(V(nB, vrg)/Ra, SRa);
+    // branch D: series Rs + Cs damping snubber (vout -> vrg), AC only
+    I(vout, nD) <+ Cs*ddt(V(vout, nD));
+    V(nD, vrg)  <+ Rs*I(nD, vrg);
+  end
+endmodule

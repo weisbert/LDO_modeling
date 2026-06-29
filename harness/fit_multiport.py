@@ -355,6 +355,42 @@ def _movavg(y, w):
 _SRA_LO, _SRA_HI = 1.0e3, 1.0e8
 
 
+_RECOV_KEYS = ("Lreg", "Rreg", "Cs", "Rs")
+
+
+def _fit_recovery(vmf):
+    """Recovery (overdamped 2nd-order Zout) param dict for ONE rail from its manifest entry, or
+    None when not opted in. Opt-in + manifest-driven (NO auto-fit yet -- see below): the rail's
+    `recovery` field must carry ALL of Lreg, Rreg, Cs, Rs as finite, strictly-positive numbers.
+    Any missing / non-positive / non-numeric value -> None -> the rail emits byte-identical.
+
+    The recovery network reshapes the post-dip climb the in-situ LTI Zout + slew front-end gets
+    wrong: a slow recovery inductor (Lreg||Rreg, lossless at DC -> DC setpoint unmoved) stretches
+    the Cout-recharge into a monotonic ~100ns overdamped climb, and a DC-blocked Rs-Cs snubber
+    damps the slew-induced overshoot. The winning topology + validated PLL-rail params are in
+    cadence/wur_real_tb/ldo_pll_compensated.va (RMS 2.47mV vs real silicon).
+
+    WHY MANIFEST-DRIVEN (not auto-fit): the four params are an overdamped-shape fit that needs a
+    CLEAN single load-step characterization waveform. The in-situ coverage.transient steps are
+    GHz-switching-contaminated (the real WuR system TB; memory real-tb-model-vs-real), so a blind
+    auto-fit would lock onto switching ripple -- exactly the failure mode _fit_slew_a is hardened
+    against. Until a clean recovery-characterization step is isolated, this stays a hand-tuned
+    designer knob (same escape-hatch discipline as the slew_a manifest override)."""
+    recov = vmf.get("recovery") if isinstance(vmf, dict) else None
+    if not isinstance(recov, dict):
+        return None
+    out = {}
+    for k in _RECOV_KEYS:
+        try:
+            v = float(recov.get(k))
+        except (TypeError, ValueError):
+            return None
+        if not (v > 0 and v < 1e30):
+            return None
+        out[k] = v
+    return out
+
+
 def _fit_slew_a(sp, tr_steps):
     """Branch-A regulation SLEW-RATE limit SRa [A/s] from the rail's transient load steps -- the
     LARGE-SIGNAL dynamic the AC Zout/PSRR fundamentally cannot carry (proven: same load + same cap
@@ -1051,6 +1087,18 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         _sa = (m["v_out"][o] or {}).get("slew_a")
         if _sa and float(_sa) > 0:
             volt[o]["slew_a"] = float(_sa)
+        # recovery (overdamped 2nd-order Zout) is an OPT-IN, manifest-driven OVERRIDE: when the
+        # rail carries a valid m['v_out'][rail]['recovery'] = {Lreg,Rreg,Cs,Rs} (all >0) it is
+        # threaded to the emit, which reshapes the post-dip climb into a monotonic ~100ns
+        # overdamped recovery + a DC-blocked snubber that kills the slew-induced overshoot
+        # (the in-situ LTI Zout + slew front-end otherwise rings/over-recovers under a fast
+        # load step). Absent/invalid -> not attached -> the rail emits byte-identical. There is
+        # NO auto-fit yet: the 4-param overdamped shape needs a clean characterization step the
+        # in-situ pipeline does not currently isolate (see _fit_recovery flag below), so this is
+        # a hand-tuned designer knob (mirrors the slew_a manifest escape hatch).
+        _rc = _fit_recovery(m["v_out"][o] or {})
+        if _rc is not None:
+            volt[o]["recovery"] = _rc
         # carry the designer's GUI symbol pin name (set by build_manifest) so the model
         # cell's PORT is the pin, not our internal role key. Default: the role key itself
         # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).

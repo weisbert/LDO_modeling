@@ -161,9 +161,10 @@ def _voltage_block(o, vfit, supply, ground):
     ESR = float(vfit["esr"])
     cft = float(vfit.get("cft", 0.0))      # gated vin->vout feedthrough cap (0.0 -> not emitted)
     slew_a = float(vfit.get("slew_a", 0.0) or 0.0)   # branch-A regulation slew limit (0 -> not emitted)
+    recov = vfit.get("recovery")           # gated overdamped 2nd-order Zout (None -> not emitted)
     sched = _schedule_loads(vfit, P)
     if sched:
-        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft, slew_a)
+        return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft, slew_a, recov)
     il = _nom_corner(P)
     p = P[il]
     vreg = float(p["vreg"])
@@ -176,7 +177,7 @@ def _voltage_block(o, vfit, supply, ground):
     nks = [f"{pre}_nk{k+1}" for k in range(len(nfk))]
     nodes = [f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
              f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
-             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks
+             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks + _recov_nodes(pre, recov)
 
     # per-rail real vars (all baked literals assigned in initial_step) + derived RLC
     rvars = [f"{pre}_Ra", f"{pre}_La", f"{pre}_Rpl", f"{pre}_Rb", f"{pre}_Lb",
@@ -215,7 +216,8 @@ def _voltage_block(o, vfit, supply, ground):
         vreg_hdr = (f"parameter real {pre}_vreg = {vreg:.6e};"
                     f"   // {o} regulated output target [V] (per-rail knob)")
     rvars = rvars + vreg_rvars
-    Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a) + [   # Cn = noise-corner caps (localparam)
+    Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a)
+        + _recov_param(pre, recov) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
@@ -243,7 +245,7 @@ def _voltage_block(o, vfit, supply, ground):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
@@ -275,18 +277,86 @@ def _slew_param(pre, sr):
     return []
 
 
-def _branchA_reg(pre, slew_sr):
+def _recov_ok(recov):
+    """True iff a recovery (overdamped 2nd-order Zout) param dict is present + fully valid:
+    all four of Lreg, Rreg, Cs, Rs finite + strictly positive. Mirrors the slew_a/cft opt-in
+    gate -- any missing/<=0/garbage value -> False -> the rail emits byte-identical to today."""
+    if not recov:
+        return False
+    try:
+        Lreg = float(recov.get("Lreg", 0.0)); Rreg = float(recov.get("Rreg", 0.0))
+        Cs = float(recov.get("Cs", 0.0)); Rs = float(recov.get("Rs", 0.0))
+    except (TypeError, ValueError):
+        return False
+    vals = (Lreg, Rreg, Cs, Rs)
+    return all(x > 0 and x < 1e30 for x in vals)
+
+
+def _recov_nodes(pre, recov):
+    """Extra internal nodes for the recovery branch (nB = slow-recovery-inductor node between
+    branch A and vrg; nD = the AC snubber node). Empty list when the recovery term is OFF so
+    the electrical declaration stays byte-identical."""
+    return [f"{pre}_nB", f"{pre}_nD"] if _recov_ok(recov) else []
+
+
+def _recov_param(pre, recov):
+    """Per-rail recovery (overdamped 2nd-order Zout) param lines: the slow-recovery inductor
+    (Lreg||Rreg) that stretches the post-dip Cout-recharge to a monotonic ~100ns climb, plus
+    the DC-blocked Rs-Cs damping snubber that kills the slew-induced overshoot. Editable CDF
+    knobs (parameter, not localparam). Empty list when OFF -> byte-identical header.
+
+    These elements are LOSSLESS / DC-BLOCKED at DC (Lreg shorts, Cs opens) so Zdc is unchanged
+    -> the regulated DC setpoint (vreg) is NOT moved; only the recovery SHAPE between the dip
+    and steady state is reshaped. Same opt-in discipline as slew_a / Cft / d2."""
+    if not _recov_ok(recov):
+        return []
+    Lreg = float(recov["Lreg"]); Rreg = float(recov["Rreg"])
+    Cs = float(recov["Cs"]); Rs = float(recov["Rs"])
+    return [
+        f"parameter real {pre}_Lreg = {Lreg:.6e};"
+        f"   // {pre} slow-recovery inductor [H] (overdamped 2nd-order Zout; lossless at DC)",
+        f"parameter real {pre}_Rreg = {Rreg:.6e};"
+        f"   // {pre} recovery damp resistance [ohm] (sets the monotonic climb shape)",
+        f"parameter real {pre}_Cs = {Cs:.6e};"
+        f"   // {pre} recovery snubber cap [F] (AC-only damping, DC-blocked -> no droop)",
+        f"parameter real {pre}_Rs = {Rs:.6e};"
+        f"   // {pre} recovery snubber resistance [ohm]",
+    ]
+
+
+def _branchA_reg(pre, slew_sr, recov=None):
     """Branch-A regulation contribution (node nA -> vrg through R_a). DEFAULT = the passive
     resistor `V(nA,vrg) <+ Ra*I(nA,vrg)` (byte-identical to the pre-slew emit). When a slew rate
     is fitted, the SAME R_a path is rate-limited via the built-in `slew()` operator:
     `I(nA,vrg) <+ slew(V(nA,vrg)/Ra, SRa)`. At DC and small signal slew()==identity, so it is
     EXACTLY the R_a resistor -> Zout/PSRR/noise (all DC+AC analyses) are unchanged; only large
     fast transients get rate-limited. SR->inf would also reduce to the resistor, but the absent
-    case is gated at emit time so the default .va text is unchanged."""
+    case is gated at emit time so the default .va text is unchanged.
+
+    When a `recov` (overdamped 2nd-order Zout) param set is present, a SLOW recovery inductor
+    (Lreg||Rreg, lossless at DC) is inserted between branch A's node nA and the regulation node,
+    and an AC-only Rs-Cs snubber (DC-blocked -> no droop) is added from vout to vrg. The
+    regulation (slew or resistor) then feeds from the inserted node nB instead of nA. With recov
+    OFF (the default) the inserted node + snubber are absent and the text is byte-identical."""
+    use_recov = _recov_ok(recov)
+    regnode = f"{pre}_nB" if use_recov else f"{pre}_nA"
+    pre_lines = ""
+    if use_recov:
+        pre_lines = (f"// recovery branch A2: slow inductor (Lreg||Rreg), nA->nB (lossless at DC)\n"
+                     f"    I({pre}_nA, {pre}_nB) <+ idt(V({pre}_nA, {pre}_nB))/{pre}_Lreg"
+                     f" + V({pre}_nA, {pre}_nB)/{pre}_Rreg;\n    ")
     if slew_sr and slew_sr > 0 and slew_sr < 1e30:        # gate matches _slew_param (SRa declared)
-        return (f"I({pre}_nA, {pre}_vrg) <+ slew(V({pre}_nA, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
-                f"   // R_a regulation, large-signal slew-limited")
-    return f"V({pre}_nA, {pre}_vrg) <+ {pre}_Ra*I({pre}_nA, {pre}_vrg);"
+        reg = (f"I({regnode}, {pre}_vrg) <+ slew(V({regnode}, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
+               f"   // R_a regulation, large-signal slew-limited")
+    else:
+        reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"
+    post_lines = ""
+    if use_recov:
+        post_lines = (f"\n    // recovery snubber: series Rs-Cs (vout->vrg), DC-blocked, kills"
+                      f" the post-dip overshoot\n"
+                      f"    I({pre}, {pre}_nD) <+ {pre}_Cs*ddt(V({pre}, {pre}_nD));\n"
+                      f"    V({pre}_nD, {pre}_vrg) <+ {pre}_Rs*I({pre}_nD, {pre}_vrg);")
+    return pre_lines + reg + post_lines
 
 
 def _cft_body(o, supply, cft):
@@ -299,7 +369,7 @@ def _cft_body(o, supply, cft):
     return ""
 
 
-def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None):
+def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
     scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
     between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
@@ -330,7 +400,7 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None):
 
     // Zout branch A: (L_a || R_pl) + R_a
     I({o}, {pre}_nA) <+ idt(V({o}, {pre}_nA))/{pre}_La + V({o}, {pre}_nA)/{pre}_Rpl;
-    {_branchA_reg(pre, slew_sr)}
+    {_branchA_reg(pre, slew_sr, recov)}
 
     // intrinsic output noise: decoupled Norton current @{o} (white floor + {len(nfk)} Lorentzians)
     I({pre}_nw, {ground}) <+ V({pre}_nw, {ground})/NRk;
@@ -356,7 +426,7 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None):
 """
 
 
-def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft=0.0, slew_a=0.0):
+def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft=0.0, slew_a=0.0, recov=None):
     """MULTI-LOAD path: each load-dependent small-signal param is a CLAMPED quadratic in
     u=ln(iload_<o>) (a per-rail module parameter, nominal = the middle schedule load's iv).
     At a schedule corner the scheduled expr == that corner's fitted value (corner-exact);
@@ -382,7 +452,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
     nks = [f"{pre}_nk{k+1}" for k in range(len(nfk))]
     nodes = [f"{pre}_vrg", f"{pre}_nA", f"{pre}_nC", f"{pre}_nbb",
              f"{pre}_np1", f"{pre}_np2", f"{pre}_np3", f"{pre}_vrf",
-             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks
+             f"{pre}_ncs1", f"{pre}_ncs2", f"{pre}_nw"] + nks + _recov_nodes(pre, recov)
 
     # u is a per-rail real var (clamped ln of the rail's iload param); all scheduled params
     # follow exactly the literal block's rvar set.
@@ -400,7 +470,8 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
                  f"   // {o} load OP [A]; ln(iload_{pre}) drives the param schedule "
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
     Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
-        f"\n  {ln}" for ln in _cft_param(pre, cft) + _slew_param(pre, slew_a)) + "".join(
+        f"\n  {ln}" for ln in _cft_param(pre, cft) + _slew_param(pre, slew_a)
+        + _recov_param(pre, recov)) + "".join(
         f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
@@ -431,7 +502,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
                 scheduled=True, valid_load=(ilo, ihi))
 
