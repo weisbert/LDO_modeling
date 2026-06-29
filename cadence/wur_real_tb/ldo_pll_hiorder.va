@@ -1,0 +1,34 @@
+`include "constants.vams"
+`include "disciplines.vams"
+// Passive higher-order LTI output-impedance model of the PLL LDO rail.
+// 2-section (L||R) ladder + series Ra + HF cap/decap branch (Cout||ESR).
+// Reproduces the MEASURED AC Zout z_pll: rising resistive shelf
+//   Z(DC) = Ra = 0.095 ohm ; Z(HF plateau) = Ra+R1+R2 = 199.3 ohm.
+// Corners R_i/L_i place the multi-decade inductive rise (10kHz..30MHz).
+// All R_i, L_i, Cout, ESR > 0  ->  strictly passive (Re(Z)>=0 all w).
+// NO slew, NO recovery tank, NO en_ls gate, NO clamp. Pure passive LTI.
+// Interface unchanged so replay_pll.py drives it as-is.
+module ldo_pll(vin, vout, gnd);
+  inout vin, vout, gnd;
+  electrical vin, vout, gnd, vrg, n1, n2, nC;
+  parameter real vreg = 8.000000e-01;   // ideal regulated reference (DC setpoint)
+  parameter real Ra   = 9.534380e-02;   // series DC resistance -> Z(DC)
+  parameter real L1   = 2.2926858e-05;  // section 1 inductor (corner R1/L1 = 298 kHz)
+  parameter real R1   = 4.2986187e+01;  // section 1 plateau resistance
+  parameter real L2   = 4.3807643e-06;  // section 2 inductor (corner R2/L2 = 5.67 MHz)
+  parameter real R2   = 1.5621466e+02;  // section 2 plateau resistance
+  parameter real Cout = 8.7347470e-13;  // HF cap branch
+  parameter real ESR  = 5.3858360e+01;  // HF cap branch series resistance
+  analog begin
+    V(vrg, gnd) <+ vreg;
+    // (L||R) ladder section 1: short at DC (inductor), -> R1 at HF
+    I(vout, n1) <+ idt(V(vout, n1))/L1 + V(vout, n1)/R1;
+    // (L||R) ladder section 2
+    I(n1, n2)   <+ idt(V(n1, n2))/L2  + V(n1, n2)/R2;
+    // series DC resistance Ra  ->  Z(DC) = Ra
+    V(n2, vrg)  <+ Ra*I(n2, vrg);
+    // HF cap/decap-region branch: series Cout + ESR, in parallel with the ladder
+    I(vout, nC) <+ Cout*ddt(V(vout, nC));
+    V(nC, vrg)  <+ ESR*I(nC, vrg);
+  end
+endmodule
