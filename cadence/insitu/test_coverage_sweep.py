@@ -556,5 +556,90 @@ def test_fan_nominal_smallsignal_completes_offnominal():
     assert list(m2) == ["z_pll_L0"]
 
 
+# =====================================================================================
+# (N) coverage_plan: the PURE cell->groups plan a GUI status tree pre-fills from, and the
+#     SAME plan the run loop iterates (so the tree shows the real job list with NO drift).
+# =====================================================================================
+def test_coverage_plan_matches_run_cells_and_splits_swept_per_load():
+    m = _wur_cov_manifest(loads=True, temps=True, kinds=True)
+    plan = PC.coverage_plan(m)
+    cells = [p["cell"] for p in plan]
+    # one once-cell + 4 load-cells per temp, over 2 temps = 10 cells, in run order
+    assert cells == ["Lnom_T-40", "L0_T-40", "L1_T-40", "L2_T-40", "L3_T-40",
+                     "Lnom_T55", "L0_T55", "L1_T55", "L2_T55", "L3_T55"]
+    by = {p["cell"]: p for p in plan}
+    swept_tags = {g["tag"] for g in RUN.groups(m) if RUN.is_load_swept_group(g)}
+    once_tags = {g["tag"] for g in RUN.groups(m) if not RUN.is_load_swept_group(g)}
+    # the once-cell carries the dc/tran/2x groups; each load-cell carries the AC/noise groups
+    assert {g["tag"] for g in by["Lnom_T55"]["groups"]} == once_tags
+    assert {g["tag"] for g in by["L0_T55"]["groups"]} == swept_tags
+    # THE property the GUI relies on: a swept tag appears in MANY cells (distinct labels) -- that
+    # is exactly why it must NOT share one status row (the done->pending flip-flop the user saw).
+    a_swept = next(iter(swept_tags))
+    homes = [p["cell"] for p in plan if any(g["tag"] == a_swept for g in p["groups"])]
+    assert len(homes) == 8 and len(set(homes)) == 8, ("a swept tag runs in 8 distinct cells", homes)
+    # op_loads routing carried on the plan: once-cell = None (TB OP), load-cell L0 = each rail's 0th
+    assert by["Lnom_T55"]["op_loads"] is None
+    assert by["L0_T55"]["op_loads"] == {o: M.load_points(m, o)[0] for o in m["v_out"]}
+
+
+def test_coverage_plan_drops_empty_offnominal_swept_cells():
+    """temp_sweep=['dc']: off-nominal temps run ONLY the dc analyses, so their swept (AC/noise)
+    cells are empty -- coverage_plan must DROP them (the loop no-ops them) so a plan entry maps
+    1:1 to a cell that actually runs + the tree shows no empty parents."""
+    m = _wur_cov_manifest(loads=True, temps=True, kinds=True)
+    m["coverage"]["temp_sweep"] = ["dc"]
+    m["coverage"]["temps"] = [-40, 55, 125]               # nominal (middle) = 55
+    plan = PC.coverage_plan(m)
+    cells = [p["cell"] for p in plan]
+    # nominal temp (55): once-cell + 4 load-cells. off-nominal (-40,125): the once-cell ONLY, and
+    # it carries the dc-analysis subset (no AC/noise/tran load cells).
+    assert "Lnom_T55" in cells and "L0_T55" in cells
+    assert "Lnom_T-40" in cells and "Lnom_T125" in cells
+    assert not any(c.startswith("L0_T-40") or c.startswith("L0_T125") for c in cells), \
+        "off-nominal swept (load) cells must be dropped (empty)"
+    by = {p["cell"]: p for p in plan}
+    off_analyses = {g["analysis"] for g in by["Lnom_T-40"]["groups"]}
+    assert off_analyses == {"dc"}, ("off-nominal once-cell runs only dc analyses", off_analyses)
+    # every plan cell is non-empty
+    assert all(p["groups"] for p in plan)
+
+
+def test_coverage_run_stamps_cell_on_group_status():
+    """The fix: each cell's group_status emit carries that cell's label, so the GUI routes the
+    job to its OWN row (no two cells share one row). Assert (cell, tag, state) tuples show the
+    SAME tag reaching 'done' under DISTINCT cell labels."""
+    m = _wur_cov_manifest(loads=True, temps=False, kinds=True)   # single temp -> short labels
+    corner = "tt_25c"
+    base = _wur_base_dir(tmp := pathlib.Path(__import__("tempfile").mkdtemp()))
+    gui = PC._gui_from_manifest(m)
+    _, dirs = PC.corner_dir(str(tmp), gui, corner)
+    grps = RUN.groups(m)
+    swept = [g for g in grps if RUN.is_load_swept_group(g)]
+    once = [g for g in grps if not RUN.is_load_swept_group(g)]
+    load_axis = RUN.load_axis(m)
+    _seed_cell_psf(dirs, "Lnom", once)
+    for (ll, _op) in load_axis:
+        _seed_cell_psf(dirs, ll, swept)
+
+    seen = []      # (cell, tag, state)
+    PC.run_pmu_coverage_sweep(
+        manifest=m, work_root=str(tmp), corner=corner, engine="alps",
+        base_netlist=str(base), netlistdir=str(base), pdk_model_dir=str(tmp / "pdk"),
+        netlister_factory=RecordingFactory(), runner=FakeRunner(), sleep=lambda *_: None,
+        steps=["netlist", "run"],
+        group_status=lambda i, n, g, st: seen.append((g.get("cell"), g["tag"], st)))
+
+    # EVERY emit carries a cell label (the stamp); no None leaked through
+    assert seen and all(c is not None for c, _t, _s in seen), "every group_status emit must carry a cell"
+    # a swept tag reaches 'done' under EACH of the 4 distinct load cells -> 4 distinct rows
+    a_swept = swept[0]["tag"]
+    done_cells = {c for c, t, s in seen if t == a_swept and s == "done"}
+    assert done_cells == {"L0", "L1", "L2", "L3"}, (a_swept, sorted(done_cells))
+    # and the once tag only at the OP cell
+    a_once = once[0]["tag"]
+    assert {c for c, t, s in seen if t == a_once and s == "done"} == {"Lnom"}
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

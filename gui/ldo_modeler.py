@@ -715,6 +715,10 @@ if _HAVE_QT:
             meta = {k: group.get(sk) for sk, k in
                     (("_job_id", "job_id"), ("_dsub_cmd", "dsub_cmd"), ("_out_abs", "out_abs"))
                     if group.get(sk) is not None}
+            # a coverage sweep STAMPS the cell label on the group (pmu_corner._cell) so the GUI can
+            # route this cell's job to its OWN status row (no cell -> the flat single-corner path).
+            if group.get("cell") is not None:
+                meta["cell"] = group["cell"]
             self.group_state.emit(i, n, group["tag"], group["analysis"], state, meta)
             # With several groups in flight at once, drive the bar off COMPLETED groups (count each
             # group ONCE by TAG, so a subset re-run -- i restarts at 0 -- can't double-count).
@@ -3712,21 +3716,30 @@ if _HAVE_QT:
             # per-GROUP run status (cluster Donau+ALPS sweep): one row per measurement group, live
             # state pending -> running -> done|failed (or 'preview' for a dry-run). Shown only when
             # Run-on = cluster (a sweep is N jobs); hidden for local/ade single runs.
-            self.x_status_box = QGroupBox("Per-group run status (Donau+ALPS sweep)")
+            self.x_status_box = QGroupBox("Per-cell run status (Donau+ALPS sweep)")
             _sbl = QVBoxLayout(self.x_status_box)
-            self.x_status = QTableWidget(0, 4)
-            self.x_status.setHorizontalHeaderLabels(["#", "Group", "Analysis", "State"])
-            self.x_status.verticalHeader().setVisible(False)
-            self.x_status.setEditTriggers(QTableWidget.NoEditTriggers)
-            self.x_status.setSelectionMode(QTableWidget.NoSelection)
+            # a TREE: a coverage sweep nests each measurement group (leaf, live pending->running->
+            # done|failed ONCE) under its CELL parent (one load x temp condition) which shows an
+            # aggregate done/total. A single-corner run / finished-sim import seeds FLAT top-level
+            # leaves (no parent). Keying each leaf by (cell, tag) is what stops a finished job from
+            # flipping back to 'pending' when the next cell's same-named group runs.
+            self.x_status = QtWidgets.QTreeWidget()
+            self.x_status.setColumnCount(4)
+            self.x_status.setHeaderLabels(["Group / cell", "Analysis", "State", "Progress"])
+            self.x_status.setRootIsDecorated(True)
+            self.x_status.setUniformRowHeights(True)
+            self.x_status.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            self.x_status.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
             self.x_status.setMinimumHeight(70)           # a floor; the SPLITTER below sets the height
             # #5: per-group right-click menu -> that group's artifacts + Donau actions (state-aware).
             self.x_status.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
             self.x_status.customContextMenuRequested.connect(self._x_status_menu)
-            _hh = self.x_status.horizontalHeader()
-            _hh.setStretchLastSection(True)
-            _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)
-            _hh.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)
+            _hh = self.x_status.header()
+            _hh.setStretchLastSection(False)
+            _hh.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+            _hh.setSectionResizeMode(1, QtWidgets.QHeaderView.ResizeToContents)
+            _hh.setSectionResizeMode(2, QtWidgets.QHeaderView.ResizeToContents)
+            _hh.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)
             _sbl.addWidget(self.x_status)
 
             # report / log: the run's multi-port fit report, the dry-run dsub command preview, or the
@@ -4676,15 +4689,24 @@ if _HAVE_QT:
                 account=self.xd_account.text().strip() or "ug_rfic.rfSClass",
                 queue=self.xd_queue.text().strip() or "short",
                 resource=f"cpu={self.xd_cpu.value()};mem={self.xd_mem.value()}")
-            # pre-fill the status table from the manifest's measurement groups, so the user sees
-            # the FULL job list immediately (before the first submit) and watches it fill in.
+            # pre-fill the status tree, so the user sees the FULL job list immediately (before the
+            # first submit) and watches it fill in. A coverage sweep nests each cell's measurement
+            # groups under a per-cell parent (load x temp, with a done/total aggregate); a single-
+            # corner run seeds a flat list of measurement-group leaves.
             try:
-                from insitu import run as _run
-                groups = _run.groups(self.extract.manifest)
+                from insitu import run as _run, pmu_corner as _PC
+                if _PC._has_coverage_sweep(self.extract.manifest):
+                    plan = _PC.coverage_plan(self.extract.manifest)
+                    self._x_status_init_plan(plan)
+                    n_jobs = sum(len(p["groups"]) for p in plan)
+                    job_word = f"{n_jobs} job(s) over {len(plan)} cell(s)"
+                else:
+                    n_jobs = len(_run.groups(self.extract.manifest))
+                    self._x_status_init(_run.groups(self.extract.manifest))
+                    job_word = f"{n_jobs} measurement group(s)"
             except Exception as e:                       # noqa: BLE001  malformed manifest
                 QMessageBox.critical(self, "Cluster run", f"{type(e).__name__}: {e}")
                 return
-            self._x_status_init(groups)
             self._x_show_run()                               # committed -> show the Run sub-tab (#4)
             self.x_run.setEnabled(False); self.x_cancel.setEnabled(True)
             self.x_import_btn.setEnabled(False)          # busy: block a racing finished-sim import
@@ -4692,8 +4714,7 @@ if _HAVE_QT:
             self.x_gate.setText("preview…" if dry else "running…")
             self.x_progmsg.setText("assembling per-group netlists…" if dry else "submitting sweep…")
             self.statusBar().showMessage(
-                f"{'Previewing' if dry else 'Running'} Donau+ALPS sweep — {len(groups)} "
-                f"measurement group(s), engine={eng}…")
+                f"{'Previewing' if dry else 'Running'} Donau+ALPS sweep — {job_word}, engine={eng}…")
             self._xw = _ClusterSweepWorker(self.extract, netlistdir=netdir, pdk=pdk, ahdl=ahdl,
                                            engine=eng, donau_cfg=cfg, dry_run=dry,
                                            max_parallel=self.xd_maxjobs.value(),
@@ -4720,45 +4741,148 @@ if _HAVE_QT:
             except Exception:                            # noqa: BLE001  no manifest / bad fields
                 return None
 
-        def _x_status_init(self, groups):
-            """Fill the per-group status table from the manifest's measurement groups (one row per
-            group: #, tag, analysis, state='—'), STASHING each row's per-group data (tag, analysis,
-            the deterministic netlist/PSF/log paths) as UserRole on the # cell so the right-click
-            menu (#5) can act on it. job_id / dsub_cmd are filled in later from the worker. Called
-            once before a sweep starts."""
+        _X_STATE_COLOUR = {"pending": "#888", "preview": "#555", "submitting": "#1565c0",
+                           "running": "#b8860b", "done": "#157f3b", "failed": "#b00020",
+                           "skipped": "#a07a00"}
+        _X_TERMINAL_OK = {"done", "skipped", "preview"}      # a leaf that counts toward a cell's done/total
+
+        # --- status TREE primitives: leaves keyed by (cell, tag); cell parents aggregate ----------
+        def _x_leaves(self):
+            """Every LEAF item (a measurement-group job): a top-level item with no children, plus
+            every child of a cell parent. The flat single-corner/import seeds are top-level leaves."""
             t = self.x_status
-            t.setRowCount(0)
+            for i in range(t.topLevelItemCount()):
+                top = t.topLevelItem(i)
+                if top.childCount() == 0:
+                    yield top
+                else:
+                    for k in range(top.childCount()):
+                        yield top.child(k)
+
+        def _x_find_item(self, cell, tag):
+            """The leaf item for (cell, tag), or None. cell=None matches the FIRST leaf with that
+            tag (the single-corner / import / re-run path, where there is no cell axis)."""
+            for it in self._x_leaves():
+                d = it.data(0, QtCore.Qt.UserRole) or {}
+                if d.get("tag") != tag:
+                    continue
+                if cell is None or d.get("cell") == cell:
+                    return it
+            return None
+
+        def _x_row_for_tag(self, tag):
+            """The leaf item whose stashed tag == tag (cell-agnostic), or None. Kept for the
+            single-group re-run + the selftest (a coverage tree has one leaf per (cell, tag))."""
+            return self._x_find_item(None, tag)
+
+        def _x_pretty_cell(self, cell):
+            """A human cell label from the raw '<load>' / '<load>_T<temp>' key: '<temp>°C · <load>'
+            ('OP' for the once-cell, 'Tnom' when no temp axis). Parsing the raw key uniformly means
+            a pre-filled cell and an insert-on-first-sight cell read the same."""
+            raw = str(cell)
+            load, temp = raw, None
+            if "_T" in raw:
+                load, temp = raw.rsplit("_T", 1)
+            lp = "OP" if load == "Lnom" else load
+            tp = f"{temp}°C" if temp is not None else "Tnom"
+            return f"{tp} · {lp}"
+
+        def _x_leaf_paths(self, tag, cell=None):
+            """The deterministic netlist/PSF/log paths for a (cell, tag) job, under the workarea
+            corner dir (cell sweep -> <netlist|psf>/<cell>/<tag>; single corner -> .../<tag>)."""
             dirs = self._x_group_dirs()
-            for i, g in enumerate(groups):
-                tag = g["tag"]
-                data = {"tag": tag, "analysis": g["analysis"], "state": "—",
-                        "job_id": None, "dsub_cmd": None}
-                if dirs:
-                    nd = str(pathlib.Path(dirs["netlist"]) / tag)
-                    data.update(netlist_dir=nd, input_scs=str(pathlib.Path(nd) / "input.scs"),
-                                psf_dir=str(pathlib.Path(dirs["psf"]) / tag), log_dir=nd)
-                t.insertRow(i)
-                num = QTableWidgetItem(str(i + 1))
-                num.setData(QtCore.Qt.UserRole, data)    # per-row data lives on the # cell
-                t.setItem(i, 0, num)
-                t.setItem(i, 1, QTableWidgetItem(tag))
-                t.setItem(i, 2, QTableWidgetItem(g["analysis"]))
-                st = QTableWidgetItem("—"); st.setForeground(QtGui.QColor("#777"))
-                t.setItem(i, 3, st)
+            if not dirs:
+                return {}
+            nbase = pathlib.Path(dirs["netlist"]); pbase = pathlib.Path(dirs["psf"])
+            nd = str((nbase / cell / tag) if cell else (nbase / tag))
+            pd = str((pbase / cell / tag) if cell else (pbase / tag))
+            return {"netlist_dir": nd, "input_scs": str(pathlib.Path(nd) / "input.scs"),
+                    "psf_dir": pd, "log_dir": nd}
+
+        def _x_cell_parent(self, cell, *, op_loads=None):
+            """Find-or-create the parent tree item for a cell (one load x temp condition)."""
+            t = self.x_status
+            for i in range(t.topLevelItemCount()):
+                top = t.topLevelItem(i)
+                d = top.data(0, QtCore.Qt.UserRole) or {}
+                if d.get("kind") == "cell" and d.get("cell") == cell:
+                    return top
+            parent = QtWidgets.QTreeWidgetItem([self._x_pretty_cell(cell), "", "pending", "0/0"])
+            parent.setData(0, QtCore.Qt.UserRole, {"kind": "cell", "cell": cell, "state": "pending"})
+            parent.setForeground(2, QtGui.QColor(self._X_STATE_COLOUR["pending"]))
+            if op_loads:
+                parent.setToolTip(0, "op_loads: " + ", ".join(f"{k}={v:g}A" for k, v in op_loads.items()))
+            t.addTopLevelItem(parent)
+            parent.setExpanded(False)        # collapsed by default: the cell's done/total is the
+            return parent                    # headline; the user expands to drill into its sims
+
+        def _x_make_leaf(self, tag, analysis, cell, *, state="—"):
+            """Create a leaf job item under its cell parent (or top-level when cell is None) and
+            stash its per-job data (tag/analysis/cell/state + deterministic paths)."""
+            data = {"tag": tag, "analysis": analysis, "state": state, "cell": cell,
+                    "job_id": None, "dsub_cmd": None}
+            data.update(self._x_leaf_paths(tag, cell))
+            leaf = QtWidgets.QTreeWidgetItem([tag, analysis or "", state, ""])
+            leaf.setForeground(2, QtGui.QColor(self._X_STATE_COLOUR.get(state, "#777")))
+            leaf.setData(0, QtCore.Qt.UserRole, data)
+            if cell is None:
+                self.x_status.addTopLevelItem(leaf)
+            else:
+                self._x_cell_parent(cell).addChild(leaf)
+            return leaf
+
+        def _x_update_cell(self, parent):
+            """Recompute a cell parent's aggregate from its leaves: 'done/total' progress + a
+            rolled-up state. MONOTONIC -- each leaf advances pending->running->done at most once
+            (a (cell, tag) is unique), so 'done' never decreases (the flip-flop is gone)."""
+            n = parent.childCount()
+            states = [(parent.child(k).data(0, QtCore.Qt.UserRole) or {}).get("state")
+                      for k in range(n)]
+            done = sum(1 for s in states if s in self._X_TERMINAL_OK)
+            fail = sum(1 for s in states if s == "failed")
+            active = sum(1 for s in states if s in ("running", "submitting"))
+            if n and done + fail >= n:
+                roll = "failed" if fail else "done"
+            elif active or done or fail:
+                roll = "running"
+            else:
+                roll = "pending"
+            parent.setText(2, roll)
+            parent.setForeground(2, QtGui.QColor(self._X_STATE_COLOUR.get(roll, "#777")))
+            parent.setText(3, f"{done}/{n}")
+            d = dict(parent.data(0, QtCore.Qt.UserRole) or {})
+            d.update(state=roll, done=done, total=n)
+            parent.setData(0, QtCore.Qt.UserRole, d)
+
+        def _x_status_init(self, groups):
+            """Seed the status tree FLAT (single-corner sweep / re-run / selftest): one TOP-LEVEL
+            leaf per measurement group, state '—'. A coverage sweep uses _x_status_init_plan, which
+            nests leaves under per-cell parents. Called once before a run starts."""
+            self.x_status.clear()
+            for g in groups:
+                self._x_make_leaf(g["tag"], g["analysis"], None)
+
+        def _x_status_init_plan(self, plan):
+            """Seed the status tree from a coverage_plan: one PARENT per cell (load x temp) with its
+            measurement groups as child leaves + a done/total aggregate. The user sees the FULL job
+            list up front (0/N) and watches it fill; each leaf is a real job that runs ONCE."""
+            self.x_status.clear()
+            for pc in plan:
+                parent = self._x_cell_parent(pc["cell"], op_loads=pc.get("op_loads"))
+                for g in pc["groups"]:
+                    self._x_make_leaf(g["tag"], g["analysis"], pc["cell"])
+                self._x_update_cell(parent)
 
         def _x_status_init_import(self, groups, psf_root, skipped_groups):
-            """Fill the per-group status table from a FINISHED-SIM import (#3) -- so the user sees
-            the measurement list and can right-click a row (Open netlist / Open PSF dir / folder /
-            terminal). One row per group: state 'done' (imported) or 'skipped' (a coverage extra
-            absent from the PSF). PSF dir = the imported root's group subdir; netlist dir = the
-            sibling <root>/../netlist/<tag> when present (so 'Open netlist' works), else the PSF dir.
-            No live job handle (a finished import, not a running sweep)."""
-            t = self.x_status
-            t.setRowCount(0)
+            """Seed the status tree from a FINISHED-SIM import (#3): flat top-level leaves, state
+            'done' (imported) or 'skipped' (a coverage extra absent from the PSF). PSF dir = the
+            imported root's group subdir; netlist dir = the sibling <root>/../netlist/<tag> when
+            present (so 'Open netlist' works), else the PSF dir. No live job handle."""
+            self.x_status.clear()
             proot = pathlib.Path(psf_root)
             nbase = proot.parent / "netlist"
             skip = set(skipped_groups or [])
-            for i, g in enumerate(groups):
+            for g in groups:
                 tag = g["tag"]
                 pdir = proot / tag
                 state = "skipped" if tag in skip else "done"
@@ -4767,68 +4891,54 @@ if _HAVE_QT:
                     ndir, scs = str(nd), str(nd / "input.scs")
                 else:
                     ndir, scs = str(pdir), None     # no netlist sibling -> folder actions use PSF dir
-                data = {"tag": tag, "analysis": g["analysis"], "state": state,
+                data = {"tag": tag, "analysis": g["analysis"], "state": state, "cell": None,
                         "job_id": None, "dsub_cmd": None,
                         "netlist_dir": ndir, "psf_dir": str(pdir), "log_dir": ndir}
                 if scs:
                     data["input_scs"] = scs
-                t.insertRow(i)
-                num = QTableWidgetItem(str(i + 1)); num.setData(QtCore.Qt.UserRole, data)
-                t.setItem(i, 0, num)
-                t.setItem(i, 1, QTableWidgetItem(tag))
-                t.setItem(i, 2, QTableWidgetItem(g["analysis"]))
-                st = QTableWidgetItem(state)
-                st.setForeground(QtGui.QColor(self._X_STATE_COLOUR.get(state, "#777")))
-                t.setItem(i, 3, st)
-
-        _X_STATE_COLOUR = {"pending": "#888", "preview": "#555", "submitting": "#1565c0",
-                           "running": "#b8860b", "done": "#157f3b", "failed": "#b00020",
-                           "skipped": "#a07a00"}
-
-        def _x_row_for_tag(self, tag):
-            """The table row index whose stashed data tag == tag, or None. Looking up by TAG (not
-            the worker's i) keeps the row mapping correct when a SUBSET re-run restarts i at 0."""
-            t = self.x_status
-            for r in range(t.rowCount()):
-                it = t.item(r, 0)
-                d = it.data(QtCore.Qt.UserRole) if it else None
-                if d and d.get("tag") == tag:
-                    return r
-            return None
+                leaf = QtWidgets.QTreeWidgetItem([tag, g["analysis"], state, ""])
+                leaf.setForeground(2, QtGui.QColor(self._X_STATE_COLOUR.get(state, "#777")))
+                leaf.setData(0, QtCore.Qt.UserRole, data)
+                self.x_status.addTopLevelItem(leaf)
 
         def _x_status_set(self, i, n, tag, analysis, state, meta=None):
-            """Update one group's row state (live, from the worker's group_state signal) AND merge
-            any newly-known job handle (job_id/dsub_cmd/out_abs) into the row's stashed data so the
-            per-group menu can use it. Locates the row BY TAG (robust to subset re-runs)."""
-            row = self._x_row_for_tag(tag)
-            if row is None:                              # defensive: table not pre-filled
-                return
-            it = QTableWidgetItem(state)
-            it.setForeground(QtGui.QColor(self._X_STATE_COLOUR.get(state, "#333")))
-            self.x_status.setItem(row, 3, it)
-            cell0 = self.x_status.item(row, 0)
-            data = dict(cell0.data(QtCore.Qt.UserRole) or {"tag": tag})
+            """Update one JOB's leaf state (live, from the worker's group_state signal) AND merge
+            any newly-known job handle (job_id/dsub_cmd/out_abs) into its stashed data. Locates the
+            leaf BY (cell, tag) -- meta carries 'cell' on a coverage sweep -- so each cell's same-
+            named group has its OWN row (no done->pending flip-flop). Inserts the leaf if a status
+            arrives for an un-seeded (cell, tag) (defensive), then refreshes the cell aggregate."""
+            cell = (meta or {}).get("cell")
+            it = self._x_find_item(cell, tag)
+            if it is None:                               # not pre-seeded -> create it on first sight
+                it = self._x_make_leaf(tag, analysis, cell)
+            it.setText(2, state)
+            it.setForeground(2, QtGui.QColor(self._X_STATE_COLOUR.get(state, "#333")))
+            data = dict(it.data(0, QtCore.Qt.UserRole) or {"tag": tag, "cell": cell})
             data["state"] = state
             for k in ("job_id", "dsub_cmd"):
                 if meta and meta.get(k) is not None:
                     data[k] = meta[k]
             if meta and meta.get("out_abs"):
                 data["psf_dir"] = meta["out_abs"]        # the authoritative PSF dir from finalize
-            cell0.setData(QtCore.Qt.UserRole, data)
+            it.setData(0, QtCore.Qt.UserRole, data)
+            if it.parent() is not None:
+                self._x_update_cell(it.parent())
 
         # --- per-group right-click menu (#5): artifacts + Donau actions, state-aware -----
-        def _x_row_data(self, row):
-            """The stashed per-row data dict for a status row (on the # cell's UserRole), or {}."""
-            it = self.x_status.item(row, 0) if 0 <= row < self.x_status.rowCount() else None
-            return dict((it.data(QtCore.Qt.UserRole) if it else None) or {})
+        def _x_row_data(self, item):
+            """The stashed per-job data dict for a leaf item (its column-0 UserRole), or {}."""
+            return dict((item.data(0, QtCore.Qt.UserRole) if item else None) or {})
 
-        def _x_status_menu_actions(self, row):
-            """The ORDERED per-group menu spec for a status row -> a list of {label, enabled, slot}
-            dicts (or {"sep": True}). STATE-AWARE off the row's State: log/tail/jump only after the
-            group STARTED; PSF dir only when done; Cancel only while running; Re-run only when
-            failed/done; JOBID/dsub/djob/dkill only once the job handle is known. Pure (no popup) so
-            the selftest can assert structure + gating without a real menu/subprocess."""
-            d = self._x_row_data(row)
+        def _x_status_menu_actions(self, item):
+            """The ORDERED per-group menu spec for a status LEAF item -> a list of {label, enabled,
+            slot} dicts (or {"sep": True}). STATE-AWARE off the leaf's State: log/tail/jump only
+            after the group STARTED; PSF dir only when done; Cancel only while running; Re-run only
+            when failed/done; JOBID/dsub/djob/dkill only once the job handle is known. A CELL parent
+            (no per-job artifacts) returns []. Pure (no popup) so the selftest can assert structure
+            + gating without a real menu/subprocess."""
+            d = self._x_row_data(item)
+            if d.get("kind") == "cell":
+                return []                                # a cell parent has no per-job actions
             state = d.get("state", "—")
             started = state in ("submitting", "running", "done", "failed")
             have_job = bool(d.get("job_id"))
@@ -4872,12 +4982,15 @@ if _HAVE_QT:
             return A
 
         def _x_status_menu(self, pos):
-            """Pop up the per-group menu for the right-clicked status row."""
-            row = self.x_status.rowAt(pos.y())
-            if row < 0:
+            """Pop up the per-group menu for the right-clicked status leaf (cell parents: no menu)."""
+            item = self.x_status.itemAt(pos)
+            if item is None:
+                return
+            specs = self._x_status_menu_actions(item)
+            if not specs:                                # a cell parent (or empty) -> no popup
                 return
             menu = QtWidgets.QMenu(self.x_status)
-            for spec in self._x_status_menu_actions(row):
+            for spec in specs:
                 if spec.get("sep"):
                     menu.addSeparator(); continue
                 act = menu.addAction(spec["label"])
@@ -6195,15 +6308,17 @@ def _selftest_import_finished_gui(win, tmp, app, root, mpath):
     # (Open netlist / Open PSF dir). Each row's PSF dir points at the imported root's group subdir.
     from insitu import run as _runm
     ngrp = len(_runm.groups(win.extract.manifest))
-    assert win.x_status.rowCount() == ngrp, f"import must list its {ngrp} groups, got {win.x_status.rowCount()}"
+    assert win.x_status.topLevelItemCount() == ngrp, \
+        f"import must list its {ngrp} groups (flat leaves), got {win.x_status.topLevelItemCount()}"
     # the post-fit chokepoint now auto-switches to the top-level Report tab; re-activate Tab 0 + its
     # Run sub-tab so the per-group-list visibility assertion (Run-tab content) is meaningful again.
     win.tabs.setCurrentIndex(0); win.x_subtabs.setCurrentIndex(1); app.processEvents()
     assert win.x_status_box.isVisibleTo(win), "the per-group list must SHOW after a finished-sim import"
-    r0 = win._x_row_data(0)
+    _it0 = win.x_status.topLevelItem(0)
+    r0 = win._x_row_data(_it0)
     assert r0.get("state") == "done" and pathlib.Path(r0["psf_dir"]).is_dir(), \
         f"imported row must be 'done' with a real PSF dir: {r0}"
-    acts0 = {a["label"]: a for a in win._x_status_menu_actions(0) if not a.get("sep")}
+    acts0 = {a["label"]: a for a in win._x_status_menu_actions(_it0) if not a.get("sep")}
     assert acts0["Open PSF dir"]["enabled"], "Open PSF dir must be enabled for an imported row"
     assert not acts0["Copy JOBID"]["enabled"], "no live job handle on an imported row"
     # Results sub-tab: the fit summary + report are mirrored here and the .va export is enabled, so
@@ -6349,19 +6464,20 @@ def _selftest_status_menu(win, tmp, app):
     groups = [{"tag": "g_a", "analysis": "ac"}, {"tag": "g_b", "analysis": "noise"},
               {"tag": "g_c", "analysis": "ac"}]
     win._x_status_init(groups)
-    assert win.x_status.rowCount() == 3, "status table must seed one row per group"
+    assert win.x_status.topLevelItemCount() == 3, "status tree must seed one flat leaf per group"
 
-    def _labels(row):
-        return {a["label"]: a for a in win._x_status_menu_actions(row) if not a.get("sep")}
+    def _labels(item):
+        return {a["label"]: a for a in win._x_status_menu_actions(item) if not a.get("sep")}
 
+    _g_a = win.x_status.topLevelItem(0)
     # row 0: NOT started ("—") -> path actions live, but tail/PSF/cancel/re-run/jobid gated OFF
-    a0 = _labels(0)
+    a0 = _labels(_g_a)
     assert a0["Open group folder"]["enabled"] and a0["Open netlist (input.scs)"]["enabled"], \
         "by-path actions must be available from the seeded paths"
     for lab in ("Tail output (dpeek)", "Open PSF dir", "Cancel job (dkill)",
                 "Re-run this group", "Copy JOBID", "Copy dsub command"):
         assert not a0[lab]["enabled"], f"'{lab}' must be disabled before the group starts"
-    full = [a.get("label") for a in win._x_status_menu_actions(0)]
+    full = [a.get("label") for a in win._x_status_menu_actions(_g_a)]
     for lab in ("Open netlist (input.scs)", "Jump to first error", "Open ALPS log", "Open PSF dir",
                 "Open terminal here", "Copy folder path", "Check job status (djob)",
                 "Re-run this group"):
@@ -6370,7 +6486,7 @@ def _selftest_status_menu(win, tmp, app):
 
     # row 'g_a': QUEUED ('pending') WITH a job handle -> Cancel MUST be enabled (the main window
     # for killing a stuck-in-queue job); a 'pending' WITHOUT a handle (the pre-submit emit) must not.
-    a0p = _labels(0)
+    a0p = _labels(_g_a)
     assert not a0p["Cancel job (dkill)"]["enabled"], "pending without a job handle -> no cancel"
     win._x_status_set(0, 3, "g_a", "ac", "pending", {"job_id": "JOBQ"})
     aq = _labels(win._x_row_for_tag("g_a"))
@@ -6411,6 +6527,55 @@ def _selftest_status_menu(win, tmp, app):
         f"terminal fallback must copy a quoted cd: {QApplication.clipboard().text()!r}"
     print("  status-menu (#5): custom menu + state-aware gating + job-handle merge + copy + "
           "terminal fallback OK")
+
+
+def _selftest_status_tree(win, tmp, app):
+    """The per-CELL status TREE (the fix for the done->pending flip-flop): a coverage sweep nests
+    each measurement group under its cell parent (load x temp); a cell's same-named group lands on
+    its OWN leaf (keyed by cell, tag), so a finished job CANNOT revert when the next cell's same
+    group runs. Asserts: prefill from a plan, per-cell aggregate done/total, and the no-regression
+    property under the worker's (cell-stamped) group_state signal."""
+    from PyQt5 import QtCore
+    # a 2-cell plan: cell A runs {z (ac), n (noise)}; cell B runs {z (ac)} -- z is the SHARED tag
+    # that previously collided on one row.
+    plan = [
+        {"cell": "L0_T55", "temp": 55, "load_label": "L0", "op_loads": {"pll": 1e-4},
+         "groups": [{"tag": "g_z", "analysis": "ac"}, {"tag": "g_n", "analysis": "noise"}]},
+        {"cell": "L1_T55", "temp": 55, "load_label": "L1", "op_loads": {"pll": 5e-4},
+         "groups": [{"tag": "g_z", "analysis": "ac"}]},
+    ]
+    win._x_status_init_plan(plan)
+    t = win.x_status
+    assert t.topLevelItemCount() == 2, "two cells -> two parent rows"
+    pa, pb = t.topLevelItem(0), t.topLevelItem(1)
+    assert win._x_row_data(pa).get("kind") == "cell" and win._x_row_data(pa).get("cell") == "L0_T55"
+    assert pa.text(0) == "55°C · L0", f"parent label must be the pretty cell: {pa.text(0)!r}"
+    assert pa.childCount() == 2 and pb.childCount() == 1, "leaves nested under their cell"
+    assert pa.text(3) == "0/2" and pb.text(3) == "0/1", "aggregate starts at 0/total"
+    # a cell parent has NO per-job menu; only leaves do
+    assert win._x_status_menu_actions(pa) == [], "a cell parent has no per-job actions"
+    assert win._x_status_menu_actions(pa.child(0)), "a leaf has a per-job menu"
+
+    def _emit(cell, tag, analysis, state):           # mimic the worker's cell-stamped group_state
+        win._x_status_set(0, 0, tag, analysis, state, {"cell": cell})
+
+    # cell A's g_z runs to DONE; THEN cell B's g_z starts (pending) -- the OLD bug flipped A back.
+    _emit("L0_T55", "g_z", "ac", "running")
+    _emit("L0_T55", "g_z", "ac", "done")
+    a_z = win._x_find_item("L0_T55", "g_z")
+    assert a_z is not None and a_z.text(2) == "done", "cell A's g_z must be done"
+    assert pa.text(3) == "1/2", f"cell A aggregate 1/2 after its g_z done: {pa.text(3)}"
+    _emit("L1_T55", "g_z", "ac", "pending")          # the collision case
+    assert a_z.text(2) == "done", "cell A's g_z MUST STAY done (no flip-flop) when cell B's g_z starts"
+    b_z = win._x_find_item("L1_T55", "g_z")
+    assert b_z is not None and b_z is not a_z, "cell B's g_z is a DISTINCT leaf (own row)"
+    assert b_z.text(2) == "pending" and pb.text(3) == "0/1", "cell B tracks independently"
+    # finish the rest -> both cells reach full done/total, monotonically
+    _emit("L0_T55", "g_n", "noise", "done")
+    _emit("L1_T55", "g_z", "ac", "done")
+    assert pa.text(3) == "2/2" and pa.text(2) == "done", "cell A fully done"
+    assert pb.text(3) == "1/1" and pb.text(2) == "done", "cell B fully done"
+    print("  status-tree: per-cell parents + done/total aggregate + NO done->pending flip-flop OK")
 
 
 def _selftest_cluster_sweep(win, tmp, app):
@@ -6505,9 +6670,9 @@ def _selftest_cluster_sweep(win, tmp, app):
     assert len(dsub_lines) == ngroups, f"expected {ngroups} per-group dsub lines, got {len(dsub_lines)}"
     assert any("-R 'cpu=16;mem=16000'" in l for l in dsub_lines), "dsub resource not shell-safe (';')"
     assert all("-ahdllibdir" not in l for l in dsub_lines), "blank ahdllibdir must drop -ahdllibdir"
-    assert win.x_status.rowCount() == ngroups, "status table must have one row per group"
-    states = {win.x_status.item(i, 3).text() for i in range(win.x_status.rowCount())}
-    assert states == {"preview"}, f"dry-run rows should be 'preview', got {states}"
+    assert win.x_status.topLevelItemCount() == ngroups, "status tree must have one flat leaf per group"
+    states = {win.x_status.topLevelItem(i).text(2) for i in range(win.x_status.topLevelItemCount())}
+    assert states == {"preview"}, f"dry-run leaves should be 'preview', got {states}"
     win.x_dryrun.setChecked(False)
 
     # the bounded-parallel surface is wired end to end: the core accepts max_parallel, the
@@ -7282,6 +7447,8 @@ def _selftest(require_qt=False):
             _selftest_import_finished_gui(win, tmp, app, *_impfin)
         # Per-group right-click menu (#5): policy + state-aware gating + job-handle plumbing.
         _selftest_status_menu(win, tmp, app)
+        # Per-cell status TREE: per-cell aggregate + the done->pending flip-flop fix.
+        _selftest_status_tree(win, tmp, app)
         # Mode-B LOCAL preview: the BARE per-group engine command (no dsub wrap), pure (no submit).
         win.x_mode.setCurrentIndex(win.x_mode.findData("import"))
         win.x_location.setCurrentIndex(win.x_location.findData("local"))

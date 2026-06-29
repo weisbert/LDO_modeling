@@ -849,6 +849,58 @@ def _temp_swept_analyses(m):
     return set(ts)
 
 
+def _cov_lbl(load_label, temp):
+    """The cell LABEL scheme run_pmu_coverage_sweep stamps: '<load>' or '<load>_T<temp>'. Shared
+    by coverage_plan + the run loop so the GUI status tree, the PSF dirs, and the npz `loads`
+    array all key off ONE label string."""
+    t = None if temp is None else f"T{temp:g}"
+    base_l = load_label or "Lnom"
+    return base_l if t is None else f"{base_l}_{t}"
+
+
+def coverage_plan(m):
+    """The planned (cell -> measurement groups) list for a coverage sweep -- the SAME load x temp
+    routing run_pmu_coverage_sweep iterates, exposed as PURE data so a GUI can pre-fill its
+    per-cell status tree (parent = cell, children = that cell's measurement groups) with the FULL
+    job list before the first submit. One dict per cell that ACTUALLY runs, in run order:
+        {cell, temp, load_label, op_loads, groups: [group dict, ...]}.
+    Empty-group cells (e.g. an off-nominal temp's swept cell, which the loop no-ops) are dropped,
+    so a plan entry maps 1:1 to a cell that runs. run_pmu_coverage_sweep iterates THIS plan, so the
+    plan and the run cannot drift. Mirrors the loop EXACTLY: load_swept routing, _temp_swept_analyses
+    scoping, _cov_lbl labels."""
+    temps_axis = _manifest.temps(m) or [None]
+    load_axis = _run.load_axis(m)
+    load_swept = len(load_axis) > 1
+    all_grps = _run.groups(m)
+    swept = [g for g in all_grps if _run.is_load_swept_group(g)]
+    once = [g for g in all_grps if not _run.is_load_swept_group(g)]
+    tsa = _temp_swept_analyses(m)
+    _utemps = sorted(t for t in temps_axis if t is not None)
+    tnom = _utemps[len(_utemps) // 2] if _utemps else None
+
+    def _grps_for(temp, base):
+        if tsa is None or temp is None or temp == tnom or len(_utemps) <= 1:
+            return base                                  # nominal temp / no sweep / 'all': everything
+        return [g for g in base if g["analysis"] in tsa]  # off-nominal: temp-dependent analyses only
+
+    cells = []
+
+    def _add(groups_subset, op_loads, temp, load_label):
+        if not groups_subset:                            # empty cell -> the loop no-ops it; drop it
+            return
+        cells.append(dict(cell=_cov_lbl(load_label, temp), temp=temp, load_label=load_label,
+                          op_loads=op_loads, groups=list(groups_subset)))
+
+    for temp in temps_axis:
+        if load_swept:
+            _add(_grps_for(temp, once), None, temp, "Lnom")        # OP once-cell (dc per temp)
+            for (load_label, op) in load_axis:
+                _add(_grps_for(temp, swept), op, temp, load_label)  # AC/noise per load
+        else:
+            _add(_grps_for(temp, all_grps), None, temp, None)      # all @ nom, dc off-nom
+    return cells
+
+
 def _fan_nominal_smallsignal(merged, labels, label_temp, tnom):
     """Off-nominal temps ran only the temp-dependent (dc/I-V) groups, so their cells carry no
     small-signal arrays. Copy each load's NOMINAL-temp small-signal onto its off-nominal-temp
@@ -985,10 +1037,8 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
     _utemps = sorted(t for t in temps_axis if t is not None)
     tnom = _utemps[len(_utemps) // 2] if _utemps else None
 
-    def _grps_for(temp, base):
-        if tsa is None or temp is None or temp == tnom or len(_utemps) <= 1:
-            return base                                  # nominal temp / no sweep / 'all': everything
-        return [g for g in base if g["analysis"] in tsa]  # off-nominal: temp-dependent analyses only
+    # (the load x temp x group routing now lives in coverage_plan(m), iterated by the loop below;
+    # swept/once/tsa/tnom are kept here only for the temp-scoping progress line.)
 
     # 5) the per-cell runner: run ONE cell (a groups-subset at one op_loads+temp). Each cell has
     #    its OWN netlist + PSF dir under <corner>/{netlist,psf}/<cell_label> (never /simulation/).
@@ -1003,8 +1053,15 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
         psf_cell = dirs["psf"] / cell_label
         psf_cell.mkdir(parents=True, exist_ok=True)
         gnl = netlister_factory(op_loads, temp, nl_dir)
+        # STAMP the cell label onto each group_status emit so the GUI can route this cell's job to
+        # its OWN status row. Without it every cell's same-named group (g_ac, g_noise, ...) collides
+        # on one row and a finished job flips back to 'pending' when the next cell's same group runs.
+        gs_cell = group_status
+        if group_status is not None:
+            def gs_cell(i, n, group, state, _cl=cell_label):
+                group_status(i, n, {**group, "cell": _cl}, state)
         rr = step_run(netinfo, psf_cell, m, engine=engine, donau=donau, runner=runner,
-                      on_status=on_status, group_status=group_status, dry_run=dry_run,
+                      on_status=on_status, group_status=gs_cell, dry_run=dry_run,
                       progress=progress, group_netlister=gnl, groups=groups_subset,
                       poll_interval=poll_interval, max_parallel=max_parallel,
                       poll_timeout=poll_timeout, sleep=sleep)
@@ -1029,13 +1086,10 @@ def run_pmu_coverage_sweep(manifest, *, work_root=None, corner=None, engine="alp
     #    (op_loads=None) per temp, then the swept groups repeat per load point. With NO load
     #    sweep: ALL groups run once per temp.
     if "run" in want:
-        for temp in temps_axis:
-            if load_swept:
-                _cell(_grps_for(temp, once), None, temp, _lbl("Lnom", temp))     # OP cell (dc per temp)
-                for (load_label, op) in load_axis:
-                    _cell(_grps_for(temp, swept), op, temp, _lbl(load_label, temp))  # AC/noise per load
-            else:
-                _cell(_grps_for(temp, all_grps), None, temp, _lbl(None, temp))   # all @ nom, dc off-nom
+        # iterate the SAME plan a GUI pre-fills its status tree from (coverage_plan) so the two
+        # cannot drift -- one cell = one (groups-subset, op_loads, temp), in run order.
+        for _pc in coverage_plan(m):
+            _cell(_pc["groups"], _pc["op_loads"], _pc["temp"], _pc["cell"])
         _ran("run")
         if tsa is not None and len(_utemps) > 1:
             per_temp = (len(once) + len(swept) * len(load_axis)) if load_swept else len(all_grps)
