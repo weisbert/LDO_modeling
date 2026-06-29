@@ -213,8 +213,8 @@ def _voltage_block(o, vfit, supply, ground):
             f"{pre}_vreg = {_sched_expr(vcur, vval, uvar, False)};",
         ]
     else:
-        vreg_hdr = (f"parameter real {pre}_vreg = {vreg:.6e};"
-                    f"   // {o} regulated output target [V] (per-rail knob)")
+        vreg_hdr = (f"localparam real {pre}_vreg = {vreg:.6e};"
+                    f"   // {o} regulated output target [V] (BAKED; edit here to retune)")
     rvars = rvars + vreg_rvars
     Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a)
         + _recov_param(pre, recov) + [   # Cn = noise-corner caps (localparam)
@@ -252,10 +252,12 @@ def _voltage_block(o, vfit, supply, ground):
 def _cft_param(pre, cft):
     """Per-rail gated vin->vout feedthrough cap param line(s). Empty list when cft<=0 so the
     header stays byte-identical to the pre-feedthrough emit (mirrors fit_model.emit_va's
-    `if CFT > 0` gate). Editable knob (parameter, not localparam) like the old single-port .va."""
+    `if CFT > 0` gate). BAKED (localparam, NOT a CDF parameter): every FITTED value is baked so
+    a re-emit always takes effect (a stale CDF instance override otherwise shadows the new
+    cellview default -- the 'slew rate still shows my old 6000' bug). Edit the value here."""
     if cft and cft > 0:
-        return [f"parameter real {pre}_Cft = {float(cft):.6e};"
-                f"   // {pre} gated vin->vout feedthrough cap [F]"]
+        return [f"localparam real {pre}_Cft = {float(cft):.6e};"
+                f"   // {pre} gated vin->vout feedthrough cap [F] (BAKED)"]
     return []
 
 
@@ -270,8 +272,8 @@ def _slew_param(pre, sr):
     breakpoints, so a LONG transient (>> 1us) WITHOUT a sim maxstep can explode the time-step --
     the GHz use case already mandates a fine maxstep so it is unaffected."""
     if sr and sr > 0 and sr < 1e30:                       # finite + positive (reject inf / garbage)
-        return [f"parameter real {pre}_SRa = {float(sr):.6e};"
-                f"   // {pre} branch-A slew-rate limit [A/s] (large-signal undershoot). Physical"
+        return [f"localparam real {pre}_SRa = {float(sr):.6e};"
+                f"   // {pre} branch-A slew-rate limit [A/s] (large-signal undershoot, BAKED). Physical"
                 f" ~1e3..1e8; too low -> non-physical deep dip. For tran >> 1us set sim maxstep"
                 f" <= ~1ns (hard slew() can blow up the time-step otherwise)."]
     return []
@@ -318,6 +320,11 @@ def _recov_param(pre, recov):
     -> the regulated DC setpoint (vreg) is NOT moved; only the recovery SHAPE between the dip
     and steady state is reshaped. Same opt-in discipline as slew_a / Cft / d2.
 
+    The four recovery + three anti-windup values are BAKED (localparam, NOT CDF parameters): they
+    are FITTED, so a re-emit must always take effect (a stale CDF instance override would shadow
+    the new cellview default). Edit them in the .va. The ONLY CDF parameter here is `en_ls`, an
+    explicit large-signal/LTI A/B MODE switch (not a fitted value) the user toggles in ADE.
+
     Also emits the ANTI-WINDUP knobs (Imax/Vcl/Gcl) that bound the loop's large-signal response:
     without them the slew-limited reg branch lags so long on an out-of-envelope harsh step that
     vout crashes and the lossless La/Lreg tank rings past the rails. Both clamps are zero inside
@@ -337,24 +344,25 @@ def _recov_param(pre, recov):
     Imax = _ov("Imax", _RECOV_IMAX); Vcl = _ov("Vcl", _RECOV_VCL); Gcl = _ov("Gcl", _RECOV_GCL)
     return [
         f"parameter real {pre}_en_ls = 1;"
-        f"   // {pre} LARGE-SIGNAL model enable: 1 = branch-A slew active (transient-accurate dip);"
-        f" 0 = pure LTI (slew->resistor). The linear Zout (La, Lreg/Rreg/Cs/Rs) AND the safety clamp"
-        f" are shared, so DC/AC/PSRR/noise are IDENTICAL either way -- only the large-signal"
-        f" load-transient dip/recovery differs. Toggle in ADE, no re-emit.",
-        f"parameter real {pre}_Lreg = {Lreg:.6e};"
-        f"   // {pre} slow-recovery inductor [H] (overdamped 2nd-order Zout; lossless at DC)",
-        f"parameter real {pre}_Rreg = {Rreg:.6e};"
-        f"   // {pre} recovery damp resistance [ohm] (sets the monotonic climb shape)",
-        f"parameter real {pre}_Cs = {Cs:.6e};"
-        f"   // {pre} recovery snubber cap [F] (AC-only damping, DC-blocked -> no droop)",
-        f"parameter real {pre}_Rs = {Rs:.6e};"
-        f"   // {pre} recovery snubber resistance [ohm]",
-        f"parameter real {pre}_Imax = {Imax:.6e};"
-        f"   // {pre} anti-windup reg pass-current limit [A]",
-        f"parameter real {pre}_Vcl = {Vcl:.6e};"
-        f"   // {pre} anti-windup clamp deadzone half-width [V] (>> the real dip)",
-        f"parameter real {pre}_Gcl = {Gcl:.6e};"
-        f"   // {pre} anti-windup clamp strength [A/V^2] beyond the deadzone",
+        f"   // {pre} LARGE-SIGNAL model enable (the ONLY CDF parameter here -- a MODE switch, not a"
+        f" fitted value): 1 = branch-A slew active (transient-accurate dip); 0 = pure LTI"
+        f" (slew->resistor). The linear Zout (La, Lreg/Rreg/Cs/Rs) AND the safety clamp are shared,"
+        f" so DC/AC/PSRR/noise are IDENTICAL either way -- only the large-signal load-transient"
+        f" dip/recovery differs. Toggle in ADE, no re-emit.",
+        f"localparam real {pre}_Lreg = {Lreg:.6e};"
+        f"   // {pre} slow-recovery inductor [H] (overdamped 2nd-order Zout; lossless at DC, BAKED)",
+        f"localparam real {pre}_Rreg = {Rreg:.6e};"
+        f"   // {pre} recovery damp resistance [ohm] (sets the monotonic climb shape, BAKED)",
+        f"localparam real {pre}_Cs = {Cs:.6e};"
+        f"   // {pre} recovery snubber cap [F] (AC-only damping, DC-blocked -> no droop, BAKED)",
+        f"localparam real {pre}_Rs = {Rs:.6e};"
+        f"   // {pre} recovery snubber resistance [ohm] (BAKED)",
+        f"localparam real {pre}_Imax = {Imax:.6e};"
+        f"   // {pre} anti-windup reg pass-current limit [A] (BAKED)",
+        f"localparam real {pre}_Vcl = {Vcl:.6e};"
+        f"   // {pre} anti-windup clamp deadzone half-width [V] (>> the real dip, BAKED)",
+        f"localparam real {pre}_Gcl = {Gcl:.6e};"
+        f"   // {pre} anti-windup clamp strength [A/V^2] beyond the deadzone (BAKED)",
     ]
 
 
@@ -642,10 +650,11 @@ def _current_block_largesignal(o, crow, supply, ground):
     rvars = [f"{pre}_didt", f"{pre}_g0", f"{pre}_vc", f"{pre}_gdd",
              f"{pre}_vk", f"{pre}_kp", f"{pre}_vhi", f"{pre}_Cp", f"{pre}_inw2", f"{pre}_kf"] \
         + d2_var + zero_var
-    # {pre}_idc55 is the bias's DC output current at Tnom -> a per-bias MODULE PARAMETER (an
-    # editable CDF field, default = fitted value) so the user can retune each bias current.
-    idc_par = (f"parameter real {pre}_idc55 = {idc55:.6e};"
-               f"   // {o} DC bias current @ {float(crow.get('tnom_c', 55.0)):g}C [A] (per-bias knob)")
+    # {pre}_idc55 is the bias's DC output current at Tnom. BAKED (localparam, NOT a CDF parameter):
+    # it is a FITTED value, so a re-emit must always take effect (a stale CDF instance override
+    # would otherwise shadow the new cellview default). Edit the value here to retune the bias.
+    idc_par = (f"localparam real {pre}_idc55 = {idc55:.6e};"
+               f"   // {o} DC bias current @ {float(crow.get('tnom_c', 55.0)):g}C [A] (BAKED)")
     asg = (f"{pre}_didt = {didt:.6e};  {pre}_g0 = {g0:.6e};  "
            f"{pre}_vc = {vc:.6g};  {pre}_gdd = {gdd_eff:.6e};  {pre}_vk = {vk:.6g};  "
            f"{pre}_kp = {kp:.6g};  {pre}_vhi = {vhi:.6g};  {pre}_Cp = {cp:.6e};  "
@@ -774,7 +783,7 @@ def va_format_report(va_text, supply, v_outs, i_outs, grounds):
         L.append(f"[emit]   params : {len(params)} -> {', '.join(params) if params else '(none)'}")
         for o in v_outs:
             sched = (f"iload_{o}" in va_text) and (f"{o}_vreg = min(max(" in va_text)
-            baked = f"parameter real {o}_vreg =" in va_text
+            baked = f"localparam real {o}_vreg =" in va_text
             cft = f"{o}_Cft" in va_text
             vreg = "load-reg SCHEDULE" if sched else ("BAKED literal" if baked else "?")
             L.append(f"[emit]   rail {o}: vreg={vreg}; Cft={'on' if cft else 'off'}")
@@ -921,8 +930,10 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
     for cb in cblocks:
         rvars += cb["rvars"]
 
-    # module-level parameters (editable CDF fields): per-rail vreg + noise corners (voltage
-    # blocks) and per-bias idc (current blocks). vdc_<supply>/NRk are added in the header.
+    # module-level decls per rail/bias. Every FITTED value is a BAKED localparam (re-emit always
+    # takes effect -- no stale CDF instance override can shadow the new cellview default). The ONLY
+    # CDF parameters are iload_<rail> (the load OP input the user sweeps) and <rail>_en_ls (the
+    # large-signal/LTI A/B MODE switch). vdc_<supply>/NRk are added in the header.
     _param_lines = [vb["params"] for vb in vblocks if vb.get("params")]
     _param_lines += [cb["params"] for cb in cblocks if cb.get("params")]
     cn_params = "\n  ".join(_param_lines)

@@ -1,0 +1,77 @@
+`include "constants.vams"
+`include "disciplines.vams"
+// ============================================================================
+// od2nd : EXPLICIT OVERDAMPED 2nd-order Zout + slew front-end (PLL LDO rail)
+// ----------------------------------------------------------------------------
+// vreg ideal source + an output-impedance network that is deliberately OVERDAMPED
+// (real poles, no complex-pair ring) with a tens-of-ns dominant time constant, so
+// vout climbs slowly & MONOTONICALLY out of the slew-limited undershoot.
+//
+//   branch A  : dip inductor La (||Rpl)  ->  large-signal slew-limited undershoot
+//   branch A2 : SLOW recovery inductor Lreg (||Rreg)  ->  THE key element. It is
+//               lossless at DC (inductor shorts -> Zdc stays tiny -> DC = 0.8 V),
+//               but it raises the regulation-branch impedance at the recovery
+//               frequencies, so the Cout recharge current ramps SLOWLY -> the
+//               climb is stretched to ~100 ns (matches silicon) instead of
+//               snapping back in ~20 ns and over-shooting.
+//   branch D  : series Rs-Cs damping snubber. Cs blocks DC (no droop), Rs dissipates
+//               the post-dip ring energy -> kills the slew-induced overshoot. The
+//               damping therefore acts ONLY post-dip; the undershoot depth is kept.
+//
+// ANTI-WINDUP (large-signal robustness, added after adversarial stress): the
+// behavioral loop is otherwise only CONDITIONALLY stable -- an out-of-envelope harsh
+// step (0.1->2mA, 0->5mA) makes the slew-limited reg branch lag so long that vout
+// crashes deep, the reg target current (V(nB,vrg)/Ra) winds up to tens of amps, and
+// the lossless La/Lreg tank rings PAST the rails (vout -> +-thousands mV). Two bounds,
+// BOTH zero inside the validated envelope so the 2.47mV replay + AC Zout are untouched:
+//   (1) Imax : clamp the reg target current to a physical pass-current limit before
+//              slew() -> a crashed vout can no longer demand absurd current.
+//   (2) Vcl/Gcl : a DEADZONE shunt clamp with ZERO value AND ZERO slope within +-Vcl
+//              of vrg (Vcl=300mV >> the real 88mV worst-case dip, so it never engages
+//              in any realistic transient and contributes nothing to DC/AC), quadratic-
+//              soft beyond -> bounds the non-physical tank ring on huge steps.
+//
+// Net effect: small Zdc (DC reg), overdamped real-pole recovery (monotonic, ~100ns),
+// the large-signal pass slew for the dip, and a physical bound under any load step.
+// ============================================================================
+module ldo_pll(vin, vout, gnd);
+  inout vin, vout, gnd;
+  electrical vin, vout, gnd, vrg, nA, nB, nD;
+  parameter real vreg = 8.000000e-01;   // setpoint (NEVER offset -> DC must be 800mV)
+  parameter real Ra   = 9.719499e-02;   // DC reg resistance (slew-limited) -> small Zdc
+  parameter real La   = 1.20e-04;        // dip inductor (di/dt-limited undershoot)
+  parameter real Rpl  = 1.602450e+02;    // parallel loss across La
+  parameter real SRa  = 8.5e3;           // branch-A regulation slew limit [A/s]
+  parameter real Lreg = 1.60e-05;        // SLOW recovery inductor -> stretches the climb
+  parameter real Rreg = 7.50e+02;        // parallel damp across Lreg (overdamp, set climb shape)
+  parameter real Cs   = 2.50e-11;        // snubber cap (AC-only damping, no DC droop)
+  parameter real Rs   = 2.00e+03;        // snubber damping resistance
+  parameter real Imax = 1.50e-02;        // anti-windup: physical reg pass-current limit [A]
+  parameter real Vcl  = 3.00e-01;        // anti-windup clamp deadzone half-width [V] (>> real dip)
+  parameter real Gcl  = 2.00e+01;        // anti-windup clamp strength [A/V^2] beyond the deadzone
+  parameter real en_ls = 0;              // LARGE-SIGNAL enable: 1 = branch-A slew active (transient-
+                                         // accurate dip); 0 = pure LTI (slew->resistor). The linear
+                                         // Zout (La,Lreg/Rreg/Cs/Rs) AND the safety clamp are shared
+                                         // -> DC/AC/PSRR/noise IDENTICAL either way; only the large-
+                                         // signal transient dip/recovery differs. Toggle in ADE.
+  analog begin
+    V(vrg, gnd) <+ vreg;
+    // branch A: dip inductor (La || Rpl), vout -> nA
+    I(vout, nA) <+ idt(V(vout, nA))/La + V(vout, nA)/Rpl;
+    // branch A2: slow recovery inductor (Lreg || Rreg), nA -> nB  (lossless at DC)
+    I(nA, nB)   <+ idt(V(nA, nB))/Lreg + V(nA, nB)/Rreg;
+    // DC reg resistance, nB -> vrg. en_ls=1 -> slew-limited + anti-windup clamped (large-signal);
+    // en_ls=0 -> plain resistor (pure LTI). slew()==identity at DC/small-signal either way.
+    I(nB, vrg)  <+ (en_ls >= 0.5) ? slew(max(-Imax, min(Imax, V(nB, vrg)/Ra)), SRa)
+                                  : V(nB, vrg)/Ra;
+    // branch D: series Rs + Cs damping snubber (vout -> vrg), AC only
+    I(vout, nD) <+ Cs*ddt(V(vout, nD));
+    V(nD, vrg)  <+ Rs*I(nD, vrg);
+    // deadzone anti-windup clamp (ALWAYS on -- shared safety net): zero value+slope within +-Vcl of
+    // vrg (invisible to dip/AC), quadratic-soft beyond -> bounds the tank ring on huge steps (a pure
+    // linear RLC scales with the step, so this keeps even the en_ls=0 LTI case physical).
+    I(vout, vrg) <+ (V(vout, vrg) >  Vcl) ?  Gcl*(V(vout, vrg) - Vcl)*(V(vout, vrg) - Vcl)
+                  : (V(vout, vrg) < -Vcl) ? -Gcl*(V(vout, vrg) + Vcl)*(V(vout, vrg) + Vcl)
+                  : 0.0;
+  end
+endmodule

@@ -416,8 +416,8 @@ def test_per_port_operating_point_params(tmp_path):
                meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
     txt = D.emit_pmu_va(res, "PMU_x", tmp_path / "x.va", supply="AVDD1P0", ground="VSS").read_text()
     # declared as parameters, exactly once each (the promotion, not a 2nd initial_step assign)
-    assert "parameter real VDD0P8_PLL_vreg = 8.000000e-01;" in txt
-    assert "parameter real IBP_PTAT_1P5U_idc55 = 1.502000e-06;" in txt
+    assert "localparam real VDD0P8_PLL_vreg = 8.000000e-01;" in txt
+    assert "localparam real IBP_PTAT_1P5U_idc55 = 1.502000e-06;" in txt
     assert txt.count("VDD0P8_PLL_vreg =") == 1, "vreg must not be re-assigned in initial_step"
     assert txt.count("IBP_PTAT_1P5U_idc55 =") == 1, "idc55 must not be re-assigned in initial_step"
     # still used by the model body (regulated-output reference + Idc(T) temp law)
@@ -440,7 +440,7 @@ def test_cft_feedthrough_emitted_when_present(tmp_path):
     res = dict(voltage={"pll": vf}, current=[],
                meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
     txt = D.emit_pmu_va(res, "PMU_cft", tmp_path / "c.va", supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_Cft = 1.740000e-13;" in txt
+    assert "localparam real VDD0P8_PLL_Cft = 1.740000e-13;" in txt
     assert "I(AVDD1P0, VDD0P8_PLL) <+ VDD0P8_PLL_Cft*ddt(V(AVDD1P0, VDD0P8_PLL));" in txt
     ok, problems = D.va_sanity(txt, "AVDD1P0", ["VDD0P8_PLL"], [], ["VSS"])
     assert ok, problems
@@ -513,7 +513,7 @@ def test_vreg_schedule_absent_is_byte_identical(tmp_path):
                  meta=dict(name="x", loads=["nom"], supplies=["AVDD1P0"]))
     none = D.emit_pmu_va(res_b, "PMU_n", tmp_path / "b.va", supply="AVDD1P0", ground="VSS").read_text()
     assert base == none
-    assert "parameter real VDD0P8_PLL_vreg = 8.000000e-01;" in base
+    assert "localparam real VDD0P8_PLL_vreg = 8.000000e-01;" in base
     assert "iload_VDD0P8_PLL" not in base
 
 

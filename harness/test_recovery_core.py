@@ -57,14 +57,14 @@ def test_recovery_on_emits_exactly_the_recovery_cards(tmp_path):
                           supply="AVDD1P0", ground="VSS").read_text()
     t_on = D.emit_pmu_va(on, "PMU_m", tmp_path / "n.va",
                          supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_Lreg = 1.600000e-05" in t_on
-    assert "parameter real VDD0P8_PLL_Rreg = 7.500000e+02" in t_on
-    assert "parameter real VDD0P8_PLL_Cs = 2.500000e-11" in t_on
-    assert "parameter real VDD0P8_PLL_Rs = 2.000000e+03" in t_on
+    assert "localparam real VDD0P8_PLL_Lreg = 1.600000e-05" in t_on
+    assert "localparam real VDD0P8_PLL_Rreg = 7.500000e+02" in t_on
+    assert "localparam real VDD0P8_PLL_Cs = 2.500000e-11" in t_on
+    assert "localparam real VDD0P8_PLL_Rs = 2.000000e+03" in t_on
     # anti-windup knobs (default values -- not in the manifest dict here) + the large-signal switch
-    assert "parameter real VDD0P8_PLL_Imax = 1.500000e-02" in t_on
-    assert "parameter real VDD0P8_PLL_Vcl = 3.000000e-01" in t_on
-    assert "parameter real VDD0P8_PLL_Gcl = 2.000000e+01" in t_on
+    assert "localparam real VDD0P8_PLL_Imax = 1.500000e-02" in t_on
+    assert "localparam real VDD0P8_PLL_Vcl = 3.000000e-01" in t_on
+    assert "localparam real VDD0P8_PLL_Gcl = 2.000000e+01" in t_on
     assert "parameter real VDD0P8_PLL_en_ls = 1" in t_on
     # the slow recovery inductor branch nA->nB
     assert ("I(VDD0P8_PLL_nA, VDD0P8_PLL_nB) <+ idt(V(VDD0P8_PLL_nA, VDD0P8_PLL_nB))/VDD0P8_PLL_Lreg"
@@ -101,7 +101,7 @@ def test_recovery_composes_with_slew(tmp_path):
             " : V(VDD0P8_PLL_nB, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra;") in t
     # NOT the nA-fed slew (recovery moved the regulation node)
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)" not in t
-    assert "parameter real VDD0P8_PLL_Lreg = " in t
+    assert "localparam real VDD0P8_PLL_Lreg = " in t
     assert "parameter real VDD0P8_PLL_en_ls = 1" in t
 
 
@@ -123,7 +123,7 @@ def test_recovery_scheduled_path_gated(tmp_path):
     t_on = D.emit_pmu_va(on, "PMU_s", tmp_path / "sn.va",
                          supply="AVDD1P0", ground="VSS").read_text()
     assert "_Lreg" not in t_off and "_nB" not in t_off
-    assert "parameter real VDD0P8_PLL_Lreg = 1.600000e-05" in t_on
+    assert "localparam real VDD0P8_PLL_Lreg = 1.600000e-05" in t_on
     assert "I(VDD0P8_PLL_nA, VDD0P8_PLL_nB) <+ idt(" in t_on
 
 
@@ -155,8 +155,8 @@ def test_fit_recovery_passes_optional_antiwindup_overrides():
     with tempfile.TemporaryDirectory() as d:
         va = D.emit_pmu_va(res, "PMU_ov", _pl.Path(d) / "ov.va",
                            supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_Imax = 2.000000e-02" in va
-    assert "parameter real VDD0P8_PLL_Vcl = 2.500000e-01" in va
+    assert "localparam real VDD0P8_PLL_Imax = 2.000000e-02" in va
+    assert "localparam real VDD0P8_PLL_Vcl = 2.500000e-01" in va
 
 
 @pytest.mark.parametrize("bad", [
@@ -184,7 +184,7 @@ def test_manifest_recovery_knob_threads_to_emit(tmp_path):
     assert res["voltage"]["pll"]["recovery"] == _RECOV
     va = D.emit_pmu_va(res, "PMU_man", tmp_path / "man.va",
                        supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_Lreg = 1.600000e-05" in va
+    assert "localparam real VDD0P8_PLL_Lreg = 1.600000e-05" in va
     assert "I(VDD0P8_PLL_nA, VDD0P8_PLL_nB) <+ idt(" in va
 
 

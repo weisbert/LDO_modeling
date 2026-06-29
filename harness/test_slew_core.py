@@ -53,7 +53,7 @@ def test_slew_on_emits_exactly_the_slew_lines(tmp_path):
                           supply="AVDD1P0", ground="VSS").read_text()
     t_on = D.emit_pmu_va(on, "PMU_m", tmp_path / "n.va",
                          supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_SRa = 1.000000e+04" in t_on
+    assert "localparam real VDD0P8_PLL_SRa = 1.000000e+04" in t_on
     assert ("I(VDD0P8_PLL_nA, VDD0P8_PLL_vrg) <+ "
             "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)") in t_on
     # the PLL rail no longer has the passive-resistor branch-A form
@@ -83,7 +83,7 @@ def test_slew_scheduled_path_gated(tmp_path):
     base["slew_a"] = 2.5e4
     txt = D.emit_pmu_va(res, "PMU_s", tmp_path / "s.va",
                         supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_SRa = 2.500000e+04" in txt
+    assert "localparam real VDD0P8_PLL_SRa = 2.500000e+04" in txt
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in txt
 
 
@@ -169,7 +169,7 @@ def test_manifest_slew_a_knob_threads_to_emit(tmp_path):
     assert res["voltage"]["pll"]["slew_a"] == 12000.0
     va = D.emit_pmu_va(res, "PMU_man", tmp_path / "man.va",
                        supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_SRa = 1.200000e+04" in va
+    assert "localparam real VDD0P8_PLL_SRa = 1.200000e+04" in va
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in va
 
 
@@ -201,7 +201,7 @@ def test_autofit_slew_engages_on_clean_undershoot(tmp_path):
     assert res["voltage"]["pll"]["slew_a"] == pytest.approx(2.0e-3 / 25e-9, rel=0.25)
     va = D.emit_pmu_va(res, "PMU_auto", tmp_path / "auto.va",
                        supply="AVDD1P0", ground="VSS").read_text()
-    assert "parameter real VDD0P8_PLL_SRa = " in va
+    assert "localparam real VDD0P8_PLL_SRa = " in va
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in va
 
 

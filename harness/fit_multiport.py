@@ -371,12 +371,20 @@ def _fit_recovery(vmf):
     damps the slew-induced overshoot. The winning topology + validated PLL-rail params are in
     cadence/wur_real_tb/ldo_pll_compensated.va (RMS 2.47mV vs real silicon).
 
-    WHY MANIFEST-DRIVEN (not auto-fit): the four params are an overdamped-shape fit that needs a
-    CLEAN single load-step characterization waveform. The in-situ coverage.transient steps are
-    GHz-switching-contaminated (the real WuR system TB; memory real-tb-model-vs-real), so a blind
-    auto-fit would lock onto switching ripple -- exactly the failure mode _fit_slew_a is hardened
-    against. Until a clean recovery-characterization step is isolated, this stays a hand-tuned
-    designer knob (same escape-hatch discipline as the slew_a manifest override).
+    WHY STILL MANIFEST-DRIVEN (not yet auto-fit): the four params are an overdamped-shape fit that
+    needs a CLEAN single load-step characterization waveform. Until that is isolated this stays a
+    hand-tuned knob (same escape-hatch discipline as slew_a).
+
+    B4 RECIPE (proven, ready to productionize -- HANDOFF_RECOVERY_STDFLOW.md, scratchpad/
+    autofit_acconsistent.py): fit {SRa, Lreg, Rreg, Cs, Rs} by replaying the DECAP'D coverage.transient
+    step (the coverage.cdecap feature) through the model and minimizing vs the box target, with TWO
+    GUARDS that keep the fit PHYSICAL and make it GENERALIZE to real_V (held-out):
+      (1) La PINNED to the AC-Zout value (NOT free) -- the deep dip is large-signal (SS!=LS); letting
+          La float makes it AC-inconsistent (La120 -> Zout peak 558 vs measured ~160).
+      (2) Cs BOUNDED <= the external decap scale (a few pF) -- else the snubber Cs floats to ~1nF as a
+          FAKE OUTPUT DECAP (the 35.5mV-held-out failure); bounded, Cs converges to ~1pF and real_V
+          lands ~5.79mV with physical params. fit_multiport is Pure-Python today -> this needs a
+          Spectre-in-loop replay (or an analytic dip-depth->SRa / recovery-tau->Lreg fit).
 
     Optional anti-windup overrides (Imax/Vcl/Gcl) pass through when present + valid; absent ->
     the emit uses its built-in defaults (the clamps bound the loop's large-signal response without
@@ -602,12 +610,36 @@ def _fit_current_largesignal(c, cp, ivmap, sink_dc, pol, tnom_c, ref):
     Vo, I = ivmap[op_label][:, 0], ivmap[op_label][:, 1]
     if np.ptp(Vo) <= 0 or Vo.size < 2:
         return None
-    # first-pass output conductance from the I-V slope away from the knee -> rout for _fit_iv.
+    # output conductance g0 (-> rout, the _fit_iv I-V anchor). MIRROR the REPORT GRADE
+    # (report_multiport: rout = 1/|ac_y[0].real|): derive g0 from the AC-admittance DC real
+    # part so the emitted g0 EQUALS the graded g0 (emit==grade). The OLD code used a FULL-SWEEP
+    # I-V chord (Is[-1]-Is[0])/(Vs[-1]-Vs[0]) -- despite the comment, that CROSSES the compliance
+    # turn-off knee (~1.7V) -> ~225x too steep -> 29-37% IVrms baked into the .va while the report
+    # grade reads 0.3-1.2%. Fall back to a POST-KNEE saturation-region chord (the upper half of the
+    # sweep, away from the knee), NOT the full sweep, when no AC admittance is present.
     order = np.argsort(Vo)
     Vs, Is = Vo[order], I[order]
-    dV = Vs[-1] - Vs[0]
-    g0_iv = float((Is[-1] - Is[0]) / dV) if dV != 0 else 0.0
-    rout = 1.0 / max(abs(g0_iv), 1e-12)
+    g0_ac = None
+    if cp.get("y"):                                # lowest-freq admittance real part = DC conductance
+        ylbl = op_label if op_label in cp["y"] else next(iter(cp["y"]))
+        yg = np.asarray(cp["y"][ylbl])
+        if yg.ndim == 2 and yg.shape[0] >= 1 and np.isfinite(yg[0, 1]) and yg[0, 1] != 0:
+            g0_ac = abs(float(yg[0, 1]))
+    if g0_ac is not None and g0_ac > 0:
+        rout = 1.0 / g0_ac
+    else:
+        # no AC admittance -> KNEE-AGNOSTIC chord: fit the slope only over the conducting
+        # SATURATION region (|I| >= 0.5*Iplat), which excludes the collapsed knee tail on
+        # EITHER side (high-side ceiling or low-side NMOS knee), so the slope is the true
+        # output conductance, not the steep knee crossing of the full sweep.
+        Iplat = float(np.median(np.sort(np.abs(Is))[-8:]))
+        sat = np.abs(Is) >= 0.5 * Iplat
+        if int(sat.sum()) >= 2 and np.ptp(Vs[sat]) > 0:
+            g0_iv = float(np.polyfit(Vs[sat], Is[sat], 1)[0])
+        else:
+            dVk = Vs[-1] - Vs[0]
+            g0_iv = float((Is[-1] - Is[0]) / dVk) if dVk != 0 else 0.0
+        rout = 1.0 / max(abs(g0_iv), 1e-12)
     iv = ISR._fit_iv(Vs, Is, vc=float(sink_dc), pol=pol, rout=rout)   # idc/g0/vknee/knee_p
 
     # temp law: Idc at each temp = each curve's fitted OP current (interp at sink_dc).
