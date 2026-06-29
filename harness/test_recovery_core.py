@@ -42,7 +42,7 @@ def test_recovery_off_is_byte_identical(tmp_path):
     res = _tem._real_pmu_fit_result()
     txt = D.emit_pmu_va(res, "PMU_m", tmp_path / "off.va",
                         supply="AVDD1P0", ground="VSS").read_text()
-    for tok in ("_Lreg", "_Rreg", "_Cs", "_Rs", "_nB", "_nD", "_Imax", "_Vcl", "_Gcl",
+    for tok in ("_Lreg", "_Rreg", "_Cs", "_Rs", "_nB", "_nD", "_Imax", "_Vcl", "_Gcl", "_en_ls",
                 "recovery branch", "recovery snubber", "anti-windup"):
         assert tok not in txt, f"unexpected recovery token {tok!r} in default emit"
 
@@ -61,10 +61,11 @@ def test_recovery_on_emits_exactly_the_recovery_cards(tmp_path):
     assert "parameter real VDD0P8_PLL_Rreg = 7.500000e+02" in t_on
     assert "parameter real VDD0P8_PLL_Cs = 2.500000e-11" in t_on
     assert "parameter real VDD0P8_PLL_Rs = 2.000000e+03" in t_on
-    # anti-windup knobs (default values -- not in the manifest dict here)
+    # anti-windup knobs (default values -- not in the manifest dict here) + the large-signal switch
     assert "parameter real VDD0P8_PLL_Imax = 1.500000e-02" in t_on
     assert "parameter real VDD0P8_PLL_Vcl = 3.000000e-01" in t_on
     assert "parameter real VDD0P8_PLL_Gcl = 2.000000e+01" in t_on
+    assert "parameter real VDD0P8_PLL_en_ls = 1" in t_on
     # the slow recovery inductor branch nA->nB
     assert ("I(VDD0P8_PLL_nA, VDD0P8_PLL_nB) <+ idt(V(VDD0P8_PLL_nA, VDD0P8_PLL_nB))/VDD0P8_PLL_Lreg"
             in t_on)
@@ -92,13 +93,16 @@ def test_recovery_composes_with_slew(tmp_path):
     res["voltage"]["pll"]["slew_a"] = 8.5e3
     t = D.emit_pmu_va(res, "PMU_m", tmp_path / "rs.va",
                       supply="AVDD1P0", ground="VSS").read_text()
-    # the slew target is anti-windup clamped to +-Imax (recovery composes with slew on the real PLL)
-    assert ("I(VDD0P8_PLL_nB, VDD0P8_PLL_vrg) <+ slew(max(-VDD0P8_PLL_Imax, "
-            "min(VDD0P8_PLL_Imax, V(VDD0P8_PLL_nB, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra)), "
-            "VDD0P8_PLL_SRa)") in t
+    # the slew target is anti-windup clamped to +-Imax AND gated by en_ls (large-signal switch):
+    # en_ls=1 -> slew (large-signal), en_ls=0 -> the plain resistor (pure LTI).
+    assert ("I(VDD0P8_PLL_nB, VDD0P8_PLL_vrg) <+ (VDD0P8_PLL_en_ls >= 0.5) ? "
+            "slew(max(-VDD0P8_PLL_Imax, min(VDD0P8_PLL_Imax, "
+            "V(VDD0P8_PLL_nB, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra)), VDD0P8_PLL_SRa)"
+            " : V(VDD0P8_PLL_nB, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra;") in t
     # NOT the nA-fed slew (recovery moved the regulation node)
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)" not in t
     assert "parameter real VDD0P8_PLL_Lreg = " in t
+    assert "parameter real VDD0P8_PLL_en_ls = 1" in t
 
 
 def test_recovery_scheduled_path_gated(tmp_path):
@@ -325,3 +329,47 @@ def test_recovery_antiwindup_bounds_harsh_step(tmp_path):
     assert np.all(np.isfinite(v)), "harsh step diverged (non-finite)"
     # firmly inside the rails -- no multi-volt ring (the un-clamped loop hit -4.1V / +2.8V here)
     assert v.min() > -0.05 and v.max() < 1.05, f"harsh step out of bounds [{v.min():.3f},{v.max():.3f}]"
+
+
+def _zout_ac(sr, va, en_ls):
+    """Local-Spectre |Zout(f)| of the emitted recovery rail with the runtime large-signal switch
+    set to en_ls (instance-param override -- the ADE knob)."""
+    scs = (f'simulator lang=spectre\nahdl_include "{va}"\n'
+           f"Xd (AVDD1P0 VDD0P8_PLL 0) PLLR VDD0P8_PLL_en_ls={en_ls}\n"
+           "Vs (AVDD1P0 0) vsource dc=1.0\n"
+           "Cd (VDD0P8_PLL 0) capacitor c=20e-12\n"
+           "Il (VDD0P8_PLL 0) isource dc=0.5e-3 mag=1\n"
+           "ac ac start=10 stop=500e6 dec=10\n")
+    o = sr.run(scs, f"enls_ac_{en_ls}")["ac"]
+    fk = next(k for k in o if k.lower() in ("freq", "hertz", "ac"))
+    vk = next(k for k in o if k.lower() == "vdd0p8_pll")
+    return np.asarray(o[fk], float), np.abs(np.asarray(o[vk], complex))
+
+
+def test_en_ls_switch_ac_identical_and_both_stable(tmp_path):
+    """The runtime en_ls switch toggles ONLY the large-signal branch-A slew. en_ls=1 (large-signal)
+    and en_ls=0 (pure LTI) must give a BIT-IDENTICAL small-signal Zout (the linear network + the
+    deadzone clamp are shared; slew()==identity at AC), and BOTH must stay DC-correct + transient-
+    stable. This is the property that makes en_ls a clean in-ADE A/B knob (no re-emit)."""
+    sr = _spectre()
+    if sr is None:
+        pytest.skip("local Spectre not available")
+    va = str(_emit_recov_rail(tmp_path, recov=True).resolve())
+    f1, z1 = _zout_ac(sr, va, 1)
+    f0, z0 = _zout_ac(sr, va, 0)
+    n = min(len(z1), len(z0))
+    assert n > 10 and np.allclose(z1[:n], z0[:n], rtol=0, atol=1e-9), \
+        "en_ls must not change the small-signal Zout (AC must be identical en_ls=0 vs 1)"
+    # both modes DC-hold at vreg and stay physical on a clean step
+    for en in (1, 0):
+        scs = (f'simulator lang=spectre\nahdl_include "{va}"\n'
+               f"Xd (AVDD1P0 VDD0P8_PLL 0) PLLR VDD0P8_PLL_en_ls={en}\n"
+               "Vs (AVDD1P0 0) vsource dc=1.0\n"
+               "Cd (VDD0P8_PLL 0) capacitor c=20e-12\n"
+               "Il (VDD0P8_PLL 0) isource type=pwl wave=[0 0.5e-3 50e-9 0.5e-3 "
+               "50.1e-9 1e-3 300e-9 1e-3]\n"
+               "tr tran stop=300e-9 step=1e-10 maxstep=1e-10\n")
+        v = np.asarray(sr.run(scs, f"enls_tran_{en}")["tr"]["VDD0P8_PLL"]).real
+        assert np.all(np.isfinite(v)), f"en_ls={en} transient diverged"
+        assert v.min() > -1e-3 and v.max() < 1.0 + 1e-3, f"en_ls={en} out of bounds"
+        assert abs(v[0] - 0.8) < 5e-3, f"en_ls={en} DC setpoint moved ({v[0]:.4f})"

@@ -49,19 +49,27 @@ module ldo_pll(vin, vout, gnd);
   parameter real Imax = 1.50e-02;        // anti-windup: physical reg pass-current limit [A]
   parameter real Vcl  = 3.00e-01;        // anti-windup clamp deadzone half-width [V] (>> real dip)
   parameter real Gcl  = 2.00e+01;        // anti-windup clamp strength [A/V^2] beyond the deadzone
+  parameter real en_ls = 1;              // LARGE-SIGNAL enable: 1 = branch-A slew active (transient-
+                                         // accurate dip); 0 = pure LTI (slew->resistor). The linear
+                                         // Zout (La,Lreg/Rreg/Cs/Rs) AND the safety clamp are shared
+                                         // -> DC/AC/PSRR/noise IDENTICAL either way; only the large-
+                                         // signal transient dip/recovery differs. Toggle in ADE.
   analog begin
     V(vrg, gnd) <+ vreg;
     // branch A: dip inductor (La || Rpl), vout -> nA
     I(vout, nA) <+ idt(V(vout, nA))/La + V(vout, nA)/Rpl;
     // branch A2: slow recovery inductor (Lreg || Rreg), nA -> nB  (lossless at DC)
     I(nA, nB)   <+ idt(V(nA, nB))/Lreg + V(nA, nB)/Rreg;
-    // DC reg resistance, regulation slew-limited, nB -> vrg; target clamped to +-Imax (anti-windup)
-    I(nB, vrg)  <+ slew(max(-Imax, min(Imax, V(nB, vrg)/Ra)), SRa);
+    // DC reg resistance, nB -> vrg. en_ls=1 -> slew-limited + anti-windup clamped (large-signal);
+    // en_ls=0 -> plain resistor (pure LTI). slew()==identity at DC/small-signal either way.
+    I(nB, vrg)  <+ (en_ls >= 0.5) ? slew(max(-Imax, min(Imax, V(nB, vrg)/Ra)), SRa)
+                                  : V(nB, vrg)/Ra;
     // branch D: series Rs + Cs damping snubber (vout -> vrg), AC only
     I(vout, nD) <+ Cs*ddt(V(vout, nD));
     V(nD, vrg)  <+ Rs*I(nD, vrg);
-    // deadzone anti-windup clamp: zero value+slope within +-Vcl of vrg (invisible to dip/AC),
-    // quadratic-soft beyond -> bounds the non-physical tank ring on huge out-of-envelope steps
+    // deadzone anti-windup clamp (ALWAYS on -- shared safety net): zero value+slope within +-Vcl of
+    // vrg (invisible to dip/AC), quadratic-soft beyond -> bounds the tank ring on huge steps (a pure
+    // linear RLC scales with the step, so this keeps even the en_ls=0 LTI case physical).
     I(vout, vrg) <+ (V(vout, vrg) >  Vcl) ?  Gcl*(V(vout, vrg) - Vcl)*(V(vout, vrg) - Vcl)
                   : (V(vout, vrg) < -Vcl) ? -Gcl*(V(vout, vrg) + Vcl)*(V(vout, vrg) + Vcl)
                   : 0.0;

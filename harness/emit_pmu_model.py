@@ -336,6 +336,11 @@ def _recov_param(pre, recov):
         return v if (v > 0 and v < 1e30) else default
     Imax = _ov("Imax", _RECOV_IMAX); Vcl = _ov("Vcl", _RECOV_VCL); Gcl = _ov("Gcl", _RECOV_GCL)
     return [
+        f"parameter real {pre}_en_ls = 1;"
+        f"   // {pre} LARGE-SIGNAL model enable: 1 = branch-A slew active (transient-accurate dip);"
+        f" 0 = pure LTI (slew->resistor). The linear Zout (La, Lreg/Rreg/Cs/Rs) AND the safety clamp"
+        f" are shared, so DC/AC/PSRR/noise are IDENTICAL either way -- only the large-signal"
+        f" load-transient dip/recovery differs. Toggle in ADE, no re-emit.",
         f"parameter real {pre}_Lreg = {Lreg:.6e};"
         f"   // {pre} slow-recovery inductor [H] (overdamped 2nd-order Zout; lossless at DC)",
         f"parameter real {pre}_Rreg = {Rreg:.6e};"
@@ -380,10 +385,11 @@ def _branchA_reg(pre, slew_sr, recov=None):
                      f"    I({pre}_nA, {pre}_nB) <+ idt(V({pre}_nA, {pre}_nB))/{pre}_Lreg"
                      f" + V({pre}_nA, {pre}_nB)/{pre}_Rreg;\n    ")
     if slew_sr and slew_sr > 0 and slew_sr < 1e30:        # gate matches _slew_param (SRa declared)
-        if use_recov:    # anti-windup: clamp the reg target current to +-Imax before slew()
-            reg = (f"I({regnode}, {pre}_vrg) <+ slew(max(-{pre}_Imax, "
-                   f"min({pre}_Imax, V({regnode}, {pre}_vrg)/{pre}_Ra)), {pre}_SRa);"
-                   f"   // R_a regulation, slew-limited, target anti-windup clamped")
+        if use_recov:    # anti-windup clamp on the target + en_ls runtime LTI/large-signal switch
+            reg = (f"I({regnode}, {pre}_vrg) <+ ({pre}_en_ls >= 0.5) ? "
+                   f"slew(max(-{pre}_Imax, min({pre}_Imax, V({regnode}, {pre}_vrg)/{pre}_Ra)), {pre}_SRa)"
+                   f" : V({regnode}, {pre}_vrg)/{pre}_Ra;"
+                   f"   // R_a regulation: en_ls=1 -> slew-limited+clamped (large-signal); 0 -> resistor (LTI)")
         else:
             reg = (f"I({regnode}, {pre}_vrg) <+ slew(V({regnode}, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
                    f"   // R_a regulation, large-signal slew-limited")
@@ -391,12 +397,16 @@ def _branchA_reg(pre, slew_sr, recov=None):
         reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"
     post_lines = ""
     if use_recov:
+        # the deadzone clamp is a SHARED safety net (NOT gated by en_ls): it is zero (value+slope)
+        # in the whole normal envelope -> AC + normal transient identical in BOTH modes, but it
+        # bounds the tank ring on pathological steps even for the pure-LTI (en_ls=0) case (a purely
+        # linear RLC scales with the step -> a 10x step would otherwise ring past the rails).
         post_lines = (f"\n    // recovery snubber: series Rs-Cs (vout->vrg), DC-blocked, kills"
                       f" the post-dip overshoot\n"
                       f"    I({pre}, {pre}_nD) <+ {pre}_Cs*ddt(V({pre}, {pre}_nD));\n"
                       f"    V({pre}_nD, {pre}_vrg) <+ {pre}_Rs*I({pre}_nD, {pre}_vrg);\n"
-                      f"    // deadzone anti-windup clamp: zero value+slope within +-Vcl of vrg"
-                      f" (invisible to dip/AC), bounds the tank ring beyond it\n"
+                      f"    // deadzone anti-windup clamp (always on): zero value+slope within +-Vcl"
+                      f" of vrg (invisible to dip/AC), bounds the tank ring beyond it\n"
                       f"    I({pre}, {pre}_vrg) <+ (V({pre}, {pre}_vrg) >  {pre}_Vcl) ? "
                       f" {pre}_Gcl*(V({pre}, {pre}_vrg) - {pre}_Vcl)*(V({pre}, {pre}_vrg) - {pre}_Vcl)\n"
                       f"                  : (V({pre}, {pre}_vrg) < -{pre}_Vcl) ? "
