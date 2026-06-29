@@ -184,6 +184,41 @@ def test_manifest_recovery_knob_threads_to_emit(tmp_path):
     assert "I(VDD0P8_PLL_nA, VDD0P8_PLL_nB) <+ idt(" in va
 
 
+def test_la_override_threads_to_emit(tmp_path):
+    """m['v_out'][rail]['la_override'] overrides the AC-fit branch-A inductance in the emitted .va
+    (the fit under-estimates La ~5x; the transient recovery needs ~120uH). Pairs with recovery."""
+    npz, m = _tfd._sweep_npz(tmp_path, name="laov")
+    m["v_out"]["pll"]["pin"] = "VDD0P8_PLL"
+    m["v_out"]["pll"]["recovery"] = dict(_RECOV)
+    m["v_out"]["pll"]["la_override"] = 1.20e-4
+    res = FMP.fit_multiport(str(npz), m)
+    # every load's fitted L_a is replaced by the override (definitive, path-independent check)
+    for p in res["voltage"]["pll"]["P"].values():
+        assert p["L_a"] == pytest.approx(1.20e-4)
+    va = D.emit_pmu_va(res, "PMU_laov", tmp_path / "laov.va",
+                       supply="AVDD1P0", ground="VSS").read_text()
+    # the override reaches the emit -- literal "1.200000e-04" (single-load) or the scheduled
+    # exp(ln(La)) form, ln(1.2e-4) = -9.0280 (multi-load). Either way it encodes 1.2e-4.
+    la_lines = [ln for ln in va.splitlines() if "VDD0P8_PLL_La =" in ln]
+    assert la_lines, "no VDD0P8_PLL_La emit line"
+    assert any(("1.200000e-04" in ln) or ("-9.028" in ln) for ln in la_lines), la_lines
+
+
+def test_la_override_absent_keeps_fitted(tmp_path):
+    """No la_override (or an invalid one) -> the fitted L_a is untouched -> byte-identical Zout."""
+    import copy
+    npz, m0 = _tfd._sweep_npz(tmp_path, name="lanoov")
+    res0 = FMP.fit_multiport(str(npz), copy.deepcopy(m0))
+    fitted = {il: p["L_a"] for il, p in res0["voltage"]["pll"]["P"].items()}
+    for bad in (0.0, -1.0, "x", None):
+        m = copy.deepcopy(m0)
+        if bad is not None:
+            m["v_out"]["pll"]["la_override"] = bad
+        res = FMP.fit_multiport(str(npz), m)
+        for il, p in res["voltage"]["pll"]["P"].items():
+            assert p["L_a"] == pytest.approx(fitted[il])
+
+
 def test_manifest_no_recovery_is_byte_identical(tmp_path):
     """No recovery in the manifest (or a partial/invalid one) -> vfit has no recovery -> no cards
     -> byte-identical to the pre-recovery emit."""

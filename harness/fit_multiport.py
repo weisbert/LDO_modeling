@@ -1112,6 +1112,24 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         _rc = _fit_recovery(m["v_out"][o] or {})
         if _rc is not None:
             volt[o]["recovery"] = _rc
+        # OPT-IN La (dip-inductor / low-freq Zout) OVERRIDE. The small-signal AC-Zout fit
+        # under-estimates the effective branch-A inductance ~5x (gives ~24uH; the real load-
+        # transient recovery -- the higher low-freq Zout -- needs ~120uH; proven on the local
+        # replay loop: La=24uH+recovery -> 11mV, La=120uH+recovery -> 2.47mV vs real silicon).
+        # Until the La fit is improved to read the recovery time-constant, m['v_out'][rail]
+        # ['la_override'] (a finite, positive [H]) corrects it. Applied AFTER all per-load
+        # fitting (incl. PSRR, which keeps its already-fit coefficients), so it only reshapes
+        # the emitted branch-A inductor / Zout; absent -> the fitted La is kept (byte-identical).
+        # Mirrors the slew_a / recovery escape-hatch discipline; pairs with the recovery dict.
+        _laov = (m["v_out"][o] or {}).get("la_override")
+        if _laov is not None:
+            try:
+                _laov = float(_laov)
+            except (TypeError, ValueError):
+                _laov = None
+            if _laov is not None and 0 < _laov < 1e30:
+                for _p in volt[o]["P"].values():
+                    _p["L_a"] = _laov
         # carry the designer's GUI symbol pin name (set by build_manifest) so the model
         # cell's PORT is the pin, not our internal role key. Default: the role key itself
         # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).
