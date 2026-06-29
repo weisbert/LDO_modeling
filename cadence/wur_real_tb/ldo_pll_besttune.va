@@ -1,0 +1,27 @@
+`include "constants.vams"
+`include "disciplines.vams"
+module ldo_pll(vin, vout, gnd);
+  inout vin, vout, gnd;
+  electrical vin, vout, gnd, vrg, nA, nC, nbb;
+  parameter real vreg = 8.000000e-01;
+  parameter real Ra   = 9.719499e-02;
+  parameter real La   = 1.20e-04;
+  parameter real Rpl  = 1.602450e+02;
+  parameter real Rb   = 1.0e9;
+  parameter real Lb   = 1.0e-12;
+  parameter real Cout = 1.0e-13;
+  parameter real ESR  = 1.793000e+02;
+  parameter real SRa  = 9.0e3;          // branch-A regulation slew limit [A/s] (en_slew core)
+  analog begin
+    V(vrg, gnd) <+ vreg;
+    // branch C: series Cout + ESR
+    I(vout, nC) <+ Cout*ddt(V(vout, nC));
+    V(nC, vrg)  <+ ESR*I(nC, vrg);
+    // branch B: R_b + L_b (Rb huge -> off)
+    I(vout, nbb) <+ idt(V(vout, nbb))/Lb;
+    V(nbb, vrg)  <+ Rb*I(nbb, vrg);
+    // branch A: (L_a||R_pl) + R_a  -- R_a regulation slew-limited (large-signal undershoot)
+    I(vout, nA) <+ idt(V(vout, nA))/La + V(vout, nA)/Rpl;
+    I(nA, vrg)  <+ slew(V(nA, vrg)/Ra, SRa);
+  end
+endmodule
