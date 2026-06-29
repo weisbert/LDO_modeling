@@ -1,7 +1,72 @@
-# HANDOFF — model the LDO large-signal recovery FROM THE STANDARD FLOW (not real_V)
+# HANDOFF — model the LDO load-transient FROM THE STANDARD FLOW (higher-order LTI Zout)
 
 Single source of truth for the next session. Supersedes HANDOFF_EMIT_BAKE_AND_VCO_RECOVERY.md (Part 0)
 and RETRACTS HANDOFF_DECAP_LTI_RECOVERY.md (its "drop slew, go LTI" conclusion).
+
+## ⭐ RESHAPE 2026-06-29 (LDO EXPERT PANEL, user-accepted) — the body below is PARTLY SUPERSEDED
+A 4-lens LDO expert panel (workflow wc7ni4bva; full report results/redzone/wur_pmu_real_sweep.report.txt's
+sibling — saved in the session transcript) UNANIMOUSLY reshaped the approach. Verdict = RESHAPE (3 reshape +
+1 blocked, adjudicated RESHAPE). Key findings (all data-grounded; experts ran convolutions + local Spectre):
+- The "SS-vs-LS Zout gap" (AC peak ~197 vs transient-needed 374-558) is an **ARTIFACT**, not physics. The
+  measured z_pll is a monotonic rising resistive SHELF (0.095Ω DC → 197Ω plateau @~31.6MHz). The OLD single
+  inductor (La‖Rpl)+Cout structure CANNOT make a rising-then-plateau shelf, so the fitter mislocated the
+  corner to 447kHz and under-represented |Z| in 1-10MHz (where the dip lives). Convolving the MEASURED
+  z_pll(‖20pF) with the clean 0.5→2mA step gives ~164-201mV vs GT 160mV — **the AC-consistent Zout ALREADY
+  reproduces the coverage dip; La=120/558Ω is unnecessary** (558 was just the recovery net's series HF R).
+- The recovery (~60-70ns, constant-τ/linear) IS the closed-loop dominant pole, lives IN the AC band, fittable
+  from a richer AC Zout. SRa slew is NOT load-bearing for PLL (lti_la120 no-slew 2.37mV beat slew 2.47mV).
+- **real_V is very likely a TURN-ON/SETTLING envelope, NOT a load transient**: 88mV dip bottoms where the load
+  is at a local MIN, recovers as load RISES, corr(I,V)=+0.50, clean single-exp τ=39ns. So the prior 2.47mV
+  "match" was an LC-tank overfit of a startup artifact (→ broke AC-consistency, collapsed to 35.5mV held-out).
+  User CANNOT run the DC-held-load mechanism check (off-site) → **real_V is REFERENCE ONLY, not a gate.**
+- **RETIRED as wrong physics:** the slew core, the Lreg‖Rreg recovery network, la_override=120µH, the en_ls
+  gate, the Vcl/Imax/Gcl anti-windup clamp (the deadzone was pinning the clean-step dip at a constant 308mV).
+
+NEW STRUCTURE (building now, workflow wq06g7awt): a SINGLE passive higher-order LTI Zout = a ladder of N
+(L_i‖R_i) rising-shelf sections in series + series Ra (Z_DC=Ra=0.095Ω) + Cout/ESR. DC: inductors short→Ra;
+HF: →Ra+ΣR_i=197Ω plateau; corners R_i/L_i place the multi-decade rise. Passive, convergent, AC-consistent,
+no gating. ONE model owns peak+dip+recovery AND fixes the flagged PSRR non-min-phase (same missing section).
+NEW ACCEPTANCE (user-locked): G1 Zout SHAPE gate (|Z| ±1.5dB @1/10/31MHz + plateau 197±10% + corner located,
+NOT just broadband RMS which hid the 447kHz miss behind 1.9dB); G2 TIME-DOMAIN gate (clean 0.5→2/3/4mA into
+20pF reproduces GT dips 160/227/282mV ±15% + sub-linear + τ~60-90ns); G3 passivity+DC/tran; +PSRR/noise no
+regress. real_V = reference. Scope this run = PROOF on the PLL standalone .va; productionize into
+fit_model/fit_multiport/emit afterward. Build_spec lives in the wq06g7awt synthesis.
+
+## PRODUCTIONIZATION (higher-order Zout into the pipeline) — STEP 1 DONE, STEP 2 = next
+The build (workflow wq06g7awt) proved + emitted `cadence/wur_real_tb/ldo_pll_hiorder.va` (2-section
+(L||R) ladder). KEY refinement of the panel claim, rigorously established (3 fits + Spectre + adversarial
+verify): **G1 (AC Zout) PASSES emphatically** (|Z| <0.27dB @1/10/31MHz, plateau 198.8Ω, corner relocated
+25kHz, 447kHz mislocation GONE), but **G2 (coverage dip) FAILS as a DATA inconsistency**: the AC-correct
+ladder OVER-predicts the step dip ~1.7-2× (245/409/573 vs GT 160/227/282) and is exactly LINEAR vs GT's
+sub-linear/concave (107/91/81 mV/mA). No passive LTI + any decap reconciles (dip needs ~250pF, tau ~20pF).
+=> the AC 197Ω shelf is small-signal loop-Zout; the load-step dip is a SHALLOWER, saturating large-signal
+response (out of passive-LTI scope). real_V (reference) = startup envelope. Plots: cadence/wur_real_tb/
+cmp_{zout,step,dip_vs_di,realv}.png. User decision: PRODUCTIONIZE the AC-correct Zout now; defer the dip
+(needs either a large-signal current-assist term OR a same-temp 55C z_pll re-export to rule out the 25/55C
+confound -- user off-site, can't re-sim/re-export now).
+
+STEP 1 SHIPPED (`940ec01`, additive, zero-regression): `fit_model.zmodel` gained optional `extra` list of
+series (L_i||R_i) branch-A sections (None/[] -> byte-identical); `fit_model.fit_zout_ladder()` gated keep-best
+ladder fit. On z_pll it recovers the build ladder (Ra=0.095, sec1=22.9uH/43, extra=[(4.42uH,155)], 0.22dB).
+Lock `harness/test_zout_ladder.py`; 49 fit_model-dependent tests green. NOT yet wired.
+
+STEP 2 = WIRE the ladder through the pipeline (best as a focused ultracode workflow w/ no-regression verify):
+- `fit_multiport._fit_voltage_output`: call fit_zout_ladder per rail; store `extra` on P[il]; pass `extra=`
+  to every zmodel/psrr/noise/error call (lines ~119/138/172/179/186) so PSRR(=i_c×Zout) + noise(=In×|Zout|)
+  AUTO-reconcile to the richer Zout (re-fit by construction); carry `extra` to emit.
+- thread `extra=None` kwarg through `fit_model`: psrr_model, _shelf, fit_psrr, _za, noise_model_sv,
+  fit_noise_bank, fit_noise_hybrid (all just pass to their internal zmodel/_za; None -> byte-identical).
+- `emit_pmu_model._voltage_body`/`_voltage_block`(+scheduled): emit the extra (L_i||R_i) sections in branch
+  A between nA and the reg node (gated; absent -> byte-identical). Standalone `emit_va`/`fit_all` UNTOUCHED
+  (pass nothing -> crossval byte-identical).
+- VERIFY (acceptance): (a) crossval/standalone byte-identical (extra absent everywhere); (b) on z_pll/z_vco
+  the emitted .va AC |Z| passes G1 (shape gate: peak freq/mag, not just broadband RMS) AND PSRR/noise do NOT
+  regress vs today (0.45/1.22dB pll); (c) local-Spectre DC/tran converge + passive; (d) suites green.
+  NOTE the report Zout grade should be upgraded to a SHAPE gate (peak-freq + per-decade), per the panel
+  (broadband 1.9dB RMS hid the 447kHz/70× mislocation). DROP/ignore the retired slew/recovery/en_ls in emit.
+
+---
+### (ORIGINAL BODY — kept for context; the slew/recovery/guards framing is SUPERSEDED by the RESHAPE above)
 
 ## GOAL (user, verbatim intent)
 Recovery / large-signal params (La, slew SRa, the recovery network) must be MODELED FROM THE STANDARD
