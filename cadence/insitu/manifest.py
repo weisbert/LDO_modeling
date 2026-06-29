@@ -364,6 +364,18 @@ def _validate_coverage(m):
             "coverage.temp_sweep must be 'all' (every measurement at every temp -- PVT-style) "
             "or a list of analysis names (e.g. ['dc']); default re-runs only the temperature-"
             "dependent analyses (the I-V that feeds Idc(T)), small-signal once at the nominal temp")
+    # cdecap: external output decap loaded on the TRANSIENT char only (global coverage.cdecap +
+    # per-rail transient.<o>.cdecap override). Positive number [F] if present; de-embedded at fit
+    # so the model stays decap-free. (AC/noise/I-V are intrinsic -- no decap.)
+    def _chk_cdecap(val, where):
+        if val is None:
+            return
+        if isinstance(val, bool) or not isinstance(val, (int, float)) or not (val > 0):
+            raise ManifestError(f"{where} must be a positive number [F], got {val!r}")
+    _chk_cdecap(cov.get("cdecap"), "coverage.cdecap")
+    for key, entry in (cov.get("transient") or {}).items():
+        if isinstance(entry, dict):
+            _chk_cdecap(entry.get("cdecap"), f"coverage.transient['{key}'].cdecap")
 
 
 def analysis_override(m, role, key, kind):
@@ -498,12 +510,22 @@ def measurements(m):
             if not tspec:
                 continue
             onet = m["v_out"][o]["net"]
+            # output decap loaded on the rail DURING the transient char only (NOT on AC/noise/I-V,
+            # which stay intrinsic). Per-rail transient.<o>.cdecap overrides the global coverage.cdecap.
+            # Purpose: char the load-step recovery in the DEPLOYMENT regime (a real ~pF-nF decap keeps
+            # the LDO in a gentle near-linear regime the behavioral model can fit -- a bare output
+            # crashes into a harsh slew/clamp regime). The decap is EXTERNAL -> de-embedded at fit
+            # (the fit's replay TB carries the same cdecap) so the emitted model stays DECAP-FREE.
+            _cdecap = tspec.get("cdecap")
+            if _cdecap is None:
+                _cdecap = cov.get("cdecap")
             for st in (tspec.get("steps") or []):
                 lbl = st.get("label") or f"{st['from']:g}_{st['to']:g}"
                 M.append(dict(tag=f"tr_{o}_{lbl}", analysis="tran", hot=[("v_out", o)],
                               reads=[("v", onet)], derive="trans", key=f"tr_{o}_{lbl}",
                               save=[("v", onet)], step=st, edge=tspec.get("edge"),
-                              tstop=tspec.get("tstop"), tstep=tspec.get("tstep")))
+                              tstop=tspec.get("tstop"), tstep=tspec.get("tstep"),
+                              cdecap=_cdecap))
 
     # guardrail-4: 2x-amplitude linearity self-check on each Zout point (analysis 'ac', amp=2)
     if (m.get("coverage") or {}).get("lin_gate"):

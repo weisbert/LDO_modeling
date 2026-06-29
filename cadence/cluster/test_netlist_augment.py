@@ -978,5 +978,49 @@ def test_iv_points_only_emits_values_list(tmp_path):
     assert "values=[0.1 0.3 0.5]" in dc
 
 
+# =====================================================================================
+# (N) transient output decap (cdecap): char the load-step recovery in the deployment regime
+# =====================================================================================
+def _cdecap_manifest(global_cd=None, pll_cd=None):
+    """Coverage manifest with a transient step on pll + an optional output decap (global and/or
+    per-rail). Mirrors _resolved_coverage_manifest but parameterizes cdecap."""
+    raw = re.sub(r"<net:([^>]+)>", r"\1", WUR.read_text())
+    d = json.loads(raw)
+    tr = {"pll": {"steps": [{"from": 5e-4, "to": 2e-3, "label": "step1"}],
+                  "edge": 1e-9, "tstop": 1e-5}}
+    if pll_cd is not None:
+        tr["pll"]["cdecap"] = pll_cd
+    cov = {"tier": "T4", "transient": tr}
+    if global_cd is not None:
+        cov["cdecap"] = global_cd
+    d["coverage"] = cov
+    return M.load(_write_tmp(d))
+
+
+def test_transient_cdecap_global_emits_output_decap(tmp_path):
+    m = _cdecap_manifest(global_cd=20e-12)
+    out = tmp_path / "out"
+    gnl = NA.make_offline_group_netlister(_base_dir(tmp_path), m, out)   # base dir built ONCE
+    tr = pathlib.Path(gnl(_group(m, "g_tr_pll_step1")), "input.scs").read_text()
+    ac = pathlib.Path(gnl(_group(m, "g_v_out_pll")), "input.scs").read_text()
+    # a capacitor on the STEPPED rail's net (ground = m['ground']), value = the global cdecap
+    assert f"Cdecap_pll (VDD0P8_PLL {m['ground']}) capacitor c=2e-11" in tr, tr
+    # AC Zout group stays INTRINSIC -- no decap loaded there
+    assert "Cdecap" not in ac, "AC char must stay decap-free (intrinsic Zout)"
+
+
+def test_transient_cdecap_per_rail_overrides_global(tmp_path):
+    m = _cdecap_manifest(global_cd=20e-12, pll_cd=5e-12)
+    txt = _netlist_text(tmp_path, m, "g_tr_pll_step1")
+    assert "Cdecap_pll (VDD0P8_PLL" in txt and "capacitor c=5e-12" in txt, txt
+    assert "c=2e-11" not in txt, "per-rail cdecap must win over the global default"
+
+
+def test_transient_cdecap_absent_is_byte_clean(tmp_path):
+    m = _cdecap_manifest()                              # neither global nor per-rail
+    txt = _netlist_text(tmp_path, m, "g_tr_pll_step1")
+    assert "Cdecap" not in txt, "no cdecap declared -> no decap emitted (byte-clean default)"
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

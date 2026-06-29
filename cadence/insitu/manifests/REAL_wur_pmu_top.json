@@ -80,6 +80,7 @@
   },
   "coverage": {
     "tier": "T4",
+    "cdecap": 2e-11,
     "loads": {
       "pll": {
         "points": [

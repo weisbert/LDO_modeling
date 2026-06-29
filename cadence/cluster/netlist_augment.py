@@ -711,6 +711,7 @@ def make_offline_group_netlister(base_input_scs, m, out_base, op_loads=None, tem
         text, n_stripped = _strip_analyses(base_text)
         inserts = []                                   # (role, key) that fall back to insert
         hot_src = None                                 # the dc-swept source name (dc groups only)
+        cdecap_inst = None                             # output decap line (tran char only; see below)
 
         if analysis in ("ac", "noise"):
             # 2a) REUSE every existing role source: set its mag=acm in place. supplies always
@@ -755,6 +756,17 @@ def make_offline_group_netlister(base_input_scs, m, out_base, op_loads=None, tem
                 raise NetlistAugmentError(
                     f"tran group {group['tag']}: stepped source '{stepped}' is not an instance "
                     f"in the base netlist.")
+            # OUTPUT DECAP (transient char only): load the stepped rail with the deployment decap so
+            # the load-step recovery is characterized in a gentle near-linear regime (a bare output
+            # crashes into a harsh slew/clamp regime that does not model). External -> de-embedded at
+            # fit (same cdecap in the replay) -> the emitted model stays decap-free. AC/noise/I-V do
+            # NOT get it (they stay intrinsic). Emitted into the appended block below via cdecap_inst.
+            cd = group.get("cdecap")
+            if cd is not None:
+                kind, key = group["hot"][0]
+                cdecap_inst = (f"Cdecap_{key} ({m[kind][key]['net']} {ground}) capacitor "
+                               f"c={float(cd):g}   // [offline-netlister] output decap on the "
+                               f"transient char (deployment regime; de-embedded at fit)")
         else:
             raise NetlistAugmentError(
                 f"group {group['tag']}: unknown analysis '{analysis}'.")
@@ -770,6 +782,8 @@ def make_offline_group_netlister(base_input_scs, m, out_base, op_loads=None, tem
             "simulator lang=spectre",          # guard a trailing spice-lang section
             _params_line(m, group),
         ]
+        if cdecap_inst is not None:             # output decap for the transient char (see tran branch)
+            lines.append(cdecap_inst)
         # FALLBACK-INSERT (open pin only, ac/noise path): the old Iext/Vprobe strings -- the ONLY
         # place they survive. v_out isource PLUS=ground MINUS=net (+1A into the out net, mirrors
         # augment); i_out probe vsource PLUS=net MINUS=ground dc=<compliance>; read <probe>:p.
