@@ -85,17 +85,44 @@ device, 1 nF Cout) but **every sign matches** ldo_gt.
 - This is **method verification on synthetic GT**, NOT the deliverable. The real route-A execution is
   per-corner characterization of the actual silicon on the box.
 
-## Next action
-Decision for the user / for a build session — NOT yet built (touches the pipeline → needs the ultracode go):
-1. **Execute route-A** on the real PMU: characterize a SMALL bounding corner set (the screen says
-   SS / hot / min-V bound the optimistic failures; find the interior worst-stability point by a sweep), fit
-   each independently, emit corner-keyed `.lib` SECTIONS (today UN-implemented — emit produces ONE card).
-2. **Make the assist `iaG` (current ceiling) corner-aware first** — it's the one parameter whose
-   TT-blindness is *signed-dangerous* (8.5× hot over-claim). Quick, high-value, ahead of the full section build.
-3. **Add an envelope guard** — corner tag + warn/conservative-fallback on un-characterized corners (the PVT
-   analog of the `floor` seatbelt + the carrier-band envelope), so off-corner sims are loud, not silently-TT.
-4. **(method) clean process axis** on a robustly-biased DUT (or re-bias) to remove the triode caveat; add
-   adaptive freq sampling around the Zout/PSRR peak so high-Q magnitudes aren't lower-bounded.
+## Next action — TOMORROW (manual 3-corner route-A for Friday's report)
+Plan (user, at the desk): ship TT/SS/FF as THREE SEPARATE `.lib`/`.va` files and switch them by Cadence
+corner config by hand. The automated corner-keyed SECTION emit stays a LATER build item (needs ultracode go).
+
+**THE CRUX — re-emit ≠ re-characterize.** The model has ZERO process dependence (METHODOLOGY/DATA §5):
+emitting 3× from the SAME npz gives 3 BYTE-IDENTICAL files. Three real corner models REQUIRE three separate
+CHARACTERIZATIONS at FF/TT/SS (3 npz from 3 box corner runs). ⇒ the long pole is whether FF/SS box
+characterization data EXISTS. If only TT/nominal has been characterized, the FF/SS ALPS/Donau corner runs
+must happen first — that, not the fit/emit, is the Friday risk. (Fallback if box data isn't ready: the LOCAL
+synthetic 3-corner flow built tonight (`research/pvt_modeling/`) can demo the 3-`.lib`+config-switch MECHANISM
+end-to-end for the slides, clearly labelled as synthetic.)
+
+Steps:
+0. **Verify the TT model runs** (the Friday baseline) — verified CLIs:
+   - fit (+emit VA per output): `python -m harness.fit_multiport --variant <tt_npz_stem>
+     --manifest cadence/insitu/manifests/REAL_wur_pmu_top.json --emit`
+   - PMU `.va`: `python -m harness.emit_pmu_model --variant <tt_npz_stem> --manifest <same> --out model/PMU_model_tt.va`
+   - sanity: local-Spectre parse-gate (`cadence/spectre_run.available()` → True) + `python harness/score.py --variant <stem>`.
+1. **Characterize FF & SS** — re-run the in-situ corner flow at each process corner. The flow is ALREADY
+   corner-aware (output lands in `<corner>/` dirs — cf. the existing `work/.../tt_25c/` layout;
+   `cadence/insitu/pmu_corner.py` + `cadence/cluster/run_corner.py` take the PDK corner / `pdk_model_dir`).
+   → `ff_*` and `ss_*` npz.
+2. **Fit+emit per corner** → `model/PMU_model_{tt,ss,ff}.va` (same manifest, different `--variant`/`--out`).
+3. **Config switch** — wire the 3 cards to the Cadence corner setup by hand.
+
+**Report caveats to carry onto the slides:**
+- Each card is BAKED at its fit OP → it does NOT track `vreg`/load WITHIN a corner (tonight's sharpest
+  finding). If a demo changes the rail setpoint, the card won't follow — present at the fit OP or note it.
+- Tonight's evidence is synthetic-toy METHOD verification: the optimism DIRECTION is solid; the HOT
+  magnitudes are toy-inflated (un-bandgap bias). Frame accordingly.
+
+## Later (build, needs the ultracode go) — the proper route-A
+1. **Automated corner-keyed `.lib` SECTIONS** emit (today UN-implemented — emit produces ONE card).
+2. **Corner-aware assist `iaG`** first — the one signed-dangerous param (hot over-claim; magnitude toy-capped).
+3. **`vreg`-continuous headroom dependence** — let ceiling/stability/PSRR track the exposed `vreg` knob
+   (headroom = Vin−vreg) continuously, like the PTAT i(T) exception, so the knob is meaningful WITHIN a corner.
+4. **Envelope guard** — corner tag + warn/conservative-fallback on un-characterized corners (PVT analog of
+   the `floor` seatbelt). And (method) a clean process axis on a robust DUT + adaptive freq sampling at the peak.
 
 ## Checklist
 - [x] Confirm local GT is transistor-level & skewable (BSIM3 Vth0/U0/Tox) — yes, all `ground_truth/*.lib`
