@@ -143,7 +143,7 @@ def _schedule_loads(vfit, P):
     return sl
 
 
-def _voltage_block(o, vfit, supply, ground):
+def _voltage_block(o, vfit, supply, ground, role=None):
     """Render the Verilog-A statements + node/var declarations for ONE voltage rail.
     Reuses the EXACT contribution structure of fit_model.emit_va, namespaced by `<o>_`.
 
@@ -162,8 +162,12 @@ def _voltage_block(o, vfit, supply, ground):
     cft = float(vfit.get("cft", 0.0))      # gated vin->vout feedthrough cap (0.0 -> not emitted)
     slew_a = float(vfit.get("slew_a", 0.0) or 0.0)   # branch-A regulation slew limit (0 -> not emitted)
     recov = vfit.get("recovery")           # gated overdamped 2nd-order Zout (None -> not emitted)
+    role = role or o                       # short user-facing name for the exposed vreg (minimal emit)
+    minimal = bool(vfit.get("minimal"))    # MINIMAL emit: single-OP, expose ONLY vreg (no iload/slew)
+    if minimal:
+        slew_a, recov = 0.0, None          # minimal -> no large-signal junk regardless of stale fields
     sched = _schedule_loads(vfit, P)
-    if sched:
+    if sched and not minimal:              # minimal forces the single-OP literal path (no iload param)
         return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft, slew_a, recov)
     il = _nom_corner(P)
     p = P[il]
@@ -198,9 +202,17 @@ def _voltage_block(o, vfit, supply, ground):
     # the real load regulation (and the real DC level, not the 0.8 target). The single-OP default
     # (no transient) is byte-identical. (Mutually exclusive with the full multi-load AC schedule
     # above, which already load-schedules vreg from per-corner AC fits.)
-    vreg_sched = vfit.get("vreg_sched")
+    vreg_sched = None if minimal else vfit.get("vreg_sched")
     vreg_rvars, vreg_asg = [], []
-    if vreg_sched:
+    if minimal:
+        # MINIMAL: expose the rail's regulated output voltage as the ONLY CDF parameter (short name
+        # vreg_<role>); no iload. The internal {pre}_vreg var is assigned from the param so the
+        # contribution body is unchanged.
+        vreg_hdr = (f"parameter real vreg_{role} = {vreg:.6e};"
+                    f"   // {o} regulated output voltage [V] (the only user parameter)")
+        vreg_rvars = [f"{pre}_vreg"]
+        vreg_asg = [f"{pre}_vreg = vreg_{role};"]
+    elif vreg_sched:
         vcur = [float(x) for x in vreg_sched["currents"]]
         vval = [float(x) for x in vreg_sched["vregs"]]
         vnom = float(vreg_sched["i_nom"])
@@ -997,7 +1009,7 @@ def emit_pmu_va(fit_result, cell_name, va_path, supply="AVDD1P0", ground="VSS",
 
     # pass the PIN name (port) as the block's `o` -- it is used as BOTH the port reference
     # and the internal node namespace prefix; pin names are unique + valid VA identifiers.
-    vblocks = [_voltage_block(port, voltage[rk], supply, g)
+    vblocks = [_voltage_block(port, voltage[rk], supply, g, role=rk)
                for rk, port, g in zip(v_keys, v_outs, v_gnd)]
     cblocks = [_current_block(port, r, supply, g) for port, r, g in zip(i_outs, crows, i_gnd)]
 

@@ -1191,6 +1191,11 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
             if _laov is not None and 0 < _laov < 1e30:
                 for _p in volt[o]["P"].values():
                     _p["L_a"] = _laov
+        # MINIMAL emit opt-in: m['v_out'][rail]['minimal']=true -> bake the rail at its nominal OP
+        # and expose ONLY the regulated voltage (parameter vreg_<rail>); no iload schedule / slew /
+        # recovery params (the designer drives the load externally). Absent -> byte-identical.
+        if (m["v_out"][o] or {}).get("minimal"):
+            volt[o]["minimal"] = True
         # carry the designer's GUI symbol pin name (set by build_manifest) so the model
         # cell's PORT is the pin, not our internal role key. Default: the role key itself
         # (the stand-in manifest carries no 'pin', so it stays 'pll'/'vco' etc.).

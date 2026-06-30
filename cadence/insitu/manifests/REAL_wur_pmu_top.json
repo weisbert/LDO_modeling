@@ -25,13 +25,15 @@
       "net": "<net:VDD0P8_PLL>",
       "pin": "VDD0P8_PLL",
       "iload": 0.0005,
-      "src": "Iload_pll"
+      "src": "Iload_pll",
+      "minimal": true
     },
     "vco": {
       "net": "<net:VDD0P8_VCO>",
       "pin": "VDD0P8_VCO",
       "iload": 0.002,
-      "src": "Iload_vco"
+      "src": "Iload_vco",
+      "minimal": true
     }
   },
   "i_out": {
