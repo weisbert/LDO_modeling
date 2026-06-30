@@ -110,3 +110,22 @@ def test_derive_iassist_accepts_pathlib_path():
     nom = lambda P: list(P)[len(P) // 2]                     # noqa: E731
     src = F.derive_iassist(fr["voltage"], NPZ_TR, m, nom_corner=nom)
     assert src == {"pll": "fit", "vco": "fit"}, src
+
+
+@pytest.mark.skipif(not (NPZ_TR.exists() and NPZ_AC.exists() and MAN.exists()),
+                    reason="real WuR npz/manifest absent")
+def test_derive_iassist_carries_manifest_floor_onto_derived():
+    """The deep backstop floor is a manifest knob INDEPENDENT of the iaG/iaV derivation. The derived
+    dict carries only iaG/iaV, so floor/gfloor must be merged onto it -- else a manifest floor would
+    only ever reach the seed path, and the DEPLOYED model derives (tr_* present), so it would never
+    see the floor. The shipped REAL manifest enables floor=0.0."""
+    import fit_multiport as FMP
+    m = json.loads(MAN.read_text())
+    assert m["v_out"]["pll"]["iassist"].get("floor") == 0.0   # shipped manifest: backstop ON
+    fr = FMP.fit_multiport(str(NPZ_AC), m)
+    nom = lambda P: list(P)[len(P) // 2]                       # noqa: E731
+    src = F.derive_iassist(fr["voltage"], NPZ_TR, m, nom_corner=nom)   # tr_* present -> DERIVE
+    assert src == {"pll": "fit", "vco": "fit"}, src
+    assert fr["voltage"]["pll"]["iassist"]["floor"] == 0.0     # floor carried onto the DERIVED assist
+    assert fr["voltage"]["vco"]["iassist"]["floor"] == 0.0
+    assert fr["voltage"]["pll"]["iassist"]["iaG"] != pytest.approx(2.8e-3)  # iaG is DERIVED, not the seed

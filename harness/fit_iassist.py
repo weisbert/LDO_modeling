@@ -186,6 +186,21 @@ def _seed(vmf):
     if not (0.0 < g < 1e30 and 0.0 < v < 1e30):
         return None
     out = {"iaG": g, "iaV": v}
+    out.update(_manifest_floor(vmf))
+    return out
+
+
+def _manifest_floor(vmf):
+    """{floor[, gfloor]} from a manifest rail's iassist -- the DEEP backstop knob, INDEPENDENT of
+    whether iaG/iaV were derived or seeded. The DERIVED assist carries only iaG/iaV, so this must be
+    merged onto it too (else a manifest `floor` only ever reaches the seed/legacy path). Empty dict
+    when absent/invalid."""
+    if not isinstance(vmf, dict):
+        return {}
+    ia = vmf.get("iassist")
+    if not isinstance(ia, dict):
+        return {}
+    out = {}
     for k in ("floor", "gfloor"):
         if k in ia:
             try:
@@ -230,6 +245,10 @@ def derive_iassist(volt, npz, manifest, *, nom_corner):
         ia = derived or seed
         if ia is None:
             src[o] = "none"; continue
+        # the deep backstop floor is a manifest knob independent of iaG/iaV derivation; the
+        # DERIVED dict carries only iaG/iaV, so merge floor/gfloor from the manifest onto it
+        # (the seed path already includes them; this is idempotent there).
+        ia.update(_manifest_floor((manifest.get("v_out", {}) or {}).get(o) or {}))
         if floor_default is not None:
             ia.setdefault("floor", floor_default)
         volt[o]["iassist"] = ia
