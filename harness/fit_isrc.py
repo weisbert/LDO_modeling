@@ -16,6 +16,7 @@ Model per current port  (I_pin = current delivered at `out`, fn of Vo, Vdd, T):
 
 Returns a flat param dict consumed by emit_isrc.emit_isrc.
 """
+import os
 import sys
 import pathlib
 
@@ -272,12 +273,19 @@ def _fit_admittance(f, Y, g0):
 
     cp0 = max(cp_hf, 1e-18)
     best = None
+    # Deploy SMOKE fast-path (LDO_NOISE_FAST, set by deploy/update.sh only): thin the 4x4 multistart
+    # grid + cap max_nfev -- the full grid x 9 sinks is a top `bash apply` cost. UNSET (pytest / CI /
+    # the real box extraction) -> full grid, byte-identical fit.
+    _fast = bool(os.environ.get("LDO_NOISE_FAST"))
+    _fzs = (1e4, 1e6) if _fast else (1e3, 1e4, 1e5, 1e6)         # zero-corner starts
+    _seps = (3.0, 30.0) if _fast else (3.0, 10.0, 30.0, 100.0)   # zero->pole spacing starts
+    _nfev = 1000 if _fast else 4000
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
-        for fz in (1e3, 1e4, 1e5, 1e6):                 # multi-start over the zero corner
-            for sep in (3.0, 10.0, 30.0, 100.0):        # ...and the zero->pole spacing
+        for fz in _fzs:                                 # multi-start over the zero corner
+            for sep in _seps:                           # ...and the zero->pole spacing
                 x0 = [np.log(2 * np.pi * fz), np.log(sep), np.log(cp0)]
                 try:
-                    s = least_squares(_resid, x0, method="lm", max_nfev=4000)
+                    s = least_squares(_resid, x0, method="lm", max_nfev=_nfev)
                 except Exception:
                     continue
                 db = _y_rms_db(_model(s.x), Y)

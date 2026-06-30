@@ -127,20 +127,26 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
             # cft/d2/slew/admittance-zero. PSRR(=i_c*Zout)+noise(=In*|Zout|) auto-reconcile to the
             # richer Zout because `extra` is threaded into every per-corner fit/score call below.
             extra_il = []
-            try:
-                Ra2, La2, Rpl2, ex2, _ = FM.fit_zout_ladder(fz, Z)
-            except Exception:                          # noqa: BLE001 -- ladder is opportunistic
-                ex2 = []
-            if ex2:                                    # the ladder fitter adopted N>=2 sections
-                def _magrms(za, ex):
-                    zm = FM.zmodel(fz, *za, extra=ex)
-                    return float(np.sqrt(np.mean(
-                        (20 * np.log10(np.abs(zm) / np.abs(Z))) ** 2)))
-                rms_single = _magrms((R_a, L_a, R_pl, R_b, L_b), None)
-                rms_ladder = _magrms((Ra2, La2, Rpl2, 1e9, 1e-12), ex2)
-                if rms_ladder <= rms_single - 0.3:
-                    R_a, L_a, R_pl, R_b, L_b = Ra2, La2, Rpl2, 1e9, 1e-12
-                    extra_il = ex2
+            # PERF GATE: the (L||R) ladder ONLY refines a rising-shelf Zout (its purpose). Skip the
+            # expensive multistart least_squares on RESONANT corners -- a rising-shelf ladder can
+            # never beat a resonant fit by the >=0.3dB adopt margin there, so it would be pure wasted
+            # compute (the `bash apply` smoke ran fit_zout_ladder 23x on synthetic refs -> ~48s).
+            # _is_shelf is a cheap pure-numpy shape check; the WuR pll/vco ARE shelves -> still fire.
+            if FM._is_shelf(fz, Z):
+                try:
+                    Ra2, La2, Rpl2, ex2, _ = FM.fit_zout_ladder(fz, Z)
+                except Exception:                      # noqa: BLE001 -- ladder is opportunistic
+                    ex2 = []
+                if ex2:                                # the ladder fitter adopted N>=2 sections
+                    def _magrms(za, ex):
+                        zm = FM.zmodel(fz, *za, extra=ex)
+                        return float(np.sqrt(np.mean(
+                            (20 * np.log10(np.abs(zm) / np.abs(Z))) ** 2)))
+                    rms_single = _magrms((R_a, L_a, R_pl, R_b, L_b), None)
+                    rms_ladder = _magrms((Ra2, La2, Rpl2, 1e9, 1e-12), ex2)
+                    if rms_ladder <= rms_single - 0.3:
+                        R_a, L_a, R_pl, R_b, L_b = Ra2, La2, Rpl2, 1e9, 1e-12
+                        extra_il = ex2
             zfits[il] = (R_a, L_a, R_pl, R_b, L_b)
             # iv = the rail's REAL current at this label. Priority: meta_iload_<o>[label]
             # (the in-situ truth, set by the sweep) -> a parseable numeric label (legacy

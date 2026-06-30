@@ -416,6 +416,15 @@ def fit_zout_ladder(f, Z, n_max=3, gain_db=0.3):
     R0 = float(mag[0]); plateau = float(np.median(mag[f >= 0.5 * f[-1]]))
     lo, hi = f[0], f[-1]
     Lmin = 1.0 / (TWO_PI * hi * 3) * (R0 / 100.0 + 1e-9)   # loose physical bounds (not binding)
+    # Deploy SMOKE fast-path (LDO_NOISE_FAST, set by deploy/update.sh only): cap the ladder's
+    # multistart + least_squares budget -- the full 3-multistart x max_nfev=6000 x n_max is the
+    # dominant `bash apply` cost on synthetic refs. UNSET (pytest / CI / the real box extraction) ->
+    # full budget, byte-identical fit.
+    _fast = bool(os.environ.get("LDO_NOISE_FAST"))
+    _jits = (1.0,) if _fast else (1.0, 0.3, 3.0)
+    _nfev = 1200 if _fast else 6000
+    if _fast:
+        n_max = min(n_max, 2)
 
     def zladder(p):                                  # p = [lnRa, lnL1,lnR1, lnL2,lnR2, ...]
         s = 1j * TWO_PI * f
@@ -440,12 +449,12 @@ def fit_zout_ladder(f, Z, n_max=3, gain_db=0.3):
         lob = [np.log(R0 / 10)] + [np.log(1e-12), np.log(R0 / 50)] * n
         hib = [np.log(max(R0 * 10, 1e-2))] + [np.log(1e-1), np.log(plateau * 5 + 1)] * n
         best = None
-        for jit in (1.0, 0.3, 3.0):                  # a few multistarts on the corner spread
+        for jit in _jits:                            # a few multistarts on the corner spread
             pp = list(p0)
             for k in range(1, len(pp), 2):
                 pp[k] += np.log(jit)
             try:
-                ss = least_squares(resid, pp, method="trf", bounds=(lob, hib), max_nfev=6000)
+                ss = least_squares(resid, pp, method="trf", bounds=(lob, hib), max_nfev=_nfev)
             except Exception:                        # noqa: BLE001
                 continue
             e = float(np.sqrt(np.mean(ss.fun ** 2))) * (20.0 / np.log(10))   # dB-RMS
