@@ -166,6 +166,9 @@ def _voltage_block(o, vfit, supply, ground, role=None):
     minimal = bool(vfit.get("minimal"))    # MINIMAL emit: single-OP, expose ONLY vreg (no iload/slew)
     if minimal:
         slew_a, recov = 0.0, None          # minimal -> no large-signal junk regardless of stale fields
+    ia = vfit.get("iassist")               # compressive large-signal current-assist (None -> not emitted).
+    # INTERNAL physics (baked localparams) -> survives minimal: minimal minimizes the SCHEMATIC
+    # parameter set, NOT the internal model -- so the assist is NOT stripped above with slew/recov.
     sched = _schedule_loads(vfit, P)
     if sched and not minimal:              # minimal forces the single-OP literal path (no iload param)
         return _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft, slew_a, recov)
@@ -232,7 +235,7 @@ def _voltage_block(o, vfit, supply, ground, role=None):
                     f"   // {o} regulated output target [V] (BAKED; edit here to retune)")
     rvars = rvars + vreg_rvars
     Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a)
-        + _recov_param(pre, recov) + [   # Cn = noise-corner caps (localparam)
+        + _recov_param(pre, recov) + _iassist_param(pre, ia) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
@@ -261,7 +264,7 @@ def _voltage_block(o, vfit, supply, ground, role=None):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra, iassist=ia)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
@@ -517,7 +520,104 @@ def _cft_body(o, supply, cft):
     return ""
 
 
-def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None, extra=None):
+# --------------------------------------------------- compressive large-signal current-assist
+# The per-rail LTI Zout (branches A/B/C) is fit to the SMALL-SIGNAL output impedance; a load-step
+# dip = di * Z_transient is therefore LINEAR in di. The real LDO loop is NOT linear: as the
+# regulation error verr=vreg-vout grows, the error amp drives the pass device harder and it
+# sources MORE current (class-AB-like), so the measured dip is SUB-linear / STIFFENING (silicon
+# z_pll: linear model 163.6 mV/mA vs GT 107/91/81; over-predict 245/409/573 vs GT 160/227/282).
+# The current-assist adds exactly this missing large-signal physics: a compressive current
+#     i_assist(verr) = iaG * tanh( verr*|verr| / iaV^2 )      (verr = V(vrg,o) = vreg - vout)
+# injected in PARALLEL with the regulation, into the vrg reference. It is ODD (symmetric for
+# over/undershoot) and has f'(0)=0 EXACTLY (the |verr| factor) -> ZERO small-signal conductance
+# at the OP -> Zout/PSRR/noise (every DC+AC analysis) are BIT-IDENTICAL; it engages only large-
+# signal and SATURATES at iaG, so the modeled dip goes sub-linear like the GT. The two params are
+# fit Spectre-in-loop against the GT load-step dips (held-out across amplitudes). BAKED localparams
+# (NOT CDF): it is a FITTED, INTERNAL value -- minimal-emit minimizes the SCHEMATIC parameter set,
+# NOT the internal physics, so the assist is emitted even in minimal mode (unlike the retired
+# slew/recovery). Each helper returns nothing when the assist is absent -> byte-identical emit.
+def _iassist_ok(ia):
+    """True iff a current-assist param dict is present + valid: iaG (max assist current [A]) and
+    iaV (engage scale [V]) both finite + strictly positive. Same opt-in gate as cft/slew/recov."""
+    if not ia:
+        return False
+    try:
+        g = float(ia.get("iaG", 0.0)); v = float(ia.get("iaV", 0.0))
+    except (TypeError, ValueError):
+        return False
+    return 0.0 < g < 1e30 and 0.0 < v < 1e30
+
+
+def _iassist_param(pre, ia):
+    """Per-rail compressive current-assist localparam lines (BAKED -- a fitted value, so a re-emit
+    always takes effect; INTERNAL, never a CDF/schematic parameter). Empty list when absent ->
+    byte-identical header. The deep out-of-envelope backstop floor (optional `floor`/`gfloor`) is
+    emitted alongside ONLY when `floor` is set -> off by default."""
+    if not _iassist_ok(ia):
+        return []
+    g = float(ia["iaG"]); v = float(ia["iaV"])
+    out = [
+        f"localparam real {pre}_iaG = {g:.6e};"
+        f"   // {pre} compressive load-transient current-assist: max assist current [A] (class-AB"
+        f" loop stiffening; BAKED, internal -- f'(0)=0 so AC/PSRR/noise are unchanged)",
+        f"localparam real {pre}_iaV = {v:.6e};"
+        f"   // {pre} current-assist engage scale [V] (BAKED, internal)",
+    ]
+    if _iassist_floor(ia) is not None:
+        fl, gf = _iassist_floor(ia)
+        out += [
+            f"localparam real {pre}_iaFloor = {fl:.6e};"
+            f"   // {pre} DEEP out-of-envelope backstop floor [V] (rail never driven below this in a"
+            f" system sim; ZERO value+slope above it -> invisible in the validated regime, BAKED)",
+            f"localparam real {pre}_iaGfloor = {gf:.6e};"
+            f"   // {pre} backstop floor stiffness [A/V^2] (BAKED, internal)",
+        ]
+    return out
+
+
+def _iassist_floor(ia):
+    """(floor_V, gfloor) when a deep backstop floor is requested (ia['floor'] finite, 0<=floor<vreg
+    range, gfloor>0), else None. Default stiffness 2e3 A/V^2. The floor is a SEPARATE, optional,
+    far-out-of-envelope guard (not the dip-shaping assist) -- off unless explicitly enabled."""
+    if not ia:
+        return None
+    fl = ia.get("floor")
+    if fl is None:
+        return None
+    try:
+        fl = float(fl); gf = float(ia.get("gfloor", 2.0e3))
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= fl < 1e30 and 0.0 < gf < 1e30):
+        return None
+    return (fl, gf)
+
+
+def _iassist_body(o, ground, ia):
+    """Compressive current-assist (+ optional deep backstop floor) contribution lines. Empty string
+    when absent -> byte-identical body. The assist holds the rail up on a load-step dip and
+    saturates at iaG (the missing class-AB physics); the floor (if enabled) is a one-sided ground-
+    referenced clamp that sources current ONLY when the rail is driven below `iaFloor` (zero value
+    AND slope above it -> invisible to DC/AC/the validated transient regime), guaranteeing a system
+    sim never sees a non-physical negative rail far outside VALID_LOAD where the saturated assist
+    can no longer hold."""
+    if not _iassist_ok(ia):
+        return ""
+    s = (f"\n\n    // ---- compressive large-signal current-assist (class-AB loop stiffening;"
+         f" f'(0)=0 -> AC/PSRR/noise bit-identical) ----"
+         f"\n    I({o}, {o}_vrg) <+ -{o}_iaG*tanh( V({o}_vrg,{o})*abs(V({o}_vrg,{o}))"
+         f" / ({o}_iaV*{o}_iaV) );")
+    if _iassist_floor(ia) is not None:
+        s += (f"\n    // deep out-of-envelope backstop: source current only below the floor"
+              f" (zero value+slope above -> invisible in the validated regime)"
+              f"\n    I({o}, {ground}) <+ (V({o},{ground}) < {o}_iaFloor)"
+              f" ? -{o}_iaGfloor*({o}_iaFloor - V({o},{ground}))*({o}_iaFloor - V({o},{ground}))"
+              f" : 0.0;")
+    return s
+
+
+def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None, extra=None,
+                  iassist=None):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
     scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
     between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
@@ -575,7 +675,7 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, reco
     I({supply}, {pre}_ncs1) <+ V({supply}, {pre}_ncs1)/{pre}_Rpc;
     I({pre}_ncs1, {pre}_ncs2) <+ idt(V({pre}_ncs1, {pre}_ncs2))/{pre}_Lpc;
     I({pre}_ncs2, {pre}_vrf) <+ {pre}_Cpc*ddt(V({pre}_ncs2, {pre}_vrf));
-    I({o}, {ground}) <+ -({pre}_pcb0*V({pre}_ncs2, {pre}_vrf) + {pre}_gqb1*V({supply}, {pre}_ncs1));{_cft_body(o, supply, cft)}
+    I({o}, {ground}) <+ -({pre}_pcb0*V({pre}_ncs2, {pre}_vrf) + {pre}_gqb1*V({supply}, {pre}_ncs1));{_cft_body(o, supply, cft)}{_iassist_body(o, ground, iassist)}
 """
 
 
@@ -589,6 +689,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
     machinery via _sched_expr (deg<=2 poly through the corners + the same envelope clamp)."""
     pre = o
     P = vfit["P"]
+    ia = vfit.get("iassist")               # compressive current-assist (internal physics; None -> off)
     # higher-order branch-A ladder: BAKE the NOMINAL corner's extra as load-INDEPENDENT
     # literals (a variable-length list cannot be scheduled across corners). The real pll/vco
     # Zout is effectively single-corner (the digest carries small-signal at the nominal load),
@@ -633,7 +734,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
     Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
         f"\n  {ln}" for ln in _cft_param(pre, cft) + _slew_param(pre, slew_a)
-        + _recov_param(pre, recov)) + "".join(
+        + _recov_param(pre, recov) + _iassist_param(pre, ia)) + "".join(
         f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
@@ -664,7 +765,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra, iassist=ia)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
                 scheduled=True, valid_load=(ilo, ihi))
 

@@ -14,9 +14,10 @@
 - **[minor] One PSRR/Zout model order per variant** (or AIC/BIC); relabel the "decoupled" noise + score Sv vs GT end-to-end.
 
 ## Large-signal step / load (see thread: large-signal-recovery)
-- **PART2 compressive branch-A current-assist** — the right fix for the GT sub-linear stiffening dip; buildable now, awaiting user scope decision.
+- ~~**PART2 compressive branch-A current-assist**~~ — **DONE** (PLL+VCO; `emit_pmu_model._iassist_*`, `fit_multiport._fit_iassist`, manifest override, `test_iassist_core.py`). Fixes the FF "trans negative" bug; AC bit-identical.
+- ~~**B5 guarded transient fit on the VCO**~~ — **DONE** with PART2 (iaG=4.0 mA, iaV=0.22 V; rms 0.9 mV vs GT).
+- **(optional) T55 z_pll re-export** — kills the ~×0.65 T-confound the assist gain currently absorbs (AC z=tt_25c vs step GT=tt_55c).
 - **PART3 / 88 mV cold-start** — OUT OF LOCAL SCOPE; needs a box turn-on/EN characterization.
-- **B5 guarded transient fit on the VCO** once it works on PLL.
 - **R1 de-hardcode large-signal step magnitudes** (trans_big=1mA/trans_slew=5mA) → profile-driven fractions of imax (2 places must agree: gen_reference GT + score re-sim).
 - A same-temp 55°C z_pll re-export to rule out the 25/55°C confound on the dip.
 

@@ -26,14 +26,18 @@
       "pin": "VDD0P8_PLL",
       "iload": 0.0005,
       "src": "Iload_pll",
-      "minimal": true
+      "minimal": true,
+      "iassist": {"iaG": 2.8e-3, "iaV": 0.33,
+                  "_note": "compressive class-AB load-transient assist; f'(0)=0 -> AC/PSRR/noise bit-identical. These iaG/iaV are a SEED/FALLBACK: fit_multiport DERIVES them PURE-PYTHON from the coverage.transient GT (harness/fit_iassist.derive_iassist -- an ODE predict_dip, NO simulator) whenever the npz carries the tr_* waveforms; the seed is used only when the npz has no coverage.transient (legacy/single-OP). To add a deep out-of-envelope backstop (rail never negative when the assist saturates far past VALID_LOAD), add e.g. \"floor\": 0.2 here (currently OFF)."}
     },
     "vco": {
       "net": "<net:VDD0P8_VCO>",
       "pin": "VDD0P8_VCO",
       "iload": 0.002,
       "src": "Iload_vco",
-      "minimal": true
+      "minimal": true,
+      "iassist": {"iaG": 4.0e-3, "iaV": 0.22,
+                  "_note": "compressive class-AB load-transient assist; f'(0)=0 -> AC/PSRR/noise bit-identical. SEED/FALLBACK only: fit_multiport DERIVES iaG/iaV PURE-PYTHON from the coverage.transient GT (harness/fit_iassist, ODE -- no simulator) when tr_* are in the npz. NOTE the 2 params are partly degenerate (a valley matches the same dips) -- the dip SHAPE is determined, not the exact split. Backstop floor OFF; add \"floor\": 0.2 to re-enable."}
     }
   },
   "i_out": {

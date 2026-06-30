@@ -1179,6 +1179,8 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         _rc = _fit_recovery(m["v_out"][o] or {})
         if _rc is not None:
             volt[o]["recovery"] = _rc
+        # (the compressive current-assist is DERIVED below, AFTER the whole volt loop, by the pure-
+        # Python fit_iassist.derive_iassist -- it needs the fitted Zout + the coverage.transient GT.)
         # OPT-IN La (dip-inductor / low-freq Zout) OVERRIDE. The small-signal AC-Zout fit
         # under-estimates the effective branch-A inductance ~5x (gives ~24uH; the real load-
         # transient recovery -- the higher low-freq Zout -- needs ~120uH; proven on the local
@@ -1210,6 +1212,18 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         sched_meta[o] = dict(labels=list(sl),
                              currents=[float(volt[o]["P"][il]["iv"]) for il in sl])
         _log_voltage_summary(o, volt[o])
+    # compressive current-assist: DERIVE each rail's (iaG, iaV) from the coverage.transient GT
+    # (pure-Python predict_dip ODE -- NO simulator), else fall back to the manifest seed. The large-
+    # signal closure of the LTI fit, folded into THE fit: it consumes the tr_* dips ALREADY in the
+    # npz (the first ALPS/Donau run), so there is no second simulation. f'(0)=0 -> AC/PSRR/noise
+    # bit-identical; absent GT + absent seed -> not attached (byte-identical).
+    try:
+        import fit_iassist as _iaf
+        _iasrc = _iaf.derive_iassist(volt, npz_path, m, nom_corner=lambda P: list(P)[len(P) // 2])
+        if any(v != "none" for v in _iasrc.values()):
+            print("[fit] current-assist: " + ", ".join(f"{k}={v}" for k, v in _iasrc.items()))
+    except Exception as _e:                            # noqa: BLE001 -- a fit miss must never break emit
+        print(f"[fit] current-assist: SKIP ({_e})")
     # nominal temp the Idc(T) fit references: middle of the manifest temps, else 55.
     _tnom = 55.0
     try:
