@@ -4546,6 +4546,30 @@ if _HAVE_QT:
             self.statusBar().showMessage(f"Saved the debug report → {fn}")
             QMessageBox.information(self, "Debug report", f"Wrote the debug report:\n{fn}")
 
+        def _port_grounds_path(self):
+            return _config_dir() / "port_grounds.json"
+
+        def _load_port_grounds(self):
+            """The last-used split-ground {port: ground} map (persisted across sessions), or {}."""
+            try:
+                p = self._port_grounds_path()
+                if p.exists():
+                    d = json.loads(p.read_text(encoding="utf-8"))
+                    if isinstance(d, dict):
+                        return {str(k): str(v) for k, v in d.items()}
+            except (OSError, ValueError):
+                pass
+            return {}
+
+        def _save_port_grounds(self, pg):
+            """Persist the split-ground map so the NEXT export pre-fills it (user request)."""
+            try:
+                p = self._port_grounds_path()
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(json.dumps(dict(pg), indent=2), encoding="utf-8")
+            except OSError:
+                pass
+
         def _ask_port_grounds(self, default_ground):
             """Modal SPLIT-GROUND editor: bind each model output port to a ground net (free text).
             Distinct names entered become separate module ground pins; ports sharing a name share
@@ -4570,13 +4594,14 @@ if _HAVE_QT:
             tbl = QTableWidget(len(ports), 3, dlg)
             tbl.setHorizontalHeaderLabels(["Port", "Kind", "Ground net"])
             tbl.verticalHeader().setVisible(False)
+            saved = self._load_port_grounds()            # last-used split-ground map (persisted)
             edits = []
             for r, (p, kind) in enumerate(ports):
                 for c, txt in ((0, p), (1, kind)):
                     it = QTableWidgetItem(txt)
                     it.setFlags(it.flags() & ~QtCore.Qt.ItemIsEditable)
                     tbl.setItem(r, c, it)
-                ed = QLineEdit(default_ground or "VSS")
+                ed = QLineEdit(saved.get(p, default_ground or "VSS"))   # pre-fill last-used ground
                 tbl.setCellWidget(r, 2, ed)
                 edits.append((p, ed))
             tbl.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -4615,6 +4640,7 @@ if _HAVE_QT:
             if pg is None:                               # user cancelled the editor
                 return
             self._va_port_grounds = pg                   # reuse for the Create-cell symbol pins
+            self._save_port_grounds(pg)                  # remember the map for the next export (persisted)
             try:
                 va = self.extract.export_va(cell, out_path=fn, port_grounds=pg)
             except Exception as e:                       # noqa: BLE001
