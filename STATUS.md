@@ -19,6 +19,7 @@
 |---|---|---|---|
 | large-signal-recovery | PART2 compressive assist committed (`78f5a7a`); FF-negative bug fixed; stress-tested; AC bit-identical | `bash apply` + box re-validate | `docs/threads/large-signal-recovery.md` |
 | wur-pmu-pll-psrr | 4/5 ports USABLE; pll PSRR = lone REVIEW blocker | `bash apply` + box re-validate | `docs/threads/wur-pmu-pll-psrr.md` |
+| pvt-modeling | local screen DONE (2 transistor GTs): single-corner model silently OPTIMISTIC at stressed corners (hot I-ceiling 8.5× over-claim, SS/low-V PSRR +11 dB); empirically confirms route-A sections + interp-REJECT, refines the continuous-T exception | user decision → route-A build (corner `.lib` sections; corner-aware iaG first) | `docs/threads/pvt-modeling.md` |
 
 ## To find X, read Y
 - measured numbers / acceptance thresholds / golden values → `docs/reference/DATA.md`
