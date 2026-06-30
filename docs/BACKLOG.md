@@ -16,6 +16,7 @@
 ## Large-signal step / load (see thread: large-signal-recovery)
 - ~~**PART2 compressive branch-A current-assist**~~ — **DONE** (PLL+VCO; `emit_pmu_model._iassist_*`, `fit_multiport._fit_iassist`, manifest override, `test_iassist_core.py`). Fixes the FF "trans negative" bug; AC bit-identical.
 - ~~**B5 guarded transient fit on the VCO**~~ — **DONE** with PART2 (iaG=4.0 mA, iaV=0.22 V; rms 0.9 mV vs GT).
+- **[MINOR] UNLOAD overshoot-above-supply** — a hard load-removal step (e.g. 12 mA→0.5 mA) makes the rail overshoot ABOVE the supply (branch-A fit-inductor kick: old +2.8 V, assist +2.0 V; present even in-envelope at ~1.1–1.4 V > 0.98 V supply). Bounded + settles to vreg (not a runaway), and the assist already halves it, but it's non-physical (an LDO output can't exceed its supply). The `floor` backstop is one-sided (low only) so doesn't touch it. Fix if hard-unload robustness matters: a high-side clamp at the supply, or a symmetric large-signal current cap on branch-A. Found by the 2026-06-30 VDD-sweep stress test (`78f5a7a`).
 - **(optional) T55 z_pll re-export** — kills the ~×0.65 T-confound the assist gain currently absorbs (AC z=tt_25c vs step GT=tt_55c).
 - **PART3 / 88 mV cold-start** — OUT OF LOCAL SCOPE; needs a box turn-on/EN characterization.
 - **R1 de-hardcode large-signal step magnitudes** (trans_big=1mA/trans_slew=5mA) → profile-driven fractions of imax (2 places must agree: gen_reference GT + score re-sim).

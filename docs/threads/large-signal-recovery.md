@@ -18,9 +18,10 @@ Modeling the PLL-rail load transient FROM THE STANDARD FLOW (higher-order LTI Zo
 Numbers: DATA.md §5. Verdicts/why: METHODOLOGY §"Large-signal / recovery".
 
 ## Next action
-PART2 (the FF-corner "trans negative" 治本) is SHIPPED for both rails. What remains is optional refinement + deploy:
-1. **Commit + `bash apply` + box re-validate** the assist (emit + fit + manifest + test on the desk; the box pulls). The deployed `.va` must regenerate WITH the assist (not the stale minimal box.va).
-2. **(optional) T55 z_pll re-export** to kill the documented ~×0.65 T-confound (AC z=tt_25c vs step GT=tt_55c). The assist gain currently absorbs it; a same-temp z would let the gain be pure compression and shrink the residual GT-RMS.
+PART2 (the FF-corner "trans negative" 治本) is COMMITTED (`78f5a7a`) for both rails + stress-tested. What remains is deploy + optional refinement:
+1. **`bash apply` + box re-validate** the assist (the box pulls; the deployed `.va` must regenerate WITH the assist, not the stale minimal box.va).
+2. **(optional) clamp the UNLOAD overshoot** — the stress test found a hard load-removal overshoots ABOVE the supply (branch-A fit-inductor kick; assist halves it but the floor is one-sided). Non-physical for an LDO; needs a high-side clamp or a symmetric branch-A current cap. See BACKLOG.
+3. **(optional) T55 z_pll re-export** to kill the documented ~×0.65 T-confound (AC z=tt_25c vs step GT=tt_55c). The assist gain currently absorbs it; a same-temp z would let the gain be pure compression and shrink the residual GT-RMS.
 3. **(out of scope, reference-only)** the 88 mV cold-start envelope (real_V, corr(I,V)≈0) is a turn-on phenomenon, NOT this load transient — excluded by design; do not fit to it.
 
 ## Checklist
@@ -29,5 +30,7 @@ PART2 (the FF-corner "trans negative" 治本) is SHIPPED for both rails. What re
 - [x] auto-fit `cadence/fit_iassist.py` (Spectre-in-loop) — params DERIVED from coverage GT, not hand-set; seed=manifest fallback; minimal-intervention tie-break (gentlest assist in the degenerate valley)
 - [x] diagnosis: negative-trans is LOAD-driven (V/T/process-independent); refutes the "VDD>0.8 causes it" guess
 - [x] WIRED into `fit_multiport` (pure-Python `derive_iassist`, after the LTI fit) — runs everywhere (box/GUI/CI), no simulator; the GUI gets it too (it IS pure-Python, not a sim). Backstop `floor` OFF by default (one manifest field to re-enable).
-- [ ] commit + `bash apply` + box re-validate the re-emitted model
-- [ ] (optional) same-temp 55°C z_pll re-export to kill the T-confound
+- [x] committed (`78f5a7a`) — assist + the Path-handling fix (`gt_dips_from_npz`/`derive_iassist` now accept `os.PathLike`; a `pathlib.Path` npz used to silently fall back to the seed on the GUI run path + emit/fit CLIs; only the box `step_fit` str()'d it) + Path regression test
+- [x] stress-tested (local Spectre, full PMU .va, VDD 0.75–0.95, old/new/+floor): no runaway, all settle to vreg; FF-negative bug gone (abuse ~12 mA PLL −1.1 V→−0.39 V, floor ≥0). Found the UNLOAD overshoot-above-supply (BACKLOG).
+- [ ] `bash apply` + box re-validate the re-emitted model
+- [ ] (optional) clamp the unload overshoot; (optional) same-temp 55°C z_pll re-export to kill the T-confound
