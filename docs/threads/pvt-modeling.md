@@ -56,13 +56,27 @@ device, 1 nF Cout) but **every sign matches** ldo_gt.
    an extreme): local-interp err Zpk 75 %, PSRRworst 101 %. → temperature needs **≥3 points (coverage already
    does −40/55/125) AND the stability worst may be interior**, so a stability sweep must FIND it, not just
    sample the box corners.
-3. **VOLTAGE → a real open gap.** Vin is pinned at 1.05 V today (BACKLOG [MAJOR]). Supply strongly moves the
-   ceiling (0.95 V → −44 %) and PSRR (0.95 V → −1.8 dB). Needs ≥2–3 supply points + the unwired `dc_linereg`.
+3. **OUTPUT-SETPOINT `vreg` (≈0.8 V) → the primary voltage axis, and the sharpest gap.** This is the model's
+   ONE exposed knob (`vreg_<rail>`), but minimal-emit BAKES Zout/PSRR/ceiling at one OP — turning `vreg`
+   shifts only the DC level, the small/large-signal characteristics DON'T track it. The silicon does:
+   raising vreg 0.80→0.95 (headroom 0.25→0.10 V, Vin=1.05 fixed, TT/27) erodes Q 2.9→**17.6×**, PSRR worst
+   16.8→**4.3 dB**, I-ceiling 60→39 mA. ⇒ a user who sets vreg above the fit point gets a **silently
+   optimistic** rail on the knob they control. (`research/pvt_modeling/pvt_vreg.py`, `results_vreg.json`.)
+   TENSION the model must hold: higher vreg = SAFER dip floor (min=vreg−dip: 0.874 vs 0.693 V) but WORSE
+   ceiling/stability/PSRR — both move with vreg, opposite signs.
+   (Secondary: the SUPPLY/line axis — AVDD, fixed ~1.0 V in deployment — moves PSRR/ceiling too; the unwired
+   `dc_linereg` is the BACKLOG [MAJOR] line-reg item. Distinct from the setpoint axis above.)
 4. **NEW actionable insight:** the worst-case stability corner can be **interior** (≈10 °C / 0.95 V here),
    not a foundry box extreme → corner selection needs a screening sweep, not just the PVT cube vertices.
 
 ## Caveats (don't over-read)
-- Synthetic TOY DUTs; skew is conservative (OP-preserving) → the sensitivities are **lower bounds**.
+- Synthetic TOY DUTs; skew is conservative (OP-preserving) → the *process* sensitivities are **lower bounds**.
+- **HOT magnitudes are an UPPER bound (toy bias).** Both toys use a crude fixed-Ibias + ideal Vref + a
+  marginal OTA output swing — NOT a bandgap-referenced production LDO. So the absolute hot-collapse numbers
+  (incl. the "8.5× hot I-ceiling" headline and the 125 °C regulation loss) are **inflated by toy bias
+  fragility**; the **direction (hot worse, less-headroom worse) is robust**, but a real T-compensated LDO
+  degrades less hot. At 125 °C the toy can't regulate low setpoints (Vout floats ~0.96–1.0 V) → the hot
+  vreg-sweep ceiling entries are regulation-loss artifacts, not capability.
 - ldo_gt FF = m4 triode, v3_miller mp = triode (both near edges) → absolute small-signal magnitudes at those
   corners are degraded; the **directions and the cross-DUT agreement** are the load-bearing evidence.
 - High-Q Zpk is **under-sampled** by the uniform 30 pt/dec AC grid (HWHM ~111 kHz vs grid ~900 kHz @12 MHz)
@@ -89,7 +103,7 @@ Decision for the user / for a build session — NOT yet built (touches the pipel
 - [x] Optimism quantified (TT-ships-everywhere vs real corner) — 8.5× hot I-ceiling, +11 dB PSRR SS/low-V
 - [x] Interpolation-fails analysis — process (region change) & temp (non-monotonic stability) both fail
 - [x] Temperature local-vs-extreme interp — monotonic OK / stability not
-- [x] Voltage axis quantified (the BACKLOG VDD gap)
+- [x] Voltage axis quantified — OUTPUT SETPOINT `vreg` (the exposed knob; supply is the separate line axis)
 - [x] 2nd-DUT cross-check (v3_miller) — directions confirmed
 - [ ] route-A `.lib` SECTIONS emit (UN-implemented today) — build-session item
 - [ ] corner-aware `iaG`; envelope guard; clean process axis + adaptive peak sampling
