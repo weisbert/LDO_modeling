@@ -615,6 +615,13 @@ except Exception as _qt_err:           # GUI optional at import time (logic core
 
 if _HAVE_QT:
 
+    def _wrap(lbl, maxw=560):
+        """Word-wrap a rich-text note QLabel + cap its width so a long single line can't widen
+        the whole dialog / scroll-area (the manifest-editor + sub-editor width blowup)."""
+        lbl.setWordWrap(True)
+        lbl.setMaximumWidth(maxw)
+        return lbl
+
     class _Canvas(FigureCanvas):
         def __init__(self, nrows=1, ncols=1, figsize=(7, 5)):
             # constrained_layout (not tight_layout) re-solves spacing on every resize, so the
@@ -1038,9 +1045,9 @@ if _HAVE_QT:
             idf.addRow("Ground net", self.f_ground)
             # Mode-A / live-Virtuoso optional fields (relocated from the deleted Advanced group).
             # Not needed for cluster/offline runs; surfaced here so the live path can still set them.
-            idf.addRow(QLabel(
+            idf.addRow(_wrap(QLabel(
                 "<span style='color:#678;font-weight:normal'>(Mode A / live Virtuoso — optional, "
-                "not needed for cluster runs)</span>"))
+                "not needed for cluster runs)</span>")))
             self.f_extract = QLineEdit()
             self.f_extract.setToolTip("(Mode A / live) The TB copy stimuli are appended to. "
                                       "Auto = <tb_cell>_extract.")
@@ -1184,7 +1191,7 @@ if _HAVE_QT:
             vg = QGroupBox("Voltage outputs — LDO rails")
             vg.setStyleSheet("QGroupBox{font-weight:bold;}")
             vgl = QVBoxLayout(vg)
-            vgl.addWidget(QLabel("<span style='color:#678'>The regulated voltage outputs "
+            vgl.addWidget(_wrap(QLabel("<span style='color:#678'>The regulated voltage outputs "
                                  "(Zout / PSRR / noise). &nbsp;<b>≥1 voltage OR current output "
                                  "required.</b> <b>src instance</b> = the load idc on this rail "
                                  "(we set its AC mag to inject the Zout test current); blank → "
@@ -1195,7 +1202,7 @@ if _HAVE_QT:
                                  "= “&lt;from&gt;:&lt;to&gt;[:label] , …” + optional trailing "
                                  "“@edge=1n,tstop=1u”, e.g. “0:2m:slew , 450u:550u:lin”. The "
                                  "<b>analysis</b> column overrides this output's AC (Zout) and "
-                                 "noise sweeps.</span>"))
+                                 "noise sweeps.</span>")))
             self.t_vout = self._make_table(
                 ["key", "net", "src instance", "iload sweep", "trans", "analysis"],
                 ["vco", "VDD0P8_VCO", "I_load", "log 200u 6m 4 + 3m", "0:6m:slew", "(gear)"],
@@ -1218,7 +1225,7 @@ if _HAVE_QT:
             cg = QGroupBox("Current outputs — bias / current sinks")
             cg.setStyleSheet("QGroupBox{font-weight:bold;}")
             cgl = QVBoxLayout(cg)
-            cgl.addWidget(QLabel("<span style='color:#678'>Current-output pins (admittance / "
+            cgl.addWidget(_wrap(QLabel("<span style='color:#678'>Current-output pins (admittance / "
                                  "current-PSRR): <b>net</b> + <b>compliance dc</b> (the single DC "
                                  "voltage held during AC/noise) + optional <b>iv_sweep</b> — a "
                                  "VOLTAGE sweep that traces the pin's I-V / compliance knee "
@@ -1227,7 +1234,7 @@ if _HAVE_QT:
                                  "read = its :p current); <b>blank → auto-detect / insert "
                                  "(Vprobe_&lt;key&gt;)</b>. The <b>analysis</b> column overrides "
                                  "this output's AC sweep. Hover any column header for details. "
-                                 "Leave the table empty if your DUT has no current outputs.</span>"))
+                                 "Leave the table empty if your DUT has no current outputs.</span>")))
             self.t_iout = self._make_table(
                 ["key", "net", "compliance dc", "iv_sweep", "probe instance", "analysis"],
                 ["i500n", "IBP_500N", "0.9", "0:0.01:1.1", "Vprobe_i500n", "(gear)"],
@@ -1263,8 +1270,8 @@ if _HAVE_QT:
             bg = QGroupBox("Bias ports — held DC")
             bg.setStyleSheet("QGroupBox{font-weight:bold;}")
             bgl = QVBoxLayout(bg)
-            bgl.addWidget(QLabel("<span style='color:#678'>Pins held at a fixed DC during the "
-                                 "AC/noise runs (net + dc). Leave empty if none.</span>"))
+            bgl.addWidget(_wrap(QLabel("<span style='color:#678'>Pins held at a fixed DC during the "
+                                 "AC/noise runs (net + dc). Leave empty if none.</span>")))
             # Bias is a HELD pin, never a one-hot stimulus -> no per-object analysis column and not
             # touched by "Scan netlist" (nothing to inject/probe). Deliberately a plain 3-col table.
             self.t_bias = self._make_table(["key", "net", "dc"], ["vbg", "VBG", "0.6"])
@@ -1275,9 +1282,9 @@ if _HAVE_QT:
             simg = QGroupBox("Simulation — default AC / noise sweep")
             simg.setStyleSheet("QGroupBox{font-weight:bold;}")
             simf = QFormLayout(simg)
-            simf.addRow(QLabel("<span style='color:#678;font-weight:normal'>The global default "
+            simf.addRow(_wrap(QLabel("<span style='color:#678;font-weight:normal'>The global default "
                                "sweep for every group. Override per object with the table "
-                               "<b>analysis</b> column.</span>"))
+                               "<b>analysis</b> column.</span>")))
             self.f_ac = QLineEdit()
             self.f_ac.setPlaceholderText("ac start=10 stop=500M dec=20")
             self.f_ac.setToolTip("Global default AC sweep (Zout / PSRR). Use Edit… for the "
@@ -2020,8 +2027,10 @@ if _HAVE_QT:
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle(f"Sweep editor — {f['name']}")
             v = QVBoxLayout(dlg)
-            v.addWidget(QLabel("<span style='color:#678'>Cadence-style sweep. The result is written "
-                               "back as a Spectre sweep string. SI suffixes ok (10, 500M, 1k).</span>"))
+            _note = QLabel("<span style='color:#678'>Cadence-style sweep. The result is written "
+                           "back as a Spectre sweep string. SI suffixes ok (10, 500M, 1k).</span>")
+            _note.setWordWrap(True); _note.setMinimumWidth(440); _note.setMaximumWidth(600)
+            v.addWidget(_note)
             form = QFormLayout(); v.addLayout(form)
 
             c_type = QComboBox(); c_type.addItem("Linear", "lin"); c_type.addItem("Logarithmic", "log")
@@ -2132,10 +2141,12 @@ if _HAVE_QT:
             dlg = QtWidgets.QDialog(self)
             dlg.setWindowTitle(title)
             v = QVBoxLayout(dlg)
-            v.addWidget(QLabel(f"<span style='color:#678'>Cadence-style {title.lower()} ({unit}). "
-                               f"Linear/log range by point count or step size, plus optional specific "
-                               f"points (land exactly on a knee/compliance value). Leave the range "
-                               f"blank for points-only; Clear for no sweep.</span>"))
+            _note = QLabel(f"<span style='color:#678'>Cadence-style {title.lower()} ({unit}). "
+                           f"Linear/log range by point count or step size, plus optional specific "
+                           f"points (land exactly on a knee/compliance value). Leave the range "
+                           f"blank for points-only; Clear for no sweep.</span>")
+            _note.setWordWrap(True); _note.setMinimumWidth(440); _note.setMaximumWidth(600)
+            v.addWidget(_note)
             form = QFormLayout(); v.addLayout(form)
             c_type = QComboBox(); c_type.addItem("Linear", "lin"); c_type.addItem("Logarithmic", "log")
             c_type.setCurrentIndex(0 if (f["type"] or "lin") == "lin" else 1)
@@ -2243,21 +2254,22 @@ if _HAVE_QT:
             whose transient is too contaminated to auto-fit). Persisted in table._slew[key]."""
             if le is None:
                 return
-            cur_slew = str((getattr(table, "_slew", {}) or {}).get(key) or "") if key else ""
             f = self._trans_parse_cell(le.text())
             steps = f["steps"]
             froms = {s["from"] for s in steps if s.get("from")}
             baseline = next(iter(froms)) if len(froms) == 1 else (steps[0]["from"] if steps else "")
             targets = [s["to"] for s in steps if s.get("to")]
             dlg = QtWidgets.QDialog(self)
-            dlg.setWindowTitle("Transient load steps (slew)")
+            dlg.setWindowTitle("Transient load steps")
             v = QVBoxLayout(dlg)
-            v.addWidget(QLabel("<span style='color:#678'>Load-transient (slew) test: from a "
-                               "<b>baseline</b> (light) load, step up to each <b>target</b> (heavy) "
-                               "load and watch Vout droop &amp; recovery. One run per target. SI "
-                               "suffixes ok. <b>edge</b> = how fast the current switches; <b>tstop</b> "
-                               "= how long to simulate (long enough to see recovery). This is the "
-                               "DYNAMIC axis; static DC loads go in 'iload sweep'.</span>"))
+            _note = QLabel("<span style='color:#678'>Load-transient test: from a "
+                           "<b>baseline</b> (light) load, step up to each <b>target</b> (heavy) "
+                           "load and watch Vout droop &amp; recovery. One run per target. SI "
+                           "suffixes ok. <b>edge</b> = how fast the current switches; <b>tstop</b> "
+                           "= how long to simulate (long enough to see recovery). This is the "
+                           "DYNAMIC axis; static DC loads go in 'iload sweep'.</span>")
+            _note.setWordWrap(True); _note.setMinimumWidth(440); _note.setMaximumWidth(600)
+            v.addWidget(_note)
             form = QFormLayout(); v.addLayout(form)
             e_base = QLineEdit(baseline); e_base.setPlaceholderText("e.g. 100u")
             e_base.setToolTip("The light/initial load every step starts from.")
@@ -2270,25 +2282,17 @@ if _HAVE_QT:
             e_tstep = QLineEdit(f["tstep"]); e_tstep.setPlaceholderText("optional, e.g. 10n")
             form.addRow("Edge time", e_edge); form.addRow("Sim time (tstop)", e_tstop)
             form.addRow("tstep (optional)", e_tstep)
-            e_slew = QLineEdit(cur_slew); e_slew.setPlaceholderText("blank = auto-fit from the steps")
-            e_slew.setToolTip("branch-A slew-rate override SRa [A/s], e.g. 12000. BLANK = the model "
-                              "auto-fits SRa from these transient steps (the normal path). A VALUE "
-                              "overrides that auto-fit -- the escape hatch when the TB transient is "
-                              "too switching-contaminated to trust (the real GHz system TB). Emits "
-                              "the editable VDD0P8_<rail>_SRa param; tune it in ADE without re-regen.")
-            # NOTE: La override + the recovery network {Lreg,Rreg,Cs,Rs} are NO LONGER user-editable
-            # here -- they are FITTED from the (decap-loaded) load-step transient, not hand-typed.
-            # Any values already in the manifest are PRESERVED losslessly (the _la/_recov stores still
-            # load->collect round-trip); they just are not exposed as form fields. Slew override stays
-            # (the GHz-contaminated-TB escape hatch for SRa auto-fit).
-            if key and table is not None:
-                form.addRow("Slew override (A/s)", e_slew)     # only for a resolved v_out rail
+            # NOTE: the large-signal overrides slew_a, la_override and the recovery network
+            # {Lreg,Rreg,Cs,Rs} are RETIRED (the LDO/IC expert panels reshaped to the LTI ladder,
+            # with a future compressive current-assist replacing slew) and are NO LONGER editable
+            # here. Any values already in a manifest are PRESERVED losslessly (the _slew/_la/_recov
+            # stores still load->collect round-trip); they are simply not exposed as form fields.
             brow = QHBoxLayout(); brow.addStretch(1)
             b_clear = QPushButton("Clear"); b_cancel = QPushButton("Cancel"); b_ok = QPushButton("OK")
             brow.addWidget(b_clear); brow.addWidget(b_cancel); brow.addWidget(b_ok); v.addLayout(brow)
             b_cancel.clicked.connect(dlg.reject); b_ok.clicked.connect(dlg.accept)
             b_clear.clicked.connect(lambda: (e_base.clear(), e_tg.clear(), e_edge.clear(),
-                                             e_tstop.clear(), e_tstep.clear(), e_slew.clear(),
+                                             e_tstop.clear(), e_tstep.clear(),
                                              dlg.accept()))
             if not dlg.exec_():
                 return
@@ -2298,16 +2302,9 @@ if _HAVE_QT:
             newf = {"steps": steps2, "edge": e_edge.text().strip(),
                     "tstop": e_tstop.text().strip(), "tstep": e_tstep.text().strip()}
             le.setText(self._trans_render_cell(newf))
-            # persist the slew override into the per-rail store (collect() writes it to slew_a):
-            # a value sets/overrides, blank clears -> the store is the form's authority for the key.
-            if key and getattr(table, "_slew", None) is not None:
-                sv = e_slew.text().strip()
-                if sv:
-                    table._slew[key] = sv
-                else:
-                    table._slew.pop(key, None)
-            # La override + recovery network are FITTED (not user-editable) -> no persist-from-form
-            # here. The _la/_recov stores keep their loaded values (lossless manifest round-trip).
+            # The large-signal overrides (slew_a / la_override / recovery) are RETIRED and not
+            # editable here -> no persist-from-form. The _slew/_la/_recov stores keep their loaded
+            # values untouched (lossless manifest round-trip), they are just no longer surfaced.
 
         @staticmethod
         def _loads_to_text(spec):
