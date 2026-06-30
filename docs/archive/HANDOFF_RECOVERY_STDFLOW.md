@@ -3,6 +3,20 @@
 Single source of truth for the next session. Supersedes HANDOFF_EMIT_BAKE_AND_VCO_RECOVERY.md (Part 0)
 and RETRACTS HANDOFF_DECAP_LTI_RECOVERY.md (its "drop slew, go LTI" conclusion).
 
+## ✅🔚 "30mV STARTUP DROP" RESOLVED + CLOSED 2026-06-30 (3-expert panel + user TB-side fix)
+3 experts (LDO-designer / Verilog-A-numerics / adversarial) ran local Spectre on the user's box .va and
+agreed: the "30mV drop" is **entirely the DC-OP initial charge of the 22.9µH/534ns branch-A fit-inductor**
+(load current unchanged, vary only the inductor preload 37→405µA ⇒ drop 55→4.8mV). **idc acts via the
+operating point (it pre-charges the inductor), NOT via the real circuit drawing different current** — a
+constant idc is provably inert (cancels in the slew gap). The model's ROBUST droop is ~3× too SHALLOW vs
+real ~25mV; "model-no-idc ≈ real" is real-but-FRAGILE (depth set by the IC, not physics). **USER RESOLVED
+it TB-side & is done:** redesigned the output iload as a STEP 600µA→300µA so the 600µA bakes the steady
+loading into the DC-OP → pre-charges the inductor at the running current → no upward slew → phantom drop
+gone, model↔real levels close. Caveat to document in the TB: stimulus-side fix; the big-inductor IC
+fragility remains (record the 600µA choice). PART2 below (robust ~25mV undershoot + the "DC-OP-start vs
+pre-settle must give the SAME droop" acceptance gate) stays a FUTURE option, user-scoped-OUT for now.
+Full detail in memory `real-tb-model-vs-real-comparison.md`.
+
 ## ⛔⛔ SLEW PLAN REVERSED 2026-06-30 (2nd LDO+IC EXPERT PANEL, workflow wny9nxjpi) — verdict RESHAPE
 The user asked the panel to review the proposed "add a branch-A slew large-signal term for the startup
 undershoot" plan BEFORE building. 4 lenses + adjudicator, ALL Spectre-grounded, UNANIMOUS: **DO NOT build

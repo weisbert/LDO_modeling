@@ -9,8 +9,9 @@ The LDO is treated as a 2-port supply element: its **Zout(f)** and **PSRR(f)** s
 spectrum. The model is fit per-block (Zout, PSRR, decoupled Norton noise, discrete spurs) from a
 ground-truth reference and emitted as both a SPICE `.lib` and a Verilog-A `.va`.
 
-See **`PROJECT.md`** (overview), **`HANDOFF.md`** (current status / latest work), and
-**`GENERALIZATION_REPORT.md`** / **`research/`** (method + tooling surveys) for the full story.
+See **`CLAUDE.md`** (start here), **`STATUS.md`** (current status / next action), **`PROJECT.md`**
+(overview), and **`docs/`** (`reference/` durable facts · `CONVENTIONS.md` the handoff system ·
+`archive/` history) for the full story.
 
 ## Layout
 | path | what |
