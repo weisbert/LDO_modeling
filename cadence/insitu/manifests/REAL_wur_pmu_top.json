@@ -25,22 +25,13 @@
       "net": "<net:VDD0P8_PLL>",
       "pin": "VDD0P8_PLL",
       "iload": 0.0005,
-      "src": "Iload_pll",
-      "slew_a": 12000.0,
-      "la_override": 0.00012,
-      "recovery": {
-        "Lreg": 1.6e-05,
-        "Rreg": 750.0,
-        "Cs": 2.5e-11,
-        "Rs": 2000.0
-      }
+      "src": "Iload_pll"
     },
     "vco": {
       "net": "<net:VDD0P8_VCO>",
       "pin": "VDD0P8_VCO",
       "iload": 0.002,
-      "src": "Iload_vco",
-      "slew_a": 12000.0
+      "src": "Iload_vco"
     }
   },
   "i_out": {
