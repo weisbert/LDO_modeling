@@ -19,7 +19,7 @@ sys.path.insert(0, str(HERE))
 
 import fit_model as FM   # noqa: E402
 
-ZNPZ = HERE.parent / "results" / "redzone" / "wur_pmu_real_tt_25c.repro.npz"
+ZNPZ = HERE.parent / "results" / "redzone" / "wur_pmu_real_tt_55c.repro.npz"
 
 
 def _cap_open():
@@ -30,7 +30,7 @@ def _cap_open():
 
 def _zpll():
     d = np.load(ZNPZ, allow_pickle=True)
-    g = np.asarray(d["z_pll_tt_25c"])
+    g = np.asarray(d["z_pll_tt_55c"])
     return g[:, 0], g[:, 1] + 1j * g[:, 2]
 
 

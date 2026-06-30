@@ -34,7 +34,7 @@ import fit_model as FM            # noqa: E402
 import fit_multiport as FMP       # noqa: E402
 import emit_pmu_model as EPM      # noqa: E402
 
-ZNPZ = ROOT / "results" / "redzone" / "wur_pmu_real_tt_25c.repro.npz"
+ZNPZ = ROOT / "results" / "redzone" / "wur_pmu_real_tt_55c.repro.npz"
 
 
 def _spectre():
@@ -49,9 +49,9 @@ def _spectre():
 def _pll_view():
     d = np.load(ZNPZ, allow_pickle=True)
     il = "pll"
-    z = np.asarray(d["z_pll_tt_25c"])
-    p = np.asarray(d["p_pll_avdd1p0_tt_25c"])
-    n = np.asarray(d["noise_pll_tt_25c"])
+    z = np.asarray(d["z_pll_tt_55c"])
+    p = np.asarray(d["p_pll_avdd1p0_tt_55c"])
+    n = np.asarray(d["noise_pll_tt_55c"])
     sp = {f"z_{il}": z, f"p_{il}": p, f"noise_{il}": n, "loads": [il]}
     view = dict(npz=sp, loads=[il], primary_supply="AVDD1P0",
                 supplies={"AVDD1P0": {il: p}}, tr_steps={})

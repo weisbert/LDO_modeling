@@ -59,7 +59,7 @@
   "corners": {
     "pull_from_session": true,
     "fallback": [
-      "tt_25c"
+      "tt_55c"
     ]
   },
   "current_psrr_supplies": [
