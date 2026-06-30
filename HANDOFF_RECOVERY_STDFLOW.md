@@ -3,6 +3,28 @@
 Single source of truth for the next session. Supersedes HANDOFF_EMIT_BAKE_AND_VCO_RECOVERY.md (Part 0)
 and RETRACTS HANDOFF_DECAP_LTI_RECOVERY.md (its "drop slew, go LTI" conclusion).
 
+## ⛔⛔ SLEW PLAN REVERSED 2026-06-30 (2nd LDO+IC EXPERT PANEL, workflow wny9nxjpi) — verdict RESHAPE
+The user asked the panel to review the proposed "add a branch-A slew large-signal term for the startup
+undershoot" plan BEFORE building. 4 lenses + adjudicator, ALL Spectre-grounded, UNANIMOUS: **DO NOT build
+the slew.** Three verified facts: (1) **slew is WRONG-SIGN** — the coverage clean-step dip is MINIMIZED at
+SRa=∞, so fitting SRa to it drives "no slew"; a positive SRa makes the already-1.7-2× over-predicted
+coverage dip catastrophically worse (245→1047→4456mV @SRa=5e4/1.2e4). (2) The coverage OVER-prediction is
+real (an independent FFT conv of measured z‖20pF reproduces ~248/413/579 ≈ Spectre 245/409/573) and LINEAR
+(163.6 mV/mA) while GT is SUB-LINEAR (107/91/81) → the real loop STIFFENS under big load steps (class-AB-
+like current boost) → needs a COMPRESSIVE term (OPPOSITE sign to slew). (3) the real_V 88mV@25ns is an
+autonomous COLD-START/TURN-ON settling envelope, NOT a load transient (load flat from t=0, corr(I,V)≈0) →
+NO Zout/slew term driven by that flat load can make 88mV; real_V stays HELD-OUT (prior fit-to-real_V
+overfit 2.47→35.5mV). REFINED PLAN: PART1 ship the STEP-2 ladder (done, `ab21b83`). PART2 (buildable
+locally NOW) = a COMPRESSIVE branch-A current-assist i_assist=f(verr), f odd/compressive with f'(0)=0 EXACT
+(→ AC bit-identical at OP), 2 params fit to the 3 coverage steps via SPECTRE-IN-LOOP (never conv-only) with
+HELD-OUT across amplitudes (fit 2m+4m, predict 3m); gated/opt-in (absent→byte-identical); CAVEAT its gain
+absorbs the T25(z)/T55(step) offset (~×0.65) → re-calibrate via a cheap T55 z re-export. PART3 = the 88mV
+startup is OUT OF LOCAL SCOPE/BLOCKED — needs a box turn-on/EN char; PART2 makes real_V SHALLOWER (further
+from 88mV) — EXPECTED, document it. OPEN Qs FOR USER (decide before build): is the 88mV required for fast
+system sim or excludable? does the TB apply an EN edge at t=0 or engage load at t=0 (→ is 88mV real silicon
+or a sim-IC artifact)? confirm temps (real_V=T25? coverage=T55? z=T25?). Full decision in the wny9nxjpi
+output. This SUPERSEDES the slew/recovery framing AND the proposed-slew PRODUCTIONIZATION direction.
+
 ## ⭐ RESHAPE 2026-06-29 (LDO EXPERT PANEL, user-accepted) — the body below is PARTLY SUPERSEDED
 A 4-lens LDO expert panel (workflow wc7ni4bva; full report results/redzone/wur_pmu_real_sweep.report.txt's
 sibling — saved in the session transcript) UNANIMOUSLY reshaped the approach. Verdict = RESHAPE (3 reshape +
@@ -16,7 +38,7 @@ sibling — saved in the session transcript) UNANIMOUSLY reshaped the approach. 
 - The recovery (~60-70ns, constant-τ/linear) IS the closed-loop dominant pole, lives IN the AC band, fittable
   from a richer AC Zout. SRa slew is NOT load-bearing for PLL (lti_la120 no-slew 2.37mV beat slew 2.47mV).
 - **real_V is very likely a TURN-ON/SETTLING envelope, NOT a load transient**: 88mV dip bottoms where the load
-  is at a local MIN, recovers as load RISES, corr(I,V)=+0.50, clean single-exp τ=39ns. So the prior 2.47mV
+  is at a local MIN, recovers as load RISES, corr(I,V)≈0 [CORRECTED: recomputed −0.05..−0.19 by the 2026-06-30 panel; the +0.50 was WRONG], clean single-exp τ≈33-45ns. So the prior 2.47mV
   "match" was an LC-tank overfit of a startup artifact (→ broke AC-consistency, collapsed to 35.5mV held-out).
   User CANNOT run the DC-held-load mechanism check (off-site) → **real_V is REFERENCE ONLY, not a gate.**
 - **RETIRED as wrong physics:** the slew core, the Lreg‖Rreg recovery network, la_override=120µH, the en_ls
