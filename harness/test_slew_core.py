@@ -63,12 +63,18 @@ def test_slew_on_emits_exactly_the_slew_lines(tmp_path):
     assert "V(VDD0P8_DIG_nA, VDD0P8_DIG_vrg) <+ VDD0P8_DIG_Ra*I(VDD0P8_DIG_nA, VDD0P8_DIG_vrg)" in t_on
     assert "V(VDD0P8_VCO_nA, VDD0P8_VCO_vrg) <+ VDD0P8_VCO_Ra*I(VDD0P8_VCO_nA, VDD0P8_VCO_vrg)" in t_on
     assert "VDD0P8_DIG_SRa" not in t_on and "VDD0P8_VCO_SRa" not in t_on and "Icomp" not in t_on
-    # off->on diff on the PLL rail = 3 lines: +SRa localparam (added), and the branch-A regulation
-    # body swaps stiff-resistor -> slew() (-1/+1). (Was 4 when the default carried an Icomp localparam.)
+    # off->on diff on the PLL rail = 9 lines. The DEFAULT (off) rail is now the stiff R_a resistor PLUS
+    # the default-ON branch-A unload-discharge (5 baked _ov* localparams + a 2-line series discharge term);
+    # turning slew ON removes ALL of that (a slew rail keeps its own slew()+Imax anti-windup, no discharge)
+    # and installs the slew form. Diff: -5 _ov* params, +1 SRa param, -2 resistor+discharge body lines,
+    # +1 slew body line = 9. (Was 3 pre-Route-1, 4 when the default carried an Icomp localparam.)
     import difflib
     changed = [l for l in difflib.unified_diff(t_off.splitlines(), t_on.splitlines(), lineterm="")
                if l and l[0] in "+-" and not l.startswith(("+++", "---"))]
-    assert len(changed) == 3, f"expected 3 changed lines, got {len(changed)}: {changed}"
+    assert len(changed) == 9, f"expected 9 changed lines, got {len(changed)}: {changed}"
+    assert sum(1 for l in changed if "_ov" in l) == 6      # 5 removed _ov* params + 1 removed _ov term line
+    assert any("_SRa = 1.000000e+04" in l for l in changed)
+    assert any("slew(V(VDD0P8_PLL_nA" in l for l in changed)
 
 
 def test_slew_scheduled_path_gated(tmp_path):

@@ -234,8 +234,11 @@ def _voltage_block(o, vfit, supply, ground, role=None):
         vreg_hdr = (f"localparam real {pre}_vreg = {vreg:.6e};"
                     f"   // {o} regulated output target [V] (BAKED; edit here to retune)")
     rvars = rvars + vreg_rvars
+    # branch-A unload-discharge (Route 1): default-ON, but only where the regulation is the RESISTOR
+    # form (slew rails keep their own slew()+Imax anti-windup). Baked localparams -> survives minimal.
+    ovd = _ovd_vals(vfit) if slew_a <= 0 else None
     Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a)
-        + _recov_param(pre, recov) + _iassist_param(pre, ia) + [   # Cn = noise-corner caps (localparam)
+        + _recov_param(pre, recov) + _iassist_param(pre, ia) + _ovd_param(pre, ovd) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
@@ -264,7 +267,7 @@ def _voltage_block(o, vfit, supply, ground, role=None):
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra, iassist=ia)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra, iassist=ia, ovd=ovd)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body)
 
 
@@ -305,6 +308,122 @@ def _slew_param(pre, sr):
 _RECOV_IMAX = 1.50e-02   # physical reg pass-current limit [A] (anti-windup on the slew target)
 _RECOV_VCL  = 3.00e-01   # clamp deadzone half-width [V] (>> the ~88mV real worst-case dip)
 _RECOV_GCL  = 2.00e+01   # clamp strength [A/V^2] beyond the deadzone
+
+
+# =========================== branch-A UNLOAD-DISCHARGE (Route 1) ===========================
+# The branch-A fit-inductor L_a (~23uH on the WuR PLL) carries the FULL DC load current, so it stores
+# 1/2 L_a I^2 (~1nJ @4mA -> would kick ~4V into a 20pF decap). On a hard UNLOAD the inductor keeps
+# sourcing the OLD current into Cout -> the rail overshoots. A pure output-side clamp CANNOT win: it
+# bounds the overshoot only by holding the rail near the ceiling, and dI_L/dt = V(across L)/L_a, so a
+# small (bounded) overshoot => a small inductor voltage => a SLOW ~4us drain (local-Spectre baseline:
+# an output high-side clamp bounds the overshoot to +24mV but HANGS 4.7us; no clamp overshoots +302mV,
+# ABOVE the supply). The hard trade-off (overshoot depth x recovery time ~ const) is intrinsic to any
+# clamp on vout.
+#
+# Route 1 breaks it by draining the INDUCTOR, not clamping the output: a nonlinear branch inside the
+# branch-A regulation applies a REVERSE EMF to the whole series inductor chain (main L_a + ladder) on
+# a large overshoot, forcing dI_L/dt strongly negative INDEPENDENTLY of the overshoot depth -> the big
+# +302mV(>supply) kick is CAPPED to physical tens-of-mV (<= supply) sub-us (no 4us ceiling-hang); the
+# residual then settles monotonically toward vreg on the L/Rpl timescale. It is written as
+# a SERIES term in the regulation voltage V(regnode,vrg) so it sits in series with the inductor path:
+#
+#   V(regnode,vrg) <+ R_a*I  +  gate(vov) * srcblk(I) * ovVmax*tanh( (ovR/ovVmax)*I )
+#     vov   = V(o,vrg) = rail-above-target overshoot;  I = the branch-A regulation current
+#     gate  = (vov>ovVdz) ? tanh((vov-ovVdz)^2/ovVsc^2) : 0      <- one-sided (overshoot only),
+#             ZERO value AND slope for vov<=ovVdz -> Zout/PSRR/noise/DC/clean-dip are BIT-IDENTICAL
+#             (the OP sits at vov<0 for every load, so gate==0 at the OP: AC exact, verified 0.0000%).
+#     srcblk= 0.5*(1-tanh(I/ovIsc))  ~1 when branch A SOURCES (unload energy dump), ~0 when it SINKS a
+#             sustained current -> a +40mA floating-rail ABUSE (a sink) never engages the drain, so the
+#             stiff R_a keeps the DC pin (no runaway). Physically: the drain targets the pass device's
+#             stored inductive energy, which only sources.
+#     ovVmax*tanh(...) = a voltage-BOUNDED reverse EMF (|.|<=ovVmax) -> the regulation ALWAYS retains
+#             conductance ~1/R_a: the DC operating point can NEVER be de-pinned. This is the crucial
+#             difference from the REMOVED "DC current compliance" (a zero-conductance current clamp that
+#             de-pinned the output -> FF runaway); here R_a is untouched and only a bounded series
+#             offset is added. drain rate ~ ovVmax/L_a -> sub-us.
+#
+# DEFAULT-ON + BAKED localparams (internal physics, NOT a CDF param) -> takes effect on `bash apply`
+# with no manifest/schematic change and SURVIVES minimal-emit, exactly like the compressive iassist.
+# Emitted only where the regulation is the RESISTOR form (the deployed default + the recov-resistor
+# path); a slew rail keeps its own slew()+Imax anti-windup untouched. Per-rail overrides via the vfit
+# 'unload_discharge' dict; set it to False to disable.
+#
+# ovVdz is the LARGE-SIGNAL TRANSPARENCY FLOOR (NOT just a DC-droop margin -- an adversarial-review
+# finding, local-Spectre-confirmed). The dump engages for ANY output excursion reaching >vreg+ovVdz
+# while branch A SOURCES -- which includes not only the one-time unload transient but ALSO the positive
+# half of a large-signal PERIODIC load/PSRR ripple. Since the model's PRIMARY product is the spur /
+# PSRR / Zout SPECTRA, ovVdz MUST sit ABOVE the largest legitimate periodic rail excursion, or the dump
+# clips those positive peaks and distorts the spectra (measured: at ovVdz=3mV a load-ripple that swings
+# the rail ~20mV above vreg gets ~16mV of clip-distortion; at ovVdz=25mV the same case distorts 0.002mV).
+# 25mV is chosen = ~2.5x the documented large-signal char ripple (DATA.md, "v4 forced 10mV") -> the dump
+# is provably inert in the validated large-signal regime -- and still << the supply headroom AVDD-vreg
+# ~160mV, and >> the DC load-droop R_a*Iload (~0.4mV) and the worst abuse-sink droop (40mA*R_a~3.8mV) so
+# a sustained sink never engages it. TRADE-OFF: the deadzone floor is also where the unload overshoot
+# SETTLES, so a higher ovVdz means a larger (still tens-of-mV, <= supply) residual and a slower final
+# creep to vreg -- the transparency of the model's primary function is worth that. AC/PSRR/noise/DC and
+# the loading dip are ALWAYS bit-identical (the OP sits at vov<0, gate==0 value+slope, for any ovVdz).
+# The other four are unload-DYNAMICS knobs, tuned Spectre-in-loop for a sub-us drain of the big overshoot.
+_OVD_VDZ  = 2.5e-02   # overshoot deadzone / LARGE-SIGNAL TRANSPARENCY floor [V] (dump inert value+slope below)
+_OVD_R    = 4.0e+03   # dump on-resistance [ohm] (series reverse-EMF conductance that drains the inductor chain)
+_OVD_VMAX = 2.0e+00   # dump reverse-EMF clamp [V] (BOUNDS the series voltage -> DC-pin conductance 1/R_a preserved)
+_OVD_VSC  = 8.0e-03   # gate ramp scale [V] (how fast the drain engages above the deadzone)
+_OVD_ISC  = 1.0e-03   # source/sink discriminator scale [A] (drain acts on branch-A SOURCING excess, not a sink)
+
+
+def _ovd_vals(vfit):
+    """The 5 unload-discharge params for this rail: defaults (_OVD_*) with any per-rail overrides from
+    vfit['unload_discharge'] (a dict of {ovVdz,ovR,ovVmax,ovVsc,ovIsc}). Returns None iff the feature is
+    explicitly disabled (vfit['unload_discharge'] is False / 0) -> the rail emits the plain stiff resistor
+    (pre-Route-1 byte-identical). Each override is validated finite+positive; a bad one falls back to the
+    default. DEFAULT (key absent) -> the full default set (default-ON)."""
+    ud = (vfit or {}).get("unload_discharge", True)
+    if ud is False or ud == 0:
+        return None
+    over = ud if isinstance(ud, dict) else {}
+
+    def _ov(key, default):
+        try:
+            v = float(over.get(key))
+        except (TypeError, ValueError):
+            return default
+        return v if (v > 0 and v < 1e30) else default
+    return dict(ovVdz=_ov("ovVdz", _OVD_VDZ), ovR=_ov("ovR", _OVD_R),
+                ovVmax=_ov("ovVmax", _OVD_VMAX), ovVsc=_ov("ovVsc", _OVD_VSC),
+                ovIsc=_ov("ovIsc", _OVD_ISC))
+
+
+def _ovd_param(pre, vals):
+    """BAKED localparam lines for the branch-A unload-discharge (internal physics, NOT CDF params -- a
+    re-emit always takes effect). Empty list when vals is None (feature disabled)."""
+    if not vals:
+        return []
+    return [
+        f"localparam real {pre}_ovVdz = {vals['ovVdz']:.6e};"
+        f"   // {pre} branch-A unload-discharge: overshoot deadzone [V] (inert value+slope below -> AC/DC bit-identical, BAKED)",
+        f"localparam real {pre}_ovR = {vals['ovR']:.6e};"
+        f"   // {pre} unload-discharge on-resistance [ohm] (drains the fit-inductor energy trap, BAKED)",
+        f"localparam real {pre}_ovVmax = {vals['ovVmax']:.6e};"
+        f"   // {pre} unload-discharge reverse-EMF clamp [V] (BOUNDS the series V -> DC pin 1/R_a preserved, BAKED)",
+        f"localparam real {pre}_ovVsc = {vals['ovVsc']:.6e};"
+        f"   // {pre} unload-discharge gate ramp scale [V] (BAKED)",
+        f"localparam real {pre}_ovIsc = {vals['ovIsc']:.6e};"
+        f"   // {pre} unload-discharge source/sink discriminator [A] (drain acts on SOURCING excess only, BAKED)",
+    ]
+
+
+def _ovd_reg_term(pre, regnode, vals):
+    """The inline series unload-discharge expression appended to the RESISTOR regulation voltage
+    `V(regnode,vrg) <+ R_a*I(regnode,vrg)`. Empty string when vals is None. At the OP vov=V(o,vrg)<0
+    so the gate is 0 with 0 slope -> the whole term + its Jacobian vanish -> AC/PSRR/noise/DC unchanged."""
+    if not vals:
+        return ""
+    vov = f"V({pre}, {pre}_vrg)"
+    I = f"I({regnode}, {pre}_vrg)"
+    gate = (f"({vov} > {pre}_ovVdz ? "
+            f"tanh(({vov}-{pre}_ovVdz)*({vov}-{pre}_ovVdz)/({pre}_ovVsc*{pre}_ovVsc)) : 0.0)")
+    srcblk = f"(0.5*(1.0 - tanh({I}/{pre}_ovIsc)))"
+    emf = f"{pre}_ovVmax*tanh(({pre}_ovR/{pre}_ovVmax)*{I})"
+    return f"\n        + {gate}*{srcblk}*{emf}"
 
 
 def _recov_ok(recov):
@@ -449,7 +568,7 @@ def _extra_body(pre, extra):
     return "".join(lines), prev
 
 
-def _branchA_reg(pre, slew_sr, recov=None, from_node=None):
+def _branchA_reg(pre, slew_sr, recov=None, from_node=None, ovd=None):
     """Branch-A regulation contribution (last ladder node -> vrg through R_a). DEFAULT = the passive
     resistor `V(nA,vrg) <+ Ra*I(nA,vrg)` (byte-identical to the pre-slew emit). `from_node` is the
     node the regulation feeds from (default <pre>_nA = the single-section case; the higher-order
@@ -489,7 +608,10 @@ def _branchA_reg(pre, slew_sr, recov=None, from_node=None):
             reg = (f"I({regnode}, {pre}_vrg) <+ slew(V({regnode}, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
                    f"   // R_a regulation, large-signal slew-limited")
     elif use_recov:
-        reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"   # recov path keeps the resistor (it carries its own Imax/deadzone anti-windup)
+        # recov path keeps the resistor (it carries its own Imax/deadzone anti-windup) + the branch-A
+        # unload-discharge (Route 1) in series (drains the L_a + Lreg chain on a hard unload).
+        reg = (f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg)"
+               f"{_ovd_reg_term(pre, regnode, ovd)};")
     else:
         # DEFAULT regulation = the STIFF passive R_a resistor. It pins vout to vreg with conductance
         # 1/Ra at EVERY excursion, so the DC solve stays well-conditioned for any vreg / PVT corner.
@@ -501,7 +623,11 @@ def _branchA_reg(pre, slew_sr, recov=None, from_node=None):
         #  DC-fight hazard the compliance targeted is already removed by the PSRR supply AUTO-TRACK; a
         #  real current-limit/dropout is out of this LTI core's SCOPE (stage 2b) and must be a one-sided,
         #  conductance-preserving soft limit -- never a symmetric hard saturation.)
-        reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"
+        # The branch-A UNLOAD-DISCHARGE (Route 1) rides in series on this resistor: a bounded, one-sided,
+        # source-gated reverse EMF that drains the fit-inductor energy trap on a hard unload (see _ovd_*).
+        # It is ZERO value+slope at the OP (vov<0) -> Zout/PSRR/noise/DC bit-identical; DEFAULT-ON here.
+        reg = (f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg)"
+               f"{_ovd_reg_term(pre, regnode, ovd)};")
     post_lines = ""
     if use_recov:
         # the deadzone clamp is a SHARED safety net (NOT gated by en_ls): it is zero (value+slope)
@@ -636,7 +762,7 @@ def _iassist_body(o, ground, ia):
 
 
 def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None, extra=None,
-                  iassist=None):
+                  iassist=None, ovd=None):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
     scheduled (multi-load) paths. Only the @(initial_step) assignments (`asg`) differ
     between them (literal numbers vs clamped ln(iload) exprs), so the topology/text of the
@@ -674,7 +800,7 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, reco
 
     // Zout branch A: (L_a || R_pl) + R_a{ladder_note}
     I({o}, {pre}_nA) <+ idt(V({o}, {pre}_nA))/{pre}_La + V({o}, {pre}_nA)/{pre}_Rpl;
-{branchA_extra}    {_branchA_reg(pre, slew_sr, recov, from_node=last_node)}
+{branchA_extra}    {_branchA_reg(pre, slew_sr, recov, from_node=last_node, ovd=ovd)}
 
     // intrinsic output noise: decoupled Norton current @{o} (white floor + {len(nfk)} Lorentzians)
     I({pre}_nw, {ground}) <+ V({pre}_nw, {ground})/NRk;
@@ -753,9 +879,10 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
     sched_par = (f"parameter real iload_{pre} = {iload_nom:.6e};"
                  f"   // {o} load OP [A]; ln(iload_{pre}) drives the param schedule "
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
+    ovd = _ovd_vals(vfit) if slew_a <= 0 else None   # branch-A unload-discharge (resistor form only)
     Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
         f"\n  {ln}" for ln in _cft_param(pre, cft) + _slew_param(pre, slew_a)
-        + _recov_param(pre, recov) + _iassist_param(pre, ia)) + "".join(
+        + _recov_param(pre, recov) + _iassist_param(pre, ia) + _ovd_param(pre, ovd)) + "".join(
         f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
@@ -786,7 +913,7 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
         f"  {pre}_gqb1 = {pre}_pcb1/{pre}_pca1;",
     ])
 
-    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra, iassist=ia)
+    body = _voltage_body(o, supply, ground, nfk, Cout, ESR, cft, slew_a, recov, extra=extra, iassist=ia, ovd=ovd)
     return dict(nodes=nodes, rvars=rvars, params=Cn_par, asg=asg, body=body,
                 scheduled=True, valid_load=(ilo, ihi))
 
