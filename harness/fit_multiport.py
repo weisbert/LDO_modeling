@@ -1224,6 +1224,27 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
             print("[fit] current-assist: " + ", ".join(f"{k}={v}" for k, v in _iasrc.items()))
     except Exception as _e:                            # noqa: BLE001 -- a fit miss must never break emit
         print(f"[fit] current-assist: SKIP ({_e})")
+    # unload-discharge TRANSPARENCY FLOOR: DERIVE each rail's ovVdz from its own characterized
+    # large-signal excursion (max|Zout|*di_ripple [+ opt-in spur/PSRR]), pure-Python -- replacing the
+    # hardcoded emit_pmu_model._OVD_VDZ (25 mV) with a per-rail value, clamped to [VDZ_MIN, ALPHA*
+    # headroom]. Written to volt[rail]['unload_discharge']['ovVdz'], the override channel emit already
+    # reads (emit is UNCHANGED). ovVdz is OP-inert (gate 0 value+slope at vov<0) -> AC/DC/PSRR/noise
+    # composite is BIT-identical regardless of its value. A manual per-rail value stays authoritative;
+    # a rail with no characterized Zout falls back to _OVD_VDZ (byte-identical to today). The gate
+    # MECHANISM is settled (heavy/state gate refuted) -- this fits only the FLOOR value.
+    try:
+        import fit_ovvdz as _ovf
+        _ovsrc = _ovf.derive_ovvdz(volt, views, m, supplies=supplies,
+                                   nom_corner=lambda P: list(P)[len(P) // 2])
+        _shown = {k: v for k, v in _ovsrc.items() if v != "default"}
+        if _shown:
+            _diag = {o: volt[o].get("ovvdz_diag") for o in volt}
+            print("[fit] unload-discharge ovVdz: " + ", ".join(
+                f"{k}={v}" + (f"({_diag[k]['ovVdz_V']*1e3:.1f}mV)"
+                              if v == "fit" and _diag.get(k) else "")
+                for k, v in _ovsrc.items()))
+    except Exception as _e:                            # noqa: BLE001 -- a floor-derive miss must never break emit
+        print(f"[fit] unload-discharge ovVdz: SKIP ({_e})")
     # nominal temp the Idc(T) fit references: middle of the manifest temps, else 55.
     _tnom = 55.0
     try:
