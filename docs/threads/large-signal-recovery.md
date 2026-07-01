@@ -21,7 +21,8 @@ Numbers: DATA.md §5. Verdicts/why: METHODOLOGY §"Large-signal / recovery".
 ## Next action
 PART2 (the FF-corner "trans negative" 治本) is COMMITTED (`78f5a7a`) for both rails + stress-tested. What remains is deploy + optional refinement:
 1. **`bash apply` + box re-validate** the assist + the Route-1 unload-discharge (the box pulls; the deployed `.va` must regenerate WITH both, not the stale minimal box.va).
-2. ~~**clamp the UNLOAD overshoot**~~ — **DONE (Route 1 branch-A discharge, 2026-07-01)**: drains the fit-inductor instead of clamping vout, so overshoot AND recovery both beat the clamp (PLL +13.7 mV/0.635 µs; AC/dip bit-identical; +40 mA pinned). See "Where it stands" above + DATA §5.
+2. ~~**clamp the UNLOAD overshoot**~~ — **DONE (Route 1 branch-A discharge, 2026-07-01)**: drains the fit-inductor instead of clamping vout (PLL +302 mV(>supply)→+34 mV(≤supply); AC/dip bit-identical; +40 mA pinned; ovVdz=25 mV transparency floor). See "Where it stands" above + DATA §5.
+3. **NEXT (planned): auto-derive `ovVdz` from the max characterized large-signal ripple** — today it is a hardcoded 25 mV chip-specific default; make it per-rail/per-corner robust across LDOs. SCOPE-FIRST: does the npz even carry an above-vreg large-signal ripple (vs only small-signal AC + loading `tr_*`)? → BACKLOG [MAJOR] "Auto-derive the unload-discharge transparency floor".
 3. **(optional) T55 z_pll re-export** to kill the documented ~×0.65 T-confound (AC z=tt_25c vs step GT=tt_55c). The assist gain currently absorbs it; a same-temp z would let the gain be pure compression and shrink the residual GT-RMS.
 3. **(out of scope, reference-only)** the 88 mV cold-start envelope (real_V, corr(I,V)≈0) is a turn-on phenomenon, NOT this load transient — excluded by design; do not fit to it.
 
