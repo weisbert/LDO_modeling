@@ -78,9 +78,12 @@ def test_recovery_on_emits_exactly_the_recovery_cards(tmp_path):
     assert "I(VDD0P8_PLL, VDD0P8_PLL_vrg) <+ (V(VDD0P8_PLL, VDD0P8_PLL_vrg) >  VDD0P8_PLL_Vcl) ?" in t_on
     # nB/nD declared
     assert "VDD0P8_PLL_nB" in t_on and "VDD0P8_PLL_nD" in t_on
-    # OTHER rails untouched: still the plain nA->vrg resistor, no recovery tokens
-    assert "V(VDD0P8_DIG_nA, VDD0P8_DIG_vrg) <+ VDD0P8_DIG_Ra*" in t_on
-    assert "V(VDD0P8_VCO_nA, VDD0P8_VCO_vrg) <+ VDD0P8_VCO_Ra*" in t_on
+    # OTHER rails untouched by recovery -> the DEFAULT regulation, which is now the DC-compliance
+    # min/max form (exactly V/Ra in-band); no recovery tokens.
+    assert ("I(VDD0P8_DIG_nA, VDD0P8_DIG_vrg) <+ max(-VDD0P8_DIG_Icomp, min(VDD0P8_DIG_Icomp,"
+            " V(VDD0P8_DIG_nA, VDD0P8_DIG_vrg)/VDD0P8_DIG_Ra))" in t_on)
+    assert ("I(VDD0P8_VCO_nA, VDD0P8_VCO_vrg) <+ max(-VDD0P8_VCO_Icomp, min(VDD0P8_VCO_Icomp,"
+            " V(VDD0P8_VCO_nA, VDD0P8_VCO_vrg)/VDD0P8_VCO_Ra))" in t_on)
     for tok in ("VDD0P8_DIG_Lreg", "VDD0P8_VCO_Lreg", "VDD0P8_DIG_nB", "VDD0P8_VCO_nB"):
         assert tok not in t_on
 

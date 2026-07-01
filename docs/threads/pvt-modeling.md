@@ -168,7 +168,39 @@ AC uses `mag=`, not `ac=`.)
 `corner_sel` dispatch/`$strobe`; generate `ldo_corners.scs` from the corner list. Supersedes the
 "corner-keyed `.lib` SECTIONS" wording in Later-build #1 (that A1 form clashes with the config veriloga).
 
+## In-situ DC-robustness root-fix — SHIPPED to the generator (2026-07-01)
+Running the emitted model **inside the real circuit** across PVT exposed a DC-SOLVE pathology distinct from
+the accuracy question above: the DC operating point solved to a non-physical rail current (~3.7 mA on a µA
+rail) with a ~25 MHz limit-cycle in transient. ROOT (box-diagnosed, then desk-reproduced pure-Python): the
+model imposes its OP through near-ideal, NO-compliance sources, so a small live-vs-baked mismatch is
+amplified into a huge current —
+- **branch-A regulation** ties vout to the baked `vreg` through Ra≈0.02–0.1 Ω (10–48 S). A co-driven /
+  off-corner output sitting sub-mV off `vreg` → 100s of mA of DC fight → ill-conditioned DC (VCO 0.078 mV →
+  3.7 mA), and the startup slam lights the branch-A-L/decap ring.
+- **PSRR is DC-coupled to the supply**: `sum(Gi)·(V(AVDD1P0) − vdc_AVDD1P0)` injects whenever the live supply
+  ≠ the baked `vdc` (VCO ΣG=13.5 mS → 0.02 V ⇒ 270 µA). A PVT supply sweep re-injects at every corner.
+
+Both are the "baked-OP stiffness" failure. Hand-aligning `vreg`/`vdc` per corner is a BAND-AID (breaks under a
+PVT sweep — the user's key push: robust for ANY set VDD), so the fix is STRUCTURAL and DEFAULT-ON in
+`emit_pmu_model.py` (no manifest opt-in):
+1. **PSRR supply ref AUTO-TRACKS the live supply** — `vrf` is a slow (~1 Hz) low-pass of `AVDD1P0`
+   (`Rtrk_psrr`/`Ctrk_psrr`), so `V(AVDD1P0,vrf)=0` at DC for ANY supply → zero DC injection across the whole
+   PVT supply sweep; AC PSRR bitwise-preserved above the corner (baked `V(vrf)<+vdc` source removed; `vdc`
+   kept only for the fA-level current-bias gdd term). Retires the supply-axis DC-injection hazard (AC
+   line-reg ACCURACY is still the separate `dc_linereg` BACKLOG item).
+2. **Regulation DC current COMPLIANCE** — branch-A's Ra termination becomes `max(-Icomp, min(Icomp, V/Ra))`
+   (the recov anti-windup form): EXACTLY V/Ra while |I|≤Icomp (Zout/PSRR/noise bitwise-unchanged in the
+   validated load), clamped to ±Icomp beyond → a co-driven/off-corner output can't force an unbounded DC
+   fight; DC well-conditioned for ANY `vreg`. `Icomp` = pass-device Imax (default `ICOMP_DEFAULT`=50 mA,
+   transparent; override per rail via `p['icomp']`, ideally the per-corner dropout current).
+
+Verified: focused emit suite green (incl. new `harness/test_pvt_robust_emit.py`), end-to-end emit correct,
+AC-PSRR/compliance transparency checked analytically, and the box PVT re-sim confirmed the mA/oscillation
+gone. NOTE: the earlier "+2 V unload overshoot" clamp (`himargin`) was a symptom-fix for what turned out to
+be this same co-drive event — REDUNDANT post-compliance, NOT shipped.
+
 ## Checklist
+- [x] in-situ DC-robustness root-fix — PSRR supply auto-track + regulation DC compliance (default-on in emit; `test_pvt_robust_emit.py`)
 - [x] Confirm local GT is transistor-level & skewable (BSIM3 Vth0/U0/Tox) — yes, all `ground_truth/*.lib`
 - [x] PVT grid sweep (process × Vin × temp) on bias-fixed ldo_gt + OP guard
 - [x] Optimism quantified (TT-ships-everywhere vs real corner) — 8.5× hot I-ceiling, +11 dB PSRR SS/low-V

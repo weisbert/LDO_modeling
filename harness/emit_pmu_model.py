@@ -235,7 +235,7 @@ def _voltage_block(o, vfit, supply, ground, role=None):
                     f"   // {o} regulated output target [V] (BAKED; edit here to retune)")
     rvars = rvars + vreg_rvars
     Cn_par = "\n  ".join([vreg_hdr] + _cft_param(pre, cft) + _slew_param(pre, slew_a)
-        + _recov_param(pre, recov) + _iassist_param(pre, ia) + [   # Cn = noise-corner caps (localparam)
+        + _recov_param(pre, recov) + _iassist_param(pre, ia) + _icomp_param(pre, slew_a, recov, p) + [   # Cn = noise-corner caps (localparam)
         f"localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk))])
@@ -488,8 +488,16 @@ def _branchA_reg(pre, slew_sr, recov=None, from_node=None):
         else:
             reg = (f"I({regnode}, {pre}_vrg) <+ slew(V({regnode}, {pre}_vrg)/{pre}_Ra, {pre}_SRa);"
                    f"   // R_a regulation, large-signal slew-limited")
+    elif use_recov:
+        reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"   # recov path keeps the resistor (it carries its own Imax/deadzone anti-windup)
     else:
-        reg = f"V({regnode}, {pre}_vrg) <+ {pre}_Ra*I({regnode}, {pre}_vrg);"
+        # DEFAULT regulation with DC current COMPLIANCE (same min/max form as the recov anti-windup):
+        # EXACTLY V/Ra while |I|<=Icomp -> Zout/PSRR/noise (every DC+AC analysis in the validated load)
+        # are BITWISE unchanged; the DC regulation current then clamps to +-Icomp. So an off-corner /
+        # co-driven output can no longer force the near-zero Ra to inject an unbounded DC current ->
+        # the DC solve is well-conditioned for ANY vreg (PVT-robust).
+        reg = (f"I({regnode}, {pre}_vrg) <+ max(-{pre}_Icomp, min({pre}_Icomp, V({regnode}, {pre}_vrg)/{pre}_Ra));"
+               f"   // R_a regulation w/ DC current compliance: exactly V/Ra in-band, clamped to +-Icomp beyond")
     post_lines = ""
     if use_recov:
         # the deadzone clamp is a SHARED safety net (NOT gated by en_ls): it is zero (value+slope)
@@ -616,6 +624,30 @@ def _iassist_body(o, ground, ia):
     return s
 
 
+ICOMP_DEFAULT = 5.0e-2   # A -- regulation DC compliance default (pass-device Imax); transparent within any realistic load, only bounds the out-of-envelope give-way. Override per rail via p['icomp'].
+
+
+def _icomp_param(pre, slew_sr, recov, p):
+    """Regulation DC current-compliance localparam. Emitted ONLY for the DEFAULT (no-slew, no-recov)
+    regulation path -- the one wrapped in the min/max compliance by _branchA_reg. The slew/recov paths
+    carry their own large-signal handling (slew(), Imax min/max, deadzone), so they keep the plain
+    resistor and need no Icomp. Value from p['icomp'] (the pass-device max / dropout current), else
+    ICOMP_DEFAULT. It is EXACTLY transparent within the validated load (|I|<=Icomp -> the min/max is
+    exactly V/Ra); it only sets the out-of-envelope give-way ceiling, so a co-driven/off-corner output
+    can't force an unbounded DC fight. Empty list (byte-identical header) when the default path is not used."""
+    if (slew_sr and slew_sr > 0) or _recov_ok(recov):
+        return []
+    try:
+        ic = float(p.get("icomp", ICOMP_DEFAULT))
+    except (TypeError, ValueError):
+        ic = ICOMP_DEFAULT
+    if not (0.0 < ic < 1e30):
+        ic = ICOMP_DEFAULT
+    return [f"localparam real {pre}_Icomp = {ic:.6e};"
+            f"   // {pre} regulation DC current compliance [A] (pass-device Imax): small-signal stays"
+            f" 1/Ra (Zout preserved), DC current saturates here -> no unbounded DC fight for any vreg"]
+
+
 def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, recov=None, extra=None,
                   iassist=None):
     """The per-rail VA contribution body -- IDENTICAL for the literal (single-OP) and the
@@ -640,7 +672,9 @@ def _voltage_body(o, supply, ground, nfk, Cout, ESR, cft=0.0, slew_sr=None, reco
         f"    I({o}, {ground})    <+ {pre}_gn{k+1}*V({pre}_nk{k+1}, {ground});"
         for k in range(len(nfk)))
     return f"""    // ============ voltage rail {o} (Cout={Cout:.3e}F ESR={ESR:.3e}ohm) ============
-    V({pre}_vrf, {ground}) <+ vdc_{supply};       // supply DC reference for {o} PSRR
+    // supply DC reference for {o} PSRR -- AUTO-TRACKS the live {supply} DC (slow LP, ~1Hz): V({supply},vrf)=0 at DC for ANY supply -> zero DC injection across PVT; AC PSRR unchanged above the corner
+    I({supply}, {pre}_vrf) <+ (V({supply}, {ground}) - V({pre}_vrf, {ground}))/Rtrk_psrr;
+    I({pre}_vrf, {ground}) <+ Ctrk_psrr*ddt(V({pre}_vrf, {ground}));
     V({pre}_vrg, {ground}) <+ {pre}_vreg;          // {o} regulated output reference
 
     // Zout branch C: series Cout + ESR (vout -> vrg)
@@ -734,7 +768,8 @@ def _voltage_block_scheduled(o, vfit, supply, ground, sched, nfk, Cout, ESR, cft
                  f"(VALID_LOAD [{ilo:g}..{ihi:g}])")
     Cn_par = sched_par + "".join(             # Cn = internal noise-corner caps (localparam)
         f"\n  {ln}" for ln in _cft_param(pre, cft) + _slew_param(pre, slew_a)
-        + _recov_param(pre, recov) + _iassist_param(pre, ia)) + "".join(
+        + _recov_param(pre, recov) + _iassist_param(pre, ia)
+        + _icomp_param(pre, slew_a, recov, P[_nom_corner(P)])) + "".join(
         f"\n  localparam real {pre}_Cn{k+1} = {1.0/(TWO_PI*nfk[k]*NRk):.6e};"
         f"   // {o} noise corner {nfk[k]:.4g} Hz"
         for k in range(len(nfk)))
@@ -1203,11 +1238,15 @@ module {cell_name}({', '.join(all_ports)});
   inout {', '.join(grounds)};
   {elec_decl}
 
-  // INTERNAL model constants (localparam -> NOT instance/CDF parameters). vdc_{supply} is the
-  // PSRR/compliance DC-operating-point REFERENCE the small-signal terms linearize around (= the
-  // characterized supply DC; the live response still tracks the actual {supply} pin). NRk is the
-  // fixed noise-section resistor (the fitted gn sets amplitude). Re-emit if the supply OP moves.
-  localparam real vdc_{supply} = {supply_dc:g};   // {supply} DC operating-point reference [V]
+  // INTERNAL model constants (localparam -> NOT instance/CDF parameters). vdc_{supply} is now used
+  // ONLY by the current-bias supply-sensitivity (gdd) term (its injection is ~fA, negligible). The
+  // VOLTAGE-RAIL PSRR no longer references it: each rail's vrf AUTO-TRACKS the live {supply} DC via
+  // a slow low-pass (Rtrk_psrr/Ctrk_psrr, ~1 Hz), so V({supply},vrf)=0 at DC for ANY supply -> ZERO
+  // spurious DC injection across PVT, with the AC PSRR unchanged above the corner. NRk is the fixed
+  // noise-section resistor (the fitted gn sets amplitude).
+  localparam real vdc_{supply} = {supply_dc:g};   // {supply} DC reference for the current-bias gdd term only [V]
+  localparam real Rtrk_psrr = 1.591549e+08;   // PSRR DC-tracker resistor [ohm]
+  localparam real Ctrk_psrr = 1.000000e-09;   // PSRR DC-tracker cap [F]; corner = 1/(2*pi*Rtrk*Ctrk) ~ 1 Hz, BELOW the PSRR band -> only the 0 Hz (DC) supply component is decoupled
   localparam real NRk = {NRk:.6e};   // fixed noise-section resistor (gm sets amplitude)
   {cn_params}
 
