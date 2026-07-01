@@ -59,16 +59,16 @@ def test_slew_on_emits_exactly_the_slew_lines(tmp_path):
     # the PLL rail no longer has the passive-resistor NOR the default DC-compliance branch-A form
     assert "V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg) <+ VDD0P8_PLL_Ra*" not in t_on
     assert "VDD0P8_PLL_Icomp" not in t_on   # slew path carries its own large-signal handling -> no Icomp
-    # the OTHER rails are untouched (still the DEFAULT DC-compliance min/max form, no SRa)
-    assert "I(VDD0P8_DIG_nA, VDD0P8_DIG_vrg) <+ max(-VDD0P8_DIG_Icomp, min(VDD0P8_DIG_Icomp," in t_on
-    assert "I(VDD0P8_VCO_nA, VDD0P8_VCO_vrg) <+ max(-VDD0P8_VCO_Icomp, min(VDD0P8_VCO_Icomp," in t_on
-    assert "VDD0P8_DIG_SRa" not in t_on and "VDD0P8_VCO_SRa" not in t_on
-    # off->on diff on the PLL rail = 4 lines: -Icomp localparam / +SRa localparam, and
-    # -compliance-body / +slew-body (the compliance line is replaced by the slew line).
+    # the OTHER rails are untouched (the DEFAULT stiff R_a resistor form, no SRa, no Icomp)
+    assert "V(VDD0P8_DIG_nA, VDD0P8_DIG_vrg) <+ VDD0P8_DIG_Ra*I(VDD0P8_DIG_nA, VDD0P8_DIG_vrg)" in t_on
+    assert "V(VDD0P8_VCO_nA, VDD0P8_VCO_vrg) <+ VDD0P8_VCO_Ra*I(VDD0P8_VCO_nA, VDD0P8_VCO_vrg)" in t_on
+    assert "VDD0P8_DIG_SRa" not in t_on and "VDD0P8_VCO_SRa" not in t_on and "Icomp" not in t_on
+    # off->on diff on the PLL rail = 3 lines: +SRa localparam (added), and the branch-A regulation
+    # body swaps stiff-resistor -> slew() (-1/+1). (Was 4 when the default carried an Icomp localparam.)
     import difflib
     changed = [l for l in difflib.unified_diff(t_off.splitlines(), t_on.splitlines(), lineterm="")
                if l and l[0] in "+-" and not l.startswith(("+++", "---"))]
-    assert len(changed) == 4, f"expected 4 changed lines, got {len(changed)}: {changed}"
+    assert len(changed) == 3, f"expected 3 changed lines, got {len(changed)}: {changed}"
 
 
 def test_slew_scheduled_path_gated(tmp_path):

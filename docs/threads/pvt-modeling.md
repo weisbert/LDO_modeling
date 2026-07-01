@@ -188,19 +188,32 @@ PVT sweep — the user's key push: robust for ANY set VDD), so the fix is STRUCT
    PVT supply sweep; AC PSRR bitwise-preserved above the corner (baked `V(vrf)<+vdc` source removed; `vdc`
    kept only for the fA-level current-bias gdd term). Retires the supply-axis DC-injection hazard (AC
    line-reg ACCURACY is still the separate `dc_linereg` BACKLOG item).
-2. **Regulation DC current COMPLIANCE** — branch-A's Ra termination becomes `max(-Icomp, min(Icomp, V/Ra))`
-   (the recov anti-windup form): EXACTLY V/Ra while |I|≤Icomp (Zout/PSRR/noise bitwise-unchanged in the
-   validated load), clamped to ±Icomp beyond → a co-driven/off-corner output can't force an unbounded DC
-   fight; DC well-conditioned for ANY `vreg`. `Icomp` = pass-device Imax (default `ICOMP_DEFAULT`=50 mA,
-   transparent; override per rail via `p['icomp']`, ideally the per-corner dropout current).
+2. **Regulation = STIFF R_a resistor** (`V(nA,vrg) <+ Ra*I(nA,vrg)`) — pins vout to vreg with conductance
+   1/Ra at EVERY excursion, so the DC solve is well-conditioned for any vreg / PVT corner.
 
-Verified: focused emit suite green (incl. new `harness/test_pvt_robust_emit.py`), end-to-end emit correct,
-AC-PSRR/compliance transparency checked analytically, and the box PVT re-sim confirmed the mA/oscillation
-gone. NOTE: the earlier "+2 V unload overshoot" clamp (`himargin`) was a symptom-fix for what turned out to
-be this same co-drive event — REDUNDANT post-compliance, NOT shipped.
+   ⚠️ **CORRECTION 2026-07-01 — a "DC current COMPLIANCE" was tried here and REVERTED.** The first cut
+   wrapped Ra in `max(-Icomp, min(Icomp, V/Ra))` (later hand-patched to `Icomp*tanh`), intending "EXACTLY
+   V/Ra in-band, clamped to ±Icomp beyond." WRONG: the clamp knee is a **voltage** = `Icomp·Ra` ≈ 20 mA ×
+   0.095 Ω ≈ **1.9 mV** for the near-zero Ra, so >~10 mV off vreg the regulation saturated to a
+   **zero-conductance ~Icomp current source** → the output node lost its DC pin → **FF-corner runaway /
+   non-convergence** (user-reported; local Spectre reproduced: floating PLL rail + a small current imbalance
+   → **2.31e6 V** with the clamp vs **0.804 V** with the resistor; DC pin-strength sweep shows far-from-vreg
+   conductance collapsing to 6e-4 S vs the intended 10.5 S). TT/SS only "worked" by happening to stay inside
+   the ±2 mV linear sliver — the corner-dependence was that fragility, not process. **Removed entirely** (no
+   `Icomp`/`ICOMP_DEFAULT`/`_icomp_param`): the resistor is bit-identical in Zout/PSRR/noise (**0.0000 %**
+   over 1 Hz–1 GHz) AND in the validated large-signal transient (fit against THIS resistor form; OLD-vs-
+   resistor load-step overlap ≤3.4 µV). The unbounded-DC-fight hazard the compliance targeted is already
+   killed by FIX 1 (PSRR auto-track); a real current-limit/dropout is out of this LTI core's SCOPE (stage 2b)
+   and must be a one-sided, conductance-preserving soft limit — never a symmetric hard saturation.
+
+Verified: focused emit suite green (`harness/test_pvt_robust_emit.py`, rewritten to lock the resistor form +
+a no-`Icomp` regression), generator re-emit correct, AC-PSRR transparency Spectre-confirmed (0.0000 %), and
+the FF floating-rail runaway test passes on the freshly-emitted card (all rails ~0.80 V, 0 convergence
+errors). NOTE: the earlier "+2 V unload overshoot" clamp (`himargin`) was a symptom-fix for the same
+co-drive event — REDUNDANT post-auto-track, NOT shipped.
 
 ## Checklist
-- [x] in-situ DC-robustness root-fix — PSRR supply auto-track + regulation DC compliance (default-on in emit; `test_pvt_robust_emit.py`)
+- [x] in-situ DC-robustness root-fix — PSRR supply auto-track + STIFF R_a resistor regulation (the "DC current compliance" was tried & REVERTED: its ~1.9 mV knee caused FF-corner runaway; `test_pvt_robust_emit.py` locks the resistor + a no-`Icomp` regression)
 - [x] Confirm local GT is transistor-level & skewable (BSIM3 Vth0/U0/Tox) — yes, all `ground_truth/*.lib`
 - [x] PVT grid sweep (process × Vin × temp) on bias-fixed ldo_gt + OP guard
 - [x] Optimism quantified (TT-ships-everywhere vs real corner) — 8.5× hot I-ceiling, +11 dB PSRR SS/low-V

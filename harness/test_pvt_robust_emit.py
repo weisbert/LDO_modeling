@@ -1,5 +1,5 @@
-"""Lock the two PVT-robustness structural fixes in the emitted PMU model (the "DC solves to a
-non-physical current" class of bug, root-caused with the real box):
+"""Lock the PVT-robustness structural fixes in the emitted PMU model (the "DC solves to a
+non-physical current / FF-corner runaway" class of bug, root-caused with the real box + local Spectre):
 
 1. PSRR supply reference AUTO-TRACKS the live supply DC (a slow ~1Hz low-pass on vrf) instead of a
    baked `V(vrf)<+vdc` source. So `V(supply,vrf)` is 0 at DC for ANY supply level -> the DC-coupled
@@ -7,12 +7,20 @@ non-physical current" class of bug, root-caused with the real box):
    differs from the characterized value (i.e. across a PVT supply sweep). The AC PSRR is unchanged
    above the tracker corner (verified analytically: the tracker is 1Hz, the PSRR band is >~kHz).
 
-2. The DEFAULT regulation (branch-A R_a termination) gets a DC current COMPLIANCE (the same min/max
-   anti-windup form the recovery path already uses): it is EXACTLY V/Ra while |I|<=Icomp -> Zout /
-   PSRR / noise are BITWISE unchanged in the validated load, but the DC regulation current clamps to
-   +-Icomp. A near-zero R_a used to convert a sub-mV output mismatch (off-corner / co-driven node)
-   into hundreds of mA and an ill-conditioned DC solve; the clamp bounds it -> well-conditioned DC
-   for ANY vreg. slew/recov rails carry their own large-signal handling and keep their form (no Icomp).
+2. The DEFAULT regulation (branch-A R_a termination) is the STIFF passive R_a resistor
+   `V(nA,vrg) <+ Ra*I(nA,vrg)`. It pins vout to vreg with conductance 1/Ra at EVERY excursion, so the
+   DC solve is well-conditioned for any vreg / PVT corner.
+
+   A prior "DC current COMPLIANCE" (`max(-Icomp, min(Icomp, V/Ra))`, and a hand-patched `Icomp*tanh`
+   variant) was REMOVED 2026-07-01. Its knee is a VOLTAGE = Icomp*Ra ~ 1.9 mV for the near-zero R_a,
+   so >~10 mV off vreg the regulation saturated to a ZERO-conductance ~Icomp source and the output
+   node lost its DC pin -> FF-corner runaway (Mvolts) / non-convergence (Spectre-reproduced: floating
+   PLL rail + a small imbalance -> 2.3e6 V with the clamp vs 0.804 V with the resistor). The resistor
+   is bit-identical in Zout/PSRR/noise (0.0000% over 1Hz-1GHz) AND in the validated large-signal
+   transient (which was fit against THIS resistor form). The unbounded DC-fight hazard the compliance
+   targeted is already removed by FIX 1 (PSRR auto-track); a real current-limit/dropout is out of this
+   LTI core's SCOPE (stage 2b) and must be a one-sided conductance-preserving soft limit, never a
+   symmetric hard saturation. slew/recov rails carry their own large-signal handling and keep their form.
 """
 import pathlib
 import sys
@@ -46,45 +54,39 @@ def test_psrr_reference_auto_tracks_supply(tmp_path):
     assert "localparam real vdc_AVDD1P0 =" in t and "parameter real vdc_AVDD1P0" not in t
 
 
-# --------------------------------------------------------------- FIX 2: regulation DC compliance
-def test_default_regulation_has_dc_compliance(tmp_path):
-    """The default (no-slew, no-recov) rails emit the min/max DC-compliance regulation + an Icomp
-    localparam, on EVERY such rail. In-band it is exactly V/Ra (the '/Ra' is literally present)."""
+# --------------------------------------------------------------- FIX 2: regulation = stiff resistor
+def test_default_regulation_is_stiff_resistor(tmp_path):
+    """The default (no-slew, no-recov) rails emit the passive R_a resistor `V(nA,vrg) <+ Ra*I(nA,vrg)`
+    on EVERY such rail (conductance 1/Ra at all excursions -> DC pin preserved everywhere)."""
     res = _tem._real_pmu_fit_result()
     t = D.emit_pmu_va(res, "PMU_m", tmp_path / "o.va", supply="AVDD1P0", ground="VSS").read_text()
     for rail in ("VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO"):
-        assert (f"I({rail}_nA, {rail}_vrg) <+ max(-{rail}_Icomp, min({rail}_Icomp,"
-                f" V({rail}_nA, {rail}_vrg)/{rail}_Ra))" in t), rail
-        assert f"localparam real {rail}_Icomp =" in t, rail
-        # the old unbounded resistor form must be gone
-        assert f"V({rail}_nA, {rail}_vrg) <+ {rail}_Ra*I" not in t, rail
+        assert f"V({rail}_nA, {rail}_vrg) <+ {rail}_Ra*I({rail}_nA, {rail}_vrg)" in t, rail
 
 
-def test_icomp_value_overridable_per_rail(tmp_path):
-    """Icomp defaults to ICOMP_DEFAULT but is taken from the rail's fitted params p['icomp'] when set
-    (the pass-device max / dropout current, ideally characterized per corner)."""
+def test_no_regulation_current_compliance_anywhere(tmp_path):
+    """REGRESSION guard for the FF-runaway root cause: neither the min/max clamp nor the hand-patched
+    Icomp*tanh saturating-current regulation may reappear. The tell-tale symbol is `Icomp` -- it must
+    not exist in the emitted card at all (default, slew, or recov rails)."""
     res = _tem._real_pmu_fit_result()
-    # default
-    t0 = D.emit_pmu_va(res, "PMU_m", tmp_path / "d.va", supply="AVDD1P0", ground="VSS").read_text()
-    assert f"VDD0P8_PLL_Icomp = {D.ICOMP_DEFAULT:.6e}" in t0
-    # override on the PLL rail only (P is a dict keyed by corner label; set every corner's dict)
-    res2 = _tem._real_pmu_fit_result()
-    for Pil in res2["voltage"]["pll"]["P"].values():
-        Pil["icomp"] = 8.0e-3
-    t1 = D.emit_pmu_va(res2, "PMU_m", tmp_path / "o.va", supply="AVDD1P0", ground="VSS").read_text()
-    assert "VDD0P8_PLL_Icomp = 8.000000e-03" in t1
-    assert f"VDD0P8_VCO_Icomp = {D.ICOMP_DEFAULT:.6e}" in t1   # other rails keep the default
+    t = D.emit_pmu_va(res, "PMU_m", tmp_path / "o.va", supply="AVDD1P0", ground="VSS").read_text()
+    assert "Icomp" not in t                       # no localparam, no min/max clamp, no tanh variant
+    # the specific saturating-regulation forms, spelled out, must be absent on every rail
+    for rail in ("VDD0P8_DIG", "VDD0P8_PLL", "VDD0P8_VCO"):
+        assert f"max(-{rail}_Icomp" not in t, rail
+        assert f"{rail}_Icomp*tanh" not in t, rail
+    # and the compliance machinery is gone from the generator module itself
+    assert not hasattr(D, "_icomp_param") and not hasattr(D, "ICOMP_DEFAULT")
 
 
-def test_slew_and_recov_rails_have_no_icomp(tmp_path):
-    """The compliance is the DEFAULT-path fix only. A slew rail (slew() rate-limit) and a recov rail
-    (its own Imax/deadzone anti-windup) keep their own regulation and get NO Icomp localparam."""
+def test_slew_and_recov_rails_keep_their_own_regulation(tmp_path):
+    """FIX 2 is the DEFAULT-path form; the large-signal paths are untouched: a slew rail emits the
+    slew()-rate-limited R_a current, a recov rail keeps its resistor + its own Imax/deadzone anti-windup.
+    None of them (nor the default rail) carry any Icomp compliance."""
     res = _tem._real_pmu_fit_result()
     res["voltage"]["pll"]["slew_a"] = 1.0e4
     res["voltage"]["vco"]["recovery"] = dict(Lreg=1.6e-5, Rreg=750.0, Cs=2.5e-11, Rs=2.0e3)
     t = D.emit_pmu_va(res, "PMU_m", tmp_path / "o.va", supply="AVDD1P0", ground="VSS").read_text()
-    assert "VDD0P8_PLL_Icomp" not in t          # slew rail: no compliance localparam
-    assert "VDD0P8_VCO_Icomp" not in t          # recov rail: no compliance localparam
-    assert "VDD0P8_DIG_Icomp" in t              # the plain default rail still gets it
-    # and the slew/recov rails reference no undefined Icomp in their bodies
-    assert "VDD0P8_PLL_Icomp, min" not in t and "VDD0P8_VCO_Icomp, min" not in t
+    assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in t   # slew rail intact
+    assert "Icomp" not in t                                                              # no compliance anywhere
+    assert "V(VDD0P8_DIG_nA, VDD0P8_DIG_vrg) <+ VDD0P8_DIG_Ra*I" in t                    # plain default rail = resistor
