@@ -124,6 +124,50 @@ Steps:
 4. **Envelope guard** — corner tag + warn/conservative-fallback on un-characterized corners (PVT analog of
    the `floor` seatbelt). And (method) a clean process axis on a robust DUT + adaptive freq sampling at the peak.
 
+## Deployment mechanism — scheme ② (config+symbol flow; Spectre-verified 2026-07-01)
+The SWITCHING layer for the automated route-A, chosen for the REAL flow: the LDO enters as a schematic
+**SYMBOL** whose config binds a `veriloga` view → the netlister already `ahdl_include`s the `.va`, so a
+`.lib` section that RE-includes it would double-define the module (the A1 form is only for a LDO dropped in
+as a pure model card, no veriloga view). Scheme ② is the config-safe realization. **Shape = ONE veriloga
+view with all PROCESS banks inside + a section-set global selector.**
+
+1. **`.va`** — expose `parameter real corner_sel = 0;` (PROCESS ONLY). In `@(initial_step)`: `cs = corner_sel;`
+   then an if/else ladder selects the bank (TT/SS/FF/SF/FS…). `else` = TT + `$strobe("… uncharacterized
+   corner_sel=%0d …")` (the PVT `floor`-analog envelope guard). Keep `$temperature` doing continuous-T work
+   (noise kT, PTAT i(T)); `vreg_*` stay the exposed setpoint params. DO NOT fold T/vreg into `corner_sel`
+   (that re-creates the Cartesian product).
+2. **`ldo_corners.scs`** — `library ldo_corners { section tt parameters ldo_sel=0 … section ff parameters
+   ldo_sel=2 … }`. Each section ONLY sets the global `ldo_sel` (does NOT `ahdl_include` the `.va` → no clash
+   with the config veriloga). Do NOT also define `ldo_sel` at top level (Spectre **SFE-59** "previously
+   defined"; the section must be the SOLE definer — so an un-characterized/missing section fails LOUD at
+   read-in: `No section found with name 'sf'`).
+3. **CDF** — set the symbol's `corner_sel` value to `ldo_sel`. Netlist → `X0 (...) PMU_model vreg_*=…
+   corner_sel=ldo_sel`.
+
+**ADE (designer, once per corner):** add `ldo_corners.scs` to the corner's Model Files, `section=` that
+corner (same axis the PDK already selects). Section names needn't match the PDK textually — each corner's
+Model-File section is set explicitly, incl. `ssMOS_ffRC`-style splits.
+
+**Why NO Cartesian blow-up:** `corner_sel` is NOT an independent swept variable — the PROCESS section carries
+its value via `ldo_sel`. ONE axis → N corners stay N, not N×M. (There is NO universal built-in "corner"
+system variable; `$temperature` is the only env axis, so you MUST create the single source — here it's the
+section the PDK already selects.)
+
+**Still requires N CHARACTERIZATIONS** (N npz from N box corner runs) to fill the banks — re-emit ≠
+re-characterize. SF/FS = own bank+section+char UNLESS the MOS/RC separability experiment lets them be
+composed (still open).
+
+**Local proofs (2026-07-01, Spectre 18.1, scratch):** (a) `library/section`+`ahdl_include` selects the right
+per-corner `.va`, same module name no clash, undefined section fatal at read-in; (b) the REAL 20 KB
+`PMU_model.va` compiles (0 errors) and runs op/ac/noise/tran INSIDE a section, LF-Zout fingerprint reads back
+per corner; (c) instance-param `corner_sel`+if/else switches banks; (d) scheme ② — section-set `ldo_sel` +
+`corner_sel=ldo_sel` switches banks driven by `section=` ALONE (no per-instance literal). (Also: `isource`
+AC uses `mag=`, not `ac=`.)
+
+**Build (needs ultracode go):** `emit_pmu_model.py` takes N per-corner npz → one `.va` with N banks + the
+`corner_sel` dispatch/`$strobe`; generate `ldo_corners.scs` from the corner list. Supersedes the
+"corner-keyed `.lib` SECTIONS" wording in Later-build #1 (that A1 form clashes with the config veriloga).
+
 ## Checklist
 - [x] Confirm local GT is transistor-level & skewable (BSIM3 Vth0/U0/Tox) — yes, all `ground_truth/*.lib`
 - [x] PVT grid sweep (process × Vin × temp) on bias-fixed ldo_gt + OP guard

@@ -19,7 +19,7 @@
 |---|---|---|---|
 | large-signal-recovery | PART2 compressive assist committed (`78f5a7a`); FF-negative bug fixed; stress-tested; AC bit-identical | `bash apply` + box re-validate | `docs/threads/large-signal-recovery.md` |
 | wur-pmu-pll-psrr | 4/5 ports USABLE; pll PSRR = lone REVIEW blocker | `bash apply` + box re-validate | `docs/threads/wur-pmu-pll-psrr.md` |
-| pvt-modeling | local screen DONE (2 transistor GTs): single-corner model silently OPTIMISTIC at stressed corners (hot I-ceiling over-claim [toy-capped], SS/high-vreg PSRR +11 dB / Q→17.6×); confirms route-A sections + interp-REJECT; vreg (the exposed knob) doesn't track but silicon does | **TOMORROW: verify TT model runs + manual 3-corner (TT/SS/FF `.lib` + config switch) for Fri report. CRUX: 3 models need 3 CHARACTERIZATIONS (re-emit≠re-characterize) → FF/SS box corner data the long pole** | `docs/threads/pvt-modeling.md` |
+| pvt-modeling | local screen DONE (2 transistor GTs): single-corner model silently OPTIMISTIC at stressed corners (hot I-ceiling over-claim [toy-capped], SS/high-vreg PSRR +11 dB / Q→17.6×); confirms route-A sections + interp-REJECT; vreg doesn't track but silicon does; **deploy scheme ② (1 veriloga view + section-set `corner_sel`, no N×M Cartesian) SPECCED & Spectre-verified 2026-07-01** | **Manual 3-corner (TT/SS/FF) for Fri report (verify TT runs first). CRUX: 3 models need 3 CHARACTERIZATIONS (re-emit≠re-characterize) → FF/SS box corner data the long pole** | `docs/threads/pvt-modeling.md` |
 
 ## To find X, read Y
 - measured numbers / acceptance thresholds / golden values → `docs/reference/DATA.md`
