@@ -183,8 +183,9 @@ def test_manifest_slew_a_knob_threads_to_emit(tmp_path):
 
 def _undershoot_tr_manifest(tmp_path, name):
     """A single-OP voltage npz + manifest whose coverage.transient waveform is a CLEAN undershoot
-    (dI=2.0mA, t_bottom=25ns -> SRa=8.0e4), so the branch-A slew AUTO-fit engages -- the clean
-    characterization the manual knob stands in for. Returns (npz_path, manifest)."""
+    (dI=2.0mA, t_bottom=25ns -> SRa=8.0e4) that the branch-A slew AUTO-fit WOULD recover -- but the
+    auto-fit is OPT-IN (default OFF), so it engages only when coverage.slew_autofit (or the per-rail
+    flag) is set. Returns (npz_path, manifest)."""
     z, p, n = _tfd._ac()
     rec = {"loads": np.array(["nom"]),
            "z_pll_nom": z, "p_pll_AVDD1P0_nom": p, "noise_pll_nom": n,
@@ -200,24 +201,50 @@ def _undershoot_tr_manifest(tmp_path, name):
     return npz, m
 
 
-def test_autofit_slew_engages_on_clean_undershoot(tmp_path):
-    """END-TO-END auto-fit (the integration this change adds): a rail whose coverage.transient
-    shows a clean undershoot yields slew_a FROM THE FIT, with NO manifest knob -- SRa is now a fit
-    product like Zout/PSRR/noise, flowing coverage.transient -> _fit_slew_a -> vfit -> emit."""
+def test_autofit_slew_is_opt_in(tmp_path):
+    """Branch-A slew auto-fit is OPT-IN (default OFF). Slew was RETIRED as wrong-sign (replaced by
+    the compressive iassist), and an auto-fitted slew would silently displace the Route-1 unload-
+    discharge + derived ovVdz at emit -- so a clean-undershoot transient yields NO slew_a by default.
+    It is recovered ONLY when opted in (coverage.slew_autofit or the per-rail flag), then SRa flows
+    coverage.transient -> _fit_slew_a -> vfit -> emit exactly as before."""
     npz, m = _undershoot_tr_manifest(tmp_path, "slewauto")
+    # DEFAULT: OFF -> None (the trap is closed even though the undershoot is clean + mapped)
+    assert FMP.fit_multiport(str(npz), m)["voltage"]["pll"]["slew_a"] is None
+    # opt in GLOBALLY (coverage.slew_autofit) -> the auto-fit engages
+    m["coverage"]["slew_autofit"] = True
     res = FMP.fit_multiport(str(npz), m)
     assert res["voltage"]["pll"]["slew_a"] == pytest.approx(2.0e-3 / 25e-9, rel=0.25)
     va = D.emit_pmu_va(res, "PMU_auto", tmp_path / "auto.va",
                        supply="AVDD1P0", ground="VSS").read_text()
     assert "localparam real VDD0P8_PLL_SRa = " in va
     assert "slew(V(VDD0P8_PLL_nA, VDD0P8_PLL_vrg)/VDD0P8_PLL_Ra, VDD0P8_PLL_SRa)" in va
+    # opt in PER-RAIL (v_out[rail].slew_autofit) -> also engages
+    npz2, m2 = _undershoot_tr_manifest(tmp_path, "slewauto2")
+    m2["v_out"]["pll"]["slew_autofit"] = True
+    assert FMP.fit_multiport(str(npz2), m2)["voltage"]["pll"]["slew_a"] is not None
+
+
+def test_autofit_off_default_keeps_unload_discharge(tmp_path):
+    """THE trap-closed guarantee: with auto-slew OFF by default, a rail whose coverage.transient
+    WOULD auto-fit a slew instead stays in the RESISTOR form -> the Route-1 unload-discharge + the
+    derived ovVdz ARE emitted (a slew rail drops both -- they are mutually exclusive branch-A forms).
+    Non-minimal emit, so this is exactly the case that used to silently lose the discharge/ovVdz."""
+    npz, m = _undershoot_tr_manifest(tmp_path, "slewtrap")
+    res = FMP.fit_multiport(str(npz), m)
+    assert res["voltage"]["pll"]["slew_a"] is None
+    va = D.emit_pmu_va(res, "PMU_trap", tmp_path / "trap.va",
+                       supply="AVDD1P0", ground="VSS").read_text()
+    assert "slew(" not in va                                   # slew did NOT sneak in
+    assert "VDD0P8_PLL_ovVdz = " in va                         # ovVdz transparency floor survives
+    assert "VDD0P8_PLL_ovVmax*tanh(" in va                     # the Route-1 discharge term survives
 
 
 def test_manifest_slew_a_overrides_autofit(tmp_path):
-    """The manifest knob OVERRIDES the auto-fit: the same clean-undershoot transient would auto-fit
-    SRa~8e4, but a manifest slew_a=5.5e4 wins -- the escape hatch for DUTs whose transient should
-    not be trusted (the real WuR GHz system TB)."""
+    """The manifest knob is the primary escape hatch and OVERRIDES the (opted-in) auto-fit: with
+    slew_autofit on, the same clean-undershoot transient auto-fits SRa~8e4, but a manifest
+    slew_a=5.5e4 wins (and the knob works regardless of the auto-fit flag)."""
     npz, m = _undershoot_tr_manifest(tmp_path, "slewover")
+    m["coverage"]["slew_autofit"] = True
     auto = FMP.fit_multiport(str(npz), m)["voltage"]["pll"]["slew_a"]
     assert auto == pytest.approx(8.0e4, rel=0.25)          # the auto-fit it would have used
     m["v_out"]["pll"]["slew_a"] = 5.5e4                    # ... overridden by the knob

@@ -80,7 +80,7 @@ def _iload_map(ref, o, loads):
     return {k: v for k, v in out.items() if k in set(str(x) for x in loads)} or out
 
 
-def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
+def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None, slew_autofit=False):
     """Fit one voltage output from its single-port view (split_ports output).
     view = {"npz": {z_<il>,p_<il>,noise_<il>,loads,meta_*}, "supplies": {s:{il:arr}}, ...}.
     Returns dict(P={il:params}, nfk, cout, esr, err=[per-corner per-metric], supplies=[...],
@@ -235,15 +235,18 @@ def _fit_voltage_output(o, view, supplies, vout_dc=0.8, iload_map=None):
     tr_steps = view.get("tr_steps") or {}
     n_tr_npz = sum(1 for k in sp if isinstance(k, str) and k.startswith("tr_"))  # waveforms present
     vreg_sched = _build_vreg_schedule(sp, tr_steps, P, nom)
-    # branch-A regulation slew-rate limit SRa (the LARGE-SIGNAL load-transient undershoot the AC
-    # Zout cannot carry) -- AUTO-FIT from the SAME coverage.transient steps the vreg schedule uses,
-    # so SRa is a fit product like Zout/PSRR/noise, not a hand-filled constant. `_fit_slew_a` is
-    # hardened to REJECT switching-rippled / under-sampled steps (returns None) rather than emit a
-    # noise-located SRa; on a clean characterization step it recovers dI/t_bottom. None (no clean
-    # undershoot, or no transient) -> the rail emits byte-identical. The manifest slew_a, when set,
-    # OVERRIDES this at the fit_multiport call site -- the escape hatch for DUTs whose transient is
-    # GHz-contaminated (the real WuR system TB) where the auto-fit must not be trusted.
-    slew_a = _fit_slew_a(sp, tr_steps)
+    # branch-A regulation slew-rate limit SRa (a LARGE-SIGNAL load-transient undershoot term).
+    # AUTO-FIT IS OFF BY DEFAULT (slew_autofit gate): branch-A slew was RETIRED as WRONG-SIGN for the
+    # coverage dip (the LTI Zout already OVER-predicts the dip -> a positive SRa makes it worse; see
+    # METHODOLOGY §Refuted + DATA §5) and REPLACED by the compressive current-assist (iassist). Left
+    # auto-on, it silently re-introduces slew whenever a transient maps -- and a slew rail drops the
+    # Route-1 unload-discharge + the derived ovVdz at emit (they are mutually exclusive branch-A
+    # forms), so the retirement (done by stripping the MANIFEST knob in 7b76d8b) is undone by this
+    # auto-fit unless minimal-emit happens to mask it. So: default None (no slew -> resistor form ->
+    # discharge/ovVdz kept). `_fit_slew_a` (kept + still unit-tested) runs ONLY when opted in via
+    # m['v_out'][rail]['slew_autofit'] (or coverage.slew_autofit). The manifest slew_a stays the
+    # explicit hand-tuned escape hatch and OVERRIDES either way at the fit_multiport call site.
+    slew_a = _fit_slew_a(sp, tr_steps) if slew_autofit else None
     # when transients ARE mapped but the schedule still didn't build, capture WHY (per-waveform
     # settled-extraction dump) so the fit log explains it without another box round-trip.
     loadreg_diag = (_loadreg_diag(sp, tr_steps)
@@ -1159,11 +1162,17 @@ def _fit_multiport_impl(npz_path, manifest, vout_dc=None):
         # schedule abscissa. {} on a single-OP / legacy npz -> iv falls back to the
         # numeric-label parse then 0.0, byte-identical to the pre-stage-2b path.
         ilmap = _iload_map(ref, o, [str(x) for x in views[o]["loads"]])
-        volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc, iload_map=ilmap)
-        # branch-A slew SRa [A/s] is AUTO-FIT from coverage.transient inside _fit_voltage_output.
-        # The manifest m['v_out'][rail]['slew_a'], when present and >0, is an OVERRIDE (the user-
-        # tuned SRa / the escape hatch for GHz-contaminated DUTs) -- it wins over the auto-fit.
-        # Absent/<=0 -> keep the auto-fitted value (None when no clean undershoot -> byte-identical).
+        # branch-A slew auto-fit is OPT-IN (default OFF -- slew is retired/wrong-sign, replaced by the
+        # compressive iassist; an auto-fitted slew would silently displace the Route-1 discharge +
+        # derived ovVdz at emit). Re-enable per-rail via m['v_out'][rail]['slew_autofit'] or globally
+        # via coverage.slew_autofit; either way the explicit manifest slew_a below still wins.
+        _saf = bool((m["v_out"][o] or {}).get("slew_autofit")
+                    or (m.get("coverage") or {}).get("slew_autofit"))
+        volt[o] = _fit_voltage_output(o, views[o], supplies, vout_dc=vdc, iload_map=ilmap,
+                                      slew_autofit=_saf)
+        # The manifest m['v_out'][rail]['slew_a'], when present and >0, is the EXPLICIT hand-tuned
+        # escape hatch (a user-set SRa for a GHz-contaminated DUT) -- it OVERRIDES the auto-fit (which
+        # is off by default). Absent/<=0 -> keep whatever the (gated) auto-fit produced (None default).
         _sa = (m["v_out"][o] or {}).get("slew_a")
         if _sa and float(_sa) > 0:
             volt[o]["slew_a"] = float(_sa)
