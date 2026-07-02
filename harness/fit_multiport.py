@@ -451,10 +451,16 @@ def _fit_recovery(vmf):
 
 
 def _fit_slew_a(sp, tr_steps):
-    """Branch-A regulation SLEW-RATE limit SRa [A/s] from the rail's transient load steps -- the
-    LARGE-SIGNAL dynamic the AC Zout/PSRR fundamentally cannot carry (proven: same load + same cap
-    + same small-signal Zout, but the real LDO undershoots ~3x deeper than a pure-LTI model; a
-    finite slew reproduces it, SR->inf collapses it). On a load step of dI, the pass-device
+    """Branch-A regulation SLEW-RATE limit SRa [A/s] from the rail's transient load steps.
+
+    OPT-IN / DEFAULT OFF (runs only when slew_autofit is set -- see the caller). Branch-A slew was
+    RETIRED as WRONG-SIGN for the coverage dip: the LTI Zout already OVER-predicts that dip, so a
+    positive SRa makes it worse (METHODOLOGY §Refuted + DATA §5), and the compressive iassist
+    replaced it. This is kept (still unit-tested) as an escape hatch for a DUT that genuinely IS
+    slew-limited where iassist is not the right model -- but it must be opted into, because an
+    auto-fitted slew silently displaces the Route-1 unload-discharge + derived ovVdz at emit.
+
+    Mechanism (when opted in): on a load step of dI, the pass-device
     regulation current can only ramp at SRa, so the output UNDERSHOOTS -- dips BELOW its settled
     post-step level -- until the current catches the load. The dip BOTTOM sits ~dI/SRa after the
     edge, CAP-INDEPENDENTLY (the test cap sets the dip DEPTH, not its TIME), so
